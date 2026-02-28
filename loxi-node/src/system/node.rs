@@ -230,6 +230,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ComputeBackend;
+    use crate::network::Transport;
     use loxi_backbone::tensor::Tensor;
     use loxi_core::control::ControlMode;
     use std::cell::RefCell;
