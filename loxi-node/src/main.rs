@@ -3,7 +3,6 @@ use loxi_core::ethics::Ethics;
 use loxi_core::memory::Memory;
 use loxi_core::state::{State, D_R, D_SIM};
 
-use loxi_backbone::ffn_reasoning::FfnReasoning;
 use loxi_node::engine::wgpu_backend::WgpuBackend;
 use loxi_node::engine::ComputeBackend;
 use loxi_node::network::Transport;
@@ -76,8 +75,7 @@ struct UnstableReasoning {
 }
 impl loxi_core::reasoning::Reasoning for UnstableReasoning {
     fn init(&self, s: &DVector<f32>) -> DVector<f32> {
-        let d_reasoning = s.len() - D_SIM;
-        s.rows(0, d_reasoning).into_owned()
+        s.clone()
     }
     fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
         let mut next = h.clone();
@@ -94,13 +92,6 @@ impl loxi_core::reasoning::Reasoning for UnstableReasoning {
         }
         next
     }
-}
-impl loxi_core::reasoning::MutableReasoning for UnstableReasoning {
-    fn perturb_weight(&mut self, _eps: f32) -> usize {
-        0
-    }
-    fn revert_weight(&mut self, _index: usize, _eps: f32) {}
-    fn apply_update(&mut self, _jacobian: &loxi_core::reasoning::JacobianEstimate, _step: f32) {}
 }
 
 fn main() {
@@ -215,20 +206,13 @@ fn test_unstable_reasoning() {
 struct StableMockReasoning;
 impl loxi_core::reasoning::Reasoning for StableMockReasoning {
     fn init(&self, s: &DVector<f32>) -> DVector<f32> {
-        let d_reasoning = s.len() - D_SIM;
-        s.rows(0, d_reasoning).into_owned()
+        s.clone()
     }
     fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
         // Retorna h con un ruido mínimo para simular convergencia rápida y alta calidad
-        h.clone() + DVector::from_element(h.len(), 0.00001)
+        // 1e-7 * sqrt(2560) approx 5.1e-6 < 1e-4 (epsilon)
+        h.clone() + DVector::from_element(h.len(), 0.0000001)
     }
-}
-impl loxi_core::reasoning::MutableReasoning for StableMockReasoning {
-    fn perturb_weight(&mut self, _eps: f32) -> usize {
-        0
-    }
-    fn revert_weight(&mut self, _index: usize, _eps: f32) {}
-    fn apply_update(&mut self, _jacobian: &loxi_core::reasoning::JacobianEstimate, _step: f32) {}
 }
 
 fn build_base_node(
@@ -264,7 +248,7 @@ fn build_base_node(
 
 fn run_sim_quiet<R, C, E, M, B, N>(node: &mut LoxiNode<R, C, E, M, B, N>)
 where
-    R: loxi_core::reasoning::MutableReasoning,
+    R: loxi_core::reasoning::Reasoning,
     C: loxi_core::control::Control,
     E: loxi_core::ethics::Ethics,
     M: loxi_core::memory::Memory,

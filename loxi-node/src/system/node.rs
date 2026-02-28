@@ -5,12 +5,9 @@ use loxi_core::{
     ethics::Ethics,
     memory::Memory,
     quality::{compute_q, QualityMetrics, Q_MIN_LEARN, Q_MIN_WRITE},
-    reasoning::{JacobianEstimate, MutableReasoning, Reasoning},
+    reasoning::Reasoning,
     state::D_SIM,
 };
-
-use crate::engine::ComputeBackend;
-use crate::network::Transport;
 
 /// Nodo LOXI: orquesta el ciclo completo sin conocer implementaciones concretas.
 pub struct LoxiNode<R, C, E, M, B, N> {
@@ -74,7 +71,7 @@ impl Default for TickMetrics {
 
 impl<R, C, E, M, B, N> LoxiNode<R, C, E, M, B, N>
 where
-    R: MutableReasoning, // Requetido para Nivel 3
+    R: Reasoning,
     C: Control,
     E: Ethics,
     M: Memory,
@@ -85,28 +82,6 @@ where
     /// h* es atractor <=> ||h_{t+1} - h_t|| < epsilon AND Q(h*) >= Q_MIN_WRITE
     pub fn is_attractor_state(&self, delta_norm: f32, q: f32) -> bool {
         delta_norm < self.epsilon && q >= Q_MIN_WRITE
-    }
-
-    /// Estima el Jacobiano local θ evaluado en el atractor.
-    fn estimate_jacobian(
-        reasoning: &mut R,
-        h_star: &DVector<f32>,
-        s: &DVector<f32>,
-        eps: f32,
-    ) -> JacobianEstimate
-    where
-        R: MutableReasoning,
-    {
-        let h_base = reasoning.step(h_star, s);
-        let idx = reasoning.perturb_weight(eps);
-        let h_perturbed = reasoning.step(h_star, s);
-        reasoning.revert_weight(idx, eps);
-
-        JacobianEstimate {
-            delta_h: h_perturbed - h_base,
-            eps,
-            weight_index: idx,
-        }
     }
 
     /// Un tick completo del nodo LOXI. Devuelve métricas si hubo integración.
@@ -218,26 +193,15 @@ where
 
                 // Caso C: Control detuvo el loop o convergencia natural
                 let allow_learning = quality.q_total >= Q_MIN_LEARN;
-                let mut write_memory = decision.write_memory && (quality.q_total >= Q_MIN_WRITE);
+                let write_memory = decision.write_memory && (quality.q_total >= Q_MIN_WRITE);
 
                 if write_memory {
                     self.memory.write(delta_s);
                 }
 
-                // --- NIVEL 3: Aprendizaje Local (Sólo en Atractores de Alta Calidad) ---
-                if allow_learning {
-                    // 1. Estimar Jacobiano local
-                    let jac = Self::estimate_jacobian(&mut self.reasoning, &h, &s0, 1e-4);
-
-                    // 2. Definir paso de aprendizaje (eta = 1e-3)
-                    let eta = 0.001;
-
-                    // 3. Regla LOXI: sign(delta_Q) * J_theta
-                    // En este tick no tenemos Q_prev real, simulamos refuerzo positivo si Q es alta
-                    let step = if quality.q_total > 0.7 { eta } else { -eta };
-
-                    self.reasoning.apply_update(&jac, step);
-                }
+                // --- NIVEL 3.5: Alineación Constitucional (Runtime Pasivo) ---
+                // El runtime NO puede aprender. Solo emite indicadores de calidad.
+                // allow_learning actúa como una señal para el orquestador externo.
 
                 self.state = proposed;
                 let stop_reason = if delta_norm < self.epsilon {
@@ -304,13 +268,6 @@ mod tests {
         fn step(&self, _h: &DVector<f32>, _x: &DVector<f32>) -> DVector<f32> {
             DVector::zeros(self.step_return_len)
         }
-    }
-    impl MutableReasoning for MockReasoning {
-        fn perturb_weight(&mut self, _eps: f32) -> usize {
-            0
-        }
-        fn revert_weight(&mut self, _index: usize, _eps: f32) {}
-        fn apply_update(&mut self, _jacobian: &JacobianEstimate, _step: f32) {}
     }
 
     struct MockControl {
