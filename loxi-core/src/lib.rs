@@ -6,6 +6,7 @@
 //!
 //! Es auditable, estable y geométricamente sellado.
 
+pub mod compute;
 pub mod control;
 pub mod ethics;
 pub mod integrator;

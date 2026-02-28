@@ -53,6 +53,15 @@ pub struct TickMetrics {
     pub quality: QualityMetrics,
 }
 
+/// Señal de salida del Tick para el laboratorio (PRIVADO/EXTERNO).
+#[derive(Debug, Clone)]
+pub struct LearningSignal {
+    pub allow_learning: bool,
+    pub q_total: f32,
+    pub h_star: DVector<f32>,
+    pub s_context: DVector<f32>,
+}
+
 impl Default for TickMetrics {
     fn default() -> Self {
         Self {
