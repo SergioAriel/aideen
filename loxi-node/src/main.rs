@@ -7,7 +7,7 @@ use loxi_backbone::ffn_reasoning::FfnReasoning;
 use loxi_node::engine::wgpu_backend::WgpuBackend;
 use loxi_node::engine::ComputeBackend;
 use loxi_node::network::Transport;
-use loxi_node::system::node::LoxiNode;
+use loxi_node::system::node::{LoxiNode, StopReason};
 
 use loxi_backbone::tensor::Tensor;
 use nalgebra::DVector;
@@ -66,7 +66,7 @@ impl Control for SimpleControl {
 }
 
 fn main() {
-    println!("🚀 Visualización de Trayectorias LOXI (S_R vs S_sim)");
+    println!("🚀 Visualización de Trayectorias LOXI (Nivel 1: Dinámica Observable)");
     println!("──────────────────────────────────────────────────");
     println!("V0: Control en modo OBSERVE. S_sim es Volátil.");
 
@@ -92,7 +92,6 @@ fn main() {
     // 2. ESCENARIO B: Ficción / Simulación (Afecta S_sim)
     println!("\n[Escenario B: Inyección en S_sim - Pura Volatilidad]");
     let mut state_b = State::new();
-    // Inyectamos un estímulo de 'ficción' directamente en S_sim
     state_b.write_sim(&vec![2.0; D_SIM]);
 
     let mut node_b = LoxiNode {
@@ -125,9 +124,14 @@ where
     for tick in 1..=10 {
         if let Some(m) = node.tick() {
             println!(
-                "{} | Tick {:02} | ER: {:.6} | ESIM: {:.6} | Iters: {}",
-                name, tick, m.energy_r, m.energy_sim, m.iters
+                "{} | Tick {:02} | iters={} | ER={:.2} | ESIM={:.2} | ET={:.2} | stop={:?} | conv={}",
+                name, tick, m.iters, m.energy_r, m.energy_sim, m.energy_total, m.stop_reason, m.converged
             );
+
+            if m.stop_reason == StopReason::Epsilon {
+                println!("{} | Tick {:02} | [Atractor Alcanzado]", name, tick + 1);
+                break;
+            }
         } else {
             println!(
                 "{} | Tick {:02} | [Inhibido / Sin Convergencia]",

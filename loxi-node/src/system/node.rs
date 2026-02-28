@@ -31,13 +31,36 @@ pub struct LoxiNode<R, C, E, M, B, N> {
     pub epsilon: f32,
 }
 
+/// Razón por la cual se detuvo el tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StopReason {
+    Control,
+    Epsilon,
+    Ethics,
+}
+
 /// Métricas de un tick para visualización y control.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TickMetrics {
     pub energy_r: f32,
     pub energy_sim: f32,
+    pub energy_total: f32,
     pub iters: usize,
-    pub stop_reason: String,
+    pub converged: bool,
+    pub stop_reason: StopReason,
+}
+
+impl Default for TickMetrics {
+    fn default() -> Self {
+        Self {
+            energy_r: 0.0,
+            energy_sim: 0.0,
+            energy_total: 0.0,
+            iters: 0,
+            converged: false,
+            stop_reason: StopReason::Control,
+        }
+    }
 }
 
 impl<R, C, E, M, B, N> LoxiNode<R, C, E, M, B, N>
@@ -71,8 +94,8 @@ where
             if decision.stop {
                 let delta_s = &h - &s0;
                 let mut proposed = self.state.clone();
-                let mut energy_r: f32 = 0.0;
-                let mut energy_sim: f32 = 0.0;
+                let mut energy_sq_r: f32 = 0.0;
+                let mut energy_sq_sim: f32 = 0.0;
 
                 let integrable_dim = self.state.len() - D_SIM;
 
@@ -83,22 +106,43 @@ where
                 {
                     let c = (self.alpha * decision.beta * di).tanh();
                     *si += c;
-                    energy_r += c * c;
+                    energy_sq_r += c * c;
                 }
 
                 // Medición de S_sim (sin integración)
                 for di in delta_s.as_slice()[integrable_dim..].iter() {
-                    energy_sim += di * di;
+                    energy_sq_sim += di * di;
                 }
 
-                if energy_r.sqrt() < self.epsilon {
-                    return None;
+                let energy_r = energy_sq_r.sqrt();
+                let energy_sim = energy_sq_sim.sqrt();
+                let energy_total = (energy_sq_r + energy_sq_sim).sqrt();
+
+                // Caso A: Cambio insignificante (Epsilon)
+                if energy_r < self.epsilon {
+                    return Some(TickMetrics {
+                        energy_r,
+                        energy_sim,
+                        energy_total,
+                        iters: iter + 1,
+                        converged: true,
+                        stop_reason: StopReason::Epsilon,
+                    });
                 }
 
+                // Caso B: Violación ética
                 if self.ethics.violates(&proposed) {
-                    return None;
+                    return Some(TickMetrics {
+                        energy_r,
+                        energy_sim,
+                        energy_total,
+                        iters: iter + 1,
+                        converged: false,
+                        stop_reason: StopReason::Ethics,
+                    });
                 }
 
+                // Caso C: Éxito/Control
                 self.state = self.ethics.project(&proposed);
 
                 if decision.write_memory {
@@ -106,10 +150,12 @@ where
                 }
 
                 return Some(TickMetrics {
-                    energy_r: energy_r.sqrt(),
-                    energy_sim: energy_sim.sqrt(),
+                    energy_r,
+                    energy_sim,
+                    energy_total,
                     iters: iter + 1,
-                    stop_reason: "ControlStop".to_string(),
+                    converged: true,
+                    stop_reason: StopReason::Control,
                 });
             }
         }
