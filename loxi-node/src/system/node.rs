@@ -4,7 +4,7 @@ use loxi_core::{
     control::{Control, ControlDecision},
     ethics::Ethics,
     memory::Memory,
-    quality::{compute_q, QualityMetrics},
+    quality::{compute_q, QualityMetrics, Q_MIN_LEARN, Q_MIN_WRITE},
     reasoning::Reasoning,
     state::D_SIM,
 };
@@ -38,6 +38,7 @@ pub enum StopReason {
     Control,
     Epsilon,
     Ethics,
+    LowQuality,
 }
 
 /// Métricas de un tick para visualización y control.
@@ -49,6 +50,8 @@ pub struct TickMetrics {
     pub iters: usize,
     pub converged: bool,
     pub stop_reason: StopReason,
+    pub is_attractor: bool,
+    pub allow_learning: bool,
     pub quality: QualityMetrics,
 }
 
@@ -61,6 +64,8 @@ impl Default for TickMetrics {
             iters: 0,
             converged: false,
             stop_reason: StopReason::Epsilon,
+            is_attractor: false,
+            allow_learning: false,
             quality: QualityMetrics::default(),
         }
     }
@@ -124,75 +129,80 @@ where
                     oscillation_var,
                 );
 
-                // Recalculamos delta_s_r para evitar el move previo de into_owned()
-                let integrable_dim = self.state.len() - D_SIM;
-                // delta_s para integración (usamos h completa: 2560)
+                // --- GATING N2 (Física Cognitiva) ---
+                let is_attractor = delta_norm < self.epsilon && quality.q_total >= Q_MIN_WRITE;
+
+                if !is_attractor {
+                    return Some(TickMetrics {
+                        energy_r: 0.0,
+                        energy_sim: 0.0,
+                        energy_total: 0.0,
+                        iters: iter + 1,
+                        converged: false,
+                        stop_reason: StopReason::LowQuality,
+                        is_attractor: false,
+                        allow_learning: false,
+                        quality,
+                    });
+                }
+
+                // Integración estable (TANH)
                 let delta_s = &h - &s0;
-                let delta_s_r_ref = delta_s.rows(0, integrable_dim);
-
                 let mut proposed = self.state.clone();
-                let mut energy_sq_r: f32 = 0.0;
-                let mut energy_sq_sim: f32 = 0.0;
+                let mut energy_sq_r = 0.0;
+                let mut energy_sq_sim = 0.0;
 
-                // Integración de S_R (y otros cores)
                 for (si, di) in proposed.as_mut_slice()[0..integrable_dim]
                     .iter_mut()
-                    .zip(delta_s_r_ref.as_slice().iter())
+                    .zip(delta_s.rows(0, integrable_dim).iter())
                 {
                     let c = (self.alpha * decision.beta * di).tanh();
                     *si += c;
                     energy_sq_r += c * c;
                 }
 
-                // Medición de S_sim (sin integración)
-                let integrable_dim = self.state.len() - D_SIM;
                 if h.len() >= integrable_dim + D_SIM {
                     let delta_s_sim =
                         &h.rows(integrable_dim, D_SIM) - &s0.rows(integrable_dim, D_SIM);
-                    for di in delta_s_sim.as_slice().iter() {
+                    for di in delta_s_sim.iter() {
                         energy_sq_sim += di * di;
                     }
                 }
 
                 let energy_r = energy_sq_r.sqrt();
-                let energy_sim = energy_sq_sim.sqrt();
                 let energy_total = (energy_sq_r + energy_sq_sim).sqrt();
 
-                // Caso A: Cambio insignificante (Epsilon)
-                if energy_r < self.epsilon {
-                    return Some(TickMetrics {
-                        energy_r,
-                        energy_sim,
-                        energy_total,
-                        iters: iter + 1,
-                        converged: true,
-                        stop_reason: StopReason::Epsilon,
-                        quality,
-                    });
-                }
-
-                // Caso B: Violación ética
                 if self.ethics.violates(&proposed) {
                     return Some(TickMetrics {
                         energy_r,
-                        energy_sim,
+                        energy_sim: energy_sq_sim.sqrt(),
                         energy_total,
                         iters: iter + 1,
                         converged: false,
                         stop_reason: StopReason::Ethics,
+                        is_attractor: false,
+                        allow_learning: false,
                         quality,
                     });
                 }
 
-                // Caso C: Control detuvo el loop
+                let allow_learning = quality.q_total >= Q_MIN_LEARN;
+                let write_memory = decision.write_memory && (quality.q_total >= Q_MIN_WRITE);
+
+                if write_memory {
+                    self.memory.write(delta_s);
+                }
+
                 self.state = proposed;
                 return Some(TickMetrics {
                     energy_r,
-                    energy_sim,
+                    energy_sim: energy_sq_sim.sqrt(),
                     energy_total,
                     iters: iter + 1,
                     converged: true,
                     stop_reason: StopReason::Control,
+                    is_attractor: true,
+                    allow_learning,
                     quality,
                 });
             }
@@ -261,6 +271,7 @@ mod tests {
                 stop: iter >= self.stop_at_iter,
                 beta: self.beta,
                 write_memory: self.write_memory,
+                allow_learning: true,
             }
         }
     }

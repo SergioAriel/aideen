@@ -16,6 +16,8 @@ pub struct ControlDecision {
     pub beta: f32,
     /// ¿Se autoriza la persistencia en memoria local?
     pub write_memory: bool,
+    /// ¿Se autoriza el aprendizaje local (ajuste de pesos)?
+    pub allow_learning: bool,
 }
 
 /// Control de convergencia y parada (El orquestador)

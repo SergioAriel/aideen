@@ -65,6 +65,7 @@ impl Control for StressControl {
             stop: iter >= self.max_iters - 1,
             beta: self.beta,
             write_memory: false,
+            allow_learning: true,
         }
     }
 }
@@ -245,10 +246,17 @@ where
         print_metrics("END  ", 5, &m);
     }
 }
-
-fn print_metrics(label: &str, tick: usize, m: &TickMetrics) {
+fn print_metrics(tag: &str, tick: usize, m: &TickMetrics) {
     println!(
-        "   {} | T{:02} | iters={} | ER={:.2} | ET={:.2} | stop={:?} | Q={:.3}",
-        label, tick, m.iters, m.energy_r, m.energy_total, m.stop_reason, m.quality.q_total
+        "   {:7} | T{:02} | iters={} | ER={:.2} | ET={:.2} | stop={:?} | Q={:.3} | attractor={} | learn={}",
+        tag,
+        tick,
+        m.iters,
+        m.energy_r,
+        m.energy_total,
+        m.stop_reason,
+        m.quality.q_total,
+        m.is_attractor,
+        m.allow_learning
     );
 }
