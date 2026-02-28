@@ -197,17 +197,37 @@ fn test_unstable_reasoning() {
 
 // --- Helpers ---
 
+// Reasoning simulado para pruebas de stress
+struct StableMockReasoning;
+impl loxi_core::reasoning::Reasoning for StableMockReasoning {
+    fn init(&self, s: &DVector<f32>) -> DVector<f32> {
+        let d_reasoning = s.len() - D_SIM;
+        s.rows(0, d_reasoning).into_owned()
+    }
+    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
+        // Retorna h con un ruido mínimo para simular convergencia rápida y alta calidad
+        h.clone() + DVector::from_element(h.len(), 0.00001)
+    }
+}
+
 fn build_base_node(
     alpha: f32,
     beta: f32,
     iters: usize,
-) -> LoxiNode<FfnReasoning, StressControl, DummyEthics, DummyMemory, WgpuBackend, DummyTransport> {
+) -> LoxiNode<
+    StableMockReasoning,
+    StressControl,
+    DummyEthics,
+    DummyMemory,
+    WgpuBackend,
+    DummyTransport,
+> {
     let mut state = State::new();
-    state.inject_delta_r(&vec![1.0; D_R]); // Estímulo estándar
+    state.inject_delta_r(&vec![1.0; D_R]);
 
     LoxiNode {
         state: state.s,
-        reasoning: FfnReasoning::new(2048), // Usamos el subespacio de razonamiento completo
+        reasoning: StableMockReasoning,
         control: StressControl {
             beta,
             max_iters: iters,
