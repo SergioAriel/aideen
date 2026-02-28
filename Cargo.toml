@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "loxi-core",       # 1. Contratos Publicos (Sellado)
+    "loxi-reasoning",  # 2. Cerebro Entrenable
+    "loxi-node",       # 3. GPU Runtime y P2P
+    "loxi-backbone",   # 4. Arquitectura del Modelo
+]
+resolver = "2"

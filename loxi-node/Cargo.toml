@@ -1,0 +1,10 @@
+[package]
+name = "loxi-node"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+loxi-core = { path = "../loxi-core" }
+loxi-backbone = { path = "../loxi-backbone" }
+nalgebra = "0.32"
+wgpu = "27.0.1"
+pollster = "0.4.0"

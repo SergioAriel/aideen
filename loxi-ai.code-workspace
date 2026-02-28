@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../loxi/protocol/crates/ai"
+		},
+		{
+			"path": "../loxi/protocol/crates/loxi-compute"
+		}
+	]
+}

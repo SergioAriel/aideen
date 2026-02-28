@@ -1,0 +1,43 @@
+[package]
+name        = "loxi-runtime"
+version     = "0.1.0"
+edition     = "2021"
+description = "GPU-agnostic inference/training runtime para Loxi AI (Metal/Vulkan/DX12/WebGPU)"
+
+[lib]
+name = "loxi_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+wgpu     = { workspace = true }
+bytemuck = { workspace = true }
+half     = { workspace = true }
+
+tokio = { workspace = true }
+
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+safetensors = { workspace = true }
+
+instant-distance = { workspace = true }
+
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid      = { workspace = true }
+lz4_flex  = { workspace = true }
+bincode   = { workspace = true }
+
+[dev-dependencies]
+tokio  = { workspace = true }
+approx = { workspace = true }
+
+[features]
+default = []
+# WebGPU/WASM — único feature que wgpu requiere activar explícitamente
+wasm = ["wgpu/webgpu"]
+
+[[bin]]
+name = "loxi-runtime-bench"
+path = "src/bin/bench.rs"
