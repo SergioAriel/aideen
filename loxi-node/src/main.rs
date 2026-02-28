@@ -161,8 +161,11 @@ fn test_unstable_reasoning() {
     println!("\n[TEST D: NO CONVERGENCIA FORZADA]");
 
     println!(">>> 1. Oscilación divergente");
+    let mut state_osc = DVector::zeros(2560);
+    state_osc.rows_mut(0, 2048).add_scalar_mut(1.0); // Inyectamos 1.0 en todo el subespacio de razonamiento
+
     let mut node_osc = LoxiNode {
-        state: DVector::zeros(2560),
+        state: state_osc,
         reasoning: UnstableReasoning { mode: 0 },
         control: StressControl {
             beta: 1.0,
@@ -178,8 +181,11 @@ fn test_unstable_reasoning() {
     run_sim_quiet(&mut node_osc);
 
     println!(">>> 2. Divergencia lineal");
+    let mut state_div = DVector::zeros(2560);
+    state_div.rows_mut(0, 2048).add_scalar_mut(1.0);
+
     let mut node_div = LoxiNode {
-        state: DVector::zeros(2560),
+        state: state_div,
         reasoning: UnstableReasoning { mode: 1 },
         control: StressControl {
             beta: 1.0,
