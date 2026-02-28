@@ -293,5 +293,8 @@ mod tests {
         let (mut node, _) = build_test_node(2, false);
         let metrics = node.tick();
         assert!(metrics.is_some());
+        let m = metrics.unwrap();
+        assert!(m.converged);
+        assert_eq!(m.stop_reason, StopReason::Control);
     }
 }
