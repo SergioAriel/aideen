@@ -76,7 +76,8 @@ struct UnstableReasoning {
 }
 impl loxi_core::reasoning::Reasoning for UnstableReasoning {
     fn init(&self, s: &DVector<f32>) -> DVector<f32> {
-        s.clone()
+        let d_reasoning = s.len() - D_SIM;
+        s.rows(0, d_reasoning).into_owned()
     }
     fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
         let mut next = h.clone();
@@ -93,6 +94,13 @@ impl loxi_core::reasoning::Reasoning for UnstableReasoning {
         }
         next
     }
+}
+impl loxi_core::reasoning::MutableReasoning for UnstableReasoning {
+    fn perturb_weight(&mut self, _eps: f32) -> usize {
+        0
+    }
+    fn revert_weight(&mut self, _index: usize, _eps: f32) {}
+    fn apply_update(&mut self, _jacobian: &loxi_core::reasoning::JacobianEstimate, _step: f32) {}
 }
 
 fn main() {
@@ -215,6 +223,13 @@ impl loxi_core::reasoning::Reasoning for StableMockReasoning {
         h.clone() + DVector::from_element(h.len(), 0.00001)
     }
 }
+impl loxi_core::reasoning::MutableReasoning for StableMockReasoning {
+    fn perturb_weight(&mut self, _eps: f32) -> usize {
+        0
+    }
+    fn revert_weight(&mut self, _index: usize, _eps: f32) {}
+    fn apply_update(&mut self, _jacobian: &loxi_core::reasoning::JacobianEstimate, _step: f32) {}
+}
 
 fn build_base_node(
     alpha: f32,
@@ -249,7 +264,7 @@ fn build_base_node(
 
 fn run_sim_quiet<R, C, E, M, B, N>(node: &mut LoxiNode<R, C, E, M, B, N>)
 where
-    R: loxi_core::reasoning::Reasoning,
+    R: loxi_core::reasoning::MutableReasoning,
     C: loxi_core::control::Control,
     E: loxi_core::ethics::Ethics,
     M: loxi_core::memory::Memory,
