@@ -4,5 +4,8 @@ members = [
     "loxi-reasoning",  # 2. Cerebro Entrenable
     "loxi-node",       # 3. GPU Runtime y P2P
     "loxi-backbone",   # 4. Arquitectura del Modelo
+    "loxi-training-lab", # 5. Laboratorio Privado
+    "loxi-engine",     # 6. Motor Computacional GPU
 ]
 resolver = "2"
+
