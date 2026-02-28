@@ -7,7 +7,8 @@ pub const D_C: usize = 256;
 pub const D_E: usize = 256;
 pub const D_SIM: usize = 512;
 
-pub const D_GLOBAL: usize = D_M + D_R + D_C + D_E + D_SIM;
+pub const D_GLOBAL: usize = 2560; // 512 + 1024 + 256 + 256 + 512
+pub const D_REASONING: usize = 2048; // D_M + D_R + D_C + D_E
 
 /// Estado cognitivo global
 #[derive(Clone, Debug)]

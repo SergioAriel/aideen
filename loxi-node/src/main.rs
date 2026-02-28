@@ -7,12 +7,13 @@ use loxi_backbone::ffn_reasoning::FfnReasoning;
 use loxi_node::engine::wgpu_backend::WgpuBackend;
 use loxi_node::engine::ComputeBackend;
 use loxi_node::network::Transport;
-use loxi_node::system::node::{LoxiNode, StopReason};
+use loxi_node::system::node::{LoxiNode, TickMetrics};
 
 use loxi_backbone::tensor::Tensor;
 use nalgebra::DVector;
+use rand::Rng;
 
-// ─── Implementaciones Temporales (Dummies) para Visualización ───
+// ─── Implementaciones Temporales (Dummies) ───────────────────────
 
 struct DummyTransport;
 impl Transport for DummyTransport {
@@ -48,71 +49,178 @@ impl Memory for DummyMemory {
     }
 }
 
-struct SimpleControl;
-impl Control for SimpleControl {
+struct StressControl {
+    beta: f32,
+    max_iters: usize,
+}
+impl Control for StressControl {
     fn max_iters(&self) -> usize {
-        5
+        self.max_iters
     }
     fn mode(&self) -> loxi_core::control::ControlMode {
         loxi_core::control::ControlMode::Observe
     }
     fn decide(&self, iter: usize, _delta_norm: f32, _entropy: f32) -> ControlDecision {
         ControlDecision {
-            stop: iter >= 4,
-            beta: 1.0,
+            stop: iter >= self.max_iters - 1,
+            beta: self.beta,
             write_memory: false,
         }
     }
 }
 
-fn main() {
-    println!("🚀 Visualización de Trayectorias LOXI (Nivel 1: Dinámica Observable)");
-    println!("──────────────────────────────────────────────────");
-    println!("V0: Control en modo OBSERVE. S_sim es Volátil.");
-
-    // 1. ESCENARIO A: Razonamiento Matemático (Afecta S_R)
-    println!("\n[Escenario A: Inyección en S_R - Integración Persistente]");
-    let mut state_a = State::new();
-    state_a.inject_delta_r(&vec![1.0; D_R]);
-
-    let mut node_a = LoxiNode {
-        state: state_a.s,
-        reasoning: FfnReasoning::new(4096),
-        control: SimpleControl,
-        ethics: DummyEthics,
-        memory: DummyMemory,
-        backend: WgpuBackend::new().unwrap(),
-        network: DummyTransport,
-        alpha: 0.1,
-        epsilon: 1e-4,
-    };
-
-    run_sim("RAZONAMIENTO", &mut node_a);
-
-    // 2. ESCENARIO B: Ficción / Simulación (Afecta S_sim)
-    println!("\n[Escenario B: Inyección en S_sim - Pura Volatilidad]");
-    let mut state_b = State::new();
-    state_b.write_sim(&vec![2.0; D_SIM]);
-
-    let mut node_b = LoxiNode {
-        state: state_b.s,
-        reasoning: FfnReasoning::new(4096),
-        control: SimpleControl,
-        ethics: DummyEthics,
-        memory: DummyMemory,
-        backend: WgpuBackend::new().unwrap(),
-        network: DummyTransport,
-        alpha: 0.1,
-        epsilon: 1e-4,
-    };
-
-    run_sim("FICCIÓN", &mut node_b);
-
-    println!("\n──────────────────────────────────────────────────");
-    println!("✅ Conclusión: S_R converge y persiste. S_sim se disipa (Energy R -> 0).");
+// Reasoning inestable para Test D
+struct UnstableReasoning {
+    mode: u8, // 0: oscillation, 1: divergence
+}
+impl loxi_core::reasoning::Reasoning for UnstableReasoning {
+    fn init(&self, s: &DVector<f32>) -> DVector<f32> {
+        s.clone()
+    }
+    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
+        let mut next = h.clone();
+        if self.mode == 0 {
+            // Oscilación: voltea el signo del subespacio de razonamiento (0 a 2048)
+            for val in next.rows_mut(0, 2048).iter_mut() {
+                *val *= -1.1; // Crece y oscila
+            }
+        } else {
+            // Divergencia lineal
+            for val in next.rows_mut(0, 2048).iter_mut() {
+                *val += 10.0;
+            }
+        }
+        next
+    }
 }
 
-fn run_sim<R, C, E, M, B, N>(name: &str, node: &mut LoxiNode<R, C, E, M, B, N>)
+fn main() {
+    println!("🟥 NIVEL 2 — STRESS DINÁMICO LOXI");
+    println!("──────────────────────────────────────────────────");
+
+    // A. Sensibilidad a Alpha
+    test_alpha_sweep();
+
+    // B. Sensibilidad a Beta
+    test_beta_sweep();
+
+    // C. Perturbación Adversaria en S_sim
+    test_adversarial_sim();
+
+    // D. No convergencia forzada
+    test_unstable_reasoning();
+}
+
+fn test_alpha_sweep() {
+    println!("\n[TEST A: BARRIDO DE ALPHA]");
+    let alphas = [0.01, 0.05, 0.1, 0.3, 0.7, 1.0];
+
+    for alpha in alphas {
+        let mut node = build_base_node(alpha, 1.0, 5);
+        println!(">>> Ejecutando alpha = {}", alpha);
+        run_sim_quiet(&mut node);
+    }
+}
+
+fn test_beta_sweep() {
+    println!("\n[TEST B: BARRIDO DE BETA (CONTROL)]");
+    let betas = [0.1, 0.5, 1.0, 2.0, 5.0];
+
+    for beta in betas {
+        let mut node = build_base_node(0.1, beta, 5);
+        println!(">>> Ejecutando beta = {}", beta);
+        run_sim_quiet(&mut node);
+    }
+}
+
+fn test_adversarial_sim() {
+    println!("\n[TEST C: PERTURBACIÓN ADVERSARIA EN S_SIM]");
+
+    // 1. Ruido aleatorio grande
+    println!(">>> 1. Ruido grande en S_sim");
+    let mut node_large = build_base_node(0.1, 1.0, 5);
+    let mut rng = rand::rng();
+    let noise: Vec<f32> = (0..D_SIM).map(|_| rng.random_range(-10.0..10.0)).collect();
+    node_large.state.as_mut_slice()[2048..].copy_from_slice(&noise);
+    run_sim_quiet(&mut node_large);
+
+    // 2. Ruido pequeño persistente (inyectado cada tick)
+    println!(">>> 2. Ruido persistente");
+    let mut node_persist = build_base_node(0.1, 1.0, 5);
+    for tick in 1..=5 {
+        let noise: Vec<f32> = (0..D_SIM).map(|_| rng.random_range(-0.1..0.1)).collect();
+        node_persist.state.as_mut_slice()[2048..].copy_from_slice(&noise);
+        if let Some(m) = node_persist.tick() {
+            print_metrics("PERSIST", tick, &m);
+        }
+    }
+}
+
+fn test_unstable_reasoning() {
+    println!("\n[TEST D: NO CONVERGENCIA FORZADA]");
+
+    println!(">>> 1. Oscilación divergente");
+    let mut node_osc = LoxiNode {
+        state: DVector::zeros(2560),
+        reasoning: UnstableReasoning { mode: 0 },
+        control: StressControl {
+            beta: 1.0,
+            max_iters: 10,
+        },
+        ethics: DummyEthics,
+        memory: DummyMemory,
+        backend: WgpuBackend::new().unwrap(),
+        network: DummyTransport,
+        alpha: 0.1,
+        epsilon: 1e-4,
+    };
+    run_sim_quiet(&mut node_osc);
+
+    println!(">>> 2. Divergencia lineal");
+    let mut node_div = LoxiNode {
+        state: DVector::zeros(2560),
+        reasoning: UnstableReasoning { mode: 1 },
+        control: StressControl {
+            beta: 1.0,
+            max_iters: 10,
+        },
+        ethics: DummyEthics,
+        memory: DummyMemory,
+        backend: WgpuBackend::new().unwrap(),
+        network: DummyTransport,
+        alpha: 0.1,
+        epsilon: 1e-4,
+    };
+    run_sim_quiet(&mut node_div);
+}
+
+// --- Helpers ---
+
+fn build_base_node(
+    alpha: f32,
+    beta: f32,
+    iters: usize,
+) -> LoxiNode<FfnReasoning, StressControl, DummyEthics, DummyMemory, WgpuBackend, DummyTransport> {
+    let mut state = State::new();
+    state.inject_delta_r(&vec![1.0; D_R]); // Estímulo estándar
+
+    LoxiNode {
+        state: state.s,
+        reasoning: FfnReasoning::new(2048), // Usamos el subespacio de razonamiento completo
+        control: StressControl {
+            beta,
+            max_iters: iters,
+        },
+        ethics: DummyEthics,
+        memory: DummyMemory,
+        backend: WgpuBackend::new().unwrap(),
+        network: DummyTransport,
+        alpha,
+        epsilon: 1e-4,
+    }
+}
+
+fn run_sim_quiet<R, C, E, M, B, N>(node: &mut LoxiNode<R, C, E, M, B, N>)
 where
     R: loxi_core::reasoning::Reasoning,
     C: loxi_core::control::Control,
@@ -121,23 +229,26 @@ where
     B: ComputeBackend,
     N: Transport,
 {
-    for tick in 1..=10 {
+    // Solo mostramos el primer y último tick relevante para no saturar
+    let mut last_m: Option<TickMetrics> = None;
+    for tick in 1..=5 {
         if let Some(m) = node.tick() {
-            println!(
-                "{} | Tick {:02} | iters={} | ER={:.2} | ESIM={:.2} | ET={:.2} | stop={:?} | conv={}",
-                name, tick, m.iters, m.energy_r, m.energy_sim, m.energy_total, m.stop_reason, m.converged
-            );
-
-            if m.stop_reason == StopReason::Epsilon {
-                println!("{} | Tick {:02} | [Atractor Alcanzado]", name, tick + 1);
-                break;
+            if tick == 1 {
+                print_metrics("START", tick, &m);
             }
+            last_m = Some(m);
         } else {
-            println!(
-                "{} | Tick {:02} | [Inhibido / Sin Convergencia]",
-                name, tick
-            );
             break;
         }
     }
+    if let Some(m) = last_m {
+        print_metrics("END  ", 5, &m);
+    }
+}
+
+fn print_metrics(label: &str, tick: usize, m: &TickMetrics) {
+    println!(
+        "   {} | T{:02} | iters={} | ER={:.2} | ET={:.2} | stop={:?} | Q={:.3}",
+        label, tick, m.iters, m.energy_r, m.energy_total, m.stop_reason, m.quality.q_total
+    );
 }

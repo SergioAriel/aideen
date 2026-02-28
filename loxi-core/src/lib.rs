@@ -10,6 +10,7 @@ pub mod control;
 pub mod ethics;
 pub mod integrator;
 pub mod memory;
+pub mod quality;
 pub mod reasoning;
 pub mod state;
 pub mod types;
