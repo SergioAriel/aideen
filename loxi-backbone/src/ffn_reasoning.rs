@@ -1,6 +1,8 @@
+use loxi_core::compute::{ComputeBackend, TensorId};
 use loxi_core::reasoning::Reasoning;
 use loxi_core::state::D_R;
 use nalgebra::{DMatrix, DVector};
+use std::cell::RefCell;
 
 /// Backbone: Red Feed-Forward de 2 capas con expansión.
 pub struct FfnReasoning {
@@ -8,6 +10,11 @@ pub struct FfnReasoning {
     b1: DVector<f32>,
     w2: DMatrix<f32>,
     b2: DVector<f32>,
+    // ⚠️ Constitutional Note:
+    // Interior mutability is ONLY allowed for GPU tensor handles (TensorId).
+    // No learning, no weight mutation, no semantic state is stored here.
+    w1_id: RefCell<Option<TensorId>>,
+    w2_id: RefCell<Option<TensorId>>,
 }
 
 impl FfnReasoning {
@@ -27,7 +34,14 @@ impl FfnReasoning {
         });
         let b2 = DVector::zeros(D_R);
 
-        Self { w1, b1, w2, b2 }
+        Self {
+            w1,
+            b1,
+            w2,
+            b2,
+            w1_id: RefCell::new(None),
+            w2_id: RefCell::new(None),
+        }
     }
 }
 
@@ -36,10 +50,52 @@ impl Reasoning for FfnReasoning {
         s.clone()
     }
 
-    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
-        let h_r = h.rows(0, D_R);
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        _s: &DVector<f32>,
+        mut exec: Option<&mut dyn ComputeBackend>,
+    ) -> DVector<f32> {
+        let h_r = h.rows(0, D_R).into_owned();
 
-        // Capa Oculta: h_mid = tanh(W1 * h_r + b1)
+        if let Some(be) = exec.as_mut() {
+            if self.w1_id.borrow().is_none() {
+                *self.w1_id.borrow_mut() = be.load_tensor(self.w1.as_slice()).ok();
+            }
+            if self.w2_id.borrow().is_none() {
+                *self.w2_id.borrow_mut() = be.load_tensor(self.w2.as_slice()).ok();
+            }
+
+            if let (Some(w1_id), Some(w2_id)) =
+                (self.w1_id.borrow().as_ref(), self.w2_id.borrow().as_ref())
+            {
+                if let Ok(i_id) = be.load_tensor(h_r.as_slice()) {
+                    let out_dim_1 = self.w1.nrows();
+                    if let Ok(mut h_mid) = be.ffn_forward(w1_id, &i_id, out_dim_1) {
+                        h_mid += &self.b1;
+                        for v in h_mid.iter_mut() {
+                            *v = v.tanh();
+                        }
+
+                        if let Ok(mid_id) = be.load_tensor(h_mid.as_slice()) {
+                            let out_dim_2 = self.w2.nrows();
+                            if let Ok(mut h_out_r) = be.ffn_forward(w2_id, &mid_id, out_dim_2) {
+                                h_out_r += &self.b2;
+                                for v in h_out_r.iter_mut() {
+                                    *v = v.tanh();
+                                }
+
+                                let mut next = h.clone();
+                                next.rows_mut(0, D_R).copy_from(&h_out_r);
+                                return next;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback or CPU exactly as before
         let mut h_mid = &self.w1 * h_r + &self.b1;
         for v in h_mid.iter_mut() {
             *v = v.tanh();
@@ -53,7 +109,6 @@ impl Reasoning for FfnReasoning {
 
         let mut next = h.clone();
         next.rows_mut(0, D_R).copy_from(&h_out_r);
-
         next
     }
 }

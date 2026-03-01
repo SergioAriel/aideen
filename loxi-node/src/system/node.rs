@@ -84,7 +84,7 @@ where
     C: Control,
     E: Ethics,
     M: Memory,
-    B: crate::engine::ComputeBackend,
+    B: loxi_core::compute::ComputeBackend,
     N: crate::network::Transport,
 {
     /// Definición Constitucional de Atractor (LOXI):
@@ -104,7 +104,7 @@ where
 
         // ── 2. Loop DEQ gobernado por Control ────────────────
         for iter in 0..self.control.max_iters() {
-            let h_next = self.reasoning.step(&h, &s0);
+            let h_next = self.reasoning.step(&h, &s0, Some(&mut self.backend));
             let delta_h = &h_next - &h;
             let delta_norm = delta_h.norm();
             delta_norms.push(delta_norm);
@@ -239,7 +239,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ComputeBackend;
     use crate::network::Transport;
     use loxi_backbone::tensor::Tensor;
     use loxi_core::control::ControlMode;
@@ -247,12 +246,17 @@ mod tests {
     use std::rc::Rc;
 
     struct MockBackend;
-    impl ComputeBackend for MockBackend {
-        fn load_tensor(&mut self, _tensor: &Tensor) -> Result<(), String> {
-            Ok(())
+    impl loxi_core::compute::ComputeBackend for MockBackend {
+        fn load_tensor(&mut self, _data: &[f32]) -> Result<loxi_core::compute::TensorId, String> {
+            Ok(loxi_core::compute::TensorId(0))
         }
-        fn execute_shader(&mut self, _shader_id: &str) -> Result<Tensor, String> {
-            Ok(Tensor::new(vec![1], vec![0.0]))
+        fn ffn_forward(
+            &mut self,
+            _w: &loxi_core::compute::TensorId,
+            _i: &loxi_core::compute::TensorId,
+            out_dim: usize,
+        ) -> Result<nalgebra::DVector<f32>, String> {
+            Ok(nalgebra::DVector::zeros(out_dim))
         }
     }
 
@@ -273,10 +277,15 @@ mod tests {
         step_return_len: usize,
     }
     impl Reasoning for MockReasoning {
-        fn init(&self, state: &DVector<f32>) -> DVector<f32> {
-            state.rows(0, 2048).into_owned()
+        fn init(&self, s: &DVector<f32>) -> DVector<f32> {
+            s.rows(0, self.step_return_len).into_owned()
         }
-        fn step(&self, _h: &DVector<f32>, _x: &DVector<f32>) -> DVector<f32> {
+        fn step(
+            &self,
+            _h: &DVector<f32>,
+            _x: &DVector<f32>,
+            _exec: Option<&mut dyn loxi_core::compute::ComputeBackend>,
+        ) -> DVector<f32> {
             DVector::zeros(self.step_return_len)
         }
     }
@@ -345,7 +354,7 @@ mod tests {
         let node = LoxiNode {
             state: DVector::zeros(2560),
             reasoning: MockReasoning {
-                step_return_len: 2048,
+                step_return_len: 2560,
             },
             control: MockControl {
                 stop_at_iter: stop_iter,
@@ -371,6 +380,6 @@ mod tests {
         assert!(metrics.is_some());
         let m = metrics.unwrap();
         assert!(m.converged);
-        assert_eq!(m.stop_reason, StopReason::Epsilon);
+        assert_eq!(m.stop_reason, StopReason::ReachedAttractor);
     }
 }

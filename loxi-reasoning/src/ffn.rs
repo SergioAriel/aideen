@@ -13,7 +13,12 @@ impl Reasoning for ExpertFFN {
         s.clone()
     }
 
-    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        _s: &DVector<f32>,
+        _exec: Option<&mut dyn loxi_core::compute::ComputeBackend>,
+    ) -> DVector<f32> {
         // h_next = W2 * act(W1 * h)
         let hidden = (&self.w1 * h).map(|x| x.max(0.0)); // ReLU
         &self.w2 * hidden

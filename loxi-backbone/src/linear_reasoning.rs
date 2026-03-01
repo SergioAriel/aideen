@@ -22,7 +22,12 @@ impl Reasoning for LinearReasoning {
         s.clone()
     }
 
-    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        _s: &DVector<f32>,
+        _exec: Option<&mut dyn loxi_core::compute::ComputeBackend>,
+    ) -> DVector<f32> {
         let mut next = h.clone();
 
         // Extraemos solo la porción de razonamiento de H

@@ -29,7 +29,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var sum = 0.0;
     for (var i = 0u; i < pc.in_dim; i = i + 1u) {
         let input_val = inputs[i];
-        let weight_val = weights[row * pc.in_dim + i];
+        let weight_val = weights[i * pc.out_dim + row]; // Column-major layout (Nalgebra)
         sum = sum + input_val * weight_val;
     }
     

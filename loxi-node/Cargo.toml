@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 [dependencies]
 loxi-core = { path = "../loxi-core" }
+loxi-reasoning = { path = "../loxi-reasoning" }
 loxi-backbone = { path = "../loxi-backbone" }
+loxi-engine = { path = "../loxi-engine" }
+
 nalgebra = "0.32"
-wgpu = "27.0.1"
-pollster = "0.4.0"
-rand = "0.9.0"
+rand = "0.8"
+tokio = { version = "1.0", features = ["full"] }

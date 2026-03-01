@@ -1,4 +1,4 @@
-/target
+/target/
+/loxi-training-lab/
 **/*.rs.bk
-Cargo.lock
 .DS_Store

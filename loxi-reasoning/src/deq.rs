@@ -18,7 +18,12 @@ impl<R: Reasoning> Reasoning for GeneralDEQ<R> {
         self.inner_model.init(s)
     }
 
-    fn step(&self, h: &DVector<f32>, s: &DVector<f32>) -> DVector<f32> {
-        self.inner_model.step(h, s)
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        s: &DVector<f32>,
+        exec: Option<&mut dyn loxi_core::compute::ComputeBackend>,
+    ) -> DVector<f32> {
+        self.inner_model.step(h, s, exec)
     }
 }

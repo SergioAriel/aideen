@@ -226,9 +226,15 @@ mod tests {
 
         let out_dim = 2;
 
+        // Weights: 2 rows x 4 cols (Column-major layout matching nalgebra)
+        // Row 0: [ 1.0, 2.0, 3.0, 4.0 ]
+        // Row 1: [-1.0,-2.0,-3.0,-4.0 ]
+        // Flattened by column:
         let w_data = vec![
-            1.0, 2.0, 3.0, 4.0, 
-            -1.0, -2.0, -3.0, -4.0
+            1.0, -1.0,  // Col 0
+            2.0, -2.0,  // Col 1
+            3.0, -3.0,  // Col 2
+            4.0, -4.0   // Col 3
         ];
         let i_data = vec![1.0, 1.0, 1.0, 1.0];
 

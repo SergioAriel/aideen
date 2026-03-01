@@ -26,9 +26,9 @@ pub fn estimate_jacobian<R>(
 where
     R: MutableReasoning,
 {
-    let h_base = reasoning.step(h_star, s);
+    let h_base = reasoning.step(h_star, s, None);
     let idx = reasoning.perturb_weight(eps);
-    let h_perturbed = reasoning.step(h_star, s);
+    let h_perturbed = reasoning.step(h_star, s, None);
     reasoning.revert_weight(idx, eps);
 
     JacobianEstimate {

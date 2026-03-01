@@ -6,7 +6,12 @@ pub trait Reasoning {
     fn init(&self, s: &DVector<f32>) -> DVector<f32>;
 
     /// Paso iterativo hₜ₊₁ = f(hₜ, S)
-    fn step(&self, h: &DVector<f32>, s: &DVector<f32>) -> DVector<f32>;
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        s: &DVector<f32>,
+        exec: Option<&mut dyn crate::compute::ComputeBackend>,
+    ) -> DVector<f32>;
 }
 
 /// Estimación del Jacobiano local por perturbación finita.

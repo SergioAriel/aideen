@@ -3,8 +3,8 @@ use loxi_core::ethics::Ethics;
 use loxi_core::memory::Memory;
 use loxi_core::state::{State, D_R, D_SIM};
 
-use loxi_node::engine::wgpu_backend::WgpuBackend;
-use loxi_node::engine::ComputeBackend;
+use loxi_core::compute::ComputeBackend;
+use loxi_engine::gpu::WgpuBackend;
 use loxi_node::network::Transport;
 use loxi_node::system::node::{LoxiNode, TickMetrics};
 
@@ -77,7 +77,12 @@ impl loxi_core::reasoning::Reasoning for UnstableReasoning {
     fn init(&self, s: &DVector<f32>) -> DVector<f32> {
         s.clone()
     }
-    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        _s: &DVector<f32>,
+        _exec: Option<&mut dyn loxi_core::compute::ComputeBackend>,
+    ) -> DVector<f32> {
         let mut next = h.clone();
         if self.mode == 0 {
             // Oscilación: voltea el signo del subespacio de razonamiento (0 a 2048)
@@ -94,61 +99,62 @@ impl loxi_core::reasoning::Reasoning for UnstableReasoning {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("🟥 NIVEL 2 — STRESS DINÁMICO LOXI");
     println!("──────────────────────────────────────────────────");
 
     // A. Sensibilidad a Alpha
-    test_alpha_sweep();
+    test_alpha_sweep().await;
 
     // B. Sensibilidad a Beta
-    test_beta_sweep();
+    test_beta_sweep().await;
 
     // C. Perturbación Adversaria en S_sim
-    test_adversarial_sim();
+    test_adversarial_sim().await;
 
     // D. No convergencia forzada
-    test_unstable_reasoning();
+    test_unstable_reasoning().await;
 }
 
-fn test_alpha_sweep() {
+async fn test_alpha_sweep() {
     println!("\n[TEST A: BARRIDO DE ALPHA]");
     let alphas = [0.01, 0.05, 0.1, 0.3, 0.7, 1.0];
 
     for alpha in alphas {
-        let mut node = build_base_node(alpha, 1.0, 5);
+        let mut node = build_base_node(alpha, 1.0, 5).await;
         println!(">>> Ejecutando alpha = {}", alpha);
         run_sim_quiet(&mut node);
     }
 }
 
-fn test_beta_sweep() {
+async fn test_beta_sweep() {
     println!("\n[TEST B: BARRIDO DE BETA (CONTROL)]");
     let betas = [0.1, 0.5, 1.0, 2.0, 5.0];
 
     for beta in betas {
-        let mut node = build_base_node(0.1, beta, 5);
+        let mut node = build_base_node(0.1, beta, 5).await;
         println!(">>> Ejecutando beta = {}", beta);
         run_sim_quiet(&mut node);
     }
 }
 
-fn test_adversarial_sim() {
+async fn test_adversarial_sim() {
     println!("\n[TEST C: PERTURBACIÓN ADVERSARIA EN S_SIM]");
 
     // 1. Ruido aleatorio grande
     println!(">>> 1. Ruido grande en S_sim");
-    let mut node_large = build_base_node(0.1, 1.0, 5);
-    let mut rng = rand::rng();
-    let noise: Vec<f32> = (0..D_SIM).map(|_| rng.random_range(-10.0..10.0)).collect();
+    let mut node_large = build_base_node(0.1, 1.0, 5).await;
+    let mut rng = rand::thread_rng();
+    let noise: Vec<f32> = (0..D_SIM).map(|_| rng.gen_range(-10.0..10.0)).collect();
     node_large.state.as_mut_slice()[2048..].copy_from_slice(&noise);
     run_sim_quiet(&mut node_large);
 
     // 2. Ruido pequeño persistente (inyectado cada tick)
     println!(">>> 2. Ruido persistente");
-    let mut node_persist = build_base_node(0.1, 1.0, 5);
+    let mut node_persist = build_base_node(0.1, 1.0, 5).await;
     for tick in 1..=5 {
-        let noise: Vec<f32> = (0..D_SIM).map(|_| rng.random_range(-0.1..0.1)).collect();
+        let noise: Vec<f32> = (0..D_SIM).map(|_| rng.gen_range(-0.1..0.1)).collect();
         node_persist.state.as_mut_slice()[2048..].copy_from_slice(&noise);
         if let Some(m) = node_persist.tick() {
             print_metrics("PERSIST", tick, &m);
@@ -156,7 +162,7 @@ fn test_adversarial_sim() {
     }
 }
 
-fn test_unstable_reasoning() {
+async fn test_unstable_reasoning() {
     println!("\n[TEST D: NO CONVERGENCIA FORZADA]");
 
     println!(">>> 1. Oscilación divergente");
@@ -172,7 +178,7 @@ fn test_unstable_reasoning() {
         },
         ethics: DummyEthics,
         memory: DummyMemory,
-        backend: WgpuBackend::new().unwrap(),
+        backend: WgpuBackend::new().await.unwrap(),
         network: DummyTransport,
         alpha: 0.1,
         epsilon: 1e-4,
@@ -192,7 +198,7 @@ fn test_unstable_reasoning() {
         },
         ethics: DummyEthics,
         memory: DummyMemory,
-        backend: WgpuBackend::new().unwrap(),
+        backend: WgpuBackend::new().await.unwrap(),
         network: DummyTransport,
         alpha: 0.1,
         epsilon: 1e-4,
@@ -208,14 +214,19 @@ impl loxi_core::reasoning::Reasoning for StableMockReasoning {
     fn init(&self, s: &DVector<f32>) -> DVector<f32> {
         s.clone()
     }
-    fn step(&self, h: &DVector<f32>, _s: &DVector<f32>) -> DVector<f32> {
+    fn step(
+        &self,
+        h: &DVector<f32>,
+        _s: &DVector<f32>,
+        _exec: Option<&mut dyn loxi_core::compute::ComputeBackend>,
+    ) -> DVector<f32> {
         // Retorna h con un ruido mínimo para simular convergencia rápida y alta calidad
         // 1e-7 * sqrt(2560) approx 5.1e-6 < 1e-4 (epsilon)
         h.clone() + DVector::from_element(h.len(), 0.0000001)
     }
 }
 
-fn build_base_node(
+async fn build_base_node(
     alpha: f32,
     beta: f32,
     iters: usize,
@@ -239,7 +250,7 @@ fn build_base_node(
         },
         ethics: DummyEthics,
         memory: DummyMemory,
-        backend: WgpuBackend::new().unwrap(),
+        backend: WgpuBackend::new().await.unwrap(),
         network: DummyTransport,
         alpha,
         epsilon: 1e-4,
@@ -254,6 +265,7 @@ where
     M: loxi_core::memory::Memory,
     B: ComputeBackend,
     N: Transport,
+    B: loxi_core::compute::ComputeBackend,
 {
     // Solo mostramos el primer y último tick relevante para no saturar
     let mut last_m: Option<TickMetrics> = None;
