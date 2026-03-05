@@ -1,0 +1,371 @@
+use aideen_core::{
+    reasoning::Reasoning,
+    state::{ArchitectureConfig, HSlots},
+};
+use nalgebra::DVector;
+use std::time::Instant;
+
+use crate::lm_head::LmHead;
+use crate::mamba_decoder::MambaDecoder;
+
+// ── Tipos auxiliares ──────────────────────────────────────────────────────────
+
+/// Resultado de una generación para comparación entre estrategias.
+#[derive(Debug, Clone)]
+pub struct GenerationResult {
+    pub strategy: &'static str,
+    pub tokens: Vec<u32>,
+    pub elapsed_ms: u128,
+}
+
+impl GenerationResult {
+    /// Diversidad: proporción de tokens únicos (0=todos iguales, 1=todos distintos).
+    pub fn diversity(&self) -> f32 {
+        if self.tokens.is_empty() {
+            return 0.0;
+        }
+        let unique: std::collections::HashSet<u32> = self.tokens.iter().cloned().collect();
+        unique.len() as f32 / self.tokens.len() as f32
+    }
+}
+
+// ── Estrategia A: SlotDirect ──────────────────────────────────────────────────
+
+/// Lee directamente los K slots de H* y los proyecta a tokens.
+/// Sin decoder, sin autoregresión — máximo K tokens.
+///
+/// Hipótesis: si el DEQ aprende a especializar slots por posición semántica,
+/// cada slot ya codifica un token diferente del output.
+pub struct SlotDirectStrategy {
+    pub config: ArchitectureConfig,
+    pub head: LmHead,
+}
+
+impl SlotDirectStrategy {
+    pub fn new(config: ArchitectureConfig) -> Self {
+        Self {
+            head: LmHead::new(config.clone()),
+            config,
+        }
+    }
+
+    pub fn generate(&self, h_star: &HSlots, max_tokens: usize) -> GenerationResult {
+        let t0 = Instant::now();
+        let n = max_tokens.min(self.config.h_slots);
+        let tokens: Vec<u32> = (0..n)
+            .map(|k| {
+                let slot = h_star.slot(k);
+                let logits = self.head.forward_on_flat(&slot.as_slice());
+                LmHead::argmax(&logits)
+            })
+            .collect();
+
+        GenerationResult {
+            strategy: "SlotDirect",
+            tokens,
+            elapsed_ms: t0.elapsed().as_millis(),
+        }
+    }
+}
+
+// ── Estrategia B: Decoder ─────────────────────────────────────────────────────
+
+/// Decoder Mamba de N capas condicionado por H* via FiLM.
+/// Autoregresivo a nivel de tokens. Largo arbitrario.
+pub struct DecoderStrategy {
+    pub config: ArchitectureConfig,
+    pub decoder: MambaDecoder,
+}
+
+impl DecoderStrategy {
+    pub fn new(n_layers: usize, config: ArchitectureConfig) -> Self {
+        Self {
+            decoder: MambaDecoder::new(n_layers, config.clone()),
+            config,
+        }
+    }
+
+    pub fn generate(
+        &self,
+        h_star: &HSlots,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+    ) -> GenerationResult {
+        let t0 = Instant::now();
+        let tokens = self.decoder.generate(h_star, prompt_tokens, max_tokens);
+        GenerationResult {
+            strategy: "Decoder",
+            tokens,
+            elapsed_ms: t0.elapsed().as_millis(),
+        }
+    }
+}
+
+// ── Estrategia C: DeqAutoReg ──────────────────────────────────────────────────
+
+/// Autoregresión a nivel DEQ: cada token se genera corriendo el DEQ completo
+/// sobre query + tokens anteriores.
+///
+/// Costo: max_deq_iters × n_tokens_a_generar (costoso sin GPU).
+/// Ventaja: cada token tiene razonamiento completo sobre el contexto.
+pub struct DeqAutoRegStrategy {
+    pub config: ArchitectureConfig,
+    pub head: LmHead,
+}
+
+impl DeqAutoRegStrategy {
+    pub fn new(config: ArchitectureConfig) -> Self {
+        Self {
+            head: LmHead::new(config.clone()),
+            config,
+        }
+    }
+
+    /// Tokenizador trivial: char → u32 (coincide con demo.rs)
+    fn embed_tokens(tokens: &[u32], dim: usize) -> DVector<f32> {
+        let scale = (dim as f32).sqrt().recip() * 0.1;
+        let mut v = DVector::zeros(dim);
+        for (i, &tok) in tokens.iter().enumerate().take(dim) {
+            v[i] = (tok as f32 * 1.6180339 % 1.0 - 0.5) * scale;
+        }
+        v
+    }
+
+    pub fn generate<R>(
+        &self,
+        reasoning: &R,
+        query_vec: &DVector<f32>,
+        max_tokens: usize,
+    ) -> GenerationResult
+    where
+        R: Reasoning,
+    {
+        let t0 = Instant::now();
+        let mut generated: Vec<u32> = Vec::new();
+        let mut current_query = query_vec.clone();
+
+        for _ in 0..max_tokens {
+            // ① Correr el DEQ sobre query actual (con tokens generados embedidos)
+            let mut h = reasoning.init(&current_query);
+            for _iter in 0..self.config.max_deq_iters {
+                let h_next = reasoning.step(&h, &current_query, None);
+                let delta: f32 = (0..self.config.h_slots)
+                    .map(|k| (h_next.slot(k) - h.slot(k)).norm())
+                    .sum::<f32>()
+                    / self.config.h_slots as f32;
+                h = h_next;
+                if delta < self.config.deq_epsilon {
+                    break;
+                }
+            }
+
+            // ② Leer el token del H* resultante
+            let logits = self.head.forward(&h);
+            let next_tok = LmHead::argmax(&logits);
+
+            // EOS token = 2
+            if next_tok == 2 {
+                break;
+            }
+            generated.push(next_tok);
+
+            // ③ Actualizar query con el token generado
+            // Usamos el tamaño real de current_query (D_R + D_SIM) para evitar mismatch
+            let tok_embed = Self::embed_tokens(&[next_tok], current_query.len());
+            current_query = (&current_query + &tok_embed) * 0.5;
+        }
+
+        GenerationResult {
+            strategy: "DeqAutoReg",
+            tokens: generated,
+            elapsed_ms: t0.elapsed().as_millis(),
+        }
+    }
+}
+
+// ── Benchmark comparativo ─────────────────────────────────────────────────────
+
+/// Compara las 3 estrategias sobre el mismo H*.
+/// Retorna los resultados ordenados por diversidad de tokens (desc).
+pub fn benchmark_strategies<R>(
+    h_star: &HSlots,
+    query_vec: &DVector<f32>,
+    reasoning: &R,
+    _vocab_size: usize,
+    max_tokens: usize,
+    config: ArchitectureConfig,
+) -> Vec<GenerationResult>
+where
+    R: Reasoning,
+{
+    let strategy_a = SlotDirectStrategy::new(config.clone());
+    let strategy_b = DecoderStrategy::new(4, config.clone());
+    let strategy_c = DeqAutoRegStrategy::new(config);
+
+    let r_a = strategy_a.generate(h_star, max_tokens);
+    let r_b = strategy_b.generate(h_star, &[], max_tokens);
+    let r_c = strategy_c.generate(reasoning, query_vec, max_tokens);
+
+    let mut results = vec![r_a, r_b, r_c];
+    results.sort_by(|a, b| {
+        b.diversity()
+            .partial_cmp(&a.diversity())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mamba_slot_reasoning::MambaSlotReasoning;
+
+    fn make_h_star(config: &ArchitectureConfig, seed: f32) -> HSlots {
+        let mut h = HSlots::zeros(config);
+        for k in 0..config.h_slots {
+            let mut slot = h.slot(k);
+            let d_r = config.d_r;
+            for i in 0..d_r {
+                slot[i] = (seed * (k * d_r + i + 1) as f32).sin() * 0.3;
+            }
+            h.set_slot(k, &slot);
+        }
+        h
+    }
+
+    fn make_query(config: &ArchitectureConfig, seed: f32) -> DVector<f32> {
+        let d_r = config.d_r;
+        let d_sim = config.d_sim;
+        let mut v = DVector::zeros(d_r + d_sim);
+        for i in 0..d_r {
+            v[i] = (seed * (i + 1) as f32).sin() * 0.5;
+        }
+        v
+    }
+
+    const VOCAB: usize = 128;
+
+    // ── A: SlotDirect ──────────────────────────────────────────────────────
+
+    #[test]
+    fn slot_direct_produces_k_tokens() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let h = make_h_star(&config, 1.0);
+        let strat = SlotDirectStrategy::new(config);
+        let r = strat.generate(&h, 8);
+        assert_eq!(r.tokens.len(), 8, "SlotDirect debe producir K tokens");
+        assert!(
+            r.tokens.iter().all(|&t| (t as usize) < VOCAB),
+            "tokens fuera de vocab"
+        );
+    }
+
+    #[test]
+    fn slot_direct_sensitive_to_h_star() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let strat = SlotDirectStrategy::new(config.clone());
+        let r_a = strat.generate(&make_h_star(&config, 1.0), 8);
+        let r_b = strat.generate(&make_h_star(&config, 2.0), 8);
+        assert_ne!(
+            r_a.tokens, r_b.tokens,
+            "SlotDirect debe diferir para H* distintos"
+        );
+    }
+
+    // ── B: Decoder ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn decoder_1_layer_produces_tokens() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let h = make_h_star(&config, 1.0);
+        let strat = DecoderStrategy::new(1, config);
+        let r = strat.generate(&h, &[], 10);
+        assert!(!r.tokens.is_empty(), "Decoder debe producir tokens");
+        assert!(r.tokens.len() <= 10);
+    }
+
+    #[test]
+    fn decoder_4_layer_produces_tokens() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let h = make_h_star(&config, 1.0);
+        let strat = DecoderStrategy::new(4, config);
+        let r = strat.generate(&h, &[], 10);
+        assert!(!r.tokens.is_empty());
+    }
+
+    #[test]
+    fn decoder_sensitive_to_h_star() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let strat = DecoderStrategy::new(2, config.clone());
+        let r_a = strat.generate(&make_h_star(&config, 1.0), &[], 8);
+        let r_b = strat.generate(&make_h_star(&config, 2.0), &[], 8);
+        assert_ne!(
+            r_a.tokens, r_b.tokens,
+            "Decoder debe diferir para H* distintos"
+        );
+    }
+
+    // ── C: DeqAutoReg ──────────────────────────────────────────────────────
+
+    #[test]
+    fn deq_autoreg_produces_tokens() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let reasoning = MambaSlotReasoning::new(config.clone());
+        let q = make_query(&config, 1.0);
+        let strat = DeqAutoRegStrategy::new(config);
+        let r = strat.generate(&reasoning, &q, 5);
+        assert!(!r.tokens.is_empty(), "DeqAutoReg debe producir tokens");
+        assert!(r.tokens.iter().all(|&t| (t as usize) < VOCAB));
+    }
+
+    #[test]
+    fn deq_autoreg_sensitive_to_query() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let reasoning = MambaSlotReasoning::new(config.clone());
+        let strat = DeqAutoRegStrategy::new(config.clone());
+        let r_a = strat.generate(&reasoning, &make_query(&config, 1.0), 5);
+        let r_b = strat.generate(&reasoning, &make_query(&config, 3.0), 5);
+        assert_ne!(
+            r_a.tokens, r_b.tokens,
+            "DeqAutoReg debe diferir para queries distintas"
+        );
+    }
+
+    // ── Benchmark comparativo ──────────────────────────────────────────────
+
+    #[test]
+    fn benchmark_all_three_strategies() {
+        let config = ArchitectureConfig {
+            vocab_size: VOCAB,
+            ..Default::default()
+        };
+        let h = make_h_star(&config, 1.5);
+        let q = make_query(&config, 1.5);
+        let reasoning = MambaSlotReasoning::new(config.clone());
+
+        let results = benchmark_strategies(&h, &q, &reasoning, VOCAB, 8, config);
+
+        assert_eq!(results.len(), 3, "Deben haber 3 resultados");
+    }
+}
