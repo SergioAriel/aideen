@@ -1,0 +1,25 @@
+[package]
+name = "aideen-backbone"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Feature enable to expose mutable weights and snapshots to training environments
+lab = []
+# Feature enable to use the wgpu/WGSL GPU backend for Mamba steps
+wgpu = ["dep:aideen-block", "dep:pollster", "dep:wgpu"]
+
+[dependencies]
+serde      = { version = "1.0", features = ["derive"] }
+nalgebra   = "0.32"
+aideen-core  = { path = "../aideen-core" }
+bytemuck   = { version = "1.14", features = ["derive"] }
+sha2       = "0.10"
+futures    = "0.3"
+
+# Optional GPU deps — only pulled in with `--features wgpu`
+aideen-block = { path = "../aideen-block", optional = true }
+pollster   = { version = "0.3", optional = true }
+wgpu       = { version = "23", optional = true }
+tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
+rand = "0.8.5"
