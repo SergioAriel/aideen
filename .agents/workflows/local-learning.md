@@ -4,7 +4,7 @@ description: How to implement and verify Local Learning (Nivel 3)
 
 # Workflow: Local Learning Implementation
 
-Follow these steps to safely implement or modify the local learning mechanism in a LOXI node.
+Follow these steps to safely implement or modify the local learning mechanism in a AIDEEN node.
 
 1. **Verify Equilibrium**: Ensure the system reaches an attractor using `node.is_attractor_state(delta_norm, quality)`.
 2. **Estimate Jacobian**: Call `estimate_jacobian` using finite perturbations ($\varepsilon = 1e-4$).

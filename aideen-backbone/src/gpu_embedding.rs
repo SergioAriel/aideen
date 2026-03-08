@@ -9,7 +9,11 @@ struct EmbeddingParams {
     seq_len: u32,
     ctx_len: u32,
     lr_bits: u32,
-    _pad0: u32,
+    beta1_bits: u32,
+    beta2_bits: u32,
+    eps_bits: u32,
+    step_t: u32,
+    ternary_flag: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -25,9 +29,11 @@ pub struct GpuEmbeddingTrainer {
     params_buf: wgpu::Buffer,
     token_ids_buf: wgpu::Buffer,
     emb_buf: wgpu::Buffer,
-    seq_buf: wgpu::Buffer,
+    pub seq_buf: wgpu::Buffer,
     query_buf: wgpu::Buffer,
     dl_dh_buf: wgpu::Buffer,
+    m_buf: wgpu::Buffer,
+    v_buf: wgpu::Buffer,
 }
 
 impl GpuEmbeddingTrainer {
@@ -106,6 +112,26 @@ impl GpuEmbeddingTrainer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -134,7 +160,7 @@ impl GpuEmbeddingTrainer {
             label: Some("Embedding Update Pipeline"),
             layout: Some(&layout),
             module: &shader,
-            entry_point: Some("embedding_sgd_update"),
+            entry_point: Some("embedding_adamw_update"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -181,6 +207,22 @@ impl GpuEmbeddingTrainer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let m_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Embedding Adam M"),
+            size: (vocab_size * d_r * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let v_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Embedding Adam V"),
+            size: (vocab_size * d_r * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Embedding Train Bind Group"),
@@ -210,6 +252,14 @@ impl GpuEmbeddingTrainer {
                     binding: 5,
                     resource: dl_dh_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: m_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: v_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -226,8 +276,68 @@ impl GpuEmbeddingTrainer {
             seq_buf,
             query_buf,
             dl_dh_buf,
+            m_buf,
+            v_buf,
             config,
         }
+    }
+
+    /// Runs the embedding gather shader and leaves results in `self.seq_buf` on the GPU.
+    /// No CPU readback — avoids the blocking device.poll() in the hot training path.
+    pub fn gather_only(
+        &self,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        tokens: &[u32],
+        emb_cpu: &[f32],
+        upload_weights: bool,
+    ) -> Result<(), String> {
+        if tokens.is_empty() || tokens.len() > self.max_seq_len {
+            return Err("token sequence length invalid for GPU embedding gather".to_string());
+        }
+        let d_r = self.config.d_r;
+        let seq_len_u32 = tokens.len() as u32;
+        let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
+
+        // eprintln!(
+        //     "[EMB] gather_only seq_len={} ctx_len_sent={}",
+        //     tokens.len(),
+        //     ctx_u32
+        // );
+
+        let params = EmbeddingParams {
+            d_model: d_r as u32,
+            vocab_size: self.vocab_size as u32,
+            seq_len: seq_len_u32,
+            ctx_len: ctx_u32,
+            lr_bits: 0f32.to_bits(),
+            beta1_bits: 0.9f32.to_bits(),
+            beta2_bits: 0.999f32.to_bits(),
+            eps_bits: 1e-8f32.to_bits(),
+            step_t: 1,
+            ternary_flag: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(&self.token_ids_buf, 0, bytemuck::cast_slice(tokens));
+        if upload_weights {
+            queue.write_buffer(&self.emb_buf, 0, bytemuck::cast_slice(emb_cpu));
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Embedding Gather Only Encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Embedding Gather Pass (no readback)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gather_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+        }
+        queue.submit(Some(encoder.finish()));
+        Ok(())
     }
 
     pub fn prepare_sequence_and_query(
@@ -235,7 +345,7 @@ impl GpuEmbeddingTrainer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tokens: &[u32],
-        ctx_len: usize,
+        _ctx_len: usize,
         emb_cpu: &[f32],
         upload_weights: bool,
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
@@ -244,13 +354,26 @@ impl GpuEmbeddingTrainer {
         }
 
         let d_r = self.config.d_r;
+        let seq_len_u32 = tokens.len() as u32;
+        let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
+
+        // eprintln!(
+        //     "[EMB] prepare seq_len={} ctx_len_sent={}",
+        //     tokens.len(),
+        //     ctx_u32
+        // );
+
         let params = EmbeddingParams {
             d_model: d_r as u32,
             vocab_size: self.vocab_size as u32,
-            seq_len: tokens.len() as u32,
-            ctx_len: ctx_len.min(tokens.len()) as u32,
+            seq_len: seq_len_u32,
+            ctx_len: ctx_u32,
             lr_bits: 0f32.to_bits(),
-            _pad0: 0,
+            beta1_bits: 0.9f32.to_bits(),
+            beta2_bits: 0.999f32.to_bits(),
+            eps_bits: 1e-8f32.to_bits(),
+            step_t: 1,
+            ternary_flag: 0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -258,6 +381,10 @@ impl GpuEmbeddingTrainer {
         queue.write_buffer(&self.token_ids_buf, 0, bytemuck::cast_slice(tokens));
         if upload_weights {
             queue.write_buffer(&self.emb_buf, 0, bytemuck::cast_slice(emb_cpu));
+            // Initialize Adam states to zero
+            let zero_vec = vec![0.0f32; self.vocab_size * d_r];
+            queue.write_buffer(&self.m_buf, 0, bytemuck::cast_slice(&zero_vec));
+            queue.write_buffer(&self.v_buf, 0, bytemuck::cast_slice(&zero_vec));
         }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -326,13 +453,77 @@ impl GpuEmbeddingTrainer {
         }
     }
 
+    /// High-performance GPU-only sequence preparation for training.
+    /// Does NOT read back to host, avoiding staging buffers and sync stalls.
+    pub fn prepare_sequence_gpu_only(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        if tokens.is_empty() || tokens.len() > self.max_seq_len {
+            return Err("token sequence length invalid for GPU embedding".to_string());
+        }
+
+        let d_r = self.config.d_r;
+        let seq_len_u32 = tokens.len() as u32;
+        let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
+
+        let params = EmbeddingParams {
+            d_model: d_r as u32,
+            vocab_size: self.vocab_size as u32,
+            seq_len: seq_len_u32,
+            ctx_len: ctx_u32,
+            lr_bits: 0f32.to_bits(),
+            beta1_bits: 0.9f32.to_bits(),
+            beta2_bits: 0.999f32.to_bits(),
+            eps_bits: 1e-8f32.to_bits(),
+            step_t: 1,
+            ternary_flag: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(&self.token_ids_buf, 0, bytemuck::cast_slice(tokens));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Embedding Prepare Encoder (GPU-Only)"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Embedding Gather Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gather_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Embedding Query Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.query_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
     pub fn apply_embedding_update(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tokens: &[u32],
+        ctx_len: usize,
         dl_dh: &[f32],
         lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        step: u32,
+        ternary: bool,
     ) -> Result<(), String> {
         if tokens.is_empty() || tokens.len() > self.max_seq_len {
             return Err("token sequence length invalid for GPU embedding update".to_string());
@@ -341,13 +532,27 @@ impl GpuEmbeddingTrainer {
             return Err("dl_dh dimension mismatch".to_string());
         }
 
+        let ctx = (ctx_len as u32)
+            .min(self.config.ctx_len as u32)
+            .min(tokens.len() as u32);
+        // eprintln!(
+        //     "[EMB] update seq_len={} ctx_len_sent={} lr={:.3e} step={}",
+        //     tokens.len(),
+        //     ctx,
+        //     lr,
+        //     step
+        // );
         let params = EmbeddingParams {
             d_model: self.config.d_r as u32,
             vocab_size: self.vocab_size as u32,
             seq_len: tokens.len() as u32,
-            ctx_len: tokens.len() as u32,
+            ctx_len: ctx,
             lr_bits: lr.to_bits(),
-            _pad0: 0,
+            beta1_bits: beta1.to_bits(),
+            beta2_bits: beta2.to_bits(),
+            eps_bits: eps.to_bits(),
+            step_t: step,
+            ternary_flag: if ternary { 1 } else { 0 },
             _pad1: 0,
             _pad2: 0,
         };
@@ -365,7 +570,11 @@ impl GpuEmbeddingTrainer {
             });
             pass.set_pipeline(&self.update_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            pass.dispatch_workgroups(
+                tokens.len() as u32,
+                (self.config.d_r as u32).div_ceil(64),
+                1,
+            );
         }
         queue.submit(Some(encoder.finish()));
         Ok(())
@@ -377,16 +586,37 @@ impl GpuEmbeddingTrainer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tokens: &[u32],
+        _ctx_len: usize,
         dl_dh_src: &wgpu::Buffer,
         lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        step: u32,
+        ternary: bool,
     ) -> Result<(), String> {
+        let seq_len_u32 = tokens.len() as u32;
+        let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
+
+        // eprintln!(
+        //     "[EMB] update_from_buf seq_len={} ctx_len_sent={} lr={:.3e} step={}",
+        //     tokens.len(),
+        //     ctx_u32,
+        //     lr,
+        //     step
+        // );
+
         let params = EmbeddingParams {
             d_model: self.config.d_r as u32,
             vocab_size: self.vocab_size as u32,
-            seq_len: tokens.len() as u32,
-            ctx_len: tokens.len() as u32,
+            seq_len: seq_len_u32,
+            ctx_len: ctx_u32,
             lr_bits: lr.to_bits(),
-            _pad0: 0,
+            beta1_bits: beta1.to_bits(),
+            beta2_bits: beta2.to_bits(),
+            eps_bits: eps.to_bits(),
+            step_t: step,
+            ternary_flag: if ternary { 1 } else { 0 },
             _pad1: 0,
             _pad2: 0,
         };
@@ -408,7 +638,11 @@ impl GpuEmbeddingTrainer {
             });
             pass.set_pipeline(&self.update_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            pass.dispatch_workgroups(
+                tokens.len() as u32,
+                (self.config.d_r as u32).div_ceil(64),
+                1,
+            );
         }
         queue.submit(Some(encoder.finish()));
         Ok(())
@@ -447,5 +681,56 @@ impl GpuEmbeddingTrainer {
         } else {
             Err("embedding read weights map failed")
         }
+    }
+
+    /// Lee los momentos Adam (m, v) para checkpoint.
+    pub fn read_moments(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(Vec<f32>, Vec<f32>), &'static str> {
+        let size = (self.vocab_size * self.config.d_r * std::mem::size_of::<f32>()) as u64;
+        let m_stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Emb M stage"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let v_stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Emb V stage"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Emb Moments Readback"),
+        });
+        enc.copy_buffer_to_buffer(&self.m_buf, 0, &m_stage, 0, size);
+        enc.copy_buffer_to_buffer(&self.v_buf, 0, &v_stage, 0, size);
+        queue.submit(Some(enc.finish()));
+
+        let ms = m_stage.slice(..);
+        let vs = v_stage.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        ms.map_async(wgpu::MapMode::Read, |_| {});
+        vs.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            return Err("embedding moments map failed");
+        }
+        let m = bytemuck::cast_slice::<u8, f32>(&ms.get_mapped_range()).to_vec();
+        let v = bytemuck::cast_slice::<u8, f32>(&vs.get_mapped_range()).to_vec();
+        m_stage.unmap();
+        v_stage.unmap();
+        Ok((m, v))
+    }
+
+    /// Sube momentos Adam guardados de vuelta a la GPU.
+    pub fn write_moments(&self, queue: &wgpu::Queue, m: &[f32], v: &[f32]) {
+        queue.write_buffer(&self.m_buf, 0, bytemuck::cast_slice(m));
+        queue.write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v));
     }
 }

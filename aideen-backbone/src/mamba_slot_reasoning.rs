@@ -6,6 +6,7 @@ use aideen_core::{
     state::{ArchitectureConfig, HSlots},
 };
 use nalgebra::{DMatrix, DVector};
+use rand::{thread_rng, Rng};
 use std::cell::RefCell;
 
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
@@ -13,20 +14,47 @@ pub struct MambaSlotReasoning {
     pub config: ArchitectureConfig,
 
     // ── Cross-slot attention ─────────────────────────────────────────────────
+    #[cfg(feature = "lab")]
+    pub w_q: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_q: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub w_k: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_k: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub w_v: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_v: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub w_o: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_o: DMatrix<f32>,
 
     // ── Input injection ──────────────────────────────────────────────────────
+    #[cfg(feature = "lab")]
+    pub w_in: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_in: DMatrix<f32>,
 
     // ── Mamba SSM por slot ───────────────────────────────────────────────────
+    #[cfg(feature = "lab")]
+    pub a_log: DVector<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) a_log: DVector<f32>,
+    #[cfg(feature = "lab")]
+    pub w_x: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_x: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub w_out: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) w_out: DMatrix<f32>,
 
     // ── LayerNorm por slot ───────────────────────────────────────────────────
+    #[cfg(feature = "lab")]
+    pub norm_scale: DVector<f32>,
+    #[cfg(not(feature = "lab"))]
     pub(crate) norm_scale: DVector<f32>,
 
     // ── Backend GPU opcional ─────────────────────────────────────────────────
@@ -39,21 +67,22 @@ pub struct MambaSlotReasoning {
 impl MambaSlotReasoning {
     pub fn new(config: ArchitectureConfig) -> Self {
         let d_r = config.d_r;
-        let scale = (d_r as f32).sqrt().recip();
-        let small = 0.01_f32;
+        let mut rng = thread_rng();
+        // Xavier Uniform initialization: range = sqrt(3 / fan_in)
+        let xavier_range = (3.0 / d_r as f32).sqrt();
 
-        let eye_s = DMatrix::identity(d_r, d_r) * scale;
-        let eye_sm = DMatrix::identity(d_r, d_r) * small;
+        let mut xavier_mat =
+            || DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range));
 
         Self {
-            w_q: eye_s.clone(),
-            w_k: eye_s.clone(),
-            w_v: eye_s.clone(),
-            w_o: DMatrix::identity(d_r, d_r),
-            w_in: eye_sm,
+            w_q: xavier_mat(),
+            w_k: xavier_mat(),
+            w_v: xavier_mat(),
+            w_o: xavier_mat(),
+            w_in: xavier_mat(),
             a_log: DVector::from_element(d_r, -0.5_f32),
-            w_x: eye_s.clone(),
-            w_out: DMatrix::identity(d_r, d_r) * 0.9,
+            w_x: xavier_mat(),
+            w_out: xavier_mat(),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             backend: RefCell::new(None),
             damping: 0.9_f32,
@@ -67,15 +96,15 @@ impl MambaSlotReasoning {
     }
 
     pub fn renormalize_weights(&mut self) {
-        let t = 0.99_f32;
+        let t = 0.8_f32; // Radio espectral máximo permitido (más conservador)
         let n = 10;
-        self.w_q = spectral_norm::normalize(&self.w_q, t, n);
-        self.w_k = spectral_norm::normalize(&self.w_k, t, n);
-        self.w_v = spectral_norm::normalize(&self.w_v, t, n);
-        self.w_o = spectral_norm::normalize(&self.w_o, t, n);
-        self.w_in = spectral_norm::normalize(&self.w_in, t, n);
-        self.w_x = spectral_norm::normalize(&self.w_x, t, n);
-        self.w_out = spectral_norm::normalize(&self.w_out, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_q, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_k, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_v, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_o, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_in, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_x, t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_out, t, n);
     }
 
     pub fn spectral_norms(&self) -> [f32; 7] {
@@ -103,19 +132,33 @@ impl MambaSlotReasoning {
         self.backend.borrow().is_some()
     }
 
+    pub fn reset(&mut self) {
+        // CPU side is currently stateless inside reasoning,
+        // but this is called by the Trainer during EOS Reset.
+    }
+
     pub fn export_weights(&self) -> std::collections::HashMap<String, Vec<f32>> {
         let mut weights = std::collections::HashMap::new();
 
-        weights.insert("reasoning.w_q".to_string(), self.w_q.as_slice().to_vec());
-        weights.insert("reasoning.w_k".to_string(), self.w_k.as_slice().to_vec());
-        weights.insert("reasoning.w_v".to_string(), self.w_v.as_slice().to_vec());
-        weights.insert("reasoning.w_o".to_string(), self.w_o.as_slice().to_vec());
-        weights.insert("reasoning.w_in".to_string(), self.w_in.as_slice().to_vec());
-        weights.insert("reasoning.w_x".to_string(), self.w_x.as_slice().to_vec());
-        weights.insert(
-            "reasoning.w_out".to_string(),
-            self.w_out.as_slice().to_vec(),
-        );
+        let to_row_major = |m: &nalgebra::DMatrix<f32>| -> Vec<f32> {
+            let rows = m.nrows();
+            let cols = m.ncols();
+            let mut data = vec![0.0f32; rows * cols];
+            for i in 0..rows {
+                for j in 0..cols {
+                    data[i * cols + j] = m[(i, j)];
+                }
+            }
+            data
+        };
+
+        weights.insert("reasoning.w_q".to_string(), to_row_major(&self.w_q));
+        weights.insert("reasoning.w_k".to_string(), to_row_major(&self.w_k));
+        weights.insert("reasoning.w_v".to_string(), to_row_major(&self.w_v));
+        weights.insert("reasoning.w_o".to_string(), to_row_major(&self.w_o));
+        weights.insert("reasoning.w_in".to_string(), to_row_major(&self.w_in));
+        weights.insert("reasoning.w_x".to_string(), to_row_major(&self.w_x));
+        weights.insert("reasoning.w_out".to_string(), to_row_major(&self.w_out));
         weights.insert(
             "reasoning.a_log".to_string(),
             self.a_log.as_slice().to_vec(),
@@ -146,7 +189,7 @@ impl MambaSlotReasoning {
                     data.len()
                 ));
             }
-            Ok(nalgebra::DMatrix::from_vec(d_r, d_r, data.clone()))
+            Ok(nalgebra::DMatrix::from_row_slice(d_r, d_r, data))
         };
 
         self.w_q = get_mat("reasoning.w_q")?;

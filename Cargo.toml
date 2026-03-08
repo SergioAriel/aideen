@@ -1,11 +1,14 @@
 [workspace]
 members = [
-    "loxi-core",       # 1. Contratos Publicos (Sellado)
-    "loxi-reasoning",  # 2. Cerebro Entrenable
-    "loxi-node",       # 3. GPU Runtime y P2P
-    "loxi-backbone",   # 4. Arquitectura del Modelo
-    "loxi-training-lab", # 5. Laboratorio Privado
-    "loxi-engine",     # 6. Motor Computacional GPU
+    "aideen-core",         # 1. Contratos Públicos (Sellado)
+    "aideen-reasoning",    # 2. Cerebro Entrenable
+    "aideen-node",         # 3. GPU Runtime y P2P
+    "aideen-backbone",     # 4. Arquitectura del Modelo
+    "aideen-training-lab", # 5. Laboratorio Privado
+    "aideen-engine",       # 6. Motor Computacional GPU
+    "aideen-coordinator",  # 7. Coordinador Criptográfico
+    "aideen-critic",       # 8. Critic — Learning Plane
+    "aideen-block",        # 9. Bloque Mamba+Attn+MoE (DEQ f-block + Decoder)
+    "aideen-bench",        # 10. Benchmark: DEQ+SSM vs Transformer iso-parámetro
 ]
 resolver = "2"
-

@@ -1,6 +1,6 @@
-# loxi-ai
+# aideen-ai
 
-Repositorio privado — motor de inteligencia artificial del sistema Loxi.
+Repositorio privado — motor de inteligencia artificial del sistema aideen.
 
 **Protocolo v1.0** — `VOCAB_SIZE=64_000`, `D_GLOBAL=2048`
 
@@ -10,16 +10,16 @@ Repositorio privado — motor de inteligencia artificial del sistema Loxi.
 
 | Crate | Estado | Descripción |
 |-------|--------|-------------|
-| `loxi-runtime` | ✅ Completo | GPU runtime (Metal/Vulkan/DX12/WebGPU) con wgpu |
-| `loxi-backbone` | ✅ Completo | Nodo backbone — routing semántico, C+D dynamics |
-| `loxi-training` | ✅ Completo | Pipeline de entrenamiento federado (4 fases) |
+| `aideen-runtime` | ✅ Completo | GPU runtime (Metal/Vulkan/DX12/WebGPU) con wgpu |
+| `aideen-backbone` | ✅ Completo | Nodo backbone — routing semántico, C+D dynamics |
+| `aideen-training` | ✅ Completo | Pipeline de entrenamiento federado (4 fases) |
 
 ## Grafo de dependencias
 
 ```
-loxi-backbone ──→ loxi-runtime
-loxi-training ──→ loxi-runtime
-loxi-runtime  ──→ (sin deps internas)
+aideen-backbone ──→ aideen-runtime
+aideen-training ──→ aideen-runtime
+aideen-runtime  ──→ (sin deps internas)
 ```
 
 ---
@@ -53,7 +53,7 @@ cargo run --release --bin train -- --phase backbone   # SOLO en M1 dueño
 
 ```bash
 # Requiere: data/experts/{domain}/train.jsonl
-#           weights/loxi_backbone_weights.safetensors (de Fase 2)
+#           weights/aideen_backbone_weights.safetensors (de Fase 2)
 
 # Un dominio
 cargo run --release --bin train_expert -- --domain math
@@ -112,20 +112,20 @@ de la red y requiere incrementar la versión mayor del protocolo (`v2.0`).
 
 ```
 weights/
-├── loxi_backbone_weights.safetensors      ← Fase 2
-├── loxi_decomposer_weights.safetensors    ← Fase 1
-├── loxi_expert_math_weights.safetensors   ← Fase 3
-├── loxi_expert_code_weights.safetensors
-├── loxi_expert_logic_weights.safetensors
-├── loxi_expert_nlp_weights.safetensors
-├── loxi_expert_science_weights.safetensors
-├── loxi_expert_creative_weights.safetensors
-├── loxi_expert_legal_weights.safetensors
-├── loxi_expert_medical_weights.safetensors
-├── loxi_expert_history_weights.safetensors
-├── loxi_expert_finance_weights.safetensors
-├── loxi_expert_philosophy_weights.safetensors
-├── loxi_expert_multilingual_weights.safetensors
-├── loxi_expert_reasoning_weights.safetensors
-└── loxi_expert_planning_weights.safetensors
+├── aideen_backbone_weights.safetensors      ← Fase 2
+├── aideen_decomposer_weights.safetensors    ← Fase 1
+├── aideen_expert_math_weights.safetensors   ← Fase 3
+├── aideen_expert_code_weights.safetensors
+├── aideen_expert_logic_weights.safetensors
+├── aideen_expert_nlp_weights.safetensors
+├── aideen_expert_science_weights.safetensors
+├── aideen_expert_creative_weights.safetensors
+├── aideen_expert_legal_weights.safetensors
+├── aideen_expert_medical_weights.safetensors
+├── aideen_expert_history_weights.safetensors
+├── aideen_expert_finance_weights.safetensors
+├── aideen_expert_philosophy_weights.safetensors
+├── aideen_expert_multilingual_weights.safetensors
+├── aideen_expert_reasoning_weights.safetensors
+└── aideen_expert_planning_weights.safetensors
 ```

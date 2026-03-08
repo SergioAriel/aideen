@@ -1,11 +1,11 @@
 ---
 name: Constitutional Engineering
-description: Guidelines for maintaining LOXI's physical and ethical boundaries.
+description: Guidelines for maintaining AIDEEN's physical and ethical boundaries.
 ---
 
-# LOXI Constitutional Engineering
+# AIDEEN Constitutional Engineering
 
-This skill defines the mandatory architectural and physical constraints of the LOXI AI system.
+This skill defines the mandatory architectural and physical constraints of the AIDEEN AI system.
 
 ## 1. MRCE Architecture
 All nodes must implement the MRCE (Memory, Reasoning, Control, Ethics) separation.
@@ -22,14 +22,14 @@ All nodes must implement the MRCE (Memory, Reasoning, Control, Ethics) separatio
 - **Learning Gating**: Learning ($J_\theta$ estimation) is ONLY allowed if $Q(h^*) \ge Q_{MIN\_LEARN}$ (0.6).
 
 ## 4. Repository Distribution
-- **loxi-core**: Public. Traits and math.
-- **loxi-runtime**: Public. Passive execution agent.
-- **loxi-backbone**: Public. Model architecture.
-- **loxi-engine**: Controlled/Private. Autograd and optimizers.
-- **loxi-training**: Private. Evolutionary training lab.
+- **aideen-core**: Public. Traits and math.
+- **aideen-runtime**: Public. Passive execution agent.
+- **aideen-backbone**: Public. Model architecture.
+- **aideen-engine**: Controlled/Private. Autograd and optimizers.
+- **aideen-training**: Private. Evolutionary training lab.
 
 ## 5. Implementation Workflow
-1. Define the physical law in `loxi-core`.
-2. Implement the stable dynamics in `loxi-node/runtime`.
+1. Define the physical law in `aideen-core`.
+2. Implement the stable dynamics in `aideen-node/runtime`.
 3. Verify stability via Stress Tests (Level 2).
 4. Enable local learning only in controlled environments (Level 3).

@@ -1,9 +1,0 @@
-[package]
-name = "loxi-reasoning"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-loxi-core = { path = "../loxi-core" }
-nalgebra = "0.32"
-serde = { version = "1.0", features = ["derive"] }
