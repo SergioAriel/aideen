@@ -13,6 +13,8 @@ pub struct LmHead {
     pub w: DMatrix<f32>,
     /// b: [vocab_size]
     pub b: DVector<f32>,
+    /// g (RMSNorm scale): [D_R]
+    pub g: DVector<f32>,
 }
 
 impl LmHead {
@@ -26,7 +28,8 @@ impl LmHead {
             (v - 0.5) * scale
         });
         let b = DVector::zeros(vocab_size);
-        Self { w, b, config }
+        let g = DVector::from_element(d_r, 1.0);
+        Self { w, b, g, config }
     }
 
     pub fn pool_h_star(&self, h_star: &HSlots) -> DVector<f32> {
@@ -38,14 +41,22 @@ impl LmHead {
             / h_slots as f32
     }
 
+    pub fn rmsnorm(x: &DVector<f32>, g: &DVector<f32>, eps: f32) -> DVector<f32> {
+        let mean_sq = x.map(|v| v * v).mean();
+        let rms = (mean_sq + eps).sqrt();
+        x.map(|v| v / rms).component_mul(g)
+    }
+
     pub fn forward(&self, h_star: &HSlots) -> DVector<f32> {
         let pooled = self.pool_h_star(h_star);
-        &self.w * pooled + &self.b
+        let h_norm = Self::rmsnorm(&pooled, &self.g, 1e-5);
+        &self.w * h_norm + &self.b
     }
 
     pub fn forward_on_flat(&self, flat_slot: &[f32]) -> DVector<f32> {
         let v = DVector::from_column_slice(flat_slot);
-        &self.w * v + &self.b
+        let v_norm = Self::rmsnorm(&v, &self.g, 1e-5);
+        &self.w * v_norm + &self.b
     }
 
     pub fn argmax(logits: &DVector<f32>) -> u32 {
@@ -101,7 +112,7 @@ impl LmHead {
         }
 
         // 3. Softmax
-        let mut probs = Self::softmax(&logits).as_slice().to_vec();
+        let probs = Self::softmax(&logits).as_slice().to_vec();
 
         // Pair up items with their indices and sort descending
         let mut prob_items: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
@@ -158,8 +169,20 @@ impl LmHead {
     pub fn export_weights(&self) -> std::collections::HashMap<String, Vec<f32>> {
         let mut weights = std::collections::HashMap::new();
 
-        weights.insert("head.w".to_string(), self.w.as_slice().to_vec());
+        // nalgebra es Col-Major. Para la GPU y persistencia preferimos Row-Major (v * d_r + d)
+        // para asegurar accesos contiguos en los bucles internos de los shaders.
+        let rows = self.w.nrows();
+        let cols = self.w.ncols();
+        let mut row_major = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                row_major[i * cols + j] = self.w[(i, j)];
+            }
+        }
+
+        weights.insert("head.w".to_string(), row_major);
         weights.insert("head.b".to_string(), self.b.as_slice().to_vec());
+        weights.insert("head.g".to_string(), self.g.as_slice().to_vec());
 
         weights
     }
@@ -179,7 +202,14 @@ impl LmHead {
                 data_w.len()
             ));
         }
-        self.w = nalgebra::DMatrix::from_vec(vocab_size, d_r, data_w.clone());
+        // Convertir de Row-Major (del archivo/GPU) a Col-Major (nalgebra)
+        let mut matrix_w = nalgebra::DMatrix::zeros(vocab_size, d_r);
+        for i in 0..vocab_size {
+            for j in 0..d_r {
+                matrix_w[(i, j)] = data_w[i * d_r + j];
+            }
+        }
+        self.w = matrix_w;
 
         let data_b = weights.get("head.b").ok_or("head.b not found")?;
         if data_b.len() != vocab_size {
@@ -190,6 +220,20 @@ impl LmHead {
             ));
         }
         self.b = nalgebra::DVector::from_vec(data_b.clone());
+
+        if let Some(data_g) = weights.get("head.g") {
+            if data_g.len() != d_r {
+                return Err(format!(
+                    "head.g size mismatch: expected {}, got {}",
+                    d_r,
+                    data_g.len()
+                ));
+            }
+            self.g = nalgebra::DVector::from_vec(data_g.clone());
+        } else {
+            // Backward compatibility
+            self.g = nalgebra::DVector::from_element(d_r, 1.0);
+        }
 
         Ok(())
     }

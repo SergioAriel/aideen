@@ -9,18 +9,22 @@
 
 use aideen_core::state::ArchitectureConfig;
 use nalgebra::{DMatrix, DVector};
+use std::path::Path;
+use tokenizers::Tokenizer as HFTokenizer;
 
 /// Tokenizer con vocabulario y embedding matrix trainable.
 pub struct Tokenizer {
     pub config: ArchitectureConfig,
-    /// Vocabulario: char → token ID.
+    /// Vocabulario: char → token ID (solo para modo char-level).
     pub vocab: Vec<char>,
-    /// Embedding matrix [vocab_size × D_R] — cada fila es el embedding de un token.
+    /// Tokenizer profesional opcional.
+    pub hf_tokenizer: Option<HFTokenizer>,
+    /// Embedding matrix [vocab_size × D_R].
     pub embeddings: DMatrix<f32>,
 }
 
 impl Tokenizer {
-    pub fn from_text(text: &str, config: ArchitectureConfig) -> Self {
+    pub fn from_text(text: &str, mut config: ArchitectureConfig) -> Self {
         let mut vocab: Vec<char> = Vec::new();
         for c in text.chars() {
             if !vocab.contains(&c) {
@@ -30,6 +34,7 @@ impl Tokenizer {
         vocab.sort();
 
         let vocab_size = vocab.len();
+        config.vocab_size = vocab_size;
         let d_r = config.d_r;
         let scale = (d_r as f32).sqrt().recip() * 0.5;
         let embeddings = DMatrix::from_fn(vocab_size, d_r, |i, j| {
@@ -39,35 +44,74 @@ impl Tokenizer {
 
         Self {
             vocab,
+            hf_tokenizer: None,
             embeddings,
             config,
         }
     }
 
+    pub fn from_file<P: AsRef<Path>>(
+        path: P,
+        mut config: ArchitectureConfig,
+    ) -> Result<Self, String> {
+        let hf_tok = HFTokenizer::from_file(path).map_err(|e| e.to_string())?;
+        let vocab_size = hf_tok.get_vocab_size(true);
+        config.vocab_size = vocab_size;
+
+        let d_r = config.d_r;
+        let scale = (d_r as f32).sqrt().recip() * 0.5;
+        let embeddings = DMatrix::from_fn(vocab_size, d_r, |i, j| {
+            let v = ((i * d_r + j) as f32 * 1.6180339) % 1.0;
+            (v - 0.5) * scale
+        });
+
+        Ok(Self {
+            vocab: Vec::new(),
+            hf_tokenizer: Some(hf_tok),
+            embeddings,
+            config,
+        })
+    }
+
     pub fn new_empty(vocab_size: usize, config: ArchitectureConfig) -> Self {
         let d_r = config.d_r;
         Self {
-            vocab: Vec::with_capacity(vocab_size),
+            vocab: vec![' '; vocab_size], // Dummy content to maintain vocab_size() integrity
+            hf_tokenizer: None,
             embeddings: nalgebra::DMatrix::zeros(vocab_size, d_r),
             config,
         }
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
+        if let Some(ref hf) = self.hf_tokenizer {
+            hf.get_vocab_size(true)
+        } else {
+            self.vocab.len()
+        }
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        text.chars()
-            .filter_map(|c| self.vocab.iter().position(|&v| v == c).map(|i| i as u32))
-            .collect()
+        if let Some(ref hf) = self.hf_tokenizer {
+            hf.encode(text, true)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default()
+        } else {
+            text.chars()
+                .filter_map(|c| self.vocab.iter().position(|&v| v == c).map(|i| i as u32))
+                .collect()
+        }
     }
 
     pub fn decode(&self, tokens: &[u32]) -> String {
-        tokens
-            .iter()
-            .filter_map(|&t| self.vocab.get(t as usize))
-            .collect()
+        if let Some(ref hf) = self.hf_tokenizer {
+            hf.decode(tokens, true).unwrap_or_default()
+        } else {
+            tokens
+                .iter()
+                .filter_map(|&t| self.vocab.get(t as usize))
+                .collect()
+        }
     }
 
     pub fn embed(&self, token_id: u32) -> DVector<f32> {

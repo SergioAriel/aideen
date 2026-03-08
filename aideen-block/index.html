@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Loxi V8 WebGPU Engine</title>
+</head>
+
+<body style="background-color: #111111; color: #00ffcc; font-family: monospace; padding: 2rem;">
+    <h1>Loxi V8 WebGPU Engine — Hardware Connection Test</h1>
+    <div id="output">Initializing WebAssembly...</div>
+
+    <script type="module">
+        // ── Logging ───────────────────────────────────────────────────────────
+        function log(msg) {
+            document.getElementById('output').innerHTML += '<br/>' + msg;
+        }
+
+        // ── Start the Web Worker (owns WASM + GPU, never blocks the main thread)
+        const worker = new Worker('./worker.js', { type: 'module' });
+
+        // ── Worker → Main: handle messages ───────────────────────────────────
+        worker.onmessage = (event) => {
+            const { type, ...data } = event.data;
+            switch (type) {
+
+                case 'log':
+                    log(data.message);
+                    break;
+
+                case 'ready':
+                    log('[OK] WebAssembly Loaded (Rust Execution Environment Ready).');
+                    log('[OK] Loxi Engine Pointer Allocated.');
+                    log('[WAIT] Negotiating physical GPU access with browser OS...');
+                    worker.postMessage({ type: 'claim_gpu' });
+                    break;
+
+                case 'gpu_claimed':
+                    log(`<span style="color:#00ff00;font-size:1.2rem">[SUCCESS] Loxi Engine claimed GPU: "${data.deviceName}"</span>`);
+                    log(`<span style="color:#aaaaaa">The mathematical backbone is bound to this graphical silicon.</span>`);
+                    // Start fetching model weights once GPU is ready
+                    fetchAndSendWeights();
+                    break;
+
+                case 'weights_loaded': {
+                    log(`<span style="color:#00ff00;font-size:1.2rem">[SUCCESS] ✅ ${data.tensorCount} tensors resident in GPU VRAM</span>`);
+                    // Debug: show key groups
+                    const mambaKeys = data.weightKeys.filter(k => k.includes('mamba'));
+                    const lmKeys = data.weightKeys.filter(k => k.includes('embed') || k.includes('vocab_head'));
+                    log(`[DEBUG] ${data.tensorCount} tensors | embed/lm: ${lmKeys.join(', ')}`);
+                    log(`[DEBUG] Mamba (${mambaKeys.length}): ${mambaKeys.slice(0, 6).join(', ')}`);
+                    // Trigger inference
+                    log(`<br>[INFER] Running forward pass on token [9906] ("Hello")...`);
+                    worker.postMessage({ type: 'inference', tokenIds: new Uint32Array([9906]) });
+                    break;
+                }
+
+                case 'inference_result': {
+                    const logits = data.logits;
+                    if (logits && logits.length > 0 && isFinite(logits[0])) {
+                        const tokenId = Math.round(logits[0]);
+                        log(`<span style="color:#00ccff">[INFER] argmax → token <b>${tokenId}</b></span>`);
+                        log(`<span style="color:#00ff00;font-size:1.1rem">[INFER] ✅ GPU pipeline complete — predicted next token: <b>${tokenId}</b></span>`);
+                    } else {
+                        log(`<span style="color:orange">[INFER] No result from GPU (logits: ${JSON.stringify(logits)})</span>`);
+                    }
+                    break;
+                }
+
+                case 'error':
+                    log(`<span style="color:red">[ERROR] ${data.message}</span>`);
+                    console.error(data.message);
+                    break;
+            }
+        };
+
+        worker.onerror = (e) => {
+            log(`<span style="color:red">[WORKER ERROR] ${e.message}</span>`);
+        };
+
+        // ── Kick off worker initialization ────────────────────────────────────
+        worker.postMessage({ type: 'init' });
+
+        // ── Fetch weights on main thread (WebSocket), then hand bytes to worker
+        // The main thread can open WebSocket; the Worker cannot access DOM/network easily.
+        async function fetchAndSendWeights() {
+            log('<br>[WAIT] Connecting to Loxi Orchestrator to request model weights...');
+            try {
+                const weightBytes = await fetchWeightsFromOrchestrator('loxi_mini');
+                log(`[OK] ${(weightBytes.byteLength / 1_048_576).toFixed(2)} MB received. Sending to Worker for GPU upload...`);
+                // Transfer the ArrayBuffer to the worker (zero-copy)
+                worker.postMessage({ type: 'load_weights', weightBytes }, [weightBytes.buffer]);
+            } catch (err) {
+                log(`<span style="color:red">[NET ERROR] ${err}</span>`);
+            }
+        }
+
+        /**
+         * Opens a WebSocket to the Loxi Orchestrator, requests model weights,
+         * returns a single Uint8Array of the full model file.
+         */
+        function fetchWeightsFromOrchestrator(modelId) {
+            return new Promise((resolve, reject) => {
+                const ws = new WebSocket('ws://localhost:3005');
+                ws.binaryType = 'arraybuffer';
+
+                let totalShards = 0, receivedShards = 0, totalBytes = 0;
+                const chunks = [];
+
+                ws.onopen = () => {
+                    log('[NET] Loxi Orchestrator connected. Sending RequestModelWeights...');
+                    ws.send(JSON.stringify({
+                        RequestModelWeights: { model_id: modelId, shard_size_bytes: 524288 }
+                    }));
+                };
+
+                ws.onmessage = (event) => {
+                    if (typeof event.data === 'string') {
+                        try {
+                            const msg = JSON.parse(event.data);
+                            if (msg.type === 'model_weights_start') {
+                                totalShards = msg.total_shards;
+                                totalBytes = msg.total_bytes;
+                                log(`[NET] Streaming ${modelId} (${(totalBytes / 1_048_576).toFixed(2)} MB in ${totalShards} shards)...`);
+                            } else if (msg.type === 'model_weights_error') {
+                                ws.close(); reject(new Error(`Orchestrator: ${msg.payload}`));
+                            } else if (msg.NotifyOwner?.notify_type === 'model_weights_error') {
+                                ws.close(); reject(new Error(`Orchestrator: ${msg.NotifyOwner.payload}`));
+                            }
+                        } catch (_) { }
+                    } else {
+                        chunks.push(new Uint8Array(event.data));
+                        receivedShards++;
+                        if (receivedShards >= totalShards && totalShards > 0) {
+                            ws.close();
+                            const full = new Uint8Array(totalBytes);
+                            let offset = 0;
+                            for (const chunk of chunks) { full.set(chunk, offset); offset += chunk.byteLength; }
+                            log(`[NET] All ${totalShards} shards received. ✅`);
+                            resolve(full);
+                        }
+                    }
+                };
+
+                ws.onerror = () => reject(new Error('WebSocket error'));
+                ws.onclose = (e) => {
+                    if (!e.wasClean && receivedShards < totalShards)
+                        reject(new Error(`Connection closed early (${receivedShards}/${totalShards} shards)`));
+                };
+            });
+        }
+    </script>
+</body>
+
+</html>

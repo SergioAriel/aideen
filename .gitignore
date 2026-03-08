@@ -2,3 +2,5 @@
 /loxi-training-lab/
 **/*.rs.bk
 .DS_Store
+*.aidn
+dataset.txt

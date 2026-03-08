@@ -1,0 +1,15 @@
+[package]
+name = "aideen-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "arch_bench"
+path = "src/main.rs"
+
+[dependencies]
+aideen-backbone  = { path = "../aideen-backbone", features = ["lab"] }
+aideen-training  = { path = "../aideen-training-lab" }
+aideen-core      = { path = "../aideen-core" }
+nalgebra         = "0.32"
+rand             = "0.8.5"
