@@ -58,16 +58,15 @@ fn embedding_build_query(
     let tid = lid.x;
 
     let L = min(params.seq_len, params.ctx_len);
-    let denom = f32(max(params.ctx_len, 1u));
-    let log_denom = log2(denom + 1.0f);
+    let denom = f32(max(L, 1u));
 
     var partial_sq_sum = 0.0;
 
     for (var d = tid; d < params.d_model; d = d + WG_SIZE) {
         var acc = 0.0;
         for (var p = 0u; p < L; p = p + 1u) {
-            // Logarithmic positional weighting for better long-range context (Genesis Audit)
-            let pos_weight = log2(f32(p) + 2.0f) / log_denom;
+            // Match CPU tokenizer.embed_context positional weighting.
+            let pos_weight = f32(p + 1u) / denom;
             acc = acc + seq_out[p * params.d_model + d] * pos_weight;
         }
         query_out[d] = acc;
@@ -120,8 +119,8 @@ fn embedding_adamw_update(
     let bc1   = 1.0 - pow(beta1, t_f);
     let bc2   = 1.0 - pow(beta2, t_f);
 
-    let denom = f32(max(params.ctx_len, 1u));
-    let pos_weight = log2(f32(p) + 2.0f) / log2(denom + 1.0f);
+    let denom = f32(max(L, 1u));
+    let pos_weight = f32(p + 1u) / denom;
     // Normalize by seq_len (L) to prevent accumulation explosion
     let grad = (dl_dh[d] * pos_weight) / f32(max(L, 1u));
 

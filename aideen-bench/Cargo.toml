@@ -9,7 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 aideen-backbone  = { path = "../aideen-backbone", features = ["lab"] }
-aideen-training  = { path = "../aideen-training-lab" }
+aideen-training  = { path = "../aideen-training-lab", features = ["wgpu"] }
 aideen-core      = { path = "../aideen-core" }
 nalgebra         = "0.32"
 rand             = "0.8.5"
+candle-core      = { version = "0.8.4", features = ["metal"] }
+candle-nn        = { version = "0.8.4", features = ["metal"] }
+statrs           = "0.18"
+bytemuck         = "1"

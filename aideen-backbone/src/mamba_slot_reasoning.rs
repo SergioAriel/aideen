@@ -6,7 +6,8 @@ use aideen_core::{
     state::{ArchitectureConfig, HSlots},
 };
 use nalgebra::{DMatrix, DVector};
-use rand::{thread_rng, Rng};
+use rand::rngs::StdRng;
+use rand::{thread_rng, Rng, SeedableRng};
 use std::cell::RefCell;
 
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
@@ -37,6 +38,28 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) w_in: DMatrix<f32>,
 
+    // ── History interface into the DEQ ─────────────────────────────────────
+    #[cfg(feature = "lab")]
+    pub w_hist_shared: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_hist_shared: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub hist_slot_scale: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) hist_slot_scale: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub hist_slot_bias: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) hist_slot_bias: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub hist_gate_logit: DVector<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) hist_gate_logit: DVector<f32>,
+    #[cfg(feature = "lab")]
+    pub slot_anchor: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) slot_anchor: DMatrix<f32>,
+
     // ── Mamba SSM por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
     pub a_log: DVector<f32>,
@@ -50,6 +73,14 @@ pub struct MambaSlotReasoning {
     pub w_out: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
     pub(crate) w_out: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub w_delta: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_delta: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub b_delta: DVector<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) b_delta: DVector<f32>,
 
     // ── LayerNorm por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
@@ -62,30 +93,152 @@ pub struct MambaSlotReasoning {
 
     // ── Picard β-relaxation ───────────────────────────────────────────────
     pub damping: f32,
+    /// Residual mixing inside f(h): combined += residual_alpha * h.
+    /// 1.0 = legacy behavior, <1.0 = contractivity-friendly experimental mode.
+    pub residual_alpha: f32,
 }
 
 impl MambaSlotReasoning {
-    pub fn new(config: ArchitectureConfig) -> Self {
+    fn matrix_to_row_major(m: &DMatrix<f32>) -> Vec<f32> {
+        let rows = m.nrows();
+        let cols = m.ncols();
+        let mut data = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                data[i * cols + j] = m[(i, j)];
+            }
+        }
+        data
+    }
+
+    fn xavier_mat_with_rng<R: Rng + ?Sized>(rng: &mut R, d_r: usize, xavier_range: f32) -> DMatrix<f32> {
+        DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range))
+    }
+
+    fn identity_like_mat_with_rng<R: Rng + ?Sized>(rng: &mut R, d_r: usize, noise: f32) -> DMatrix<f32> {
+        let jitter = DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-noise..noise));
+        DMatrix::identity(d_r, d_r) + jitter
+    }
+
+    fn scaled_identity_like_mat_with_rng<R: Rng + ?Sized>(
+        rng: &mut R,
+        d_r: usize,
+        scale: f32,
+        noise: f32,
+    ) -> DMatrix<f32> {
+        let jitter = DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-noise..noise));
+        DMatrix::identity(d_r, d_r) * scale + jitter
+    }
+
+    fn default_slot_anchor(config: &ArchitectureConfig) -> DMatrix<f32> {
+        let h_slots = config.h_slots;
         let d_r = config.d_r;
+        DMatrix::from_fn(h_slots, d_r, |slot, dim| {
+            // Deterministic slot identity basis. This breaks permutation symmetry in H0
+            // without injecting large energy that would destabilize the DEQ operator.
+            let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+            let phase = (((slot + 1) * (dim + 3) * 17) % 2048) as f32 / 1024.0 - 1.0;
+            centered * 2.0e-3f32 + phase * 2.5e-4f32
+        })
+    }
+
+    pub fn new(config: ArchitectureConfig) -> Self {
         let mut rng = thread_rng();
+        Self::new_with_rng(config, &mut rng)
+    }
+
+    pub fn new_with_seed(config: ArchitectureConfig, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Self::new_with_rng(config, &mut rng)
+    }
+
+    fn new_with_rng<R: Rng + ?Sized>(config: ArchitectureConfig, rng: &mut R) -> Self {
+        let d_r = config.d_r;
+        let h_slots = config.h_slots;
         // Xavier Uniform initialization: range = sqrt(3 / fan_in)
         let xavier_range = (3.0 / d_r as f32).sqrt();
 
-        let mut xavier_mat =
-            || DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range));
+        let mut w_q = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        let mut w_k = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        let mut w_v = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        let mut w_o = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        let mut w_in = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        // The historical interface must start semantically neutral. If W_hist is non-zero at
+        // initialization, the model injects a random history vector before the DEQ has learned
+        // how to use it, which is exactly the failure mode we see under seeded stress: no-mamba
+        // remains contractive while hist_gated enters BOOST/FAIL immediately. Zero-init keeps
+        // the branch equivalent to no-mamba at step 0 while preserving non-zero gradients into
+        // W_hist through g_u and the normalized carrier.
+        let w_hist_shared = DMatrix::zeros(d_r, d_r);
+        // The temporal carrier is applied as a residual around identity:
+        //   x_proj = h_unit + W_x h_unit
+        //   M_t    = m_inner + W_out m_inner
+        // Therefore W_x/W_out should initialize near zero, not near identity. This keeps
+        // the carrier alive by construction while still allowing learned deviations later.
+        let w_x = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.0f32, 0.01f32);
+        let w_out = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.0f32, 0.01f32);
+        // Selective branch starts neutral: delta=0 => a_t = a_base.
+        let w_delta = DMatrix::zeros(d_r, d_r);
+
+        // DEQ requiere σ(J_f) < 1 desde la inicialización.
+        // El Jacobiano compuesto de atención (W_o · softmax · W_v · W_q) puede superar 1
+        // con Xavier estándar. Renormalizamos las matrices de atención a σ ≤ 0.10
+        // para garantizar σ(J_attn) << 1 antes del primer token de entrenamiento.
+        // residual_alpha=0.0 es necesario — incluso alpha=0.2 lleva contr→1.
+        let deq_threshold = 0.10_f32;
+        let n_iter = 20;
+        spectral_norm::normalize_if_needed(&mut w_q, deq_threshold, n_iter);
+        spectral_norm::normalize_if_needed(&mut w_k, deq_threshold, n_iter);
+        spectral_norm::normalize_if_needed(&mut w_v, deq_threshold, n_iter);
+        spectral_norm::normalize_if_needed(&mut w_o, deq_threshold, n_iter);
+        spectral_norm::normalize_if_needed(&mut w_in, deq_threshold, n_iter);
+
+        let hist_slot_scale =
+            DMatrix::from_fn(h_slots, d_r, |slot, _| {
+                // Keep multiplicative history adaptation off at initialization. A non-zero
+                // diagonal scale would create an implicit bypass from M_{t-1} into the DEQ.
+                let _ = slot;
+                0.0
+            });
+        let hist_slot_bias =
+            DMatrix::from_fn(h_slots, d_r, |slot, _| {
+                // Break slot permutation symmetry structurally. Without a slot-specific additive
+                // anchor, all slots remain exchangeable because H0 is broadcast and the early
+                // historical carrier M_{t-1} is nearly identical across slots.
+                let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+                centered * 2.5e-3f32 + rng.gen_range(-5.0e-4f32..5.0e-4f32)
+            });
+        let hist_gate_logit = DVector::from_fn(h_slots, |slot, _| {
+            // The historical branch is now stable enough that the next bottleneck is
+            // under-learning, not contractivity. Start the gate at alpha≈0.14 with a
+            // positive floor (alpha_min=0.08, alpha_max=0.28) so the interface has
+            // enough energy to learn without relying on optimizer-only fixes.
+            let base = -0.847_297_85_f32; // alpha = 0.14 for alpha_min=0.08, alpha_max=0.28
+            let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+            base + centered * 0.02
+        });
+        let slot_anchor = Self::default_slot_anchor(&config);
 
         Self {
-            w_q: xavier_mat(),
-            w_k: xavier_mat(),
-            w_v: xavier_mat(),
-            w_o: xavier_mat(),
-            w_in: xavier_mat(),
-            a_log: DVector::from_element(d_r, -0.5_f32),
-            w_x: xavier_mat(),
-            w_out: xavier_mat(),
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            w_in,
+            w_hist_shared,
+            hist_slot_scale,
+            hist_slot_bias,
+            hist_gate_logit,
+            slot_anchor,
+            a_log: DVector::from_element(d_r, -0.5_f32), // keep frozen in production path
+            w_x,
+            w_out,
+            w_delta,
+            b_delta: DVector::zeros(d_r),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             backend: RefCell::new(None),
-            damping: 0.9_f32,
+            damping: 0.70_f32,
+            residual_alpha: 0.0_f32,
             config,
         }
     }
@@ -95,19 +248,29 @@ impl MambaSlotReasoning {
         self
     }
 
-    pub fn renormalize_weights(&mut self) {
-        let t = 0.8_f32; // Radio espectral máximo permitido (más conservador)
-        let n = 10;
-        spectral_norm::normalize_if_needed(&mut self.w_q, t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_k, t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_v, t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_o, t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_in, t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_x, t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_out, t, n);
+    pub fn with_residual_alpha(mut self, alpha: f32) -> Self {
+        self.residual_alpha = alpha.clamp(0.0, 1.0);
+        self
     }
 
-    pub fn spectral_norms(&self) -> [f32; 7] {
+    pub fn renormalize_weights(&mut self) {
+        // Umbral 0.10 para matrices de atención — necesario para mantener σ(J_attn) < 1
+        // durante el entrenamiento (no solo en la inicialización).
+        // w_x y w_out (Mamba externo) usan umbral 0.70 — no afectan la contractividad del DEQ.
+        let attn_t = 0.10_f32;
+        let mamba_t = 0.70_f32;
+        let n = 20;
+        spectral_norm::normalize_if_needed(&mut self.w_q, attn_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_k, attn_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_v, attn_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_o, attn_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_in, attn_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_hist_shared, 1.5, n);
+        spectral_norm::normalize_if_needed(&mut self.w_x, mamba_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_out, mamba_t, n);
+    }
+
+    pub fn spectral_norms(&self) -> [f32; 8] {
         let n = 10;
         [
             spectral_norm::spectral_norm(&self.w_q, n),
@@ -115,6 +278,7 @@ impl MambaSlotReasoning {
             spectral_norm::spectral_norm(&self.w_v, n),
             spectral_norm::spectral_norm(&self.w_o, n),
             spectral_norm::spectral_norm(&self.w_in, n),
+            spectral_norm::spectral_norm(&self.w_hist_shared, n),
             spectral_norm::spectral_norm(&self.w_x, n),
             spectral_norm::spectral_norm(&self.w_out, n),
         ]
@@ -139,26 +303,38 @@ impl MambaSlotReasoning {
 
     pub fn export_weights(&self) -> std::collections::HashMap<String, Vec<f32>> {
         let mut weights = std::collections::HashMap::new();
-
-        let to_row_major = |m: &nalgebra::DMatrix<f32>| -> Vec<f32> {
-            let rows = m.nrows();
-            let cols = m.ncols();
-            let mut data = vec![0.0f32; rows * cols];
-            for i in 0..rows {
-                for j in 0..cols {
-                    data[i * cols + j] = m[(i, j)];
-                }
-            }
-            data
-        };
-
-        weights.insert("reasoning.w_q".to_string(), to_row_major(&self.w_q));
-        weights.insert("reasoning.w_k".to_string(), to_row_major(&self.w_k));
-        weights.insert("reasoning.w_v".to_string(), to_row_major(&self.w_v));
-        weights.insert("reasoning.w_o".to_string(), to_row_major(&self.w_o));
-        weights.insert("reasoning.w_in".to_string(), to_row_major(&self.w_in));
-        weights.insert("reasoning.w_x".to_string(), to_row_major(&self.w_x));
-        weights.insert("reasoning.w_out".to_string(), to_row_major(&self.w_out));
+        weights.insert("reasoning.w_q".to_string(), Self::matrix_to_row_major(&self.w_q));
+        weights.insert("reasoning.w_k".to_string(), Self::matrix_to_row_major(&self.w_k));
+        weights.insert("reasoning.w_v".to_string(), Self::matrix_to_row_major(&self.w_v));
+        weights.insert("reasoning.w_o".to_string(), Self::matrix_to_row_major(&self.w_o));
+        weights.insert("reasoning.w_in".to_string(), Self::matrix_to_row_major(&self.w_in));
+        weights.insert(
+            "reasoning.w_hist_shared".to_string(),
+            Self::matrix_to_row_major(&self.w_hist_shared),
+        );
+        weights.insert(
+            "reasoning.hist_slot_scale".to_string(),
+            Self::matrix_to_row_major(&self.hist_slot_scale),
+        );
+        weights.insert(
+            "reasoning.hist_slot_bias".to_string(),
+            Self::matrix_to_row_major(&self.hist_slot_bias),
+        );
+        weights.insert(
+            "reasoning.hist_gate_logit".to_string(),
+            self.hist_gate_logit.as_slice().to_vec(),
+        );
+        weights.insert(
+            "reasoning.slot_anchor".to_string(),
+            Self::matrix_to_row_major(&self.slot_anchor),
+        );
+        weights.insert("reasoning.w_x".to_string(), Self::matrix_to_row_major(&self.w_x));
+        weights.insert("reasoning.w_out".to_string(), Self::matrix_to_row_major(&self.w_out));
+        weights.insert("reasoning.w_delta".to_string(), Self::matrix_to_row_major(&self.w_delta));
+        weights.insert(
+            "reasoning.b_delta".to_string(),
+            self.b_delta.as_slice().to_vec(),
+        );
         weights.insert(
             "reasoning.a_log".to_string(),
             self.a_log.as_slice().to_vec(),
@@ -168,8 +344,34 @@ impl MambaSlotReasoning {
             self.norm_scale.as_slice().to_vec(),
         );
         weights.insert("reasoning.damping".to_string(), vec![self.damping]);
+        weights.insert(
+            "reasoning.residual_alpha".to_string(),
+            vec![self.residual_alpha],
+        );
 
         weights
+    }
+
+    pub fn history_params_gpu_layout(
+        &self,
+    ) -> (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    ) {
+        (
+            Self::matrix_to_row_major(&self.w_hist_shared),
+            Self::matrix_to_row_major(&self.hist_slot_scale),
+            Self::matrix_to_row_major(&self.hist_slot_bias),
+            self.hist_gate_logit.as_slice().to_vec(),
+            Self::matrix_to_row_major(&self.slot_anchor),
+            Self::matrix_to_row_major(&self.w_delta),
+            self.b_delta.as_slice().to_vec(),
+        )
     }
 
     pub fn import_weights(
@@ -197,8 +399,65 @@ impl MambaSlotReasoning {
         self.w_v = get_mat("reasoning.w_v")?;
         self.w_o = get_mat("reasoning.w_o")?;
         self.w_in = get_mat("reasoning.w_in")?;
+        self.w_hist_shared = get_mat("reasoning.w_hist_shared")?;
+        {
+            let data = weights
+                .get("reasoning.hist_slot_scale")
+                .ok_or("reasoning.hist_slot_scale not found")?;
+            let h_slots = self.config.h_slots;
+            if data.len() != h_slots * d_r {
+                return Err(format!(
+                    "Weight reasoning.hist_slot_scale size mismatch: expected {}, got {}",
+                    h_slots * d_r,
+                    data.len()
+                ));
+            }
+            self.hist_slot_scale = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+        }
+        {
+            let data = weights
+                .get("reasoning.hist_slot_bias")
+                .ok_or("reasoning.hist_slot_bias not found")?;
+            let h_slots = self.config.h_slots;
+            if data.len() != h_slots * d_r {
+                return Err(format!(
+                    "Weight reasoning.hist_slot_bias size mismatch: expected {}, got {}",
+                    h_slots * d_r,
+                    data.len()
+                ));
+            }
+            self.hist_slot_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+        }
+        self.hist_gate_logit = nalgebra::DVector::from_vec(
+            weights
+                .get("reasoning.hist_gate_logit")
+                .ok_or("reasoning.hist_gate_logit not found")?
+                .clone(),
+        );
+        {
+            let h_slots = self.config.h_slots;
+            if let Some(data) = weights.get("reasoning.slot_anchor") {
+                if data.len() != h_slots * d_r {
+                    return Err(format!(
+                        "Weight reasoning.slot_anchor size mismatch: expected {}, got {}",
+                        h_slots * d_r,
+                        data.len()
+                    ));
+                }
+                self.slot_anchor = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+            } else {
+                self.slot_anchor = Self::default_slot_anchor(&self.config);
+            }
+        }
         self.w_x = get_mat("reasoning.w_x")?;
         self.w_out = get_mat("reasoning.w_out")?;
+        self.w_delta = get_mat("reasoning.w_delta")?;
+        self.b_delta = nalgebra::DVector::from_vec(
+            weights
+                .get("reasoning.b_delta")
+                .ok_or("reasoning.b_delta not found")?
+                .clone(),
+        );
 
         self.a_log = nalgebra::DVector::from_vec(
             weights
@@ -215,6 +474,10 @@ impl MambaSlotReasoning {
         self.damping = weights
             .get("reasoning.damping")
             .ok_or("reasoning.damping not found")?[0];
+        self.residual_alpha = weights
+            .get("reasoning.residual_alpha")
+            .map(|v| v[0])
+            .unwrap_or(1.0);
 
         Ok(())
     }
@@ -239,11 +502,19 @@ impl MambaSlotReasoning {
         w_v: nalgebra::DMatrix<f32>,
         w_o: nalgebra::DMatrix<f32>,
         w_in: nalgebra::DMatrix<f32>,
+        w_hist_shared: nalgebra::DMatrix<f32>,
+        hist_slot_scale: nalgebra::DMatrix<f32>,
+        hist_slot_bias: nalgebra::DMatrix<f32>,
+        hist_gate_logit: nalgebra::DVector<f32>,
+        slot_anchor: nalgebra::DMatrix<f32>,
         w_x: nalgebra::DMatrix<f32>,
         w_out: nalgebra::DMatrix<f32>,
+        w_delta: nalgebra::DMatrix<f32>,
+        b_delta: nalgebra::DVector<f32>,
         a_log: nalgebra::DVector<f32>,
         norm_scale: nalgebra::DVector<f32>,
         damping: f32,
+        residual_alpha: f32,
     ) -> Self {
         Self {
             w_q,
@@ -251,12 +522,20 @@ impl MambaSlotReasoning {
             w_v,
             w_o,
             w_in,
+            w_hist_shared,
+            hist_slot_scale,
+            hist_slot_bias,
+            hist_gate_logit,
+            slot_anchor,
             w_x,
             w_out,
+            w_delta,
+            b_delta,
             a_log,
             norm_scale,
             backend: RefCell::new(None),
             damping,
+            residual_alpha,
             config,
         }
     }
@@ -294,39 +573,6 @@ impl MambaSlotReasoning {
         }
         next
     }
-
-    fn mamba_step(&self, h_slot: &DVector<f32>) -> DVector<f32> {
-        let d_r = self.config.d_r;
-        let x: Vec<f32> = (&self.w_x * h_slot).data.as_vec().clone();
-        let a: Vec<f32> = self.a_log.data.as_vec().clone();
-        let dt: Vec<f32> = vec![1.0_f32; d_r];
-        let b: Vec<f32> = vec![1.0_f32; d_r];
-        let c: Vec<f32> = vec![1.0_f32; d_r];
-
-        let y = {
-            let mut backend_ref = self.backend.borrow_mut();
-            if let Some(backend) = backend_ref.as_mut() {
-                match backend.mamba_batch_step(&x, &dt, &a, &b, &c) {
-                    Ok(y) => DVector::from_vec(y),
-                    Err(e) => {
-                        eprintln!("[MambaSlotReasoning] GPU error: {e} — CPU fallback");
-                        self.mamba_step_cpu(h_slot)
-                    }
-                }
-            } else {
-                self.mamba_step_cpu(h_slot)
-            }
-        };
-
-        &self.w_out * y
-    }
-
-    fn mamba_step_cpu(&self, h_slot: &DVector<f32>) -> DVector<f32> {
-        let a_bar = self.a_log.map(|a| a.exp());
-        let b_bar = a_bar.map(|a| 1.0 - a);
-        let x_proj = &self.w_x * h_slot;
-        a_bar.zip_map(h_slot, |a, h| a * h) + b_bar.zip_map(&x_proj, |b, x| b * x)
-    }
 }
 
 impl Reasoning for MambaSlotReasoning {
@@ -343,7 +589,13 @@ impl Reasoning for MambaSlotReasoning {
             v.rows_mut(0, s.len()).copy_from(&s.rows(0, s.len()));
             v
         };
-        HSlots::from_broadcast(&s_r, &self.config)
+        let mut h0 = HSlots::from_broadcast(&s_r, &self.config);
+        for k in 0..self.config.h_slots {
+            for d in 0..d_r {
+                h0.data[(k, d)] += self.slot_anchor[(k, d)];
+            }
+        }
+        h0
     }
 
     fn step(&self, h: &HSlots, s: &DVector<f32>, _exec: Option<&mut dyn ComputeBackend>) -> HSlots {
@@ -365,14 +617,42 @@ impl Reasoning for MambaSlotReasoning {
         for k in 0..h_slots {
             let h_slot = h.slot(k);
             let attn_k = h_attn.slot(k);
-            let mamba_k = self.mamba_step(&h_slot);
 
-            let combined = attn_k + mamba_k + &input_signal + &h_slot;
-            let f_h = self.rms_norm(&combined);
+            // v14: En el loop DEQ, solo combinamos atención e inyección de contexto.
+            // La conexión residual interna ha sido purgada para forzar p(J)<1.
+            let combined = attn_k + &input_signal;
+            let slot_bias = self.slot_anchor.row(k).transpose().into_owned();
+            let f_h = self.rms_norm(&(combined + slot_bias));
             let damped = spectral_norm::damped_update(&h_slot, &f_h, self.damping);
             next.set_slot(k, &damped);
         }
         next
+    }
+
+    fn temporal_step(&self, m_prev: &HSlots, h_star: &HSlots) -> HSlots {
+        let h_slots = self.config.h_slots;
+        let mut next_m = HSlots::zeros(&self.config);
+
+        for k in 0..h_slots {
+            let m_k = m_prev.slot(k);
+            let h_k = h_star.slot(k);
+            let h_rms = ((h_k.dot(&h_k) / h_k.len() as f32) + 1e-6).sqrt();
+            let h_unit = h_k / h_rms;
+
+            // The temporal carrier should depend on the content of H*, not on the raw amplitude
+            // of the fixed point. As the DEQ learns, ||H*|| can contract substantially; using the
+            // unit-RMS slot state keeps the external memory alive without changing Picard itself.
+            let a_bar = self.a_log.map(|a| 1.0 / (1.0 + a.exp()));
+            let b_bar = a_bar.map(|a| 1.0 - a);
+            let x_proj = h_unit.clone_owned() + &self.w_x * h_unit;
+            let m_k_next = a_bar.zip_map(&m_k, |a, m| a * m) + b_bar.zip_map(&x_proj, |b, x| b * x);
+
+            // Keep an identity carrier path so the temporal memory cannot self-annihilate
+            // when W_x/W_out are trainable.
+            let out_k = m_k_next.clone_owned() + &self.w_out * m_k_next;
+            next_m.set_slot(k, &out_k);
+        }
+        next_m
     }
 }
 

@@ -38,19 +38,19 @@ impl Default for ArchitectureConfig {
     fn default() -> Self {
         Self {
             d_m: 1024, // Cerebro robusto
-            d_r: 1024, // Espacio de equilibrio
+            d_r: 512,  // Espacio de equilibrio (estable en GPU actual)
             d_c: 256,
             d_e: 256,
             d_sim: 1024,
             h_slots: 4,        // 4 Slots = Alta velocidad + Razonamiento paralelo
             vocab_size: 50257, // DEBE coincidir con tu tokenizer.json
             ctx_len: 256,      // Ventana de memoria para chat
-            max_deq_iters: 1,
+            max_deq_iters: 16, // v14 (Optimizado tras sweep: garantiza 100% conv con alpha=0)
             deq_epsilon: 1e-4,
-            cg_iters: 6, // Precisión de gradiente estable
+            cg_iters: 8, // Mejor estabilidad del gradiente implícito
             train_deq: true,
-            deq_grad_scale: 0.1,
-            renorm_every_steps: 50, // Mantiene el radio espectral a raya
+            deq_grad_scale: 0.01,
+            renorm_every_steps: 16, // Mantiene el radio espectral a raya
             num_samples: 512,
             weight_decay: 0.01,
         }
@@ -124,7 +124,14 @@ impl HSlots {
 
     /// Aplana para envío por red.
     pub fn to_flat(&self) -> Vec<f32> {
-        self.data.as_slice().to_vec()
+        // Export in row-major ([slot][d]) to match `from_flat` and GPU buffers.
+        let mut out = Vec::with_capacity(self.slots * self.d_r);
+        for k in 0..self.slots {
+            for d in 0..self.d_r {
+                out.push(self.data[(k, d)]);
+            }
+        }
+        out
     }
 
     /// Reconstruye desde bytes aplanados.

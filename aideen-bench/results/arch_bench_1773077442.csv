@@ -1,0 +1,2 @@
+seed,exp1_ai_best,exp1_tf_best,exp1_ai_tps,exp1_tf_tps,exp2_ai_best,exp2_tf_best,exp2_ai_tokens,exp2_tf_tokens,inf_ai_nll,inf_tf_nll,inf_ai_tps,inf_tf_tps
+42,3.867276,3.773696,318.315,2583.420,4.132423,3.924712,480,480,3.687547,3.645338,1616.974,5887.452

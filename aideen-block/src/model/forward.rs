@@ -787,7 +787,7 @@ impl AideenForwardPass {
         let pipeline = Self::make_pipeline(device, "attn_pipe", &bgl, &shader, "attention_step");
 
         // Helper to run one stream (light or heavy)
-        let mut run_stream =
+        let run_stream =
             |name: &str, head_dim: usize, input_buf: &wgpu::Buffer| -> Result<(), BlockError> {
                 let norm_w = weight_buffers
                     .get(&format!("layers.{}.attn.norm_{}.weight", layer_idx, name))

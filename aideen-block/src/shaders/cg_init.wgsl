@@ -18,13 +18,13 @@ struct CGComputeShape {
     h_slots:    u32,
     cg_iters:   u32,
     epsilon:    f32,
+    damping:    f32,
     curr_iter:  u32,
     _pad0:      u32,
     _pad1:      u32,
     _pad2:      u32,
     _pad3:      u32,
     _pad4:      u32,
-    _pad5:      u32,
 };
 
 // ── Group 0: todos los bindings declarados (evita gaps de mapping en Metal) ──
@@ -74,7 +74,12 @@ fn cg_init_main(
     for (var i = 0u; i < items_per_thread; i = i + 1u) {
         let idx = tid + i * 256u;
         if (idx < n_total) {
-            let r_val = dl_dh_pooled[batch_idx * d_model + (idx % d_model)] * 1.0; 
+            let slot_id = idx / d_model;
+            // Solo slot 0 recibe gradiente del pool (head)
+            var r_val = 0.0;
+            if (slot_id == 0u) {
+                r_val = dl_dh_pooled[batch_idx * d_model + (idx % d_model)];
+            }
             R[b_offset + idx] = r_val;
             P[b_offset + idx] = r_val;
             V_out[b_offset + idx] = 0.0;

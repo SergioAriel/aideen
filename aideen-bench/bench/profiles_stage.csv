@@ -1,0 +1,10 @@
+name,stage,dr,h_slots,max_iters,cg_iters,eps,lr,iters
+core_fast,core,512,8,8,8,3e-4,3e-4,10
+core_bal,core,512,8,10,10,2e-4,3e-4,10
+core_qual,core,512,8,12,12,1.5e-4,3e-4,10
+attn_fast,attn,512,8,8,8,3e-4,3e-4,10
+attn_bal,attn,512,8,10,10,2e-4,3e-4,10
+attn_qual,attn,512,8,12,12,1.5e-4,3e-4,10
+full_fast,full,512,8,8,8,3e-4,3e-4,10
+full_bal,full,512,8,10,10,2e-4,3e-4,10
+full_qual,full,512,8,12,12,1.5e-4,3e-4,10

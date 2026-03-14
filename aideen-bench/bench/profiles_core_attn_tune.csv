@@ -1,0 +1,13 @@
+name,stage,dr,h_slots,max_iters,cg_iters,eps,lr,iters
+core_512_s8_i8,core,512,8,8,8,3e-4,3e-4,10
+core_512_s8_i10,core,512,8,10,10,2e-4,3e-4,10
+core_512_s6_i8,core,512,6,8,8,3e-4,3e-4,10
+core_384_s8_i8,core,384,8,8,8,3e-4,3e-4,10
+attn_512_s8_i8,attn,512,8,8,8,3e-4,3e-4,10
+attn_512_s8_i10,attn,512,8,10,10,2e-4,3e-4,10
+attn_512_s8_i12,attn,512,8,12,12,1.5e-4,3e-4,10
+attn_512_s6_i8,attn,512,6,8,8,3e-4,3e-4,10
+attn_512_s6_i10,attn,512,6,10,10,2e-4,3e-4,10
+attn_512_s4_i8,attn,512,4,8,8,3e-4,3e-4,10
+attn_384_s8_i8,attn,384,8,8,8,3e-4,3e-4,10
+attn_384_s6_i8,attn,384,6,8,8,3e-4,3e-4,10
