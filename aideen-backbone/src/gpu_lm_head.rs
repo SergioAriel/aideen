@@ -990,6 +990,43 @@ impl GpuLmHeadTrainer {
         }
     }
 
+    /// Read back the reduced dL/dh vector from GPU memory.
+    pub fn read_dl_dh_temp(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        d_model: usize,
+    ) -> Result<Vec<f32>, String> {
+        let bytes = (d_model * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("LM dl_dh_temp staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("LM dl_dh_temp readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.dl_dh_temp_buf, 0, &staging, 0, bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(Ok(())) = rx.recv() {
+            let data = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+            staging.unmap();
+            Ok(data)
+        } else {
+            Err("LM dl_dh_temp map failed".to_string())
+        }
+    }
+
     pub fn read_weights(
         &self,
         device: &wgpu::Device,

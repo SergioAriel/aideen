@@ -6,8 +6,8 @@
 struct SpectralParams {
     d_model:   u32,
     n_iters:   u32,
-    threshold: f32,
-    _pad:      u32,
+    attn_threshold: f32,
+    mamba_threshold: f32,
 };
 
 @group(0) @binding(0) var<uniform>            params: SpectralParams;
@@ -145,8 +145,9 @@ fn spectral_renorm_main(
     }
 
     // --- If σ > threshold, rescale W in-place ---
-    if (sigma > params.threshold) {
-        let scale = params.threshold / sigma;
+    let threshold = select(params.attn_threshold, params.mamba_threshold, mat_idx >= 5u);
+    if (sigma > threshold) {
+        let scale = threshold / sigma;
         for (var i = 0u; i < items_per_thread; i++) {
             let row_idx = tid + i * WG_SIZE;
             if (row_idx < d) {

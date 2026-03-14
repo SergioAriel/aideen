@@ -1,8 +1,6 @@
 // Rust orchestrator for the Mamba WGSL Compute Shader.
 // Binds the PyTorch aligned C buffers to the A, B, C, and dt matrices for the parallel scan.
 
-use crate::tensor::{AlignedTensor, ComputeShape};
-use bytemuck;
 use wgpu;
 
 pub struct RustMambaBridge {

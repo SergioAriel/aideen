@@ -42,7 +42,7 @@ async fn test_deq_forward_wgpu_dispatch() {
         epsilon: 1e-4,
         damping: 0.9,
         seq_len: 1,
-        _pad: 0,
+        residual_alpha: 0.0,
     };
 
     let len_sq = d * d;
@@ -113,7 +113,7 @@ async fn test_cg_solver_wgpu_dispatch() {
         _pad2: 0,
         _pad3: 0,
         _pad4: 0,
-        _pad5: 0,
+        damping: 0.9,
     };
 
     let len_sq = d * d;

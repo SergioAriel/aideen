@@ -4,7 +4,8 @@
 /// Sin dependencias de autograd — todos los gradientes son analíticos.
 
 use nalgebra::{DMatrix, DVector};
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 // ─── Configuración ────────────────────────────────────────────────────────────
 
@@ -200,20 +201,29 @@ pub struct Transformer {
 impl Transformer {
     pub fn new(cfg: TransformerConfig) -> Self {
         let mut rng = rand::thread_rng();
+        Self::new_with_rng(cfg, &mut rng)
+    }
+
+    pub fn new_with_seed(cfg: TransformerConfig, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Self::new_with_rng(cfg, &mut rng)
+    }
+
+    fn new_with_rng<R: Rng>(cfg: TransformerConfig, rng: &mut R) -> Self {
         let d = cfg.d_model;
         let v = cfg.vocab_size;
         let scale_emb = 0.02f32;
 
         let layers = (0..cfg.n_layers)
-            .map(|_| TransformerLayer::new(&cfg, &mut rng))
+            .map(|_| TransformerLayer::new(&cfg, rng))
             .collect();
 
         Self {
-            token_embed: random_mat(v, d, scale_emb, &mut rng),
-            pos_embed: random_mat(cfg.ctx_len, d, scale_emb, &mut rng),
+            token_embed: random_mat(v, d, scale_emb, rng),
+            pos_embed: random_mat(cfg.ctx_len, d, scale_emb, rng),
             layers,
             ln_f: LayerNorm::new(d),
-            lm_head: random_mat(d, v, scale_emb, &mut rng),
+            lm_head: random_mat(d, v, scale_emb, rng),
             lm_bias: DVector::zeros(v),
             cfg,
         }

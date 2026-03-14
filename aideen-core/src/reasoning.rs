@@ -19,4 +19,14 @@ pub trait Reasoning {
         s: &DVector<f32>,
         exec: Option<&mut dyn crate::compute::ComputeBackend>,
     ) -> HSlots;
+
+    /// Paso temporal de memoria M_t = g(M_{t-1}, H*).
+    /// Se ejecuta una única vez por token, después de que `step` haya convergido
+    /// a una solución de punto fijo H*. Actualiza el estado temporal que se pasará
+    /// al siguiente token secuencial.
+    fn temporal_step(&self, _m_prev: &HSlots, h_star: &HSlots) -> HSlots {
+        // Implementación por defecto: identidad (sin memoria a corto plazo explícita)
+        // o sobrescribir con el último estado convergido.
+        h_star.clone()
+    }
 }

@@ -1,4 +1,3 @@
-use wgpu::util::DeviceExt;
 
 /// Forma del cómputo para el Conjugate Gradient
 #[derive(Debug, Clone)]
@@ -8,13 +7,13 @@ pub struct CGComputeShape {
     pub h_slots: u32,
     pub cg_iters: u32,
     pub epsilon: f32,
+    pub damping: f32,
     pub curr_iter: u32,
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
     pub _pad3: u32,
     pub _pad4: u32,
-    pub _pad5: u32,
 }
 
 impl CGComputeShape {
@@ -25,13 +24,13 @@ impl CGComputeShape {
             self.h_slots,
             self.cg_iters,
             bytemuck::cast(self.epsilon),
+            bytemuck::cast(self.damping),
             self.curr_iter,
             self._pad0,
             self._pad1,
             self._pad2,
             self._pad3,
             self._pad4,
-            self._pad5,
         ]
     }
 }

@@ -1,0 +1,7 @@
+profile,dr,max_iters,cg_iters,eps,iter10_loss,iter10_ms,hit_ratio_pct,last_delta,rs_cg,avg_iters,conv,mode
+a1 12 8 3e-4,512,,,,2.8023,1783,0.0,7.772e-5,4.6e-4,2.6,OK,NORMAL
+a2 12 10 2e-4,512,,,,2.7865,1746,0.0,9.620e-5,5.2e-4,2.4,OK,NORMAL
+a3 12 12 1.5e-4,512,,,,2.7907,1729,0.0,1.154e-4,4.9e-4,2.4,OK,NORMAL
+b1 14 8 3e-4,512,,,,2.7967,1827,0.0,1.861e-4,4.7e-4,2.5,OK,NORMAL
+b2 14 10 2e-4,512,,,,2.7902,1855,0.0,1.493e-4,4.8e-4,2.6,OK,NORMAL
+b3 14 12 1.5e-4,512,,,,2.8006,1563,0.0,9.859e-5,4.6e-4,2.1,OK,NORMAL

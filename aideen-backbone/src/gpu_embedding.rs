@@ -683,6 +683,42 @@ impl GpuEmbeddingTrainer {
         }
     }
 
+    /// Reads the current pooled query vector from GPU (`query_buf`).
+    pub fn read_query(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<f32>, &'static str> {
+        let size = (self.config.d_r * std::mem::size_of::<f32>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Embedding Query Readback Staging"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Embedding Query Readback Encoder"),
+        });
+        encoder.copy_buffer_to_buffer(&self.query_buf, 0, &staging, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(Ok(())) = rx.recv() {
+            let data = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
+            staging.unmap();
+            Ok(data)
+        } else {
+            Err("embedding read query map failed")
+        }
+    }
+
     /// Lee los momentos Adam (m, v) para checkpoint.
     pub fn read_moments(
         &self,

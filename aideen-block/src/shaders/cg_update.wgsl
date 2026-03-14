@@ -7,13 +7,13 @@ struct CGComputeShape {
     h_slots:    u32,
     cg_iters:   u32,
     epsilon:    f32,
+    damping:    f32,
     curr_iter:  u32,
     _pad0:      u32,
     _pad1:      u32,
     _pad2:      u32,
     _pad3:      u32,
     _pad4:      u32,
-    _pad5:      u32,
 };
 
 // ── Group 0: todos los bindings declarados ──

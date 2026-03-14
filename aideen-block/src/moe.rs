@@ -1,7 +1,6 @@
 // Rust bridge to the `moe.wgsl` compute shader.
 // Orchestrates the gating multiplication of expert weights directly on VRAM.
 
-use crate::tensor::{AlignedTensor, ComputeShape};
 use wgpu;
 
 pub struct RustMoEBridge {

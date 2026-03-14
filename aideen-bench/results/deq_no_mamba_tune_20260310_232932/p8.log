@@ -1,0 +1,96 @@
+warning: fields `ternary_pipeline` and `s_h_rms_buf` are never read
+  --> aideen-backbone/src/gpu_lm_head.rs:48:5
+   |
+21 | pub struct GpuLmHeadTrainer {
+   |            ---------------- fields in this struct
+...
+48 |     ternary_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^
+49 |     s_h_rms_buf: wgpu::Buffer,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `aideen-backbone` (lib) generated 1 warning
+warning: unused variable: `gpu_emb`
+   --> aideen-training-lab/src/trainer.rs:487:26
+    |
+487 |                 let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+    |                          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gpu_emb`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: associated items `env_f32` and `apply_training_update_from_pooled` are never used
+   --> aideen-training-lab/src/trainer.rs:126:8
+    |
+115 | impl Trainer {
+    | ------------ associated items in this implementation
+...
+126 |     fn env_f32(name: &str) -> Option<f32> {
+    |        ^^^^^^^
+...
+805 |     fn apply_training_update_from_pooled(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `aideen-training` (lib) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 0.30s
+     Running `target/release/stress_test`
+
+[STRESS-TEST] Iniciando Auditoría de Integridad v13.2...
+[STRESS-TEST] Config: d_r=512 h_slots=8 total=4096 max_iters=14 cg_iters=10 eps=0.0002 lr=0.0003 (STABLE PROFILE)
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[STRESS-TEST] Backend: GPU Metal ✅
+[STRESS-TEST] Ejecutando ráfagas de entrenamiento...
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0039, max=0.0039, abs_mean=0.001946
+    W_in: min=-0.0039, max=0.0039, abs_mean=0.001936
+[GPU-LM] Sincronizando pesos del LM Head... (abs_sum=11.3146)
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0039, max=0.0039, abs_mean=0.001946
+    W_in: min=-0.0039, max=0.0039, abs_mean=0.001936
+[STRESS-TEST] Iter  1 | Loss: 2.9890 | Time: 1002ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0041, max=0.0041, abs_mean=0.001952
+    W_in: min=-0.0041, max=0.0041, abs_mean=0.001942
+[STRESS-TEST] Iter  2 | Loss: 3.0005 | Time: 7463ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0044, max=0.0044, abs_mean=0.001971
+    W_in: min=-0.0043, max=0.0043, abs_mean=0.001962
+[STRESS-TEST] Iter  3 | Loss: 2.9776 | Time: 2438ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0046, max=0.0046, abs_mean=0.002003
+    W_in: min=-0.0046, max=0.0046, abs_mean=0.001995
+[STRESS-TEST] Iter  4 | Loss: 2.9462 | Time: 1438ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0049, max=0.0049, abs_mean=0.002046
+    W_in: min=-0.0049, max=0.0049, abs_mean=0.002037
+[STRESS-TEST] Iter  5 | Loss: 2.9091 | Time: 1774ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0052, max=0.0052, abs_mean=0.002094
+    W_in: min=-0.0052, max=0.0052, abs_mean=0.002086
+[STRESS-TEST] Iter  6 | Loss: 2.8746 | Time: 1453ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0055, max=0.0055, abs_mean=0.002144
+    W_in: min=-0.0055, max=0.0055, abs_mean=0.002137
+[STRESS-TEST] Iter  7 | Loss: 2.8467 | Time: 1475ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0058, max=0.0058, abs_mean=0.002193
+    W_in: min=-0.0058, max=0.0058, abs_mean=0.002187
+[STRESS-TEST] Iter  8 | Loss: 2.8283 | Time: 1579ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0061, max=0.0061, abs_mean=0.002240
+    W_in: min=-0.0061, max=0.0061, abs_mean=0.002235
+[STRESS-TEST] Iter  9 | Loss: 2.8124 | Time: 1613ms
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.0064, max=0.0064, abs_mean=0.002287
+    W_in: min=-0.0064, max=0.0064, abs_mean=0.002282
+    [90m[GPU-DEBUG] Step 10: hit=  0/98 (  0.0%) contr=3.822 jf=0.100 maxΔ=1.578e0 lastΔ=7.170e-5 rs_cg=4.6e-4 iters=2.2 cap=14 damp=0.90 mode=EMERG conv=FAIL max_h=1.577777 shared=OK total=4096 fb(deq/lm/emb)=0/0/0[0m
+[STRESS-TEST] Iter 10 | Loss: 2.8041 | Time: 1515ms
+
+[STRESS-TEST] Audit Finalizado. Revisa los logs [GPU-ORACLE] arriba.
+  - Si 'mode' es NORMAL/BOOST y 'conv' es OK -> El Sync de Memoria Global funciona.
+  - Si 'rs_cg' es bajo -> La escalabilidad del CG Solver funciona.
+  - Para forzar d_r=1024: AIDEEN_STRESS_FORCE_GLOBAL=1
+  - Overrides: AIDEEN_STRESS_DR, AIDEEN_STRESS_HSLOTS, AIDEEN_STRESS_MAX_ITERS, AIDEEN_STRESS_CG_ITERS, AIDEEN_STRESS_EPS, AIDEEN_STRESS_LR, AIDEEN_STRESS_ITERS

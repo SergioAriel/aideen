@@ -9,7 +9,7 @@ pub struct DeqComputeShape {
     pub epsilon: f32,
     pub damping: f32,
     pub seq_len: u32,
-    pub _pad: u32,
+    pub residual_alpha: f32,
 }
 
 #[repr(C)]
@@ -28,8 +28,8 @@ struct DeqUpdateParams {
 struct SpectralParams {
     d_model: u32,
     n_iters: u32,
-    threshold: f32,
-    _pad: u32,
+    attn_threshold: f32,
+    mamba_threshold: f32,
 }
 
 pub struct RustDeqBridge {
@@ -52,6 +52,7 @@ pub struct RustDeqBridge {
     pub wv_buf: wgpu::Buffer,
     pub wo_buf: wgpu::Buffer,
     pub win_buf: wgpu::Buffer,
+    pub hist_params_buf: wgpu::Buffer,
     pub wx_buf: wgpu::Buffer,
     pub wout_buf: wgpu::Buffer,
     pub a_buf: wgpu::Buffer,
@@ -74,9 +75,21 @@ impl RustDeqBridge {
         max_batch_size: u32,
         max_seq_len: u32,
     ) -> Self {
+        let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let shader_src = if use_exact_forward {
+            include_str!("shaders/deq_forward_exact.wgsl")
+        } else {
+            include_str!("shaders/deq_forward.wgsl")
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("AIDEEN Full DEQ Forward Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/deq_forward.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
         let mut entries = Vec::new();
@@ -116,6 +129,16 @@ impl RustDeqBridge {
                 count: None,
             });
         }
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 16,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("DEQ Core Bind Group Layout"),
@@ -334,6 +357,16 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let hist_params_len =
+            2u32 * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 1u32;
+        let hist_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hist Params"),
+            size: (hist_params_len * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let wx_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("W_x"),
             size: (d_model * d_model * 4) as u64,
@@ -385,7 +418,8 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
 
-        let h_bytes = (max_batch_size * h_slots * d_model * 4) as u64;
+        let h_bytes =
+            (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
         let hcurr_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_curr"),
             size: h_bytes,
@@ -394,9 +428,16 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // H_next stores exact H*_t for each token:
+        // deq_forward.wgsl indexes it as (batch_idx * seq_len + t) * (h_slots * d_model).
+        let hnext_bytes = (max_batch_size as u64)
+            * (max_seq_len as u64)
+            * (h_slots as u64)
+            * (d_model as u64)
+            * 4u64;
         let hnext_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_next"),
-            size: h_bytes,
+            size: hnext_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -404,18 +445,25 @@ impl RustDeqBridge {
         });
         let conv_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Converged"),
-            size: (max_batch_size * 4) as u64,
+            size: (max_batch_size as u64) * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // v12 stride: d_model * (h_slots*4 + 1)
-        let scratch_stride = d_model * (h_slots * 4 + 1);
+        // v14 stride por (batch, token):
+        //   q [h*d] + k [h*d] + v [h*d] + attn_out [h*d] + mamba [h*d] + signal [d]
+        //   + final attention weights [h*h] cached for fused backward reuse
+        // deq_forward.wgsl indexa Scratch como:
+        //   (batch_idx * seq_len + t) * scratch_stride
+        // por lo que el buffer debe reservar batch * seq_len * stride.
+        let scratch_stride = d_model * (h_slots * 6 + 1) + h_slots * h_slots;
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
-            // v12: max_batch_size * scratch_stride * 4 bytes
-            size: (max_batch_size * scratch_stride * 4) as u64,
+            size: (max_batch_size as u64)
+                * (max_seq_len as u64)
+                * (scratch_stride as u64)
+                * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -423,7 +471,10 @@ impl RustDeqBridge {
         });
         let hpooled_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_pooled"),
-            size: (max_batch_size * max_seq_len * d_model * 4) as u64, // ✅ v12
+            size: (max_batch_size as u64)
+                * (max_seq_len as u64)
+                * (d_model as u64)
+                * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -432,7 +483,7 @@ impl RustDeqBridge {
 
         let debug_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Debug Log"),
-            size: 256, // 64 floats
+            size: 512, // 128 floats
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -486,6 +537,10 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: n_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: hist_params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
@@ -702,6 +757,7 @@ impl RustDeqBridge {
             wv_buf,
             wo_buf,
             win_buf,
+            hist_params_buf,
             wx_buf,
             wout_buf,
             a_buf,
@@ -763,14 +819,15 @@ impl RustDeqBridge {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         d_model: u32,
-        threshold: f32,
+        attn_threshold: f32,
+        mamba_threshold: f32,
         n_iters: u32,
     ) {
         let params = SpectralParams {
             d_model,
             n_iters,
-            threshold,
-            _pad: 0,
+            attn_threshold,
+            mamba_threshold,
         };
         queue.write_buffer(
             &self.spectral_renorm_params_buf,
