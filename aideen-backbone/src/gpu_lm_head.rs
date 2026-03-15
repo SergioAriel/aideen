@@ -26,6 +26,7 @@ pub struct GpuLmHeadTrainer {
     b_buf: wgpu::Buffer,
     pub dl_dh_buf: wgpu::Buffer,
     pub dl_dh_temp_buf: wgpu::Buffer,
+    dl_dh_rms_red_buf: wgpu::Buffer,
 
     loss_buf: wgpu::Buffer,
     g_buf: wgpu::Buffer,
@@ -44,9 +45,13 @@ pub struct GpuLmHeadTrainer {
     update_pipeline: wgpu::ComputePipeline,
 
     backprop_pipeline: wgpu::ComputePipeline,
+    backprop_rms_reduce_pipeline: wgpu::ComputePipeline,
+    backprop_rms_apply_pipeline: wgpu::ComputePipeline,
     backprop_reduce_pipeline: wgpu::ComputePipeline,
     ternary_pipeline: wgpu::ComputePipeline,
     s_h_rms_buf: wgpu::Buffer,
+    last_sampled_indices: Vec<u32>,
+    last_num_samples: u32,
 }
 
 impl GpuLmHeadTrainer {
@@ -221,6 +226,16 @@ impl GpuLmHeadTrainer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -270,6 +285,40 @@ impl GpuLmHeadTrainer {
             compilation_options: Default::default(),
             cache: None,
         });
+
+        // --- PIPELINE 3.5: Backprop RMS Reduce ---
+        let backprop_rms_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("LM Backprop RMS Reduce Pipeline"),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("LM Backprop RMS Reduce PL"),
+                        bind_group_layouts: &[&bgl_probs],
+                        push_constant_ranges: &[],
+                    }),
+                ),
+                module: &shader,
+                entry_point: Some("lm_backprop_rms_reduce_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // --- PIPELINE 3.6: Backprop RMS Apply ---
+        let backprop_rms_apply_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("LM Backprop RMS Apply Pipeline"),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("LM Backprop RMS Apply PL"),
+                        bind_group_layouts: &[&bgl_probs],
+                        push_constant_ranges: &[],
+                    }),
+                ),
+                module: &shader,
+                entry_point: Some("lm_backprop_rms_apply_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // --- PIPELINE 4: Backprop Reduce ---
         let backprop_reduce_pipeline =
@@ -409,6 +458,12 @@ impl GpuLmHeadTrainer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let dl_dh_rms_red_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("LM dL/dh RMS Reduce"),
+            size: (safe_ctx * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let sampled_indices_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM Sampled Indices"),
             size: (config.num_samples * 4) as u64,
@@ -503,6 +558,10 @@ impl GpuLmHeadTrainer {
                     binding: 15,
                     resource: s_h_rms_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: dl_dh_rms_red_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -513,6 +572,7 @@ impl GpuLmHeadTrainer {
             w_buf,
             b_buf,
             dl_dh_buf,
+            dl_dh_rms_red_buf,
             loss_buf,
             g_buf,
             moments_w_buf,
@@ -528,14 +588,26 @@ impl GpuLmHeadTrainer {
             probs_bg,
             update_pipeline,
             backprop_pipeline,
+            backprop_rms_reduce_pipeline,
+            backprop_rms_apply_pipeline,
             backprop_reduce_pipeline,
             ternary_pipeline,
             s_h_rms_buf,
+            last_sampled_indices: Vec::new(),
+            last_num_samples: 0,
         }
     }
 
+    pub fn last_sampled_indices(&self) -> &[u32] {
+        &self.last_sampled_indices
+    }
+
+    pub fn last_num_samples(&self) -> u32 {
+        self.last_num_samples
+    }
+
     pub fn train_step(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         h_pooled: &[f32],
@@ -576,6 +648,8 @@ impl GpuLmHeadTrainer {
             sampled_indices.truncate(max_samples);
         }
         let actual_num_samples = sampled_indices.len() as u32;
+        self.last_sampled_indices = sampled_indices.clone();
+        self.last_num_samples = actual_num_samples;
 
         if seq_len > self.config.ctx_len {
             return Err(format!(
@@ -653,6 +727,24 @@ impl GpuLmHeadTrainer {
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("LM Backprop RMS Reduce Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backprop_rms_reduce_pipeline);
+            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.dispatch_workgroups(seq_len as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("LM Backprop RMS Apply Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backprop_rms_apply_pipeline);
+            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.dispatch_workgroups(seq_len as u32, d_r as u32, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Backprop Reduce Pass"),
                 timestamp_writes: None,
             });
@@ -697,7 +789,7 @@ impl GpuLmHeadTrainer {
 
     #[allow(clippy::too_many_arguments)]
     pub fn train_step_from_buffer(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         h_src: &wgpu::Buffer,
@@ -727,6 +819,8 @@ impl GpuLmHeadTrainer {
         // Truncar a max_samples para no desbordar sampled_indices_buf.
         sampled_indices.truncate(max_samples);
         let actual_num_samples = sampled_indices.len() as u32;
+        self.last_sampled_indices = sampled_indices.clone();
+        self.last_num_samples = actual_num_samples;
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -799,6 +893,24 @@ impl GpuLmHeadTrainer {
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("LM Backprop RMS Reduce Pass (buffer input)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backprop_rms_reduce_pipeline);
+            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.dispatch_workgroups(seq_len as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("LM Backprop RMS Apply Pass (buffer input)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backprop_rms_apply_pipeline);
+            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Backprop Reduce Pass (buffer input)"),
                 timestamp_writes: None,
             });
@@ -844,7 +956,7 @@ impl GpuLmHeadTrainer {
     /// Executa el entrenamiento del LM Head sin leer resultados de vuelta a la CPU.
     /// Ideal para encadenar con el retro-propagación de la DEQ en la GPU.
     pub fn train_step_no_readback(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         h_src: &wgpu::Buffer,
@@ -871,6 +983,8 @@ impl GpuLmHeadTrainer {
         // Truncar a max_samples para no desbordar sampled_indices_buf
         sampled_indices.truncate(max_samples);
         let actual_num_samples = sampled_indices.len() as u32;
+        self.last_sampled_indices = sampled_indices.clone();
+        self.last_num_samples = actual_num_samples;
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -927,6 +1041,24 @@ impl GpuLmHeadTrainer {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.backprop_pipeline);
+            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("LM Backprop RMS Reduce Pass (NO READBACK)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backprop_rms_reduce_pipeline);
+            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.dispatch_workgroups(seq_len as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("LM Backprop RMS Apply Pass (NO READBACK)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backprop_rms_apply_pipeline);
             pass.set_bind_group(0, &self.probs_bg, &[]);
             pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
         }
@@ -1024,6 +1156,45 @@ impl GpuLmHeadTrainer {
             Ok(data)
         } else {
             Err("LM dl_dh_temp map failed".to_string())
+        }
+    }
+
+    /// Read back the final dL/dh vector (post-RMSNorm) from GPU memory.
+    pub fn read_dl_dh(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        d_model: usize,
+    ) -> Result<Vec<f32>, String> {
+        let bytes = (d_model * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("LM dl_dh staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("LM dl_dh readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.dl_dh_buf, 0, &staging, 0, bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(Ok(())) = rx.recv() {
+            let data = slice.get_mapped_range();
+            let vec = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+            drop(data);
+            staging.unmap();
+            Ok(vec)
+        } else {
+            Err("LM dl_dh map failed".to_string())
         }
     }
 

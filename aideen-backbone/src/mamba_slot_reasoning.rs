@@ -111,11 +111,19 @@ impl MambaSlotReasoning {
         data
     }
 
-    fn xavier_mat_with_rng<R: Rng + ?Sized>(rng: &mut R, d_r: usize, xavier_range: f32) -> DMatrix<f32> {
+    fn xavier_mat_with_rng<R: Rng + ?Sized>(
+        rng: &mut R,
+        d_r: usize,
+        xavier_range: f32,
+    ) -> DMatrix<f32> {
         DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range))
     }
 
-    fn identity_like_mat_with_rng<R: Rng + ?Sized>(rng: &mut R, d_r: usize, noise: f32) -> DMatrix<f32> {
+    fn identity_like_mat_with_rng<R: Rng + ?Sized>(
+        rng: &mut R,
+        d_r: usize,
+        noise: f32,
+    ) -> DMatrix<f32> {
         let jitter = DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-noise..noise));
         DMatrix::identity(d_r, d_r) + jitter
     }
@@ -163,13 +171,10 @@ impl MambaSlotReasoning {
         let mut w_v = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_o = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_in = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
-        // The historical interface must start semantically neutral. If W_hist is non-zero at
-        // initialization, the model injects a random history vector before the DEQ has learned
-        // how to use it, which is exactly the failure mode we see under seeded stress: no-mamba
-        // remains contractive while hist_gated enters BOOST/FAIL immediately. Zero-init keeps
-        // the branch equivalent to no-mamba at step 0 while preserving non-zero gradients into
-        // W_hist through g_u and the normalized carrier.
-        let w_hist_shared = DMatrix::zeros(d_r, d_r);
+        // Historical interface: start with a small identity (0.1*I) so history is real but
+        // does not dominate early contractivity. Jitter (0.01) breaks symmetry.
+        let w_hist_shared =
+            Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.05_f32, 0.01_f32);
         // The temporal carrier is applied as a residual around identity:
         //   x_proj = h_unit + W_x h_unit
         //   M_t    = m_inner + W_out m_inner
@@ -193,27 +198,23 @@ impl MambaSlotReasoning {
         spectral_norm::normalize_if_needed(&mut w_o, deq_threshold, n_iter);
         spectral_norm::normalize_if_needed(&mut w_in, deq_threshold, n_iter);
 
-        let hist_slot_scale =
-            DMatrix::from_fn(h_slots, d_r, |slot, _| {
-                // Keep multiplicative history adaptation off at initialization. A non-zero
-                // diagonal scale would create an implicit bypass from M_{t-1} into the DEQ.
-                let _ = slot;
-                0.0
-            });
-        let hist_slot_bias =
-            DMatrix::from_fn(h_slots, d_r, |slot, _| {
-                // Break slot permutation symmetry structurally. Without a slot-specific additive
-                // anchor, all slots remain exchangeable because H0 is broadcast and the early
-                // historical carrier M_{t-1} is nearly identical across slots.
-                let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
-                centered * 2.5e-3f32 + rng.gen_range(-5.0e-4f32..5.0e-4f32)
-            });
+        let hist_slot_scale = DMatrix::from_fn(h_slots, d_r, |slot, _| {
+            // Keep multiplicative history adaptation off at initialization. A non-zero
+            // diagonal scale would create an implicit bypass from M_{t-1} into the DEQ.
+            let _ = slot;
+            0.0
+        });
+        let hist_slot_bias = DMatrix::from_fn(h_slots, d_r, |slot, _| {
+            // Break slot permutation symmetry structurally. Without a slot-specific additive
+            // anchor, all slots remain exchangeable because H0 is broadcast and the early
+            // historical carrier M_{t-1} is nearly identical across slots.
+            let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+            centered * 2.5e-3f32 + rng.gen_range(-5.0e-4f32..5.0e-4f32)
+        });
         let hist_gate_logit = DVector::from_fn(h_slots, |slot, _| {
-            // The historical branch is now stable enough that the next bottleneck is
-            // under-learning, not contractivity. Start the gate at alpha≈0.14 with a
-            // positive floor (alpha_min=0.08, alpha_max=0.28) so the interface has
-            // enough energy to learn without relying on optimizer-only fixes.
-            let base = -0.847_297_85_f32; // alpha = 0.14 for alpha_min=0.08, alpha_max=0.28
+            // Gate inicial: alpha_target ≈ 0.10 con piso 0.07 y techo 0.20.
+            // sigma(g) = (alpha - alpha_min)/(alpha_max - alpha_min) = 0.23077 -> g ≈ -1.204.
+            let base = -1.204_f32;
             let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
             base + centered * 0.02
         });
@@ -303,11 +304,26 @@ impl MambaSlotReasoning {
 
     pub fn export_weights(&self) -> std::collections::HashMap<String, Vec<f32>> {
         let mut weights = std::collections::HashMap::new();
-        weights.insert("reasoning.w_q".to_string(), Self::matrix_to_row_major(&self.w_q));
-        weights.insert("reasoning.w_k".to_string(), Self::matrix_to_row_major(&self.w_k));
-        weights.insert("reasoning.w_v".to_string(), Self::matrix_to_row_major(&self.w_v));
-        weights.insert("reasoning.w_o".to_string(), Self::matrix_to_row_major(&self.w_o));
-        weights.insert("reasoning.w_in".to_string(), Self::matrix_to_row_major(&self.w_in));
+        weights.insert(
+            "reasoning.w_q".to_string(),
+            Self::matrix_to_row_major(&self.w_q),
+        );
+        weights.insert(
+            "reasoning.w_k".to_string(),
+            Self::matrix_to_row_major(&self.w_k),
+        );
+        weights.insert(
+            "reasoning.w_v".to_string(),
+            Self::matrix_to_row_major(&self.w_v),
+        );
+        weights.insert(
+            "reasoning.w_o".to_string(),
+            Self::matrix_to_row_major(&self.w_o),
+        );
+        weights.insert(
+            "reasoning.w_in".to_string(),
+            Self::matrix_to_row_major(&self.w_in),
+        );
         weights.insert(
             "reasoning.w_hist_shared".to_string(),
             Self::matrix_to_row_major(&self.w_hist_shared),
@@ -328,9 +344,18 @@ impl MambaSlotReasoning {
             "reasoning.slot_anchor".to_string(),
             Self::matrix_to_row_major(&self.slot_anchor),
         );
-        weights.insert("reasoning.w_x".to_string(), Self::matrix_to_row_major(&self.w_x));
-        weights.insert("reasoning.w_out".to_string(), Self::matrix_to_row_major(&self.w_out));
-        weights.insert("reasoning.w_delta".to_string(), Self::matrix_to_row_major(&self.w_delta));
+        weights.insert(
+            "reasoning.w_x".to_string(),
+            Self::matrix_to_row_major(&self.w_x),
+        );
+        weights.insert(
+            "reasoning.w_out".to_string(),
+            Self::matrix_to_row_major(&self.w_out),
+        );
+        weights.insert(
+            "reasoning.w_delta".to_string(),
+            Self::matrix_to_row_major(&self.w_delta),
+        );
         weights.insert(
             "reasoning.b_delta".to_string(),
             self.b_delta.as_slice().to_vec(),
@@ -644,7 +669,12 @@ impl Reasoning for MambaSlotReasoning {
             // unit-RMS slot state keeps the external memory alive without changing Picard itself.
             let a_bar = self.a_log.map(|a| 1.0 / (1.0 + a.exp()));
             let b_bar = a_bar.map(|a| 1.0 - a);
-            let x_proj = h_unit.clone_owned() + &self.w_x * h_unit;
+            let mut x_proj = h_unit.clone_owned();
+            let wx_max = 0.5_f32;
+            for i in 0..self.config.d_r {
+                let wx = wx_max * self.w_x[(i, i)].tanh();
+                x_proj[i] += wx * h_unit[i];
+            }
             let m_k_next = a_bar.zip_map(&m_k, |a, m| a * m) + b_bar.zip_map(&x_proj, |b, x| b * x);
 
             // Keep an identity carrier path so the temporal memory cannot self-annihilate

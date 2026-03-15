@@ -43,16 +43,41 @@ var<workgroup> avg_hist_rms_sum: f32;
 var<workgroup> avg_hist_ratio_sum: f32;
 
 fn hist_cap_mult() -> f32 {
-    return 1.0;
+    return 0.08;
 }
 
 fn hist_cap_floor_mult() -> f32 {
-    return 0.0;
+    return 0.08;
+}
+
+fn hist_cap_ratio_max() -> f32 {
+    return 0.80;
 }
 var<workgroup> avg_mamba_rms_sum: f32;
+var<workgroup> avg_q_rms_sum: f32;
+var<workgroup> avg_k_rms_sum: f32;
+var<workgroup> avg_v_rms_sum: f32;
+var<workgroup> avg_mix_rms_sum: f32;
+var<workgroup> avg_attn_out_rms_sum: f32;
+var<workgroup> avg_attn_max_sum: f32;
+var<workgroup> avg_attn_entropy_sum: f32;
+var<workgroup> avg_combined_rms_sum: f32;
+var<workgroup> combined_rms_curr: f32;
 
 fn hist_selective_a_floor() -> f32 {
-    return 0.10;
+    return 0.070;
+}
+
+fn hist_alpha_min_target() -> f32 {
+    return 0.070;
+}
+
+fn hist_alpha_min_start() -> f32 {
+    return 0.030;
+}
+
+fn hist_alpha_max() -> f32 {
+    return 0.20;
 }
 // Attention weights [query_slot, key_slot], reused across all d_out for the iter.
 var<workgroup> attn_w: array<f32, 64>;
@@ -97,6 +122,15 @@ fn deq_forward_main(
         avg_hist_rms_sum = 0.0;
         avg_hist_ratio_sum = 0.0;
         avg_mamba_rms_sum = 0.0;
+        avg_q_rms_sum = 0.0;
+        avg_k_rms_sum = 0.0;
+        avg_v_rms_sum = 0.0;
+        avg_mix_rms_sum = 0.0;
+        avg_attn_out_rms_sum = 0.0;
+        avg_attn_max_sum = 0.0;
+        avg_attn_entropy_sum = 0.0;
+        avg_combined_rms_sum = 0.0;
+        combined_rms_curr = 0.0;
     }
     workgroupBarrier();
 
@@ -124,6 +158,14 @@ fn deq_forward_main(
         let hist_delta_base = slot_anchor_base + h_slots * d_model;
         let hist_delta_bias_base = hist_delta_base + d_model * d_model;
         let hist_selective_flag_base = hist_delta_bias_base + d_model;
+        let hist_warmup_base = hist_selective_flag_base + 1u;
+        let hist_rms_floor_base = hist_warmup_base + 1u;
+        let hist_contr_floor_base = hist_rms_floor_base + 1u;
+        let hist_inject_flag_base = hist_contr_floor_base + 1u;
+        let hist_minner_zero_base = hist_inject_flag_base + 1u;
+        let hist_force_nomamba_base = hist_minner_zero_base + 1u;
+        let hist_prelude_skip_base = hist_force_nomamba_base + 1u;
+        let hist_loop_force_nomamba_base = hist_prelude_skip_base + 1u;
         
         let h_base_t = (batch_idx * shape.seq_len + t) * total_elements;
 
@@ -138,7 +180,7 @@ fn deq_forward_main(
         }
         workgroupBarrier();
 
-        if (hist_gated_mode) {
+        if (hist_gated_mode && HistParams[hist_prelude_skip_base] < 0.5) {
             var local_inj_sumsq = 0.0;
             for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                 let inj = Scratch[signal_base + d_out];
@@ -205,19 +247,14 @@ fn deq_forward_main(
                     workgroupBarrier();
                 }
                 let hist_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-                let tau = max(
-                    hist_cap_mult() * inj_rms,
-                    hist_cap_floor_mult() * hist_rms,
-                );
-                let hist_scale = min(1.0, tau / max(hist_rms, 1e-6));
                 let gate_logit = HistParams[hist_gate_base + s];
-                // Keep the historical channel structurally alive. The previous
-                // alpha range [0.05, 0.25] stabilized the DEQ but left the
-                // interface too weak to learn on practical horizons. Raising the
-                // floor and init energy here is the mathematically correct locus:
-                // it changes the history-to-DEQ interface gain directly instead
-                // of patching the optimizer.
-                let alpha = 0.08 + 0.20 * (1.0 / (1.0 + exp(-gate_logit)));
+                let warmup = clamp(HistParams[hist_warmup_base], 0.0, 1.0);
+                let alpha_min = hist_alpha_min_start()
+                    + (hist_alpha_min_target() - hist_alpha_min_start()) * warmup;
+                let alpha_max = hist_alpha_max();
+                let alpha = alpha_min + (alpha_max - alpha_min) * (1.0 / (1.0 + exp(-gate_logit)));
+                let hist_post = alpha * hist_rms;
+                let hist_scale = min(1.0, (hist_cap_mult() * inj_rms) / max(hist_post, 1e-6));
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                     Scratch[m_inner_base + off + d_out] =
                         alpha * Scratch[m_inner_base + off + d_out] * hist_scale;
@@ -226,9 +263,9 @@ fn deq_forward_main(
                     if (s == 0u) {
                         avg_inj_rms_sum = avg_inj_rms_sum + inj_rms;
                     }
-                    avg_hist_rms_sum = avg_hist_rms_sum + alpha * hist_rms * hist_scale;
+                    avg_hist_rms_sum = avg_hist_rms_sum + hist_post * hist_scale;
                     avg_hist_ratio_sum = avg_hist_ratio_sum
-                        + (alpha * hist_rms * hist_scale) / max(inj_rms, 1e-6);
+                        + (hist_post * hist_scale) / max(inj_rms, 1e-6);
                 }
                 workgroupBarrier();
             }
@@ -347,9 +384,20 @@ fn deq_forward_main(
                         sum_exp = sum_exp + e;
                     }
                     let inv_sum = 1.0 / max(sum_exp, 1e-12);
-                for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                    var local_max_p = 0.0;
+                    var local_entropy = 0.0;
+                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
                         attn_w[qs * h_slots + ks] = attn_w[qs * h_slots + ks] * inv_sum;
                         Scratch[attn_weight_base + qs * h_slots + ks] = attn_w[qs * h_slots + ks];
+                        if (qs == 0u) {
+                            let p = attn_w[qs * h_slots + ks];
+                            local_max_p = max(local_max_p, p);
+                            local_entropy = local_entropy - p * log(max(p, 1.0e-8));
+                        }
+                    }
+                    if (qs == 0u && iter == 0u) {
+                        avg_attn_max_sum = avg_attn_max_sum + local_max_p;
+                        avg_attn_entropy_sum = avg_attn_entropy_sum + local_entropy;
                     }
                 }
                 workgroupBarrier();
@@ -393,6 +441,98 @@ fn deq_forward_main(
                     }
                 }
                 workgroupBarrier();
+
+                if (iter == 0u) {
+                    let off0 = 0u;
+                    var q_sumsq = 0.0;
+                    var k_sumsq = 0.0;
+                    var v_sumsq = 0.0;
+                    for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+                        let qv = Scratch[q_base + off0 + d_out];
+                        let kv = Scratch[k_base + off0 + d_out];
+                        let vv = Scratch[v_base + off0 + d_out];
+                        q_sumsq = q_sumsq + qv * qv;
+                        k_sumsq = k_sumsq + kv * kv;
+                        v_sumsq = v_sumsq + vv * vv;
+                    }
+                    shared_vals[tid] = q_sumsq;
+                    workgroupBarrier();
+                    for (var stride_q = WG_SIZE / 2u; stride_q > 0u; stride_q = stride_q >> 1u) {
+                        if (tid < stride_q) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_q];
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        avg_q_rms_sum = avg_q_rms_sum
+                            + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                    }
+                    workgroupBarrier();
+
+                    shared_vals[tid] = k_sumsq;
+                    workgroupBarrier();
+                    for (var stride_k = WG_SIZE / 2u; stride_k > 0u; stride_k = stride_k >> 1u) {
+                        if (tid < stride_k) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_k];
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        avg_k_rms_sum = avg_k_rms_sum
+                            + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                    }
+                    workgroupBarrier();
+
+                    shared_vals[tid] = v_sumsq;
+                    workgroupBarrier();
+                    for (var stride_v = WG_SIZE / 2u; stride_v > 0u; stride_v = stride_v >> 1u) {
+                        if (tid < stride_v) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_v];
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        avg_v_rms_sum = avg_v_rms_sum
+                            + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                    }
+                    workgroupBarrier();
+
+                    var mix_sumsq = 0.0;
+                    var out_sumsq = 0.0;
+                    for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+                        let mv = Scratch[mamba_base + off0 + d_out];
+                        let ov = Scratch[attn_base + off0 + d_out];
+                        mix_sumsq = mix_sumsq + mv * mv;
+                        out_sumsq = out_sumsq + ov * ov;
+                    }
+                    shared_vals[tid] = mix_sumsq;
+                    workgroupBarrier();
+                    for (var stride_m = WG_SIZE / 2u; stride_m > 0u; stride_m = stride_m >> 1u) {
+                        if (tid < stride_m) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_m];
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        avg_mix_rms_sum = avg_mix_rms_sum
+                            + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                    }
+                    workgroupBarrier();
+
+                    shared_vals[tid] = out_sumsq;
+                    workgroupBarrier();
+                    for (var stride_o = WG_SIZE / 2u; stride_o > 0u; stride_o = stride_o >> 1u) {
+                        if (tid < stride_o) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_o];
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        avg_attn_out_rms_sum = avg_attn_out_rms_sum
+                            + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                    }
+                    workgroupBarrier();
+                }
             } else {
                 // Stage-0 DEQ stabilization: disable attention branch entirely.
                 for (var s = 0u; s < h_slots; s = s + 1u) {
@@ -410,14 +550,24 @@ fn deq_forward_main(
                 let off = s * d_model;
 
                 var local_sumsq = 0.0;
+                let hist_inject = HistParams[hist_inject_flag_base];
+                let hist_force_nomamba = HistParams[hist_force_nomamba_base];
+                let hist_loop_force_nomamba = HistParams[hist_loop_force_nomamba_base];
+                let hist_minner_zero = HistParams[hist_minner_zero_base];
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     let h_prev = H_curr[h_base + off + d];
-                    let combined = Scratch[attn_base + off + d]
+                    var hist_ctx = 0.0;
+                    if (hist_gated_mode && hist_inject > 0.5 && hist_minner_zero < 0.5) {
+                        hist_ctx = Scratch[m_inner_base + off + d];
+                    }
+                    var final_combined = Scratch[attn_base + off + d]
                         + Scratch[signal_base + d]
-                        + select(0.0, Scratch[m_inner_base + off + d], hist_gated_mode)
-                        + HistParams[slot_anchor_base + off + d];
-                    H_next[h_base_t + off + d] = combined;
-                    local_sumsq = local_sumsq + combined * combined;
+                        + hist_ctx;
+                    if (hist_force_nomamba > 0.5 || hist_loop_force_nomamba > 0.5) {
+                        final_combined = Scratch[attn_base + off + d] + Scratch[signal_base + d];
+                    }
+                    H_next[h_base_t + off + d] = final_combined;
+                    local_sumsq = local_sumsq + final_combined * final_combined;
                 }
                 shared_vals[tid] = local_sumsq;
                 workgroupBarrier();
@@ -427,11 +577,21 @@ fn deq_forward_main(
                     }
                     workgroupBarrier();
                 }
-                let rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                var rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+                let rms_floor = HistParams[hist_rms_floor_base];
+                if (rms_floor > 0.0 && rms < rms_floor) {
+                    rms = rms_floor;
+                }
+                if (s == 0u && tid == 0u) {
+                    combined_rms_curr = rms;
+                }
+                if (iter == 0u && s == 0u && tid == 0u) {
+                    avg_combined_rms_sum = avg_combined_rms_sum + rms;
+                }
 
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     let h_prev = H_curr[h_base + off + d];
-                    let f_h = NormScale[d] * (H_next[h_base_t + off + d] / rms);
+                    var f_h = NormScale[d] * (H_next[h_base_t + off + d] / rms);
                     let val = shape.damping * f_h + (1.0 - shape.damping) * h_prev;
                     local_max_delta = max(local_max_delta, abs(val - h_prev));
                     local_max_h = max(local_max_h, abs(val));
@@ -454,11 +614,15 @@ fn deq_forward_main(
             }
 
             if (tid == 0u) {
+                let contr_floor = HistParams[hist_contr_floor_base];
                 let d_curr = shared_vals[0];
                 let d_prev = last_delta;
                 curr_contractivity = 0.0;
                 if (iter > 0u && d_prev > 1e-12) {
                     curr_contractivity = d_curr / d_prev;
+                }
+                if (contr_floor > 0.0 && combined_rms_curr < contr_floor) {
+                    curr_contractivity = 0.0;
                 }
                 last_delta = d_curr;
                 max_contractivity = max(max_contractivity, curr_contractivity);
@@ -488,7 +652,7 @@ fn deq_forward_main(
 
         total_iters = total_iters + iter;
         if (tid == 0u) {
-            let d = shared_vals[0];
+            let d = last_delta;
             max_delta_seen = max(max_delta_seen, d);
             if (!converged) {
                 atomicAdd(&hit_count, 1u);
@@ -519,6 +683,9 @@ fn deq_forward_main(
                 }
                 let h_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
 
+                let warmup = clamp(HistParams[hist_warmup_base], 0.0, 1.0);
+                let alpha_min = hist_alpha_min_start()
+                    + (hist_alpha_min_target() - hist_alpha_min_start()) * warmup;
                 // 1. x_proj = (I + W_x) * RMSUnit(H^*)
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     // Safe temporal reading: zero initialize on first token
@@ -529,7 +696,7 @@ fn deq_forward_main(
                     }
                     var x_proj = H_curr[h_base + off + d] / h_rms;
                     for (var j = 0u; j < d_model; j = j + 1u) {
-                        x_proj = x_proj + W_x[j * d_model + d]
+                        x_proj = x_proj + W_x[d * d_model + j]
                             * (H_curr[h_base + off + j] / h_rms);
                     }
                     var a = 1.0 / (1.0 + exp(A_log[d]));
@@ -537,7 +704,7 @@ fn deq_forward_main(
                        var delta_pre = HistParams[hist_delta_bias_base + d];
                         for (var j = 0u; j < d_model; j = j + 1u) {
                             delta_pre = delta_pre
-                                + HistParams[hist_delta_base + j * d_model + d]
+                                + HistParams[hist_delta_base + d * d_model + j]
                                 * (H_curr[h_base + off + j] / h_rms);
                         }
                         // Center delta so that delta_pre=0 => a_core = a_base (neutral).
@@ -547,8 +714,8 @@ fn deq_forward_main(
                         // preserves the non-selective decay (a_t = a_base when a_base > floor).
                         let delta_factor = 1.0 + 0.5 * tanh(delta_pre);
                         let a_core = pow(max(a, 1.0e-6), delta_factor);
-                        if (a_core < hist_selective_a_floor()) {
-                            a = hist_selective_a_floor();
+                        if (a_core < alpha_min) {
+                            a = alpha_min;
                         } else {
                             a = a_core;
                         }
@@ -563,7 +730,7 @@ fn deq_forward_main(
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                     var out = Scratch[m_inner_base + off + d_out];
                     for (var j = 0u; j < d_model; j = j + 1u) {
-                        out = out + W_out[j * d_model + d_out] * Scratch[m_inner_base + off + j];
+                        out = out + W_out[d_out * d_model + j] * Scratch[m_inner_base + off + j];
                     }
                     // Fixed-mamba mode keeps this as an external temporal bias. Full mode writes
                     // it back into H_curr, reproducing the fully coupled path.
@@ -622,5 +789,42 @@ fn deq_forward_main(
         DebugLog[23] = avg_hist_rms_sum / slot_norm;
         DebugLog[24] = avg_hist_ratio_sum / slot_norm;
         DebugLog[25] = avg_mamba_rms_sum / slot_norm;
+        DebugLog[26] = avg_q_rms_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[27] = avg_k_rms_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[28] = avg_v_rms_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[29] = avg_mix_rms_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[30] = avg_attn_out_rms_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[31] = avg_attn_max_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[32] = avg_attn_entropy_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[33] = avg_combined_rms_sum / max(1.0, f32(shape.seq_len));
+        DebugLog[40] = HistParams[0];
+        DebugLog[41] = HistParams[1];
+        DebugLog[42] = HistParams[2];
+        let hist_mat_len_dbg = d_model * d_model;
+        let hist_scale_base_dbg = hist_mat_len_dbg;
+        let hist_bias_base_dbg = hist_scale_base_dbg + h_slots * d_model;
+        let hist_gate_base_dbg = hist_bias_base_dbg + h_slots * d_model;
+        let slot_anchor_base_dbg = hist_gate_base_dbg + h_slots;
+        let hist_delta_base_dbg = slot_anchor_base_dbg + h_slots * d_model;
+        let hist_delta_bias_base_dbg = hist_delta_base_dbg + d_model * d_model;
+        let hist_selective_flag_base_dbg = hist_delta_bias_base_dbg + d_model;
+        let hist_warmup_base_dbg = hist_selective_flag_base_dbg + 1u;
+        let hist_rms_floor_base_dbg = hist_warmup_base_dbg + 1u;
+        let hist_contr_floor_base_dbg = hist_rms_floor_base_dbg + 1u;
+        let hist_inject_flag_base_dbg = hist_contr_floor_base_dbg + 1u;
+        let hist_minner_zero_base_dbg = hist_inject_flag_base_dbg + 1u;
+        let hist_force_nomamba_base_dbg = hist_minner_zero_base_dbg + 1u;
+        let hist_prelude_skip_base_dbg = hist_force_nomamba_base_dbg + 1u;
+        let hist_loop_force_nomamba_base_dbg = hist_prelude_skip_base_dbg + 1u;
+
+        DebugLog[43] = HistParams[slot_anchor_base_dbg];
+        DebugLog[44] = HistParams[slot_anchor_base_dbg + 1u];
+        DebugLog[45] = HistParams[hist_rms_floor_base_dbg];
+        DebugLog[46] = HistParams[hist_contr_floor_base_dbg];
+        DebugLog[47] = HistParams[hist_inject_flag_base_dbg];
+        DebugLog[48] = HistParams[hist_minner_zero_base_dbg];
+        DebugLog[49] = HistParams[hist_force_nomamba_base_dbg];
+        DebugLog[50] = HistParams[hist_prelude_skip_base_dbg];
+        DebugLog[51] = HistParams[hist_loop_force_nomamba_base_dbg];
     }
 }

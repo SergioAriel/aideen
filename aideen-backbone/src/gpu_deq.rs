@@ -125,15 +125,63 @@ impl GpuDeqBackend {
         out.extend_from_slice(hist_slot_scale);
         out.extend_from_slice(hist_slot_bias);
         out.extend_from_slice(hist_gate_logit);
-        out.extend_from_slice(slot_anchor);
+        if Self::env_flag("AIDEEN_DEQ_SLOT_ANCHOR_ZERO") {
+            out.extend(std::iter::repeat(0.0).take(h * d));
+        } else {
+            out.extend_from_slice(slot_anchor);
+        }
         out.extend_from_slice(w_delta);
         out.extend_from_slice(b_delta);
         out.push(if Self::hist_selective_from_env() { 1.0 } else { 0.0 });
+        // Warmup factor for alpha_min (0..1). Default to 1.0 so inference is unaffected.
+        out.push(1.0);
+        let rms_floor = Self::env_f32("AIDEEN_DEQ_RMS_FLOOR").unwrap_or(0.0).max(0.0);
+        let contr_floor = Self::env_f32("AIDEEN_DEQ_CONTR_RMS_FLOOR").unwrap_or(0.0).max(0.0);
+        out.push(rms_floor);
+        out.push(contr_floor);
+        let hist_inject = if Self::env_flag("AIDEEN_DEQ_HIST_ZERO") {
+            0.0
+        } else {
+            1.0
+        };
+        out.push(hist_inject);
+        let hist_minner_zero = if Self::env_flag("AIDEEN_DEQ_HIST_MINNER_ZERO") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(hist_minner_zero);
+        let hist_force_nomamba = if Self::env_flag("AIDEEN_DEQ_HIST_FORCE_NOMAMBA") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(hist_force_nomamba);
+        let hist_prelude_skip = if Self::env_flag("AIDEEN_DEQ_HIST_PRELUDE_SKIP") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(hist_prelude_skip);
+        let hist_loop_force_nomamba = if Self::env_flag("AIDEEN_DEQ_HIST_LOOP_FORCE_NOMAMBA") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(hist_loop_force_nomamba);
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
-        2 * d * d + 3 * h * d + h + d + 1
+        2 * d * d + 3 * h * d + h + d + 9
+    }
+
+    pub fn set_hist_warmup_factor(&self, factor: f32) {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let idx = Self::history_params_len(d, h) - 1;
+        self.queue
+            .write_buffer(&self.bridge.hist_params_buf, (idx * 4) as u64, bytemuck::bytes_of(&factor));
     }
 
     fn hist_selective_from_env() -> bool {
@@ -144,6 +192,20 @@ impl GpuDeqBackend {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false)
+    }
+
+    fn env_flag(name: &str) -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false)
+    }
+
+    fn env_f32(name: &str) -> Option<f32> {
+        std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
     }
 
     fn residual_alpha_from_env() -> f32 {
@@ -187,20 +249,27 @@ impl GpuDeqBackend {
             ..Default::default()
         });
 
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
-            .await?;
+            .await
+        {
+            Some(adapter) => adapter,
+            None => {
+                eprintln!("[GpuDeqBackend] No compatible GPU adapter found.");
+                return None;
+            }
+        };
 
         println!("[GpuDeqBackend] Adapter: {}", adapter.get_info().name);
         let mut limits = adapter.limits();
         limits.max_storage_buffers_per_shader_stage = 16;
 
         // 3. Crear Device
-        let (device, queue) = adapter
+        let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("AIDEEN DEQ GPU"),
@@ -211,7 +280,13 @@ impl GpuDeqBackend {
                 None,
             )
             .await
-            .ok()?;
+        {
+            Ok((device, queue)) => (device, queue),
+            Err(err) => {
+                eprintln!("[GpuDeqBackend] request_device failed: {err:?}");
+                return None;
+            }
+        };
 
         // Forward DEQ and backward CG do not use the same geometry:
         // - Forward DEQ processes one sequence as batch=1, seq_len=T

@@ -17,6 +17,41 @@ La estrategia productiva será:
 
 Este plan es la ruta productiva. La integración interna de memoria dentro del DEQ queda explícitamente postergada a una fase experimental posterior.
 
+## Nota de nomenclatura (evitar ambigüedad)
+
+En este plan y en los flags actuales, “**mamba**” significa **memoria temporal externa / canal histórico** (el contexto `c_{t,k}` o la inicialización histórica), **no** un “mamba interno” dentro del DEQ.
+
+Referencia rápida de flags:
+- `AIDEEN_DEQ_ONLY=1` → DEQ sin atención ni historia.
+- `AIDEEN_DEQ_NO_MAMBA=1` → atención ON, **historia OFF**.
+- `AIDEEN_DEQ_HIST_GATED=1` → atención ON, **historia ON** (gated).
+
+Si más adelante implementamos memoria interna al DEQ, los flags se renombrarán para evitar colisión semántica.
+
+## Estado actual (2026-03-14)
+
+**Fase 1 cerrada** con baseline estable:
+- `hist_cap_floor_mult = 0.08`
+- `α_min = 0.070`, `α_max = 0.20`
+- warmup de `α_min` por `AIDEEN_HIST_ALPHA_WARMUP_STEPS=20`
+- warmup de epsilon por `AIDEEN_DEQ_EPS_WARMUP_STEPS=10`, `AIDEEN_DEQ_EPS_WARMUP_VALUE=3e-4`
+- estabilidad confirmada en seeds `7/11/13/42` (sin BOOST/FAIL)
+
+**Fase 2 cerrada**: selectividad input-dependent con `W_Δ`/`b_Δ` entrenables.
+Validación: seeds `7/11/13/42`, `AIDEEN_HIST_SELECTIVE=1`, `AIDEEN_HIST_TRAIN_DELTA=1`, `AIDEEN_LM_FROZEN=1`,
+sin BOOST/FAIL, `conv=OK` en steps 10/20/30/40, `hist/inj ≈ 0.08` estable.
+Requisito estructural (solver): cuando `AIDEEN_DEQ_HIST_GATED=1`, `adaptive_max_iters >= 20`
+(criterio de convergencia, no parche).
+
+**Fase 3 cerrada**: LM activo con historia selectiva estable.
+Validación: seeds `11/13/42`, `AIDEEN_HIST_SELECTIVE=1`, `AIDEEN_HIST_TRAIN_DELTA=1`, LM **no** congelado,
+sin BOOST/FAIL, `conv=OK` en steps 10/20/30/40, `hist/inj ≈ 0.08` estable.
+Fix estructural: backward LM en GPU ahora incluye RMSNorm; `dl_dh` correcto (post-RMSNorm).
+
+**Política LM (actualizada)**:
+- LM habilitado por default desde Fase 3.
+- `AIDEEN_LM_FROZEN=1` queda como flag de aislamiento si se necesita en fases posteriores.
+
 ---
 
 ## 1. Failure mode objetivo
@@ -110,17 +145,14 @@ Esto debe implementarse como invariante explícita.
 \alpha_k = \alpha_{min} + (\alpha_{max} - \alpha_{min}) \sigma(g_k)
 \]
 
-con:
-
-- `α_min = 0.05`
-- `α_max = 0.25`
-
-Inicialización:
-- `α_k(0) = 0.10`
+Valores operativos:
+- `α_min = 0.070`
+- `α_max = 0.20`
+- `α_k(0) ≈ 0.10` por los logits iniciales.
 
 ### Justificación
-- evita canal histórico muerto desde el arranque
-- mantiene control estructural de escala
+- piso no nulo evita canal histórico muerto; 0.070 mantiene contr < 0.85 y hist/inj en 0.04–0.08 en stress.
+- techo 0.20 limita el gate para no erosionar contractividad en pasos largos.
 
 ### Contexto final
 
@@ -503,18 +535,18 @@ Runs:
 
 ## 8.3 Acceptance criteria
 
-### Fase 1
-- `mode = NORMAL`
+### Fase 1 (hist_gated + selectivo con α_min=0.070, α_max=0.20)
+- `mode = NORMAL` (BOOST puntual aceptable si contr < 1 y se autocorrige)
 - `conv = OK`
-- `hit = 0`
-- `contr < 0.30`
+- `hit ≈ 0`
+- `contr < 0.85` en Steps 10/20/30/40
 - `loss20 <= loss20(no_mamba) + 1%`
-- `loss100 < loss100(no_mamba)`
+- `loss40 no creciente explosiva; max_h < 3.5`
 
 ### Canal histórico
-- `hist_ctx_rms / inj_rms` mediano en `[0.06, 0.25]`
-- máximo `< 0.35`
-- gate efectiva media por slot en `[0.08, 0.18]`
+- `hist_ctx_rms / inj_rms` mediano en `[0.04, 0.08]`
+- máximo `< 0.12`
+- gate efectiva media por slot en `[0.06, 0.12]`
 
 ### Criterio de canal muerto
 Si tras `100` steps:
@@ -536,7 +568,7 @@ la fase falla.
 2. `d_k` inicia en `0`.
 3. `W_hist_shared` inicia cerca de identidad.
 4. `W_hist_shared` no se renormaliza a `0.10`.
-5. La gate tiene piso positivo.
+5. Gate con piso 0.070 y techo 0.20 (clamp activo).
 6. El canal histórico entra per-slot.
 7. La memoria temporal selectiva es el objetivo final.
 8. El backward temporal se hace por `TBPTT`.

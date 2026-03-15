@@ -59,6 +59,39 @@ fn slot_anchor_base(d: u32, h_slots: u32) -> u32 {
     return hist_gate_base(d, h_slots) + h_slots;
 }
 
+fn hist_delta_base(d: u32, h_slots: u32) -> u32 {
+    return slot_anchor_base(d, h_slots) + h_slots * d;
+}
+
+fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 {
+    return hist_delta_base(d, h_slots) + d * d;
+}
+
+fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 {
+    return hist_delta_bias_base(d, h_slots) + d;
+}
+
+fn hist_warmup_base(d: u32, h_slots: u32) -> u32 {
+    return hist_selective_flag_base(d, h_slots) + 1u;
+}
+
+fn hist_alpha_min_target() -> f32 {
+    return 0.070;
+}
+
+fn hist_alpha_min_start() -> f32 {
+    return 0.030;
+}
+
+fn hist_alpha_max() -> f32 {
+    return 0.20;
+}
+
+fn hist_alpha_min(d: u32, h_slots: u32) -> f32 {
+    let warmup = clamp(HistParams[hist_warmup_base(d, h_slots)], 0.0, 1.0);
+    return hist_alpha_min_start() + (hist_alpha_min_target() - hist_alpha_min_start()) * warmup;
+}
+
 fn token_mamba_base(t: u32, d: u32, h_slots: u32) -> u32 {
     return t * scratch_stride(d, h_slots) + h_slots * 4u * d;
 }
@@ -123,7 +156,9 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
         let hist_rms = sqrt(hist_sumsq / max(1.0, f32(d)) + 1e-6);
         hist_scale = min(1.0, inj_rms / max(hist_rms, 1e-6));
         let gate_logit = HistParams[hist_gate_base(d, h_slots) + qs];
-        hist_alpha = 0.05 + 0.20 * (1.0 / (1.0 + exp(-gate_logit)));
+        let amin = hist_alpha_min(d, h_slots);
+        let amax = hist_alpha_max();
+        hist_alpha = amin + (amax - amin) * (1.0 / (1.0 + exp(-gate_logit)));
     }
 
     var sumsq = 0.0;
