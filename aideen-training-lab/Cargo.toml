@@ -1,0 +1,42 @@
+[package]
+name = "aideen-training"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+wgpu = [
+    "dep:aideen-block",
+    "dep:pollster",
+    "dep:wgpu",
+    "aideen-backbone/wgpu",
+]
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
+[[bin]]
+name = "chat"
+path = "src/bin/chat.rs"
+
+[dependencies]
+aideen-core    = { path = "../aideen-core" }
+aideen-backbone = { path = "../aideen-backbone", features = ["lab"] }
+nalgebra       = "0.32"
+serde          = { version = "1.0", features = ["derive"] }
+bytemuck       = { version = "1.14", features = ["derive"] }
+sha2           = "0.10"
+futures        = "0.3"
+tokio          = { version = "1.50.0", features = ["rt-multi-thread"] }
+rand           = "0.8.5"
+tokenizers     = "0.21"
+ed25519-dalek  = { version = "2", features = ["rand_core"] }
+
+# Optional GPU deps — sólo con --features wgpu
+aideen-block = { path = "../aideen-block", optional = true }
+pollster     = { version = "0.3", optional = true }
+wgpu         = { version = "23", optional = true }
