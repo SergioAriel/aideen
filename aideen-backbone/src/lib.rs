@@ -21,10 +21,13 @@ pub mod readout;
 pub mod spectral_norm;
 pub mod tensor;
 pub mod tokenizer;
+pub mod weights_io;
 
 pub use gpu_backend::CpuBlockBackend;
 #[cfg(feature = "wgpu")]
 pub use gpu_backend::WgpuBlockBackend;
-pub use lm_head::LmHead;
+pub use lm_head::{LmHead, LmHeadGrads};
 pub use mamba_decoder::{ClassHead, EmbedHead, MambaDecoder};
 pub use mamba_slot_reasoning::MambaSlotReasoning;
+#[cfg(feature = "lab")]
+pub use mamba_slot_reasoning::StepGrads;

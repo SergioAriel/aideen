@@ -6,6 +6,16 @@ use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use std::collections::HashSet;
 
+/// Gradients for LmHead parameters.
+pub struct LmHeadGrads {
+    /// Gradient w.r.t. W: [vocab_size × d_r]
+    pub grad_w: DMatrix<f32>,
+    /// Gradient w.r.t. b: [vocab_size]
+    pub grad_b: DVector<f32>,
+    /// Gradient w.r.t. g (RMSNorm scale): [d_r]
+    pub grad_g: DVector<f32>,
+}
+
 /// LmHead — proyección del H* del DEQ al espacio de vocabulario.
 pub struct LmHead {
     pub config: ArchitectureConfig,
@@ -57,6 +67,106 @@ impl LmHead {
         let v = DVector::from_column_slice(flat_slot);
         let v_norm = Self::rmsnorm(&v, &self.g, 1e-5);
         &self.w * v_norm + &self.b
+    }
+
+    /// Run forward pass and compute cross-entropy loss against the target token.
+    pub fn forward_loss(&self, h_star: &HSlots, target: u32) -> f32 {
+        let logits = self.forward(h_star);
+        let probs = Self::softmax(&logits);
+        let p = probs[target as usize].max(1e-12);
+        -p.ln()
+    }
+
+    /// Backward pass of RMSNorm.
+    ///
+    /// Given y = (x / rms) * g where rms = sqrt(mean(x^2) + eps),
+    /// returns (dL/dx, dL/dg).
+    pub fn rmsnorm_backward(
+        x: &DVector<f32>,
+        g: &DVector<f32>,
+        dl_dy: &DVector<f32>,
+        eps: f32,
+    ) -> (DVector<f32>, DVector<f32>) {
+        let n = x.len() as f32;
+        let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / n;
+        let rms = (mean_sq + eps).sqrt();
+        let x_hat = x / rms;
+
+        // dL/dg = dL/dy * x_hat (element-wise)
+        let dl_dg = dl_dy.component_mul(&x_hat);
+
+        // dl_dy_g = dL/dy . g (element-wise)
+        let dl_dy_g = dl_dy.component_mul(g);
+
+        // dL/dx = (1/rms) * (dl_dy_g - x_hat * mean(dl_dy_g . x_hat))
+        let mean_term: f32 = dl_dy_g.component_mul(&x_hat).sum() / n;
+        let dl_dx = (&dl_dy_g - &x_hat * mean_term) / rms;
+
+        (dl_dx, dl_dg)
+    }
+
+    /// Full backward pass through LmHead.
+    ///
+    /// Returns (loss, grad_h_star, LmHeadGrads).
+    ///
+    /// The chain is:
+    /// 1. pooled = mean(h_star slots)
+    /// 2. h_norm = RMSNorm(pooled, g, eps)
+    /// 3. logits = W @ h_norm + b
+    /// 4. loss = cross_entropy(logits, target)
+    ///
+    /// Backward:
+    /// - dL/d_logits = softmax(logits) - one_hot(target)
+    /// - dL/d_b = dL/d_logits
+    /// - dL/d_h_norm = W^T @ dL/d_logits
+    /// - dL/d_W = dL/d_logits @ h_norm^T (outer product)
+    /// - dL/d_pooled, dL/d_g = rmsnorm_backward(pooled, g, dL/d_h_norm)
+    /// - dL/d_h_star[k] = dL/d_pooled / h_slots for each slot k
+    pub fn backward(&self, h_star: &HSlots, target: u32) -> (f32, HSlots, LmHeadGrads) {
+        let h_slots = self.config.h_slots;
+        let eps = 1e-5_f32;
+
+        // --- Forward ---
+        let pooled = self.pool_h_star(h_star);
+        let h_norm = Self::rmsnorm(&pooled, &self.g, eps);
+        let logits = &self.w * &h_norm + &self.b;
+
+        // --- Loss ---
+        let probs = Self::softmax(&logits);
+        let p = probs[target as usize].max(1e-12);
+        let loss = -p.ln();
+
+        // --- dL/d_logits = softmax - one_hot ---
+        let mut dl_dlogits = probs;
+        dl_dlogits[target as usize] -= 1.0;
+
+        // --- dL/d_b = dL/d_logits ---
+        let grad_b = dl_dlogits.clone();
+
+        // --- dL/d_W = dL/d_logits @ h_norm^T (outer product) ---
+        let grad_w = &dl_dlogits * h_norm.transpose();
+
+        // --- dL/d_h_norm = W^T @ dL/d_logits ---
+        let dl_dh_norm = self.w.transpose() * &dl_dlogits;
+
+        // --- RMSNorm backward ---
+        let (dl_dpooled, grad_g) = Self::rmsnorm_backward(&pooled, &self.g, &dl_dh_norm, eps);
+
+        // --- Broadcast gradient to each slot: dL/d_h_star[k] = dL/d_pooled / h_slots ---
+        let mut grad_h_star = HSlots::zeros(&self.config);
+        let scale = 1.0 / h_slots as f32;
+        let slot_grad = &dl_dpooled * scale;
+        for k in 0..h_slots {
+            grad_h_star.set_slot(k, &slot_grad);
+        }
+
+        let grads = LmHeadGrads {
+            grad_w,
+            grad_b,
+            grad_g,
+        };
+
+        (loss, grad_h_star, grads)
     }
 
     pub fn argmax(logits: &DVector<f32>) -> u32 {

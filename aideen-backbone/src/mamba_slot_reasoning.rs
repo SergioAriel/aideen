@@ -10,6 +10,29 @@ use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use std::cell::RefCell;
 
+/// Gradients from a single Picard step backward pass.
+#[cfg(feature = "lab")]
+pub struct StepGrads {
+    /// dL/dh^(ℓ) — gradient to propagate to the previous Picard iteration
+    pub grad_h_prev: HSlots,
+    /// dL/dW_q: [d_r x d_r]
+    pub grad_w_q: DMatrix<f32>,
+    /// dL/dW_k: [d_r x d_r]
+    pub grad_w_k: DMatrix<f32>,
+    /// dL/dW_v: [d_r x d_r]
+    pub grad_w_v: DMatrix<f32>,
+    /// dL/dW_o: [d_r x d_r]
+    pub grad_w_o: DMatrix<f32>,
+    /// dL/dW_in: [d_r x d_r]
+    pub grad_w_in: DMatrix<f32>,
+    /// dL/d_norm_scale: [d_r]
+    pub grad_norm_scale: DVector<f32>,
+    /// dL/d_slot_anchor: [h_slots x d_r]
+    pub grad_slot_anchor: DMatrix<f32>,
+    /// dL/ds — gradient w.r.t. the input signal
+    pub grad_s: DVector<f32>,
+}
+
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
 pub struct MambaSlotReasoning {
     pub config: ArchitectureConfig,
@@ -543,6 +566,199 @@ impl MambaSlotReasoning {
     fn rms_norm(&self, v: &DVector<f32>) -> DVector<f32> {
         let rms = (v.map(|x| x * x).mean() + 1e-6).sqrt();
         v.zip_map(&self.norm_scale, |x, s| s * x / rms)
+    }
+
+    /// Backward pass through one Picard iteration (the `step` method).
+    ///
+    /// Given dL/dh_next (gradient of loss w.r.t. the output of this step),
+    /// computes gradients w.r.t. all parameters and the input h_prev.
+    ///
+    /// The forward computation per slot k is:
+    ///   1. attn_out = cross_slot_attn(h_prev)        — via Q, K, V, O projections
+    ///   2. input_signal = W_in @ s_r
+    ///   3. combined = attn_out[k] + input_signal + slot_anchor[k]
+    ///   4. f_h = RMSNorm(combined, norm_scale)
+    ///   5. h_next[k] = damping * f_h + (1 - damping) * h_prev[k]
+    #[cfg(feature = "lab")]
+    pub fn step_backward(
+        &self,
+        h_prev: &HSlots,
+        s: &DVector<f32>,
+        dl_dh_next: &HSlots,
+    ) -> StepGrads {
+        let d_r = self.config.d_r;
+        let h_slots = self.config.h_slots;
+        let scale = (d_r as f32).sqrt().recip();
+        let eps = 1e-6_f32;
+        let beta = self.damping;
+
+        // Prepare s_r (same truncation / zero-pad as forward)
+        let s_r = if s.len() >= d_r {
+            s.rows(0, d_r).into_owned()
+        } else {
+            let mut v = DVector::zeros(d_r);
+            v.rows_mut(0, s.len()).copy_from(&s.rows(0, s.len()));
+            v
+        };
+
+        // ── Re-run forward intermediates we need for backward ────────────────
+        let qs: Vec<DVector<f32>> = (0..h_slots).map(|k| &self.w_q * h_prev.slot(k)).collect();
+        let ks: Vec<DVector<f32>> = (0..h_slots).map(|k| &self.w_k * h_prev.slot(k)).collect();
+        let vs: Vec<DVector<f32>> = (0..h_slots).map(|k| &self.w_v * h_prev.slot(k)).collect();
+
+        let input_signal = &self.w_in * &s_r;
+
+        // Per-query attention intermediates
+        let mut attn_weights_all: Vec<Vec<f32>> = Vec::with_capacity(h_slots);
+        let mut mixed_all: Vec<DVector<f32>> = Vec::with_capacity(h_slots);
+        let mut combined_all: Vec<DVector<f32>> = Vec::with_capacity(h_slots);
+
+        for q_idx in 0..h_slots {
+            let raw_scores: Vec<f32> = ks.iter().map(|k| qs[q_idx].dot(k) * scale).collect();
+            let max_s = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = raw_scores.iter().map(|s_| (s_ - max_s).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            let attn: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+            let mixed: DVector<f32> = attn
+                .iter()
+                .zip(vs.iter())
+                .map(|(a, v)| v * *a)
+                .fold(DVector::zeros(d_r), |acc, v| acc + v);
+
+            let attn_out = &self.w_o * &mixed;
+            let slot_bias = self.slot_anchor.row(q_idx).transpose().into_owned();
+            let combined = attn_out + &input_signal + slot_bias;
+
+            attn_weights_all.push(attn);
+            mixed_all.push(mixed);
+            combined_all.push(combined);
+        }
+
+        // ── Initialize gradient accumulators ─────────────────────────────────
+        let mut grad_h_prev = HSlots::zeros(&self.config);
+        let mut grad_w_q = DMatrix::zeros(d_r, d_r);
+        let mut grad_w_k = DMatrix::zeros(d_r, d_r);
+        let mut grad_w_v = DMatrix::zeros(d_r, d_r);
+        let mut grad_w_o = DMatrix::zeros(d_r, d_r);
+        let mut grad_w_in = DMatrix::zeros(d_r, d_r);
+        let mut grad_norm_scale = DVector::zeros(d_r);
+        let mut grad_slot_anchor = DMatrix::zeros(h_slots, d_r);
+        let mut grad_s = DVector::zeros(d_r);
+
+        // ── Backprop per slot k ──────────────────────────────────────────────
+        for k in 0..h_slots {
+            let dl_dhk = dl_dh_next.slot(k);
+
+            // Step 5 backward: h_next[k] = beta * f_h + (1 - beta) * h_prev[k]
+            // dL/d_f_h = beta * dL/dh_next[k]
+            let dl_df_h = &dl_dhk * beta;
+            // dL/dh_prev[k] += (1 - beta) * dL/dh_next[k]
+            let mut h_prev_grad_k = &dl_dhk * (1.0 - beta);
+
+            // Step 4 backward: f_h = RMSNorm(combined, norm_scale)
+            //   y_i = norm_scale_i * combined_i / rms
+            //   rms = sqrt(mean(combined^2) + eps)
+            let combined = &combined_all[k];
+            let n = combined.len() as f32;
+            let mean_sq: f32 = combined.iter().map(|v| v * v).sum::<f32>() / n;
+            let rms = (mean_sq + eps).sqrt();
+            let x_hat = combined / rms;
+
+            // dL/d_norm_scale += dL/d_f_h * x_hat  (element-wise)
+            grad_norm_scale += dl_df_h.component_mul(&x_hat);
+
+            // dL/d_combined = (1/rms) * (dl_df_h . norm_scale - x_hat * mean(dl_df_h . norm_scale . x_hat))
+            let dl_dy_g = dl_df_h.component_mul(&self.norm_scale);
+            let mean_term: f32 = dl_dy_g.component_mul(&x_hat).sum() / n;
+            let dl_dcombined = (&dl_dy_g - &x_hat * mean_term) / rms;
+
+            // Step 3 backward: combined = attn_out + input_signal + slot_anchor[k]
+            let dl_dattn_out = dl_dcombined.clone();
+            let dl_dinput_signal = dl_dcombined.clone();
+            // dL/d_slot_anchor[k] = dL/d_combined
+            for d in 0..d_r {
+                grad_slot_anchor[(k, d)] += dl_dcombined[d];
+            }
+
+            // Step 2 backward: input_signal = W_in @ s_r
+            // dL/dW_in += dL/d_input_signal @ s_r^T
+            grad_w_in += &dl_dinput_signal * s_r.transpose();
+            // dL/ds_r += W_in^T @ dL/d_input_signal
+            grad_s += self.w_in.transpose() * &dl_dinput_signal;
+
+            // Step 1 backward: through W_o and attention
+            // attn_out = W_o @ mixed
+            // dL/d_mixed = W_o^T @ dL/d_attn_out
+            let dl_dmixed = self.w_o.transpose() * &dl_dattn_out;
+            // dL/dW_o += dL/d_attn_out @ mixed^T
+            grad_w_o += &dl_dattn_out * mixed_all[k].transpose();
+
+            // Backward through attention weighted sum: mixed = sum_j(attn[j] * v[j])
+            // dL/d_attn[j] = dL/d_mixed . v[j]
+            // dL/d_v[j] += attn[j] * dL/d_mixed
+            let attn = &attn_weights_all[k];
+            let mut dl_dattn: Vec<f32> = Vec::with_capacity(h_slots);
+            for j in 0..h_slots {
+                dl_dattn.push(dl_dmixed.dot(&vs[j]));
+            }
+
+            // Backward through softmax: p = softmax(scores)
+            // dL/d_scores[j] = p[j] * (dL/dp[j] - sum_m(p[m] * dL/dp[m]))
+            let dot_sum: f32 = attn.iter().zip(dl_dattn.iter()).map(|(a, d)| a * d).sum();
+            let mut dl_dscores: Vec<f32> = Vec::with_capacity(h_slots);
+            for j in 0..h_slots {
+                dl_dscores.push(attn[j] * (dl_dattn[j] - dot_sum));
+            }
+
+            // Backward through scores: scores[j] = q[k] . k[j] * scale
+            // dL/d_q[k] += sum_j(dL/d_scores[j] * scale * k[j])
+            // dL/d_k[j] += dL/d_scores[j] * scale * q[k]
+            let mut dl_dq_k = DVector::zeros(d_r);
+            for j in 0..h_slots {
+                let s_j = dl_dscores[j] * scale;
+                dl_dq_k += &ks[j] * s_j;
+
+                // dL/d_k[j] from this query slot k
+                let dl_dk_j = &qs[k] * s_j;
+                // dL/dW_k += dL/d_k[j] @ h_prev[j]^T
+                grad_w_k += &dl_dk_j * h_prev.slot(j).transpose();
+                // dL/dh_prev[j] += W_k^T @ dL/d_k[j]
+                let contrib = self.w_k.transpose() * &dl_dk_j;
+                let cur = grad_h_prev.slot(j);
+                grad_h_prev.set_slot(j, &(cur + contrib));
+
+                // dL/d_v[j] from attention weighting
+                let dl_dv_j = &dl_dmixed * attn[j];
+                // dL/dW_v += dL/d_v[j] @ h_prev[j]^T
+                grad_w_v += &dl_dv_j * h_prev.slot(j).transpose();
+                // dL/dh_prev[j] += W_v^T @ dL/d_v[j]
+                let contrib_v = self.w_v.transpose() * &dl_dv_j;
+                let cur = grad_h_prev.slot(j);
+                grad_h_prev.set_slot(j, &(cur + contrib_v));
+            }
+
+            // dL/dW_q += dL/d_q[k] @ h_prev[k]^T
+            grad_w_q += &dl_dq_k * h_prev.slot(k).transpose();
+            // dL/dh_prev[k] += W_q^T @ dL/d_q[k]
+            h_prev_grad_k += self.w_q.transpose() * &dl_dq_k;
+
+            // Accumulate h_prev gradient for slot k
+            let cur = grad_h_prev.slot(k);
+            grad_h_prev.set_slot(k, &(cur + h_prev_grad_k));
+        }
+
+        StepGrads {
+            grad_h_prev,
+            grad_w_q,
+            grad_w_k,
+            grad_w_v,
+            grad_w_o,
+            grad_w_in,
+            grad_norm_scale,
+            grad_slot_anchor,
+            grad_s,
+        }
     }
 
     fn cross_slot_attn(&self, h: &HSlots) -> HSlots {

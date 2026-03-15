@@ -36,7 +36,9 @@ dependencies = [
  "nalgebra 0.32.6",
  "pollster",
  "rand 0.8.5",
+ "safetensors",
  "serde",
+ "serde_json",
  "sha2",
  "tokenizers",
  "tokio",
@@ -171,19 +173,15 @@ name = "aideen-training"
 version = "0.1.0"
 dependencies = [
  "aideen-backbone",
- "aideen-block",
  "aideen-core",
- "bytemuck",
+ "bincode",
  "ed25519-dalek",
- "futures",
  "nalgebra 0.32.6",
- "pollster",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "sha2",
- "tokenizers",
- "tokio",
- "wgpu 23.0.1",
+ "zstd",
 ]
 
 [[package]]

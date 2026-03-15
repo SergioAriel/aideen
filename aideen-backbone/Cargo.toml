@@ -24,3 +24,5 @@ wgpu       = { version = "23", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 rand = "0.8.5"
 tokenizers = "0.21"
+safetensors = "0.4"
+serde_json  = "1"

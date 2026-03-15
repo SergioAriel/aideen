@@ -1,0 +1,24 @@
+[package]
+name = "aideen-training"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+wgpu = ["aideen-backbone/wgpu"]
+
+[dependencies]
+aideen-core      = { path = "../aideen-core" }
+aideen-backbone  = { path = "../aideen-backbone", features = ["lab"] }
+nalgebra         = "0.32"
+rand             = "0.8"
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+bincode          = "1"
+ed25519-dalek    = { version = "2", features = ["rand_core"] }
+sha2             = "0.10"
+zstd             = "0.13"
+
+[[bin]]
+name = "infer"
+path = "src/bin/infer.rs"
