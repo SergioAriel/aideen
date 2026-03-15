@@ -358,7 +358,7 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
         let hist_params_len =
-            2u32 * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 1u32;
+            2u32 * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 9u32;
         let hist_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Hist Params"),
             size: (hist_params_len * 4) as u64,

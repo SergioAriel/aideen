@@ -25,15 +25,22 @@ impl ComputeState {
     pub async fn new() -> Option<Self> {
         let instance = wgpu::Instance::default();
 
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
             })
-            .await?;
+            .await
+        {
+            Some(adapter) => adapter,
+            None => {
+                eprintln!("[ComputeState] No compatible GPU adapter found.");
+                return None;
+            }
+        };
 
-        let (device, queue) = adapter
+        let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Aideen-Block-V8"),
@@ -44,7 +51,13 @@ impl ComputeState {
                 None,
             )
             .await
-            .ok()?;
+        {
+            Ok((device, queue)) => (device, queue),
+            Err(err) => {
+                eprintln!("[ComputeState] request_device failed: {err:?}");
+                return None;
+            }
+        };
 
         Some(Self { device, queue })
     }

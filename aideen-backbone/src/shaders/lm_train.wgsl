@@ -29,6 +29,7 @@ struct TrainParams {
 @group(0) @binding(13) var<storage, read_write> dl_dh_temp: array<f32>;  // [seq_len, d_model]
 @group(0) @binding(14) var<storage, read> sampled_indices: array<u32>;  // [num_samples]
 @group(0) @binding(15) var<storage, read_write> s_h_rms: array<f32>;    // Dynamic intermediate h_rms
+@group(0) @binding(16) var<storage, read_write> dl_dh_rms_red: array<f32>; // [seq_len]
 
 const WG_SIZE: u32 = 256u;
 var<workgroup> s_rms: f32;
@@ -268,9 +269,59 @@ fn lm_backprop_h_t_main(
     
     if (tid == 0u) {
         let val = s_scratch[0];
-        dl_dh_temp[t * params.d_model + d] = val;
-        dl_dh[t * params.d_model + d] = val; // <--- SEÑAL PARA EL CG SOLVER
+        dl_dh_temp[t * params.d_model + d] = val; // dL/dy (pre-RMSNorm backprop)
     }
+}
+
+// Pipeline 3.5: Reduce sum_j (g_j * x_j * dL/dy_j) per token.
+@compute @workgroup_size(256, 1, 1)
+fn lm_backprop_rms_reduce_main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>
+) {
+    let t = wgid.x;
+    if (t >= params.seq_len) { return; }
+    let tid = lid.x;
+    let d_model = params.d_model;
+    let base = t * d_model;
+
+    var local_sum = 0.0;
+    for (var d = tid; d < d_model; d += WG_SIZE) {
+        let dldy = dl_dh_temp[base + d];
+        let x = h_pooled[base + d];
+        let g = g_lm[d];
+        local_sum += dldy * g * x;
+    }
+    s_scratch[tid] = local_sum;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { s_scratch[tid] += s_scratch[tid + stride]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) {
+        dl_dh_rms_red[t] = s_scratch[0];
+    }
+}
+
+// Pipeline 3.6: Apply RMSNorm backward to get dL/dh.
+@compute @workgroup_size(256, 1, 1)
+fn lm_backprop_rms_apply_main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>
+) {
+    let t = wgid.x;
+    let d = wgid.y;
+    if (t >= params.seq_len || d >= params.d_model) { return; }
+    let base = t * params.d_model;
+    let dldy = dl_dh_temp[base + d];
+    let x = h_pooled[base + d];
+    let g = g_lm[d];
+    let rms = rms_buf[t];
+    let inv_r = 1.0 / rms;
+    let inv_r3 = inv_r / (rms * rms);
+    let sum = dl_dh_rms_red[t];
+    let term = (x * inv_r3 / f32(params.d_model)) * sum;
+    dl_dh[base + d] = (g * inv_r) * dldy - term;
 }
 
 // Pipeline 4: Final reduction and AdamW for g.
