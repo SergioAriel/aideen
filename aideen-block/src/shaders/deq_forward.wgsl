@@ -555,23 +555,24 @@ fn deq_forward_main(
                 let hist_loop_force_nomamba = HistParams[hist_loop_force_nomamba_base];
                 let hist_minner_zero = HistParams[hist_minner_zero_base];
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                    let h_prev = H_curr[h_base + off + d];
                     var hist_ctx = 0.0;
                     if (hist_gated_mode && hist_inject > 0.5 && hist_minner_zero < 0.5) {
                         hist_ctx = Scratch[m_inner_base + off + d];
                     }
                     let slot_bias = HistParams[slot_anchor_base + off + d];
-                    var final_combined = Scratch[attn_base + off + d]
-                        + Scratch[signal_base + d]
-                        + slot_bias
-                        + hist_ctx;
+                    // attn_signal is the only h-dependent term (∂slot_bias/∂h = 0,
+                    // ∂hist_ctx/∂h = 0). rms is anchored to attn_signal alone so that
+                    // the Lipschitz constant is independent of slot_bias and hist_ctx
+                    // magnitude. Both still enter the numerator (final_combined), so
+                    // they shift h* and provide slot identity / history context.
+                    let attn_signal = Scratch[attn_base + off + d]
+                        + Scratch[signal_base + d];
+                    var final_combined = attn_signal + slot_bias + hist_ctx;
                     if (hist_force_nomamba > 0.5 || hist_loop_force_nomamba > 0.5) {
-                        final_combined = Scratch[attn_base + off + d]
-                            + Scratch[signal_base + d]
-                            + slot_bias;
+                        final_combined = attn_signal + slot_bias;
                     }
                     H_next[h_base_t + off + d] = final_combined;
-                    local_sumsq = local_sumsq + final_combined * final_combined;
+                    local_sumsq = local_sumsq + attn_signal * attn_signal;
                 }
                 shared_vals[tid] = local_sumsq;
                 workgroupBarrier();
@@ -625,7 +626,12 @@ fn deq_forward_main(
                 let d_curr = shared_vals[0];
                 let d_prev = last_delta;
                 curr_contractivity = 0.0;
-                if (iter > 0u && d_prev > 1e-12) {
+                // Only measure contractivity when the residual is meaningfully
+                // larger than the convergence threshold.  Near epsilon, d_prev
+                // is dominated by numerical noise and the ratio d_curr/d_prev
+                // can exceed 1.0 as a measurement artifact even when the map
+                // is globally contractive.  The factor 10 gives a safe margin.
+                if (iter > 0u && d_prev > 1e-12 && d_prev > shape.epsilon * 10.0) {
                     curr_contractivity = d_curr / d_prev;
                 }
                 if (contr_floor > 0.0 && combined_rms_curr < contr_floor) {

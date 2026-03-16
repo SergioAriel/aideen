@@ -50,7 +50,7 @@ impl Default for ArchitectureConfig {
             cg_iters: 8, // Mejor estabilidad del gradiente implícito
             train_deq: true,
             deq_grad_scale: 0.01,
-            renorm_every_steps: 16, // Mantiene el radio espectral a raya
+            renorm_every_steps: 4,  // Mantiene el radio espectral a raya (4x más frecuente = ~0 coste GPU)
             num_samples: 512,
             weight_decay: 0.01,
         }

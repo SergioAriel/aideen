@@ -1285,9 +1285,12 @@ impl Trainer {
             let contractivity = if fw.len() > 21 { fw[21] } else { 0.0 };
             let seq = heartbeat.max(1.0);
             let hit_ratio = hit_count.max(0.0) / seq;
-            let conv_like =
-                hit_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
-            let invalid_fixed_point = contractivity > 1.0 && conv_like;
+            // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
+            // also being non-contractive. Non-monotone convergence (contr transiently > 1
+            // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
+            // does NOT indicate an invalid fixed point — the system DID find h*.
+            let invalid_fixed_point =
+                contractivity > 1.0 && max_delta > self.config.deq_epsilon * 10.0;
             if invalid_fixed_point {
                 eprintln!(
                     "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
