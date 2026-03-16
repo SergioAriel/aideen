@@ -146,7 +146,7 @@ impl MambaSlotReasoning {
             // without injecting large energy that would destabilize the DEQ operator.
             let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
             let phase = (((slot + 1) * (dim + 3) * 17) % 2048) as f32 / 1024.0 - 1.0;
-            centered * 2.0e-3f32 + phase * 2.5e-4f32
+            centered * 2.0e-4f32 + phase * 2.5e-5f32
         })
     }
 
