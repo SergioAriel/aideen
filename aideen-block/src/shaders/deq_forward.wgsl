@@ -560,11 +560,15 @@ fn deq_forward_main(
                     if (hist_gated_mode && hist_inject > 0.5 && hist_minner_zero < 0.5) {
                         hist_ctx = Scratch[m_inner_base + off + d];
                     }
+                    let slot_bias = HistParams[slot_anchor_base + off + d];
                     var final_combined = Scratch[attn_base + off + d]
                         + Scratch[signal_base + d]
+                        + slot_bias
                         + hist_ctx;
                     if (hist_force_nomamba > 0.5 || hist_loop_force_nomamba > 0.5) {
-                        final_combined = Scratch[attn_base + off + d] + Scratch[signal_base + d];
+                        final_combined = Scratch[attn_base + off + d]
+                            + Scratch[signal_base + d]
+                            + slot_bias;
                     }
                     H_next[h_base_t + off + d] = final_combined;
                     local_sumsq = local_sumsq + final_combined * final_combined;
@@ -577,11 +581,14 @@ fn deq_forward_main(
                     }
                     workgroupBarrier();
                 }
-                var rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                 let rms_floor = HistParams[hist_rms_floor_base];
-                if (rms_floor > 0.0 && rms < rms_floor) {
-                    rms = rms_floor;
-                }
+                // Smooth floor inside sqrt to keep the map differentiable and enforce
+                // a minimum RMS magnitude without regime switches.
+                var rms = sqrt(
+                    shared_vals[0] / max(1.0, f32(d_model))
+                    + rms_floor * rms_floor
+                    + 1e-6
+                );
                 if (s == 0u && tid == 0u) {
                     combined_rms_curr = rms;
                 }
