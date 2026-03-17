@@ -2394,11 +2394,14 @@ impl GpuDeqBackend {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
-        let use_precomputed_adjoint =
-            std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1")
-                || std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1")
-                || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1")
-                || std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1");
+        // El trainer siempre corre run_staged_adjoint_picard_no_readback antes de llamar
+        // esta función — el adjoint siempre está precomputado. El inline Picard de abajo
+        // queda comentado como referencia del diseño original.
+        // let use_precomputed_adjoint =
+        //     std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1")
+        //         || std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1")
+        //         || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1")
+        //         || std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1");
         let hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1");
         let hist_selective = hist_gated && Self::hist_selective_from_env();
         let hist_internal_probe = std::env::var("AIDEEN_HIST_INTERNAL_PROBE")
@@ -2418,23 +2421,22 @@ impl GpuDeqBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Fused Update Zero Buffers"),
             });
-        // In hist-gated mode the initial historical backward consumes the staged Picard
-        // g_comb written into fused_mix_buf by the precomputed adjoint path that runs in
-        // the trainer just before apply_fused_deq_update(). Clearing it here disconnects
-        // the whole historical branch before hist_prep can read ∂L/∂c_t.
-        if !hist_gated {
-            zero_encoder.clear_buffer(&self.fused_mix_buf, 0, None);
-        }
+        // fused_mix_buf NO se limpia — el staged Picard ya lo llenó con g_comb correcto.
+        // (antes se limpiaba para el path inline Picard que ya no se usa)
+        // if !hist_gated {
+        //     zero_encoder.clear_buffer(&self.fused_mix_buf, 0, None);
+        // }
         zero_encoder.clear_buffer(&self.fused_weighted_h_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_gmix_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_hist_delta_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_gscore_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
-        if !use_precomputed_adjoint {
-            zero_encoder.clear_buffer(&self.cg_bridge.b_v_out, 0, None);
-            zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
-        }
+        // b_v_out y fused_v_next_buf ya no se usan — eran output del inline Picard.
+        // if !use_precomputed_adjoint {
+        //     zero_encoder.clear_buffer(&self.cg_bridge.b_v_out, 0, None);
+        //     zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
+        // }
         self.queue.submit(Some(zero_encoder.finish()));
         if profile_fused {
             self.device.poll(wgpu::Maintain::Wait);
@@ -2472,20 +2474,20 @@ impl GpuDeqBackend {
             }
         };
 
-        if !use_precomputed_adjoint {
-            // 0. PICARD ADJOINT: Reemplaza el CG Solver (O(D) vs O(D^2))
-            run_stage(
-                &self.device,
-                &self.queue,
-                "Picard Adjoint (BPTT)",
-                &self.fused_adjoint_picard_pipeline,
-                &self.fused_adjoint_bg,
-                &self.fused_adjoint_weights_bg,
-                seq_len,
-                1,
-                profile_fused,
-            );
-        }
+        // INLINE PICARD — comentado. El trainer siempre corre run_staged_adjoint_picard_no_readback
+        // antes de llamar esta función. El staged Picard (staged_adjoint_picard.wgsl) escribe
+        // correctamente a fused_mix_buf. El inline Picard escribía a cg_bridge.b_v_out (buffer
+        // equivocado), dejando fused_mix_buf en cero → stage1a computaba gradiente cero.
+        // if !use_precomputed_adjoint {
+        //     run_stage(
+        //         &self.device, &self.queue,
+        //         "Picard Adjoint (BPTT)",
+        //         &self.fused_adjoint_picard_pipeline,
+        //         &self.fused_adjoint_bg,
+        //         &self.fused_adjoint_weights_bg,
+        //         seq_len, 1, profile_fused,
+        //     );
+        // }
 
         if hist_gated {
             let train_hist_carrier = std::env::var("AIDEEN_HIST_TRAIN_CARRIER")
