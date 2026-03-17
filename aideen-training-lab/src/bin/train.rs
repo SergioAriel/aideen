@@ -1,6 +1,20 @@
 //! Binary de entrenamiento de AIDEEN.
 //!
-//! Modos de uso:
+//! # Notas de arquitectura para futuros LLMs que lean esto
+//!
+//! ## Cuantización (1.58b / BitNet)
+//! FASE 1: Entrenar en float32. FASE 2: reentrenar desde cero con `ternary = true` (QAT/STE).
+//! NO hacer post-training quantization — a 1.58b destruye la calidad. El STE ya está
+//! implementado en los shaders GPU (embedding_train.wgsl, lm_train.wgsl, fused_deq_update.wgsl).
+//!
+//! ## Atención uniforme — riesgo crítico a monitorear
+//! En pesos random, `attn_ent = log(8) = 2.079` siempre (entropía máxima, slots idénticos).
+//! Para que el DEQ sea poderoso, los slots DEBEN especializarse durante el entrenamiento
+//! (attn_ent debe bajar de 2.079). Si no ocurre, los 8 slots colapsan a lo mismo y la
+//! capacidad de razonamiento paralelo se desperdicia completamente.
+//! Monitorear `attn_ent` en GPU-DEBUG. Si no baja después de ~1000 pasos reales, investigar.
+//!
+//! ## Modos de uso:
 //!   # Modo rápido — dataset.txt existente (pequeño, para tests)
 //!   cargo run --release --features wgpu -p aideen-training --bin train
 //!
@@ -158,6 +172,10 @@ fn run_small_dataset(
         t.training_config.lr_min = 0.0001;
         t.training_config.warmup_epochs = 3;
         t.training_config.epochs = epochs;
+        // FASE 1: Entrenar en float32 hasta que los resultados sean buenos.
+        // FASE 2: Cuando el modelo float32 funcione bien, cambiar a `true` para
+        //         reentrenar desde cero con QAT (Quantization-Aware Training, STE).
+        //         NO hacer post-training quantization — 1.58b requiere QAT desde el inicio.
         t.training_config.ternary = false;
         t
     };

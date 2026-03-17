@@ -384,23 +384,33 @@ fn deq_forward_main(
                         sum_exp = sum_exp + e;
                     }
                     let inv_sum = 1.0 / max(sum_exp, 1e-12);
-                    var local_max_p = 0.0;
-                    var local_entropy = 0.0;
                     for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
                         attn_w[qs * h_slots + ks] = attn_w[qs * h_slots + ks] * inv_sum;
                         Scratch[attn_weight_base + qs * h_slots + ks] = attn_w[qs * h_slots + ks];
-                        if (qs == 0u) {
-                            let p = attn_w[qs * h_slots + ks];
-                            local_max_p = max(local_max_p, p);
-                            local_entropy = local_entropy - p * log(max(p, 1.0e-8));
-                        }
-                    }
-                    if (qs == 0u && iter == 0u) {
-                        avg_attn_max_sum = avg_attn_max_sum + local_max_p;
-                        avg_attn_entropy_sum = avg_attn_entropy_sum + local_entropy;
                     }
                 }
                 workgroupBarrier();
+
+                // Entropy y max promediados sobre TODOS los slots (no solo slot 0).
+                // Thread 0 recalcula desde Scratch para evitar race conditions.
+                // attn_ent=log(8)=2.079 → slots uniformes. Debe bajar con entrenamiento real.
+                if (tid == 0u && iter == 0u) {
+                    var total_entropy = 0.0;
+                    var total_max_p = 0.0;
+                    for (var s = 0u; s < h_slots; s = s + 1u) {
+                        var slot_ent = 0.0;
+                        var slot_max = 0.0;
+                        for (var k = 0u; k < h_slots; k = k + 1u) {
+                            let p = Scratch[attn_weight_base + s * h_slots + k];
+                            slot_max = max(slot_max, p);
+                            slot_ent = slot_ent - p * log(max(p, 1.0e-8));
+                        }
+                        total_entropy = total_entropy + slot_ent;
+                        total_max_p = total_max_p + slot_max;
+                    }
+                    avg_attn_entropy_sum = avg_attn_entropy_sum + total_entropy / f32(h_slots);
+                    avg_attn_max_sum = avg_attn_max_sum + total_max_p / f32(h_slots);
+                }
 
                 // Build mixed V vector per query slot once:
                 // mix[qs, j] = Σ_ks attn_w[qs,ks] * V[ks,j]

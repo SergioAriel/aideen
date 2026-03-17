@@ -646,7 +646,7 @@ impl Trainer {
             }
         }
 
-        // ⑥ Backward DEQ (Implicit Differentiation via CG)
+        // ⑥ Backward DEQ (Picard Adjoint)
         if self.config.train_deq {
             #[cfg(feature = "wgpu")]
             let mut deq_updated_on_gpu = false;
@@ -1340,49 +1340,40 @@ impl Trainer {
                 self.lm_head_cpu_stale = true;
             }
 
-            if invalid_fixed_point {
-                return current_loss;
-            }
-
             // 4. Embedding Update from GPU dl_dh buffer (Moved to step 6 to avoid duplication)
 
-            // 5. DEQ Reasoning Core Update (Backward Adjoint CG + Fused Weight Update)
+            // 5. DEQ Reasoning Core Update (Picard Adjoint + Fused GPU Weight Update)
             if self.eval_mode {
                 return current_loss;
             }
 
             if !self.frozen_deq {
-                let use_fused_gpu_update = std::env::var("AIDEEN_GPU_FUSED_DEQ_UPDATE")
-                    .ok()
-                    .map(|v| {
-                        let vl = v.trim().to_ascii_lowercase();
-                        vl == "1" || vl == "true" || vl == "yes"
-                    })
-                    .unwrap_or(false);
+                // ⑥ Backward DEQ — Picard Adjoint (GPU, siempre).
+                // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
+                // aplica el weight update completo en GPU. Un solo path, siempre correcto.
+                let seq_len = targets_u32.len() as u32;
+                let _ = gpu.run_staged_adjoint_picard_no_readback(
+                    seq_len,
+                    self.reasoning.damping,
+                    self.config.cg_iters as u32,
+                    Some(&gpu_lm.dl_dh_buf),
+                    false,
+                );
+                let _ = gpu.apply_fused_deq_update(
+                    base_lr,
+                    self.config.deq_grad_scale,
+                    self.training_config.ternary,
+                    self.config.weight_decay,
+                    seq_len,
+                    self.reasoning.damping,
+                );
+                self.gpu_weights_uploaded = true;
+                self.gpu_cg_weights_uploaded = true;
 
-                if use_fused_gpu_update {
-                    // Legacy fast path: approximate fused update fully on GPU.
-                    let seq_len = targets_u32.len() as u32;
-                    let cg_shape = gpu.build_cg_shape(seq_len, self.adaptive_cg_iters);
-                    let _ = gpu.cg_bridge.run_backward_no_readback(
-                        &gpu.device,
-                        &gpu.queue,
-                        &cg_shape,
-                        &gpu.bridge.hnext_buf,
-                        0,
-                        &gpu_lm.dl_dh_buf,
-                    );
-                    let _ = gpu.apply_fused_deq_update(
-                        base_lr,
-                        self.config.deq_grad_scale,
-                        self.training_config.ternary,
-                        self.config.weight_decay,
-                        targets_u32.len() as u32,
-                        self.reasoning.damping,
-                    );
-                    self.gpu_weights_uploaded = true;
-                    self.gpu_cg_weights_uploaded = true;
-                } else {
+                // CPU PATH — por las dudas, si GPU no disponible.
+                // Para activar: comentar el bloque GPU de arriba y descomentar este bloque.
+                // Recalcula h* en CPU, corre CG, aplica weight update en CPU y re-sube a GPU.
+                if false {
                     // Strict path: CPU CG with GPU's h_star.
                     // Reads h_star from hnext_buf after GPU forward, then uses numerical
                     // JVP through reasoning.step() — captures all weights correctly and
