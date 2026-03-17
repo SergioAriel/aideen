@@ -224,20 +224,18 @@ impl GpuDeqBackend {
         if std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1") {
             return -0.75;
         }
-        if std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1") {
-            return -0.5;
-        }
         if std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1") {
             return -0.25;
         }
 
+        // hist_gated (-0.5) is the default mode. Override only if another mode is set.
         let alpha = std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or_else(|| {
-                // v14 Default: 0.0 is mathematically proven to converge 100% of the time.
-                0.0
+                // Default: hist_gated mode (residual_alpha = -0.5 sentinel).
+                -0.5
             });
         alpha
     }
@@ -1447,19 +1445,13 @@ impl GpuDeqBackend {
         }
     }
 
-    fn cg_damping_from_env() -> f32 {
+    fn picard_damping_from_env() -> f32 {
+        // Damping for Picard fixed-point iterations (was: cg_damping_from_env).
+        // hist_gated is default, so 0.90 is the default damping.
         if std::env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1") {
             0.95
-        } else if std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1") {
-            0.90
-        } else if std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1") {
-            0.90
-        } else if std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1") {
-            0.90
-        } else if std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1") {
-            0.90
         } else {
-            0.85
+            0.90
         }
     }
 
@@ -1474,7 +1466,7 @@ impl GpuDeqBackend {
             h_slots: self.config.h_slots as u32,
             cg_iters,
             epsilon: self.config.deq_epsilon,
-            damping: Self::cg_damping_from_env(),
+            damping: Self::picard_damping_from_env(),
             curr_iter: 0,
             _pad0: 0,
             _pad1: 0,
@@ -2402,7 +2394,8 @@ impl GpuDeqBackend {
         //         || std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1")
         //         || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1")
         //         || std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1");
-        let hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1");
+        // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
+        let hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let hist_selective = hist_gated && Self::hist_selective_from_env();
         let hist_internal_probe = std::env::var("AIDEEN_HIST_INTERNAL_PROBE")
             .ok()
