@@ -459,7 +459,8 @@ impl Trainer {
             self.reset_state();
         }
 
-        if Self::env_flag("AIDEEN_DEQ_HIST_GATED") {
+        // hist_gated is default — always enforce min_iters for stable history injection.
+        {
             let min_iters = Self::env_u32("AIDEEN_HIST_MIN_ITERS").unwrap_or(20);
             if self.adaptive_max_iters < min_iters {
                 self.adaptive_max_iters = min_iters;
