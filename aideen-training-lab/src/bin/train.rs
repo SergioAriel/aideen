@@ -15,6 +15,7 @@ use std::process;
 
 struct CliArgs {
     data: String,
+    val_data: Option<String>,
     tokenizer: String,
     checkpoint: String,
     d_r: usize,
@@ -33,14 +34,15 @@ impl CliArgs {
 
         let mut cli = CliArgs {
             data: "data/corpus/train.tokens.bin".to_string(),
+            val_data: None,
             tokenizer: "aideen-backbone/tokenizer.json".to_string(),
             checkpoint: "checkpoints/latest".to_string(),
             d_r: 256,
             lr: 1e-3,
-            steps: 10000,
-            eval_every: 500,
-            save_every: 1000,
-            ctx_len: 128,
+            steps: 100000,
+            eval_every: 1000,
+            save_every: 5000,
+            ctx_len: 256,
             seed: 42,
             resume: false,
         };
@@ -54,6 +56,13 @@ impl CliArgs {
                         eprintln!("Error: --data requires a value");
                         process::exit(1);
                     });
+                }
+                "--val-data" => {
+                    i += 1;
+                    cli.val_data = Some(args.get(i).cloned().unwrap_or_else(|| {
+                        eprintln!("Error: --val-data requires a value");
+                        process::exit(1);
+                    }));
                 }
                 "--tokenizer" => {
                     i += 1;
@@ -144,8 +153,8 @@ impl CliArgs {
                 }
                 other => {
                     eprintln!("Unknown argument: {}", other);
-                    eprintln!("Usage: train [--data PATH] [--tokenizer PATH] [--checkpoint PATH]");
-                    eprintln!("             [--d-r N] [--lr FLOAT] [--steps N]");
+                    eprintln!("Usage: train [--data PATH] [--val-data PATH] [--tokenizer PATH]");
+                    eprintln!("             [--checkpoint PATH] [--d-r N] [--lr FLOAT] [--steps N]");
                     eprintln!("             [--eval-every N] [--save-every N] [--ctx-len N]");
                     eprintln!("             [--seed N] [--resume]");
                     process::exit(1);
@@ -163,6 +172,7 @@ fn main() {
 
     println!("=== AIDEEN Training CLI ===");
     println!("  data:       {}", args.data);
+    println!("  val_data:   {}", args.val_data.as_deref().unwrap_or("(split from data)"));
     println!("  tokenizer:  {}", args.tokenizer);
     println!("  checkpoint: {}", args.checkpoint);
     println!("  d_r:        {}", args.d_r);
@@ -202,21 +212,45 @@ fn main() {
         Trainer::from_tokenizer_seeded(tokenizer, args.lr, args.seed)
     };
 
-    // 4. Load training data and split 90/10
+    // 4. Load training data (and validation data if separate file provided)
     println!("[3/5] Loading data from {} ...", args.data);
-    let full_loader = DataLoader::from_file(&args.data, args.ctx_len, args.seed).unwrap_or_else(|e| {
-        eprintln!("Failed to load training data: {}", e);
-        process::exit(1);
-    });
-    let (train_tokens, val_tokens) = DataLoader::split(&full_loader.tokens, 0.9);
-    println!(
-        "       Train tokens: {}, Val tokens: {}",
-        train_tokens.len(),
-        val_tokens.len()
-    );
-
-    let mut train_loader = DataLoader::new(train_tokens, args.ctx_len, args.seed);
-    let mut val_loader = DataLoader::new(val_tokens, args.ctx_len, args.seed + 1);
+    let (mut train_loader, mut val_loader) = if let Some(ref val_path) = args.val_data {
+        // Separate train/val files — no redundant split needed
+        let train_loader = DataLoader::from_file(&args.data, args.ctx_len, args.seed)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load training data: {}", e);
+                process::exit(1);
+            });
+        println!("       Loading validation data from {} ...", val_path);
+        let val_loader = DataLoader::from_file(val_path, args.ctx_len, args.seed + 1)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load validation data: {}", e);
+                process::exit(1);
+            });
+        println!(
+            "       Train tokens: {}, Val tokens: {}",
+            train_loader.len(),
+            val_loader.len()
+        );
+        (train_loader, val_loader)
+    } else {
+        // Legacy: single file, split 90/10
+        let full_loader = DataLoader::from_file(&args.data, args.ctx_len, args.seed)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load training data: {}", e);
+                process::exit(1);
+            });
+        let (train_tokens, val_tokens) = DataLoader::split(&full_loader.tokens, 0.9);
+        println!(
+            "       Train tokens: {}, Val tokens: {}",
+            train_tokens.len(),
+            val_tokens.len()
+        );
+        drop(full_loader); // free ~14GB before allocating train/val
+        let train_loader = DataLoader::new(train_tokens, args.ctx_len, args.seed);
+        let val_loader = DataLoader::new(val_tokens, args.ctx_len, args.seed + 1);
+        (train_loader, val_loader)
+    };
 
     // 5. Set up cosine learning rate schedule
     let warmup_steps = args.steps / 20; // 5% warmup

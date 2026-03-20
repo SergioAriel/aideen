@@ -1,306 +1,263 @@
 #!/usr/bin/env python3
 """
-fetch_corpus.py -- Download open-license text and assemble a raw corpus.
+fetch_corpus.py -- Download open-license text corpus for AIDEEN training.
 
-Sources (in priority order):
+Sources:
   1. Existing corpus   : train_aideen.txt (~2 MB, SmolTalk + Rust docs)
-  2. Project Gutenberg : ~20 public-domain books (capped at 200 KB each)
-  3. Simple Wikipedia  : ~1000 random article extracts
+  2. Wikipedia dumps    : Simple English + Spanish Wikipedia (articles XML)
+  3. Project Gutenberg  : ~100 public-domain books
 
-Output: data/corpus/raw_corpus.txt  (target 50-100 MB)
+Output: data/corpus/raw_corpus.txt  (target ~2-5 GB)
+
+All data is public domain or CC BY-SA (legal for training).
 """
 
+import bz2
 import json
+import os
 import re
+import struct
+import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR   = PROJECT_ROOT / "data" / "corpus"
-OUTPUT_FILE  = OUTPUT_DIR / "raw_corpus.txt"
+OUT_DIR = Path("data/corpus")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-EXISTING_CORPUS = PROJECT_ROOT / "train_aideen.txt"
-
-NET_TIMEOUT = 30
-NET_RETRY   = 3
-BOOK_CAP    = 200 * 1024  # 200 KB per book
-
-DOC_SEP = "\n\n<|endoftext|>\n\n"
-
-# Project Gutenberg book IDs and titles
-GUTENBERG_BOOKS = [
-    (1342,  "Pride and Prejudice"),
-    (11,    "Alice's Adventures in Wonderland"),
-    (1661,  "The Adventures of Sherlock Holmes"),
-    (84,    "Frankenstein"),
-    (1080,  "A Modest Proposal"),
-    (98,    "A Tale of Two Cities"),
-    (2701,  "Moby Dick"),
-    (74,    "The Adventures of Tom Sawyer"),
-    (1232,  "The Prince"),
-    (46,    "A Christmas Carol"),
-    (219,   "Heart of Darkness"),
-    (345,   "Dracula"),
-    (1400,  "Great Expectations"),
-    (16328, "Beowulf"),
-    (514,   "Little Women"),
-    (2591,  "Grimms' Fairy Tales"),
-    (5200,  "Metamorphosis"),
-    (1952,  "The Yellow Wallpaper"),
-    (36,    "The War of the Worlds"),
-    (174,   "The Picture of Dorian Gray"),
-]
-
-# Simple Wikipedia config
-WIKI_API = "https://simple.wikipedia.org/w/api.php"
-WIKI_BATCH_SIZE = 20
-WIKI_TARGET_ARTICLES = 1000
-
-# ---------------------------------------------------------------------------
-# Network helpers
-# ---------------------------------------------------------------------------
-
-def fetch_url(url: str, retries: int = NET_RETRY,
-              timeout: int = NET_TIMEOUT) -> bytes | None:
-    """Download a URL with retries and exponential back-off."""
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "AIDEEN-CorpusFetcher/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        except (urllib.error.URLError, urllib.error.HTTPError,
-                TimeoutError, OSError) as exc:
-            if attempt < retries - 1:
-                time.sleep(2.0 ** attempt)
-            else:
-                print(f"  [WARN] Failed to fetch {url[:90]}: {exc}")
-    return None
+CHUNK_FILE = OUT_DIR / "raw_corpus.txt"
 
 
-def fetch_text(url: str) -> str:
-    data = fetch_url(url)
-    return data.decode("utf-8", errors="replace") if data else ""
-
-
-def fetch_json(url: str) -> dict | None:
-    data = fetch_url(url)
-    if data is None:
-        return None
+def download_file(url, dest, desc=""):
+    """Download a file with progress reporting."""
+    if dest.exists():
+        size = dest.stat().st_size
+        print(f"  [skip] {desc or dest.name} already exists ({size/1e6:.1f} MB)")
+        return True
+    print(f"  Downloading {desc or url}...")
     try:
-        return json.loads(data)
-    except json.JSONDecodeError:
-        return None
-
-# ---------------------------------------------------------------------------
-# 1. Existing corpus
-# ---------------------------------------------------------------------------
-
-def load_existing_corpus() -> str:
-    """Read train_aideen.txt if it exists."""
-    if not EXISTING_CORPUS.exists():
-        print("  [INFO] No existing corpus found at train_aideen.txt, skipping.")
-        return ""
-    size = EXISTING_CORPUS.stat().st_size
-    print(f"  Reading {EXISTING_CORPUS.name} ({size / 1_048_576:.1f} MB) ...")
-    text = EXISTING_CORPUS.read_text(encoding="utf-8", errors="replace")
-    print(f"  OK -- {len(text):,} chars")
-    return text
-
-# ---------------------------------------------------------------------------
-# 2. Project Gutenberg
-# ---------------------------------------------------------------------------
-
-def strip_gutenberg_header_footer(text: str) -> str:
-    """Remove the Project Gutenberg boilerplate header and footer."""
-    # Find the start marker
-    start_markers = ["*** START OF THIS PROJECT GUTENBERG",
-                     "*** START OF THE PROJECT GUTENBERG",
-                     "***START OF THIS PROJECT GUTENBERG",
-                     "***START OF THE PROJECT GUTENBERG"]
-    start_idx = 0
-    for marker in start_markers:
-        pos = text.find(marker)
-        if pos != -1:
-            # Move past the marker line
-            nl = text.find("\n", pos)
-            start_idx = nl + 1 if nl != -1 else pos + len(marker)
-            break
-
-    # Find the end marker
-    end_markers = ["*** END OF THIS PROJECT GUTENBERG",
-                   "*** END OF THE PROJECT GUTENBERG",
-                   "***END OF THIS PROJECT GUTENBERG",
-                   "***END OF THE PROJECT GUTENBERG"]
-    end_idx = len(text)
-    for marker in end_markers:
-        pos = text.find(marker)
-        if pos != -1:
-            end_idx = pos
-            break
-
-    return text[start_idx:end_idx].strip()
+        req = urllib.request.Request(url, headers={"User-Agent": "AideenCorpusFetcher/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)  # 1MB chunks
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = downloaded * 100 / total
+                        print(f"\r  {downloaded/1e6:.1f}/{total/1e6:.1f} MB ({pct:.0f}%)", end="", flush=True)
+                    else:
+                        print(f"\r  {downloaded/1e6:.1f} MB", end="", flush=True)
+        print()
+        return True
+    except Exception as e:
+        print(f"\n  Error: {e}")
+        if dest.exists():
+            dest.unlink()
+        return False
 
 
-def fetch_gutenberg_books() -> list[str]:
-    """Download public-domain books from Project Gutenberg."""
-    documents: list[str] = []
-    total = len(GUTENBERG_BOOKS)
+def extract_wiki_articles(bz2_path, max_articles=None):
+    """Extract article text from a Wikipedia XML dump (bz2 compressed)."""
+    print(f"  Extracting articles from {bz2_path.name}...")
+    articles = []
+    count = 0
+    in_text = False
+    current_text = []
+    current_title = ""
 
-    for i, (book_id, title) in enumerate(GUTENBERG_BOOKS, 1):
-        url = f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt"
-        print(f"  [{i}/{total}] Gutenberg #{book_id}: {title} ...")
+    with bz2.open(bz2_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            # Simple XML parsing (avoids heavy deps)
+            if "<title>" in line:
+                m = re.search(r"<title>(.*?)</title>", line)
+                if m:
+                    current_title = m.group(1)
 
-        raw = fetch_text(url)
-        if not raw or len(raw) < 1000:
-            print(f"    [WARN] Skipped (too short or download failed)")
-            continue
-
-        body = strip_gutenberg_header_footer(raw)
-        if len(body) < 500:
-            print(f"    [WARN] Skipped (body too short after stripping)")
-            continue
-
-        # Cap at BOOK_CAP bytes (measured in UTF-8)
-        if len(body.encode("utf-8")) > BOOK_CAP:
-            # Truncate at a word boundary near the cap
-            body_bytes = body.encode("utf-8")[:BOOK_CAP]
-            body = body_bytes.decode("utf-8", errors="ignore").rsplit(" ", 1)[0]
-
-        documents.append(f"# {title}\n# Source: Project Gutenberg #{book_id} (public domain)\n\n{body}")
-        print(f"    OK -- {len(body):,} chars")
-        time.sleep(0.3)  # be polite
-
-    print(f"  Gutenberg: {len(documents)}/{total} books downloaded")
-    return documents
-
-# ---------------------------------------------------------------------------
-# 3. Simple English Wikipedia
-# ---------------------------------------------------------------------------
-
-def fetch_wiki_articles() -> list[str]:
-    """Fetch random articles from Simple English Wikipedia."""
-    documents: list[str] = []
-    fetched_titles: set[str] = set()
-    batches_needed = (WIKI_TARGET_ARTICLES + WIKI_BATCH_SIZE - 1) // WIKI_BATCH_SIZE
-
-    print(f"  Fetching ~{WIKI_TARGET_ARTICLES} articles in batches of {WIKI_BATCH_SIZE} ...")
-
-    for batch_num in range(batches_needed):
-        if len(documents) >= WIKI_TARGET_ARTICLES:
-            break
-
-        # Step 1: get random page titles
-        random_url = (
-            f"{WIKI_API}?action=query&list=random"
-            f"&rnlimit={WIKI_BATCH_SIZE}&rnnamespace=0&format=json"
-        )
-        random_data = fetch_json(random_url)
-        if random_data is None:
-            print(f"    [WARN] Batch {batch_num + 1}: failed to get random titles")
-            time.sleep(1.0)
-            continue
-
-        pages = random_data.get("query", {}).get("random", [])
-        if not pages:
-            continue
-
-        # Deduplicate
-        titles = [p["title"] for p in pages if p["title"] not in fetched_titles]
-        if not titles:
-            continue
-        fetched_titles.update(titles)
-
-        # Step 2: get extracts for these titles
-        titles_param = "|".join(titles)
-        extract_url = (
-            f"{WIKI_API}?action=query&titles={urllib.request.quote(titles_param)}"
-            f"&prop=extracts&explaintext=1&exlimit={WIKI_BATCH_SIZE}&format=json"
-        )
-        extract_data = fetch_json(extract_url)
-        if extract_data is None:
-            print(f"    [WARN] Batch {batch_num + 1}: failed to get extracts")
-            time.sleep(1.0)
-            continue
-
-        query_pages = extract_data.get("query", {}).get("pages", {})
-        batch_count = 0
-        for page_id, page_info in query_pages.items():
-            if page_id == "-1":
+            if "<text" in line:
+                in_text = True
+                # Get text after the tag on same line
+                m = re.search(r'<text[^>]*>(.*)', line)
+                if m:
+                    current_text = [m.group(1)]
+                else:
+                    current_text = []
                 continue
-            title = page_info.get("title", "")
-            extract = page_info.get("extract", "")
-            if not extract or len(extract) < 200:
-                continue  # skip stubs
 
-            doc = f"# {title}\n# Source: Simple English Wikipedia (CC BY-SA)\n\n{extract}"
-            documents.append(doc)
-            batch_count += 1
+            if in_text:
+                if "</text>" in line:
+                    current_text.append(line.split("</text>")[0])
+                    in_text = False
+                    text = "\n".join(current_text)
 
-        if (batch_num + 1) % 10 == 0 or batch_num == 0:
-            print(f"    Batch {batch_num + 1}/{batches_needed}: "
-                  f"{len(documents)} articles so far")
+                    # Skip redirects, stubs, meta pages
+                    if text.startswith("#REDIRECT") or text.startswith("#redirect"):
+                        continue
+                    if len(text) < 500:
+                        continue
+                    if ":" in current_title:  # Skip Wikipedia:, Template:, etc.
+                        continue
 
-        time.sleep(0.5)  # rate-limit
+                    # Strip basic wiki markup
+                    text = re.sub(r'\[\[(?:[^|\]]*\|)?([^\]]*)\]\]', r'\1', text)  # [[link|text]] -> text
+                    text = re.sub(r"'{2,5}", "", text)  # Bold/italic markup
+                    text = re.sub(r'\{\{[^}]*\}\}', '', text)  # Templates
+                    text = re.sub(r'<ref[^>]*>.*?</ref>', '', text, flags=re.DOTALL)  # References
+                    text = re.sub(r'<[^>]+>', '', text)  # HTML tags
+                    text = re.sub(r'\n{3,}', '\n\n', text)  # Excess newlines
 
-    print(f"  Wikipedia: {len(documents)} articles fetched")
-    return documents
+                    if len(text) > 200:
+                        articles.append(f"# {current_title}\n\n{text}")
+                        count += 1
+                        if count % 10000 == 0:
+                            print(f"    {count} articles extracted...")
+                        if max_articles and count >= max_articles:
+                            break
+                else:
+                    current_text.append(line)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    print(f"    Total: {count} articles")
+    return articles
 
-def main() -> None:
-    print("=" * 64)
-    print("  AIDEEN Corpus Fetcher")
-    print("=" * 64)
+
+def fetch_wikipedia():
+    """Download and extract Wikipedia articles."""
+    wiki_sources = [
+        {
+            "name": "Simple English Wikipedia",
+            "url": "https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2",
+            "file": "simplewiki-latest.xml.bz2",
+            "max": None,  # All articles (~200K)
+        },
+        # English Wikipedia is ~22GB compressed. Download separately with:
+        #   wget -c https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2 -O data/corpus/enwiki-latest.xml.bz2
+        # Then re-run this script to extract it.
+        # {
+        #     "name": "English Wikipedia",
+        #     "url": "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2",
+        #     "file": "enwiki-latest.xml.bz2",
+        #     "max": None,
+        # },
+        {
+            "name": "Spanish Wikipedia",
+            "url": "https://dumps.wikimedia.org/eswiki/latest/eswiki-latest-pages-articles.xml.bz2",
+            "file": "eswiki-latest.xml.bz2",
+            "max": None,  # All articles
+        },
+    ]
+
+    total_bytes = 0
+    for src in wiki_sources:
+        print(f"\n{'='*60}")
+        print(f"Source: {src['name']}")
+        print(f"{'='*60}")
+        dest = OUT_DIR / src["file"]
+        if download_file(src["url"], dest, src["name"]):
+            articles = extract_wiki_articles(dest, src.get("max"))
+            # Write incrementally to avoid holding everything in memory
+            with open(CHUNK_FILE, "a", encoding="utf-8") as f:
+                for article in articles:
+                    f.write(article)
+                    f.write("\n\n")
+                    total_bytes += len(article) + 2
+            print(f"  Written: {total_bytes/1e6:.1f} MB cumulative")
+    return total_bytes
+
+
+def fetch_gutenberg():
+    """Download public-domain books from Project Gutenberg."""
+    print(f"\n{'='*60}")
+    print(f"Source: Project Gutenberg")
+    print(f"{'='*60}")
+
+    # Top 100 most downloaded + classics
+    book_ids = [
+        1342, 11, 1661, 84, 98, 2701, 1232, 174, 345, 5200,
+        1400, 16, 43, 76, 1952, 219, 2591, 2554, 1080, 74,
+        996, 55, 160, 1260, 844, 768, 2600, 4300, 25344, 1184,
+        2542, 46, 514, 1023, 2814, 35, 6130, 135, 158, 203,
+        3207, 1497, 100, 244, 2852, 120, 730, 205, 36, 209,
+        33, 1322, 113, 23, 408, 30254, 1727, 2148, 105, 2500,
+        4363, 27827, 161, 1399, 3296, 3825, 829, 910, 3090, 19942,
+        28054, 932, 2680, 1998, 2097, 14838, 19033, 41, 45, 947,
+        58585, 28885, 1250, 5740, 2641, 7370, 236, 766, 2160, 541,
+        1257, 521, 375, 158, 30, 394, 420, 8800, 2197, 6761,
+    ]
+
+    texts = []
+    for bid in book_ids:
+        urls = [
+            f"https://www.gutenberg.org/cache/epub/{bid}/pg{bid}.txt",
+            f"https://www.gutenberg.org/files/{bid}/{bid}-0.txt",
+        ]
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "AideenCorpusFetcher/1.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                # Strip Gutenberg header/footer
+                start = text.find("*** START")
+                if start < 0:
+                    start = text.find("***START")
+                end = text.find("*** END")
+                if end < 0:
+                    end = text.find("***END")
+                if start > 0 and end > start:
+                    text = text[start + 80:end]
+                if len(text) > 1000:
+                    texts.append(text)
+                    print(f"  Book {bid}: {len(text)/1e3:.0f} KB")
+                    break
+            except Exception:
+                continue
+        time.sleep(0.3)  # Be polite to Gutenberg servers
+
+    result = "\n\n".join(texts)
+    print(f"  Total Gutenberg: {len(result)/1e6:.1f} MB ({len(texts)} books)")
+    return result
+
+
+def main():
+    print("AIDEEN Corpus Fetcher")
+    print(f"Output: {CHUNK_FILE.absolute()}")
+    print(f"Storage: {OUT_DIR.absolute()}")
     print()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    all_parts: list[str] = []
+    # Start fresh
+    if CHUNK_FILE.exists():
+        CHUNK_FILE.unlink()
 
     # 1. Existing corpus
-    print("[1/3] Existing corpus (train_aideen.txt)")
-    existing = load_existing_corpus()
-    if existing:
-        all_parts.append(existing)
-    print()
+    existing = Path("train_aideen.txt")
+    if existing.exists():
+        text = existing.read_text(errors="replace")
+        with open(CHUNK_FILE, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n\n")
+        print(f"Existing corpus: {len(text)/1e6:.1f} MB")
 
-    # 2. Project Gutenberg
-    print("[2/3] Project Gutenberg (public domain books)")
-    gutenberg_docs = fetch_gutenberg_books()
-    for doc in gutenberg_docs:
-        all_parts.append(doc)
-    print()
+    # 2. Wikipedia (writes incrementally to CHUNK_FILE)
+    wiki_bytes = fetch_wikipedia()
 
-    # 3. Simple English Wikipedia
-    print("[3/3] Simple English Wikipedia")
-    wiki_docs = fetch_wiki_articles()
-    for doc in wiki_docs:
-        all_parts.append(doc)
-    print()
+    # 3. Gutenberg (append)
+    gut_text = fetch_gutenberg()
+    if gut_text:
+        with open(CHUNK_FILE, "a", encoding="utf-8") as f:
+            f.write(gut_text)
 
-    # Assemble
-    print("Assembling corpus ...")
-    corpus = DOC_SEP.join(all_parts)
-
-    OUTPUT_FILE.write_text(corpus, encoding="utf-8")
-    size_bytes = OUTPUT_FILE.stat().st_size
-    size_mb = size_bytes / 1_048_576
-
-    print(f"Wrote {OUTPUT_FILE}")
-    print(f"  Total size : {size_mb:.2f} MB ({size_bytes:,} bytes)")
-    print(f"  Documents  : {len(all_parts):,}")
-    print()
-    print("Next step: python scripts/tokenize_corpus.py")
+    # Report
+    total_size = CHUNK_FILE.stat().st_size if CHUNK_FILE.exists() else 0
+    print(f"\n{'='*60}")
+    print(f"CORPUS COMPLETE")
+    print(f"{'='*60}")
+    print(f"  Total size: {total_size/1e6:.1f} MB ({total_size/1e9:.2f} GB)")
+    print(f"  Output: {CHUNK_FILE.absolute()}")
+    print(f"  Approx tokens (at 4 chars/token): ~{total_size//4:,}")
 
 
 if __name__ == "__main__":
