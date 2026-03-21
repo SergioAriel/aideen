@@ -8,6 +8,8 @@ use aideen_core::{
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::cell::RefCell;
 
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
@@ -191,12 +193,13 @@ impl MambaSlotReasoning {
         // para garantizar σ(J_attn) << 1 antes del primer token de entrenamiento.
         // residual_alpha=0.0 es necesario — incluso alpha=0.2 lleva contr→1.
         let deq_threshold = 0.10_f32;
+        let win_threshold = 0.30_f32;
         let n_iter = 20;
         spectral_norm::normalize_if_needed(&mut w_q, deq_threshold, n_iter);
         spectral_norm::normalize_if_needed(&mut w_k, deq_threshold, n_iter);
         spectral_norm::normalize_if_needed(&mut w_v, deq_threshold, n_iter);
         spectral_norm::normalize_if_needed(&mut w_o, deq_threshold, n_iter);
-        spectral_norm::normalize_if_needed(&mut w_in, deq_threshold, n_iter);
+        spectral_norm::normalize_if_needed(&mut w_in, win_threshold, n_iter);
 
         let hist_slot_scale = DMatrix::from_fn(h_slots, d_r, |slot, _| {
             // Keep multiplicative history adaptation off at initialization. A non-zero
@@ -254,18 +257,53 @@ impl MambaSlotReasoning {
         self
     }
 
+    /// Returns W_in as a flat GPU buffer: per-slot W_in with deterministic jitter.
+    /// This breaks slot symmetry at step 1 while keeping σ(W_in) bounded.
+    pub fn w_in_gpu_flat(&self) -> Vec<f32> {
+        let h_slots = self.config.h_slots;
+        let d_r = self.config.d_r;
+        let base = Self::matrix_to_row_major(&self.w_in);
+        let mut hasher = DefaultHasher::new();
+        for v in &base {
+            hasher.write_u32(v.to_bits());
+        }
+        let seed = hasher.finish();
+        let mut out = Vec::with_capacity(h_slots * base.len());
+        let attn_t = 0.10_f32;
+        let win_t = 0.30_f32;
+        let n_iter = 20;
+        // Disable per-slot jitter to remove seed-dependent W_in variance during diagnosis.
+        let jitter = 0.0_f32;
+        for s in 0..h_slots {
+            let slot_seed = seed ^ (s as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let mut mat = self.w_in.clone();
+            if jitter > 0.0 {
+                let mut rng = StdRng::seed_from_u64(slot_seed);
+                for r in 0..d_r {
+                    for c in 0..d_r {
+                        mat[(r, c)] += rng.gen_range(-jitter..jitter);
+                    }
+                }
+            }
+            spectral_norm::normalize_if_needed(&mut mat, win_t, n_iter);
+            out.extend_from_slice(&Self::matrix_to_row_major(&mat));
+        }
+        out
+    }
+
     pub fn renormalize_weights(&mut self) {
         // Umbral 0.10 para matrices de atención — necesario para mantener σ(J_attn) < 1
         // durante el entrenamiento (no solo en la inicialización).
         // w_x y w_out (Mamba externo) usan umbral 0.70 — no afectan la contractividad del DEQ.
         let attn_t = 0.10_f32;
+        let win_t = 0.30_f32;
         let mamba_t = 0.70_f32;
         let n = 20;
         spectral_norm::normalize_if_needed(&mut self.w_q, attn_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_k, attn_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_v, attn_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_o, attn_t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_in, attn_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_in, win_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_hist_shared, 1.5, n);
         spectral_norm::normalize_if_needed(&mut self.w_x, mamba_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_out, mamba_t, n);

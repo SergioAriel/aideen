@@ -98,7 +98,10 @@ pub struct Trainer {
     pub emergency_left: u32,
     pub last_max_h: f32,
     pub max_h_growth_streak: u32,
+    pub max_delta_hi_streak: u32,
+    pub invalid_hi_streak: u32,
     pub contractivity_hi_streak: u32,
+    pub force_renorm_done: bool,
 
     // --- v14 Temporal Memory State ---
     pub m_prev: Option<HSlots>,
@@ -232,7 +235,7 @@ impl Trainer {
             frozen_lm: false,
             eval_mode: false,
             // --- v13.2 Stability Oracle ---
-            adaptive_max_iters: 6,
+            adaptive_max_iters: 12,
             adaptive_damping: 0.85,
             adaptive_cg_iters: 8,
             hit_hi_streak: 0,
@@ -242,7 +245,10 @@ impl Trainer {
             emergency_left: 0,
             last_max_h: 0.0,
             max_h_growth_streak: 0,
+            max_delta_hi_streak: 0,
+            invalid_hi_streak: 0,
             contractivity_hi_streak: 0,
+            force_renorm_done: false,
             m_prev: None,
         };
         trainer.apply_experimental_profile_from_env();
@@ -287,7 +293,7 @@ impl Trainer {
             frozen_emb: false,
             frozen_lm: false,
             eval_mode: false,
-            adaptive_max_iters: 6,
+            adaptive_max_iters: 12,
             adaptive_damping: 0.85,
             adaptive_cg_iters: 8,
             hit_hi_streak: 0,
@@ -297,7 +303,10 @@ impl Trainer {
             emergency_left: 0,
             last_max_h: 0.0,
             max_h_growth_streak: 0,
+            max_delta_hi_streak: 0,
+            invalid_hi_streak: 0,
             contractivity_hi_streak: 0,
+            force_renorm_done: false,
             m_prev: None,
         };
         trainer.apply_experimental_profile_from_env();
@@ -504,7 +513,7 @@ impl Trainer {
                         self.reasoning.w_k.as_slice(),
                         self.reasoning.w_v.as_slice(),
                         self.reasoning.w_o.as_slice(),
-                        self.reasoning.w_in.as_slice(),
+                        &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
                         self.reasoning.a_log.as_slice(),
@@ -519,6 +528,12 @@ impl Trainer {
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
+                }
+                // TEST-ONLY: force one spectral renorm before the first step.
+                // Disabled by default; set AIDEEN_DEQ_FORCE_RENORM=1 in tests only.
+                if !self.force_renorm_done && Self::env_flag("AIDEEN_DEQ_FORCE_RENORM") {
+                    let _ = gpu.renormalize_spectral();
+                    self.force_renorm_done = true;
                 }
 
                 // Pipeline GPU fused
@@ -668,7 +683,7 @@ impl Trainer {
                             self.reasoning.w_k.as_slice(),
                             self.reasoning.w_v.as_slice(),
                             self.reasoning.w_o.as_slice(),
-                            self.reasoning.w_in.as_slice(),
+                            &self.reasoning.w_in_gpu_flat(),
                             self.reasoning.w_x.as_slice(),
                             self.reasoning.w_out.as_slice(),
                             self.reasoning.a_log.as_slice(),
@@ -1058,7 +1073,7 @@ impl Trainer {
                     self.reasoning.w_k.as_slice(),
                     self.reasoning.w_v.as_slice(),
                     self.reasoning.w_o.as_slice(),
-                    self.reasoning.w_in.as_slice(),
+                    &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
                     self.reasoning.a_log.as_slice(),
@@ -1247,7 +1262,17 @@ impl Trainer {
                     .write_buffer(&gpu.bridge.hnext_buf, 0, bytemuck::cast_slice(&h_init));
             } else {
                 // train_sequence path: use token sequence embeddings.
-                let _ = gpu_emb.prepare_sequence_gpu_only(&gpu.device, &gpu.queue, context);
+                let emb_needs_upload = !self.gpu_emb_weights_uploaded;
+                let _ = gpu_emb.gather_only(
+                    &gpu.queue,
+                    &gpu.device,
+                    context,
+                    self.tokenizer.embeddings.as_slice(),
+                    emb_needs_upload,
+                );
+                if emb_needs_upload {
+                    self.gpu_emb_weights_uploaded = true;
+                }
                 let mut conn_enc =
                     gpu.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1293,6 +1318,11 @@ impl Trainer {
             let invalid_fixed_point =
                 contractivity > 1.0 && max_delta > self.config.deq_epsilon * 10.0;
             if invalid_fixed_point {
+                self.invalid_hi_streak += 1;
+            } else {
+                self.invalid_hi_streak = 0;
+            }
+            if self.invalid_hi_streak >= 3 {
                 eprintln!(
                     "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
                     self.optimizer.step_count(),
@@ -1301,8 +1331,9 @@ impl Trainer {
                     max_delta,
                     seq
                 );
+                self.invalid_hi_streak = 0;
                 self.emergency_left = 3;
-                self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(24);
+                self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
                 #[cfg(feature = "wgpu")]
                 let _ = gpu.renormalize_spectral();
                 lm_lr = 0.0;
@@ -1348,8 +1379,10 @@ impl Trainer {
                 return current_loss;
             }
 
-            if !self.frozen_deq {
+            if !self.frozen_deq && !invalid_fixed_point {
                 // ⑥ Backward DEQ — Picard Adjoint (GPU, siempre).
+                // Skip when DEQ diverged (invalid_fixed_point): gradients from a non-converged
+                // forward pass are unreliable (∂L/∂θ via implicit diff requires h* to exist).
                 // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
                 // aplica el weight update completo en GPU. Un solo path, siempre correcto.
                 let seq_len = targets_u32.len() as u32;
@@ -1371,9 +1404,20 @@ impl Trainer {
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
-                // CPU PATH — por las dudas, si GPU no disponible.
-                // Para activar: comentar el bloque GPU de arriba y descomentar este bloque.
-                // Recalcula h* en CPU, corre CG, aplica weight update en CPU y re-sube a GPU.
+                // =============================================================================
+                // [LEGACY — NO UTILIZADO] CPU fallback path (CG en CPU con h* leído del GPU).
+                //
+                // Reemplazado por: run_staged_adjoint_picard_no_readback() + apply_fused_deq_update()
+                // (path GPU completo, líneas arriba de este bloque).
+                //
+                // Este bloque nunca ejecuta (if false). Lo que hace:
+                //   1. Lee h* del GPU, recalcula en CPU via reasoning.step()
+                //   2. Corre deq_implicit_grad (CG numérico con finite differences)
+                //   3. Aplica weight update en CPU y re-sube todo a GPU
+                //
+                // Problemas: latencia de readback, CG escalar (O(N²) por iter),
+                // no soporta W_hist ni hist_gate (solo W_q/W_k/W_v/W_o/W_in/NormScale).
+                // =============================================================================
                 if false {
                     // Strict path: CPU CG with GPU's h_star.
                     // Reads h_star from hnext_buf after GPU forward, then uses numerical
@@ -1537,7 +1581,7 @@ impl Trainer {
                         self.reasoning.w_k.as_slice(),
                         self.reasoning.w_v.as_slice(),
                         self.reasoning.w_o.as_slice(),
-                        self.reasoning.w_in.as_slice(),
+                        &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
                         self.reasoning.a_log.as_slice(),
@@ -1608,20 +1652,39 @@ impl Trainer {
                 let attn_max = if fw.len() > 31 { fw[31] } else { 0.0 };
                 let attn_entropy = if fw.len() > 32 { fw[32] } else { 0.0 };
                 let combined_rms = if fw.len() > 33 { fw[33] } else { 0.0 };
-                let hist0 = if fw.len() > 40 { fw[40] } else { 0.0 };
-                let hist1 = if fw.len() > 41 { fw[41] } else { 0.0 };
-                let hist2 = if fw.len() > 42 { fw[42] } else { 0.0 };
-                let hist_anchor0 = if fw.len() > 43 { fw[43] } else { 0.0 };
-                let hist_anchor1 = if fw.len() > 44 { fw[44] } else { 0.0 };
-                let hist_rms_floor = if fw.len() > 45 { fw[45] } else { 0.0 };
-                let hist_contr_floor = if fw.len() > 46 { fw[46] } else { 0.0 };
-                let hist_inject = if fw.len() > 47 { fw[47] } else { 0.0 };
-                let hist_minner_zero = if fw.len() > 48 { fw[48] } else { 0.0 };
-                let hist_force_nomamba = if fw.len() > 49 { fw[49] } else { 0.0 };
-                let hist_prelude_skip = if fw.len() > 50 { fw[50] } else { 0.0 };
-                let hist_loop_force_nomamba = if fw.len() > 51 { fw[51] } else { 0.0 };
+                let hist0 = if fw.len() > 100 { fw[100] } else { 0.0 };
+                let hist1 = if fw.len() > 101 { fw[101] } else { 0.0 };
+                let hist2 = if fw.len() > 102 { fw[102] } else { 0.0 };
+                let hist_anchor0 = if fw.len() > 103 { fw[103] } else { 0.0 };
+                let hist_anchor1 = if fw.len() > 104 { fw[104] } else { 0.0 };
+                let hist_rms_floor = if fw.len() > 105 { fw[105] } else { 0.0 };
+                let hist_contr_floor = if fw.len() > 106 { fw[106] } else { 0.0 };
+                let hist_inject = if fw.len() > 107 { fw[107] } else { 0.0 };
+                let hist_minner_zero = if fw.len() > 108 { fw[108] } else { 0.0 };
+                let hist_force_nomamba = if fw.len() > 109 { fw[109] } else { 0.0 };
+                let hist_prelude_skip = if fw.len() > 110 { fw[110] } else { 0.0 };
+                let hist_loop_force_nomamba = if fw.len() > 111 { fw[111] } else { 0.0 };
 
                 let trunc_str = if trunc_flag >= 0.5 { "TRUNC" } else { "OK" };
+
+                if std::env::var("AIDEEN_DEQ_WV_DEBUG").ok().as_deref() == Some("1") {
+                    if let Ok((_, _, wv, _, _, _, _, _, _)) = gpu.read_weights() {
+                        let mut max_abs = 0.0f32;
+                        let mut sum_abs = 0.0f32;
+                        for v in &wv {
+                            let av = v.abs();
+                            if av > max_abs {
+                                max_abs = av;
+                            }
+                            sum_abs += av;
+                        }
+                        let mean_abs = sum_abs / (wv.len().max(1) as f32);
+                        println!(
+                            "    \x1b[90m[GPU-WV] abs_mean={:.6e} max_abs={:.6e}\x1b[0m",
+                            mean_abs, max_abs
+                        );
+                    }
+                }
 
                 let seq = heartbeat.max(1.0);
                 let hit = hit_count.max(0.0);
@@ -1715,16 +1778,24 @@ impl Trainer {
                     self.max_h_growth_streak = 0;
                 }
 
-                // EMERGENCY Triggers: crecimiento rápido, NaNs, residuo inaceptable (>1e-2) o Divergencia (>1.05)
+                if max_delta > 5e-1 {
+                    self.max_delta_hi_streak += 1;
+                } else {
+                    self.max_delta_hi_streak = 0;
+                }
+
+                // EMERGENCY Triggers: crecimiento rápido, NaNs, residuo inaceptable sostenido
+                // o Divergencia (>1.20).
                 if self.max_h_growth_streak >= 3
+                    || self.max_delta_hi_streak >= 3
                     || max_h.is_nan()
                     || max_delta.is_nan()
-                    || max_delta > 5e-1
                     || contractivity > 1.20
                 {
                     self.emergency_left = 3; // 3 windows de debug (~30 steps)
-                    self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(24);
+                    self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
                     self.max_h_growth_streak = 0;
+                    self.max_delta_hi_streak = 0;
                     // Trigger spectral renorm immediately
                     #[cfg(feature = "wgpu")]
                     let _ = gpu.renormalize_spectral();
@@ -1793,6 +1864,49 @@ impl Trainer {
                     trunc_str,
                     total_elems
                 );
+                let hist_w_grad = fw.get(64).copied().unwrap_or(0.0);
+                let hist_w_step = fw.get(65).copied().unwrap_or(0.0);
+                let hist_w_before = fw.get(66).copied().unwrap_or(0.0);
+                let hist_w_after = fw.get(67).copied().unwrap_or(0.0);
+                let hist_gate_grad = fw.get(68).copied().unwrap_or(0.0);
+                let hist_gate_step = fw.get(69).copied().unwrap_or(0.0);
+                let hist_gate_before = fw.get(70).copied().unwrap_or(0.0);
+                let hist_gate_after = fw.get(71).copied().unwrap_or(0.0);
+                let hist_lr = fw.get(80).copied().unwrap_or(0.0);
+                let hist_grad_scale = fw.get(81).copied().unwrap_or(0.0);
+                let hist_wd = fw.get(82).copied().unwrap_or(0.0);
+                println!(
+                    "    \x1b[90m[GPU-HIST] W_hist grad/step/before/after={:.3e}/{:.3e}/{:.3e}/{:.3e} gate grad/step/before/after={:.3e}/{:.3e}/{:.3e}/{:.3e} lr={:.3e} gscale={:.3e} wd={:.3e}\x1b[0m",
+                    hist_w_grad,
+                    hist_w_step,
+                    hist_w_before,
+                    hist_w_after,
+                    hist_gate_grad,
+                    hist_gate_step,
+                    hist_gate_before,
+                    hist_gate_after,
+                    hist_lr,
+                    hist_grad_scale,
+                    hist_wd
+                );
+
+                // Per-token debug (slot 0) for small sequences.
+                let seq_len = heartbeat.max(1.0).round() as usize;
+                if seq_len > 0 && seq_len <= 16 {
+                    let base = 200usize;
+                    let mut per_token = String::new();
+                    for t in 0..seq_len {
+                        let idx = base + t * 3;
+                        let h_rms = if fw.len() > idx { fw[idx] } else { 0.0 };
+                        let v_rms = if fw.len() > idx + 1 { fw[idx + 1] } else { 0.0 };
+                        let a_rms = if fw.len() > idx + 2 { fw[idx + 2] } else { 0.0 };
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut per_token,
+                            format_args!(" t{:02} h={:.3e} v={:.3e} a={:.3e}", t, h_rms, v_rms, a_rms),
+                        );
+                    }
+                    println!("    \x1b[90m[GPU-TOKENS]{}\x1b[0m", per_token);
+                }
             }
 
             return current_loss;
@@ -2063,7 +2177,7 @@ impl Trainer {
                     self.reasoning.w_k.as_slice(),
                     self.reasoning.w_v.as_slice(),
                     self.reasoning.w_o.as_slice(),
-                    self.reasoning.w_in.as_slice(),
+                    &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
                     self.reasoning.a_log.as_slice(),
@@ -2188,7 +2302,7 @@ impl Trainer {
                     self.reasoning.w_k.as_slice(),
                     self.reasoning.w_v.as_slice(),
                     self.reasoning.w_o.as_slice(),
-                    self.reasoning.w_in.as_slice(),
+                    &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
                     self.reasoning.a_log.as_slice(),
@@ -2891,7 +3005,21 @@ impl Trainer {
                 self.reasoning.w_k = to_mat(wk);
                 self.reasoning.w_v = to_mat(wv);
                 self.reasoning.w_o = to_mat(wo);
-                self.reasoning.w_in = to_mat(win);
+                // win is h_slots*d*d — average slots for CPU representation.
+                let d_r = self.config.d_r;
+                let h_slots = self.config.h_slots;
+                let mut win_avg = vec![0.0f32; d_r * d_r];
+                for s in 0..h_slots {
+                    let base = s * d_r * d_r;
+                    for i in 0..d_r * d_r {
+                        win_avg[i] += win[base + i];
+                    }
+                }
+                let inv_slots = 1.0 / h_slots as f32;
+                for v in &mut win_avg {
+                    *v *= inv_slots;
+                }
+                self.reasoning.w_in = to_mat(win_avg);
                 self.reasoning.w_x = to_mat(wx);
                 self.reasoning.w_out = to_mat(wout);
                 self.reasoning.a_log = nalgebra::DVector::from_column_slice(&alog);

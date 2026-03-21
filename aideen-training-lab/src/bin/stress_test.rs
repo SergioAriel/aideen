@@ -72,8 +72,15 @@ fn main() {
 
     let tok = Tokenizer::from_text(PROMPT, config.clone());
     let tokens = tok.encode(PROMPT);
-    let train_tokens = &tokens[..tokens.len() - 1];
-    let targets = &tokens[1..];
+    let mut train_tokens = &tokens[..tokens.len() - 1];
+    let mut targets = &tokens[1..];
+    if let Some(seq_len) = env_u32("AIDEEN_STRESS_SEQ_LEN") {
+        let seq_len = seq_len as usize;
+        if seq_len >= 2 && tokens.len() >= seq_len {
+            train_tokens = &tokens[..seq_len - 1];
+            targets = &tokens[1..seq_len];
+        }
+    }
 
     let mut trainer = Trainer::from_tokenizer_seeded(tok, lr, seed);
     trainer.config = config;

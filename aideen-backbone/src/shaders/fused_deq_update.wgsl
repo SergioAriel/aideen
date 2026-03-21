@@ -41,7 +41,7 @@ fn entry_base(entry: u32, d: u32) -> u32 {
 }
 
 fn scratch_stride(d: u32, h_slots: u32) -> u32 {
-    return d * (h_slots * 6u + 1u) + h_slots * h_slots;
+    return d * (h_slots * 7u) + h_slots * h_slots;
 }
 
 fn hist_mat_len(d: u32) -> u32 {
@@ -78,6 +78,50 @@ fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 {
 
 fn hist_warmup_base(d: u32, h_slots: u32) -> u32 {
     return hist_selective_flag_base(d, h_slots) + 1u;
+}
+
+fn hist_rms_floor_base(d: u32, h_slots: u32) -> u32 {
+    return hist_warmup_base(d, h_slots) + 1u;
+}
+
+fn hist_contr_floor_base(d: u32, h_slots: u32) -> u32 {
+    return hist_rms_floor_base(d, h_slots) + 1u;
+}
+
+fn hist_inject_flag_base(d: u32, h_slots: u32) -> u32 {
+    return hist_contr_floor_base(d, h_slots) + 1u;
+}
+
+fn hist_minner_zero_base(d: u32, h_slots: u32) -> u32 {
+    return hist_inject_flag_base(d, h_slots) + 1u;
+}
+
+fn hist_force_nomamba_base(d: u32, h_slots: u32) -> u32 {
+    return hist_minner_zero_base(d, h_slots) + 1u;
+}
+
+fn hist_prelude_skip_base(d: u32, h_slots: u32) -> u32 {
+    return hist_force_nomamba_base(d, h_slots) + 1u;
+}
+
+fn hist_loop_force_nomamba_base(d: u32, h_slots: u32) -> u32 {
+    return hist_prelude_skip_base(d, h_slots) + 1u;
+}
+
+fn signal_zero_base(d: u32, h_slots: u32) -> u32 {
+    return hist_loop_force_nomamba_base(d, h_slots) + 1u;
+}
+
+fn attn_out_mode_base(d: u32, h_slots: u32) -> u32 {
+    return signal_zero_base(d, h_slots) + 1u;
+}
+
+fn attn_uniform_base(d: u32, h_slots: u32) -> u32 {
+    return attn_out_mode_base(d, h_slots) + 1u;
+}
+
+fn attn_freeze_base(d: u32, h_slots: u32) -> u32 {
+    return attn_uniform_base(d, h_slots) + 1u;
 }
 
 fn hist_alpha_min_target() -> f32 {
@@ -140,7 +184,7 @@ fn token_signal_base(t: u32, d: u32, h_slots: u32) -> u32 {
 }
 
 fn token_minner_base(t: u32, d: u32, h_slots: u32) -> u32 {
-    return token_signal_base(t, d, h_slots) + d;
+    return token_signal_base(t, d, h_slots) + h_slots * d;
 }
 
 var<workgroup> hist_reduce_u: array<f32, 64>;
@@ -191,11 +235,12 @@ fn fused_attn_stage1b_main(
 
     let t = entry / h_slots;
     let qs = entry % h_slots;
-    let scratch_stride = d * (h_slots * 6u + 1u) + h_slots * h_slots;
+    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
     let base = t * scratch_stride;
     let v_base = base + h_slots * d * 2u;
     let signal_base = base + d * (h_slots * 5u);
-    let attn_weight_base = signal_base + d + h_slots * d;
+    let attn_weight_base = signal_base + 2u * h_slots * d;
+    let slot_anchor = slot_anchor_base(d, h_slots);
 
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var mix = 0.0;
@@ -204,7 +249,10 @@ fn fused_attn_stage1b_main(
             let a = Scratch[attn_weight_base + qs * h_slots + ks];
             let k_off = ks * d;
             mix = mix + a * Scratch[v_base + k_off + dim];
-            weighted_h = weighted_h + a * h_star[(t * h_slots * d) + k_off + dim];
+            // V_fixed path: W_v is applied to (signal + slot_anchor), so g_wv must use
+            // the same source vector to keep forward/backward consistent.
+            let src = Scratch[signal_base + k_off + dim] + HistParams[slot_anchor + k_off + dim];
+            weighted_h = weighted_h + a * src;
         }
         let out_idx = entry_base(entry, d) + dim;
         mix_buf[out_idx] = mix;
@@ -224,11 +272,11 @@ fn fused_attn_stage2_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let t = entry / h_slots;
     let qs = entry % h_slots;
-    let scratch_stride = d * (h_slots * 6u + 1u) + h_slots * h_slots;
+    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
     let base = t * scratch_stride;
     let v_base = base + h_slots * d * 2u;
     let signal_base = base + d * (h_slots * 5u);
-    let attn_weight_base = signal_base + d + h_slots * d;
+    let attn_weight_base = signal_base + 2u * h_slots * d;
     let off = entry_base(entry, d);
 
     var g_alpha = 0.0;
@@ -264,7 +312,7 @@ fn fused_attn_stage3_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let t = entry / h_slots;
     let scale = inverseSqrt(max(1.0, f32(d)));
-    let scratch_stride = d * (h_slots * 6u + 1u) + h_slots * h_slots;
+    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
     let base = t * scratch_stride;
     let k_base = base + h_slots * d;
     var gq = 0.0;
@@ -291,7 +339,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var g_wo = 0.0;
     var g_wv = 0.0;
-    var g_win = 0.0;
+    var g_win: array<f32, 16>;  // per-slot W_in gradient (max 16 slots), zero-initialized
     var g_wq = 0.0;
     var g_wk = 0.0;
     let scale = inverseSqrt(max(1.0, f32(d)));
@@ -301,14 +349,16 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let qs = entry % h_slots;
         let q_off = qs * d;
         let off = entry_base(entry, d);
-        let scratch_stride = d * (h_slots * 6u + 1u) + h_slots * h_slots;
+        let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
         let base = t * scratch_stride;
         let q_base = base;
         let g_attn_col = v_adjoint[t * h_slots * d + q_off + col];
         g_wo = g_wo + g_attn_col * mix_buf[off + row];
         g_wv = g_wv + weighted_h_buf[off + row] * gmix_buf[off + col];
-        g_win = g_win + q_input[t * d + row] * g_attn_col;
-        g_wq = g_wq + qgrad_buf[off + row] * h_star[t * h_slots * d + q_off + col];
+        // Per-slot W_in gradient: dL/dW_in_s[row,col] += x[t,row] * adjoint[t,s,col]
+        g_win[qs] = g_win[qs] + q_input[t * d + row] * g_attn_col;
+        let q_src = h_star[t * h_slots * d + q_off + col];
+        g_wq = g_wq + qgrad_buf[off + row] * q_src;
         let q_row = Scratch[q_base + q_off + row];
         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
             let hk_col = h_star[t * h_slots * d + ks * d + col];
@@ -317,7 +367,6 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let seq_scale = 1.0 / max(1.0, f32(n_entries));
-    g_win = g_win * seq_scale;
     g_wv = g_wv * seq_scale;
     g_wo = g_wo * seq_scale;
     g_wq = g_wq * seq_scale;
@@ -326,7 +375,6 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let clip = 0.5;
     let s_wv = clamp(lr * g_wv * grad_scale, -clip, clip);
     let s_wo = clamp(lr * g_wo * grad_scale, -clip, clip);
-    let s_win = clamp(lr * g_win * grad_scale, -clip, clip);
     let s_wq = clamp(lr * g_wq * grad_scale, -clip, clip);
     let s_wk = clamp(lr * g_wk * grad_scale, -clip, clip);
 
@@ -334,14 +382,19 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     W_k[idx] = W_k[idx] * wd_factor - s_wk;
     W_v[idx] = W_v[idx] * wd_factor - s_wv;
     W_o[idx] = W_o[idx] * wd_factor - s_wo;
-    W_in[idx] = W_in[idx] * wd_factor - s_win;
+    // Per-slot W_in update: each slot's matrix at offset s * d * d
+    for (var s = 0u; s < h_slots; s = s + 1u) {
+        let g_win_s = g_win[s] * seq_scale;
+        let s_win_s = clamp(lr * g_win_s * grad_scale, -clip, clip);
+        W_in[s * d * d + idx] = W_in[s * d * d + idx] * wd_factor - s_win_s;
+    }
 
     if (idx == 0u) {
         debug_log[8] = 204.0;
         debug_log[40] = g_wq;
         debug_log[41] = g_wo;
         debug_log[42] = g_wv;
-        debug_log[43] = g_win;
+        debug_log[43] = g_win[0]; // log slot-0 gradient for diagnostics
         debug_log[44] = g_wk;
     }
 }
@@ -407,7 +460,7 @@ fn fused_hist_stage_prep_main(
         }
         qgrad_buf[hist_out + dim] = u;
         local_u_sumsq = local_u_sumsq + u * u;
-        let inj = Scratch[signal_base + dim];
+        let inj = Scratch[signal_base + off + dim];
         local_inj_sumsq = local_inj_sumsq + inj * inj;
     }
     hist_reduce_u[lane] = local_u_sumsq;
@@ -506,17 +559,12 @@ fn fused_hist_stage_mat_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         grad = grad + weighted_h_buf[entry_base(entry, d) + row] * (prev_val / prev_rms);
     }
 
-    // This path already integrates over the full sequence and receives the staged
-    // Picard RHS after slot splitting. Averaging once more by the number of tokens
-    // drives the historical-interface step below f32 resolution under the stable
-    // profile, which is exactly why W_hist stayed frozen while the carrier branch
-    // moved. Keep the exact accumulated reduction and rely on lr/clip for scale.
+    // Normalize by the effective token count to keep updates invariant to seq_len.
+    // Without this, gradients scale with sequence length and can destabilize long runs.
     let idx = row * d + col;
     let clip = 0.5;
-    // Historical-interface gradients are already exact path-specific reductions.
-    // Applying the global DEQ grad_scale here suppresses the branch by ~100x and
-    // prevents W_hist from learning at all under the production stress profile.
-    let step = clamp(params.lr * grad, -clip, clip);
+    let token_norm = 1.0 / max(1.0, f32(n_tokens));
+    let step = clamp(params.lr * (grad * token_norm) * params.grad_scale, -clip, clip);
     let before = HistParams[idx];
     let after = before - step;
     HistParams[idx] = after;
@@ -554,11 +602,11 @@ fn fused_hist_stage_scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         grad = grad + weighted_h_buf[entry_base(entry, d) + dim] * prev_val;
     }
 
-    // Same rationale as W_hist_shared: do not divide away the only signal that can
-    // move the per-slot history scale out of its initialization.
     let idx = hist_scale_base(d, h_slots) + slot * d + dim;
     let clip = 0.5;
-    let step = clamp(params.lr * grad, -clip, clip);
+    let n_tokens = max(1u, params.seq_len) - 1u;
+    let token_norm = 1.0 / max(1.0, f32(n_tokens));
+    let step = clamp(params.lr * (grad * token_norm) * params.grad_scale, -clip, clip);
     HistParams[idx] = HistParams[idx] - step;
 }
 
@@ -603,11 +651,10 @@ fn fused_hist_stage_gate_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let idx = hist_gate_base(d, h_slots) + slot;
     let sigma = hist_gate_sigma(HistParams[idx]);
-    // Gate learns only from the projected historical context. Token averaging here
-    // makes the slot scalar effectively frozen in the stable profile.
-    let gate_grad = 0.20 * sigma * (1.0 - sigma) * grad;
+    let token_norm = 1.0 / max(1.0, f32(params.seq_len) * f32(d));
+    let gate_grad = 0.20 * sigma * (1.0 - sigma) * grad * token_norm;
     let clip = 0.5;
-    let step = clamp(params.lr * gate_grad, -clip, clip);
+    let step = clamp(params.lr * gate_grad * params.grad_scale, -clip, clip);
     let before = HistParams[idx];
     let after = before - step;
     HistParams[idx] = after;
