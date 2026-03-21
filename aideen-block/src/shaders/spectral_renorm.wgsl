@@ -1,13 +1,20 @@
 // AIDEEN Spectral Renormalization – Power Iteration on GPU
-// 7 workgroups (one per matrix: W_q, W_k, W_v, W_o, W_in, W_x, W_out)
+// (6 + h_slots) workgroups: W_q, W_k, W_v, W_o, W_in_0..W_in_{h-1}, W_x, W_out
 // 256 threads per workgroup, each handling one row element.
-// Shared memory: s_u[256] + s_v[256] + s_dot[256] = 3KB
 
 struct SpectralParams {
     d_model:   u32,
     n_iters:   u32,
     attn_threshold: f32,
+    win_threshold: f32,
     mamba_threshold: f32,
+    wv_threshold: f32,
+    wo_threshold: f32,
+    h_slots:   u32,
+    mat_idx:   u32,
+    _pad0:     u32,
+    _pad1:     u32,
+    _pad2:     u32,
 };
 
 @group(0) @binding(0) var<uniform>            params: SpectralParams;
@@ -39,24 +46,29 @@ fn reduce_sum(tid: u32) -> f32 {
     return s_dot[0];
 }
 
-// Runtime-indexed read from one of the 7 matrices (mat_idx is uniform in workgroup).
+// Runtime-indexed read from matrices.
+// mat_idx: 0=W_q, 1=W_k, 2=W_v, 3=W_o, 4...(4+h_slots-1)=W_in slots, (4+h_slots)=W_x, (4+h_slots+1)=W_out
 fn read_W(mat_idx: u32, idx: u32) -> f32 {
+    let h_slots = params.h_slots;
+    let d = params.d_model;
     if (mat_idx == 0u) { return W_q[idx]; }
     if (mat_idx == 1u) { return W_k[idx]; }
     if (mat_idx == 2u) { return W_v[idx]; }
     if (mat_idx == 3u) { return W_o[idx]; }
-    if (mat_idx == 4u) { return W_in[idx]; }
-    if (mat_idx == 5u) { return W_x[idx]; }
-    return W_out[idx]; // mat_idx == 6
+    if (mat_idx < 4u + h_slots) { return W_in[(mat_idx - 4u) * d * d + idx]; }
+    if (mat_idx == 4u + h_slots) { return W_x[idx]; }
+    return W_out[idx];
 }
 
 fn write_W(mat_idx: u32, idx: u32, val: f32) {
+    let h_slots = params.h_slots;
+    let d = params.d_model;
     if (mat_idx == 0u) { W_q[idx]  = val; return; }
     if (mat_idx == 1u) { W_k[idx]  = val; return; }
     if (mat_idx == 2u) { W_v[idx]  = val; return; }
     if (mat_idx == 3u) { W_o[idx]  = val; return; }
-    if (mat_idx == 4u) { W_in[idx] = val; return; }
-    if (mat_idx == 5u) { W_x[idx]  = val; return; }
+    if (mat_idx < 4u + h_slots) { W_in[(mat_idx - 4u) * d * d + idx] = val; return; }
+    if (mat_idx == 4u + h_slots) { W_x[idx] = val; return; }
     W_out[idx] = val;
 }
 
@@ -66,7 +78,7 @@ fn spectral_renorm_main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id)        group_id:  vec3<u32>,
 ) {
-    let mat_idx = group_id.x;  // 0=W_q … 6=W_out
+    let mat_idx = params.mat_idx;  // 0=W_q … (4+h_slots+1)=W_out
     let tid     = local_id.x;
     let d       = params.d_model;
 
@@ -145,7 +157,22 @@ fn spectral_renorm_main(
     }
 
     // --- If σ > threshold, rescale W in-place ---
-    let threshold = select(params.attn_threshold, params.mamba_threshold, mat_idx >= 5u);
+    // Thresholds:
+    // 0..1: W_q/W_k use attn_threshold
+    // 2: W_v uses wv_threshold
+    // 3: W_o uses wo_threshold
+    // 4..(4+h_slots-1): W_in slots use win_threshold
+    // 4+h_slots..: W_x/W_out use mamba_threshold
+    var threshold = params.attn_threshold;
+    if (mat_idx == 2u) {
+        threshold = params.wv_threshold;
+    } else if (mat_idx == 3u) {
+        threshold = params.wo_threshold;
+    } else if (mat_idx >= 4u && mat_idx < 4u + params.h_slots) {
+        threshold = params.win_threshold;
+    } else if (mat_idx >= 4u + params.h_slots) {
+        threshold = params.mamba_threshold;
+    }
     if (sigma > threshold) {
         let scale = threshold / sigma;
         for (var i = 0u; i < items_per_thread; i++) {

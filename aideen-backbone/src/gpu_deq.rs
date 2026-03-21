@@ -169,17 +169,77 @@ impl GpuDeqBackend {
             0.0
         };
         out.push(hist_loop_force_nomamba);
+        let signal_zero = if Self::env_flag("AIDEEN_DEQ_SIGNAL_ZERO") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(signal_zero);
+        let attn_out_mode = Self::env_f32("AIDEEN_DEQ_ATTN_OUT_MODE")
+            .unwrap_or(0.0)
+            .clamp(0.0, 2.0);
+        out.push(attn_out_mode);
+        let attn_uniform = if Self::env_flag("AIDEEN_DEQ_ATTN_UNIFORM") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(attn_uniform);
+        let attn_freeze = if Self::env_flag("AIDEEN_DEQ_ATTN_FREEZE") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(attn_freeze);
+        let v_fixed = if std::env::var("AIDEEN_DEQ_V_FIXED")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false)
+        {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(v_fixed);
+        let v_lag = if Self::env_flag("AIDEEN_DEQ_V_LAG") {
+            1.0
+        } else {
+            0.0
+        };
+        out.push(v_lag);
+        let v_scale = Self::env_f32("AIDEEN_DEQ_V_SCALE")
+            .unwrap_or(1.0)
+            .clamp(0.01, 10.0);
+        out.push(v_scale);
+        let signal_scale = Self::env_f32("AIDEEN_DEQ_SIGNAL_SCALE")
+            .unwrap_or(1.0)
+            .clamp(0.01, 10.0);
+        out.push(signal_scale);
+        // V gating (scalar per slot) — disabled by default.
+        let v_gate_scale = Self::env_f32("AIDEEN_DEQ_V_GATE_SCALE").unwrap_or(0.0);
+        let v_gate_bias = Self::env_f32("AIDEEN_DEQ_V_GATE_BIAS").unwrap_or(0.0);
+        out.push(v_gate_scale);
+        out.push(v_gate_bias);
+        // V normalization (per-slot RMS) with optional learned scale.
+        let v_norm = if Self::env_flag("AIDEEN_DEQ_V_NORM") { 1.0 } else { 0.0 };
+        let v_norm_scale = Self::env_f32("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
+        out.push(v_norm);
+        out.push(v_norm_scale);
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
-        2 * d * d + 3 * h * d + h + d + 9
+        2 * d * d + 3 * h * d + h + d + 21
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let idx = Self::history_params_len(d, h) - 1;
+        let base = 2 * d * d + 3 * h * d + h + d;
+        let idx = base + 1; // warmup is the second scalar after hist_selective flag
         self.queue
             .write_buffer(&self.bridge.hist_params_buf, (idx * 4) as u64, bytemuck::bytes_of(&factor));
     }
@@ -191,7 +251,7 @@ impl GpuDeqBackend {
                 let vl = v.trim().to_ascii_lowercase();
                 vl == "1" || vl == "true" || vl == "yes"
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     fn env_flag(name: &str) -> bool {
@@ -224,20 +284,18 @@ impl GpuDeqBackend {
         if std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1") {
             return -0.75;
         }
-        if std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1") {
-            return -0.5;
-        }
         if std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1") {
             return -0.25;
         }
 
+        // hist_gated (-0.5) is the default mode. Override only if another mode is set.
         let alpha = std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or_else(|| {
-                // v14 Default: 0.0 is mathematically proven to converge 100% of the time.
-                0.0
+                // Default: hist_gated mode (residual_alpha = -0.5 sentinel).
+                -0.5
             });
         alpha
     }
@@ -1447,19 +1505,13 @@ impl GpuDeqBackend {
         }
     }
 
-    fn cg_damping_from_env() -> f32 {
+    fn picard_damping_from_env() -> f32 {
+        // Damping for Picard fixed-point iterations (was: cg_damping_from_env).
+        // hist_gated is default, so 0.90 is the default damping.
         if std::env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1") {
             0.95
-        } else if std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1") {
-            0.90
-        } else if std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1") {
-            0.90
-        } else if std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1") {
-            0.90
-        } else if std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1") {
-            0.90
         } else {
-            0.85
+            0.90
         }
     }
 
@@ -1474,7 +1526,7 @@ impl GpuDeqBackend {
             h_slots: self.config.h_slots as u32,
             cg_iters,
             epsilon: self.config.deq_epsilon,
-            damping: Self::cg_damping_from_env(),
+            damping: Self::picard_damping_from_env(),
             curr_iter: 0,
             _pad0: 0,
             _pad1: 0,
@@ -1532,7 +1584,7 @@ impl GpuDeqBackend {
         );
         queue.submit([]);
         self.device.poll(wgpu::Maintain::Wait);
-        if let Ok((wq_check, _, _, _, win_check, _, _, _, _)) = self.read_weights() {
+        if let Ok((wq_check, wk_check, wv_check, wo_check, win_check, _, _, _, _)) = self.read_weights() {
             let stats = |v: &[f32]| -> (f32, f32, f32) {
                 let min = v.iter().fold(f32::INFINITY, |a, &b| a.min(b));
                 let max = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -1540,10 +1592,17 @@ impl GpuDeqBackend {
                 (min, max, abs_mean)
             };
             let (q_min, q_max, q_abs) = stats(&wq_check);
+            let (k_min, k_max, k_abs) = stats(&wk_check);
+            let (v_min, v_max, v_abs) = stats(&wv_check);
+            let (o_min, o_max, o_abs) = stats(&wo_check);
             let (in_min, in_max, in_abs) = stats(&win_check);
             eprintln!(
-                "[GPU-VERIFY] Post-upload:\n    W_q:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_in: min={:.4}, max={:.4}, abs_mean={:.6}",
-                q_min, q_max, q_abs, in_min, in_max, in_abs
+                "[GPU-VERIFY] Post-upload:\n    W_q:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_k:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_v:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_o:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_in: min={:.4}, max={:.4}, abs_mean={:.6}",
+                q_min, q_max, q_abs,
+                k_min, k_max, k_abs,
+                v_min, v_max, v_abs,
+                o_min, o_max, o_abs,
+                in_min, in_max, in_abs
             );
         }
         self.cg_bridge.sync_weights_from_deq_buffers(
@@ -2073,6 +2132,9 @@ impl GpuDeqBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Staged Picard Zero Buffers"),
             });
+        // Picard adjoint must start from v_state = 0 each call to solve (I - J^T)v = b.
+        // Leaving b_v_out stale carries state across steps and breaks the linear solve.
+        zero_encoder.clear_buffer(&self.cg_bridge.b_v_out, 0, None);
         zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
         // `fused_mix_buf` carries the staged Picard `g_comb` output when we come from the
         // precomputed adjoint path. Hist-gated temporal kernels consume that signal first;
@@ -2402,7 +2464,8 @@ impl GpuDeqBackend {
         //         || std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1")
         //         || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1")
         //         || std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1");
-        let hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1");
+        // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
+        let hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let hist_selective = hist_gated && Self::hist_selective_from_env();
         let hist_internal_probe = std::env::var("AIDEEN_HIST_INTERNAL_PROBE")
             .ok()
@@ -2526,7 +2589,14 @@ impl GpuDeqBackend {
                     let vl = v.trim().to_ascii_lowercase();
                     vl == "1" || vl == "true" || vl == "yes"
                 })
-                .unwrap_or(false);
+                .unwrap_or(hist_selective);
+            let train_hist_delta = std::env::var("AIDEEN_HIST_TRAIN_DELTA")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(hist_selective);
             run_stage(
                 &self.device,
                 &self.queue,
@@ -2538,7 +2608,7 @@ impl GpuDeqBackend {
                 1,
                 profile_fused,
             );
-            let train_hist_temporal = train_hist_carrier || train_hist_alog;
+            let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
             if train_hist_temporal {
                 run_stage(
                     &self.device,
@@ -2603,7 +2673,10 @@ impl GpuDeqBackend {
                     );
                 }
                 let picard_t0 = std::time::Instant::now();
-                self.run_staged_adjoint_picard_no_readback(seq_len, damping, 1, None, false)?;
+                // Rerun Picard for hist temporal updates: rhs_slot must be zero.
+                // Otherwise the historical RHS feeds back into the adjoint solve and
+                // explodes g_comb.
+                self.run_staged_adjoint_picard_no_readback(seq_len, damping, 1, None, true)?;
                 // The staged Picard helper reuses the same uniform buffer and writes a
                 // solver-only UpdateUniforms payload with lr/grad_scale/weight_decay = 0.
                 // All subsequent history/fused update kernels must see the original
@@ -2755,30 +2828,30 @@ impl GpuDeqBackend {
                         d.div_ceil(16),
                         profile_fused,
                     );
-                    if hist_selective {
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_wdelta",
-                            &self.fused_update_hist_wdelta_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(16),
-                            d.div_ceil(16),
-                            profile_fused,
-                        );
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_bdelta",
-                            &self.fused_update_hist_bdelta_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(64),
-                            1,
-                            profile_fused,
-                        );
-                    }
+                }
+                if train_hist_delta && hist_selective {
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "hist_wdelta",
+                        &self.fused_update_hist_wdelta_pipeline,
+                        &self.fused_update_bg0,
+                        &self.fused_update_bg1,
+                        d.div_ceil(16),
+                        d.div_ceil(16),
+                        profile_fused,
+                    );
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "hist_bdelta",
+                        &self.fused_update_hist_bdelta_pipeline,
+                        &self.fused_update_bg0,
+                        &self.fused_update_bg1,
+                        d.div_ceil(64),
+                        1,
+                        profile_fused,
+                    );
                 }
             }
         }
@@ -2860,12 +2933,25 @@ impl GpuDeqBackend {
     /// Spectral renormalization fully on GPU: power iteration on W_q..W_out,
     /// then syncs updated weights to the CG bridge.
     pub fn renormalize_spectral(&self) -> Result<(), String> {
+        let attn_threshold = Self::env_f32("AIDEEN_DEQ_ATTN_THRESHOLD")
+            .unwrap_or(0.10)
+            .max(0.01);
+        let win_threshold = Self::env_f32("AIDEEN_DEQ_WIN_THRESHOLD").unwrap_or(0.30).max(0.05);
+        let wv_threshold = Self::env_f32("AIDEEN_DEQ_WV_THRESHOLD")
+            .unwrap_or(0.50)
+            .max(0.01);
+        let wo_threshold = Self::env_f32("AIDEEN_DEQ_WO_THRESHOLD")
+            .unwrap_or(0.50)
+            .max(0.01);
         self.bridge.renormalize_spectral(
             &self.device,
             &self.queue,
             self.config.d_r as u32,
-            0.10, // W_q/W_k/W_v/W_o/W_in: DEQ operator must stay contractive
+            attn_threshold, // W_q/W_k: keep attention logits stable
+            win_threshold, // W_in only — does not enter J_h, can be larger to carry signal
             0.70, // W_x/W_out: temporal carrier, does not enter J_h of the DEQ solve
+            wv_threshold,
+            wo_threshold,
             12,
         );
         self.cg_bridge.sync_weights_from_deq_buffers(
