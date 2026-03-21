@@ -4,3 +4,10 @@
 .DS_Store
 *.aidn
 dataset.txt
+
+# Model checkpoints and binary data
+*.opt
+*.bin
+
+# Claude memory files
+.claude/

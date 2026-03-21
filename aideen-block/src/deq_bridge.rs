@@ -29,10 +29,19 @@ struct SpectralParams {
     d_model: u32,
     n_iters: u32,
     attn_threshold: f32,
+    win_threshold: f32,
     mamba_threshold: f32,
+    wv_threshold: f32,
+    wo_threshold: f32,
+    h_slots: u32,
+    mat_idx: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 pub struct RustDeqBridge {
+    pub h_slots: u32,
     pub pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
@@ -351,14 +360,14 @@ impl RustDeqBridge {
         });
         let win_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("W_in"),
-            size: (d_model * d_model * 4) as u64,
+            size: (h_slots * d_model * d_model * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let hist_params_len =
-            2u32 * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 9u32;
+            2u32 * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 21u32;
         let hist_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Hist Params"),
             size: (hist_params_len * 4) as u64,
@@ -451,13 +460,18 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // v14 stride por (batch, token):
-        //   q [h*d] + k [h*d] + v [h*d] + attn_out [h*d] + mamba [h*d] + signal [d]
-        //   + final attention weights [h*h] cached for fused backward reuse
+        // Stride por (batch, token):
+        //   q [h*d] + k [h*d] + v [h*d] + attn_out [h*d] + mamba [h*d] + signal [h*d]
+        //   + m_inner [h*d] + attn_weights [h*h]
+        //   = d*(7h) + h²
         // deq_forward.wgsl indexa Scratch como:
         //   (batch_idx * seq_len + t) * scratch_stride
         // por lo que el buffer debe reservar batch * seq_len * stride.
-        let scratch_stride = d_model * (h_slots * 6 + 1) + h_slots * h_slots;
+        //
+        // BUG (viejo): scratch_stride = d_model * (h_slots * 6 + 1) + h_slots * h_slots;
+        // Faltaba la región m_inner [h*d] y "signal [d]" era incorrecto (es [h*d] con W_in per-slot).
+        // Para d=512, h=8: viejo=25152 floats/token, correcto=28736. Escrituras de attn_weights OOB.
+        let scratch_stride = d_model * h_slots * 7 + h_slots * h_slots;
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
             size: (max_batch_size as u64)
@@ -483,7 +497,7 @@ impl RustDeqBridge {
 
         let debug_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Debug Log"),
-            size: 512, // 128 floats
+            size: 2048, // 512 floats (extra space for per-token debug)
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -740,6 +754,7 @@ impl RustDeqBridge {
         });
 
         Self {
+            h_slots,
             pipeline,
             bind_group_layout,
             update_pipeline,
@@ -820,33 +835,48 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         d_model: u32,
         attn_threshold: f32,
+        win_threshold: f32,
         mamba_threshold: f32,
+        wv_threshold: f32,
+        wo_threshold: f32,
         n_iters: u32,
     ) {
-        let params = SpectralParams {
-            d_model,
-            n_iters,
-            attn_threshold,
-            mamba_threshold,
-        };
-        queue.write_buffer(
-            &self.spectral_renorm_params_buf,
-            0,
-            bytemuck::bytes_of(&params),
-        );
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Spectral Renorm Encoder"),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Spectral Renorm Pass"),
-                timestamp_writes: None,
+        let h_slots = self.h_slots;
+        let mat_count = 6 + h_slots;
+        for mat_idx in 0..mat_count {
+            let params = SpectralParams {
+                d_model,
+                n_iters,
+                attn_threshold,
+                win_threshold,
+                mamba_threshold,
+                wv_threshold,
+                wo_threshold,
+                h_slots,
+                mat_idx,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            queue.write_buffer(
+                &self.spectral_renorm_params_buf,
+                0,
+                bytemuck::bytes_of(&params),
+            );
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Spectral Renorm Encoder"),
             });
-            pass.set_pipeline(&self.spectral_renorm_pipeline);
-            pass.set_bind_group(0, &self.spectral_renorm_bg, &[]);
-            pass.dispatch_workgroups(7, 1, 1); // one workgroup per matrix
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Spectral Renorm Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.spectral_renorm_pipeline);
+                pass.set_bind_group(0, &self.spectral_renorm_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            queue.submit(Some(encoder.finish()));
         }
-        queue.submit(Some(encoder.finish()));
     }
 
     pub fn read_weights(
@@ -869,6 +899,7 @@ impl RustDeqBridge {
         &'static str,
     > {
         let mat_size = (d_model * d_model * 4) as u64;
+        let win_size = (self.h_slots * d_model * d_model * 4) as u64;
         let vec_size = (d_model * 4) as u64;
 
         let create_staging = |size| {
@@ -884,7 +915,7 @@ impl RustDeqBridge {
         let st_k = create_staging(mat_size);
         let st_v = create_staging(mat_size);
         let st_o = create_staging(mat_size);
-        let st_in = create_staging(mat_size);
+        let st_in = create_staging(win_size);
         let st_x = create_staging(mat_size);
         let st_out = create_staging(mat_size);
         let st_a = create_staging(vec_size);
@@ -898,7 +929,7 @@ impl RustDeqBridge {
         encoder.copy_buffer_to_buffer(&self.wk_buf, 0, &st_k, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.wv_buf, 0, &st_v, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.wo_buf, 0, &st_o, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.win_buf, 0, &st_in, 0, mat_size);
+        encoder.copy_buffer_to_buffer(&self.win_buf, 0, &st_in, 0, win_size);
         encoder.copy_buffer_to_buffer(&self.wx_buf, 0, &st_x, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.wout_buf, 0, &st_out, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.a_buf, 0, &st_a, 0, vec_size);
