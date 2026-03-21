@@ -368,7 +368,7 @@ impl RustCgBridge {
         let b_wk = create_storage("W_k", buf_size(d_model * d_model));
         let b_wv = create_storage("W_v", buf_size(d_model * d_model));
         let b_wo = create_storage("W_o", buf_size(d_model * d_model));
-        let b_win = create_storage("W_in", buf_size(d_model * d_model));
+        let b_win = create_storage("W_in", buf_size(h_slots * d_model * d_model));
         let b_wx = create_storage("W_x", buf_size(d_model * d_model));
         let b_wout = create_storage("W_out", buf_size(d_model * d_model));
         let b_alog = create_storage("A_log", buf_size(d_model));
@@ -690,7 +690,9 @@ impl RustCgBridge {
         encoder.copy_buffer_to_buffer(wk_src, 0, &self.b_wk, 0, mat_bytes);
         encoder.copy_buffer_to_buffer(wv_src, 0, &self.b_wv, 0, mat_bytes);
         encoder.copy_buffer_to_buffer(wo_src, 0, &self.b_wo, 0, mat_bytes);
-        encoder.copy_buffer_to_buffer(win_src, 0, &self.b_win, 0, mat_bytes);
+        // b_win is h_slots*d*d — copy full buffer
+        let win_bytes = self.b_win.size();
+        encoder.copy_buffer_to_buffer(win_src, 0, &self.b_win, 0, win_bytes);
         encoder.copy_buffer_to_buffer(wx_src, 0, &self.b_wx, 0, mat_bytes);
         encoder.copy_buffer_to_buffer(wout_src, 0, &self.b_wout, 0, mat_bytes);
         encoder.copy_buffer_to_buffer(a_src, 0, &self.b_alog, 0, vec_bytes);
