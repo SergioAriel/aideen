@@ -1,3 +1,18 @@
+// =============================================================================
+// [LEGACY — NO UTILIZADO]
+// Este shader fue reemplazado por staged_adjoint_picard.wgsl.
+//
+// Razones por las que quedó obsoleto:
+//   1. scratch_stride incorrecto: usaba d*(6h+1)+h² en lugar de d*7h+h².
+//      Para d=512, h=8: 25152 vs 28736 floats/token → lecturas de attn_weights OOB.
+//   2. Sin soporte para hist_gated: no conoce m_inner ni slot_anchor.
+//   3. Kernel monolítico: no reutiliza gcomb_buf con apply_fused_deq_update.
+//
+// El path activo es: run_staged_adjoint_picard_no_readback() en gpu_deq.rs
+//   → staged_adjoint_picard.wgsl (picard_init → picard_gcomb → picard_gmix
+//                                  → picard_gscore → picard_accum × N)
+// =============================================================================
+//
 // AIDEEN GPU Kernel: Exact Fused Picard Adjoint Solver
 // Resuelve (I - J_f^T) v = b usando iteraciones de Picard: v_{k+1} = J_f^T v_k + b
 // Matemática derivada del forward en deq_forward.wgsl (RMSNorm + Attention + Damping)
