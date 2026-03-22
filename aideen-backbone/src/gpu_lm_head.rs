@@ -360,9 +360,15 @@ impl GpuLmHeadTrainer {
             mapped_at_creation: false,
         });
 
+        let lm_batch_size = std::env::var("AIDEEN_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let safe_ctx = config.ctx_len.max(1024) * lm_batch_size;
         let h_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM h_pooled"),
-            size: (d_r * config.ctx_len * 4) as u64,
+            size: (d_r * safe_ctx * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -382,7 +388,6 @@ impl GpuLmHeadTrainer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let safe_ctx = config.ctx_len.max(1024);
         let dl_dh_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM dL/dh"),
             size: (safe_ctx * d_r * 4) as u64,
@@ -651,10 +656,16 @@ impl GpuLmHeadTrainer {
         self.last_sampled_indices = sampled_indices.clone();
         self.last_num_samples = actual_num_samples;
 
-        if seq_len > self.config.ctx_len {
+        let lm_batch_cap = std::env::var("AIDEEN_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        if seq_len > self.config.ctx_len * lm_batch_cap {
             return Err(format!(
                 "seq_len {} exceeds architectural limit of {}",
-                seq_len, self.config.ctx_len
+                seq_len,
+                self.config.ctx_len * lm_batch_cap
             ));
         }
 
