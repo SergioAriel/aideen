@@ -381,7 +381,7 @@ fn run_cg_vs_picard_case(
     config.h_slots = 4;
     config.ctx_len = 2;
     config.max_deq_iters = 4;
-    config.cg_iters = 4;
+    config.adj_iters = 4;
 
     let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
 
@@ -433,7 +433,7 @@ fn run_cg_vs_picard_case(
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
-    let cg_shape = gpu.build_cg_shape(seq_len, config.cg_iters as u32);
+    let cg_shape = gpu.build_cg_shape(seq_len, config.adj_iters as u32);
     gpu.cg_bridge
         .run_backward_no_readback(
             &gpu.device,
