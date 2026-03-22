@@ -90,7 +90,7 @@ pub struct Trainer {
     // --- v13.2 Stability Oracle (v13.1 plus upgrade) ---
     pub adaptive_max_iters: u32,
     pub adaptive_damping: f32,
-    pub adaptive_cg_iters: u32,
+    pub adaptive_adj_iters: u32,
     pub hit_hi_streak: u32,
     pub hit_lo_streak: u32,
     pub cg_res_hi_streak: u32,
@@ -189,9 +189,9 @@ impl Trainer {
             // Experimental DEQ stabilization profile.
             self.config.renorm_every_steps = 1;
             self.config.max_deq_iters = self.config.max_deq_iters.min(8).max(4);
-            self.config.cg_iters = self.config.cg_iters.min(8).max(4);
+            self.config.adj_iters = self.config.adj_iters.min(8).max(4);
             self.adaptive_max_iters = self.adaptive_max_iters.min(8).max(4);
-            self.adaptive_cg_iters = self.adaptive_cg_iters.min(8).max(4);
+            self.adaptive_adj_iters = self.adaptive_adj_iters.min(8).max(4);
             self.adaptive_damping = 0.80;
             self.reasoning.damping = self.adaptive_damping;
         }
@@ -237,7 +237,7 @@ impl Trainer {
             // --- v13.2 Stability Oracle ---
             adaptive_max_iters: 12,
             adaptive_damping: 0.85,
-            adaptive_cg_iters: 8,
+            adaptive_adj_iters: 8,
             hit_hi_streak: 0,
             hit_lo_streak: 0,
             cg_res_hi_streak: 0,
@@ -295,7 +295,7 @@ impl Trainer {
             eval_mode: false,
             adaptive_max_iters: 12,
             adaptive_damping: 0.85,
-            adaptive_cg_iters: 8,
+            adaptive_adj_iters: 8,
             hit_hi_streak: 0,
             hit_lo_streak: 0,
             cg_res_hi_streak: 0,
@@ -374,9 +374,6 @@ impl Trainer {
         if reset_state {
             self.reset_state();
         }
-
-        #[cfg(feature = "wgpu")]
-        self.sync_lm_head_from_gpu_if_needed();
 
         #[cfg(feature = "wgpu")]
         {
@@ -477,9 +474,6 @@ impl Trainer {
         }
 
         #[cfg(feature = "wgpu")]
-        self.sync_lm_head_from_gpu_if_needed();
-
-        #[cfg(feature = "wgpu")]
         if self.gpu_deq.is_some() {
             let gpu = self.take_gpu().expect("gpu_deq checked as Some");
 
@@ -509,14 +503,14 @@ impl Trainer {
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
-                        self.reasoning.w_q.as_slice(),
-                        self.reasoning.w_k.as_slice(),
+                        &self.reasoning.w_q_gpu_flat(),
+                        &self.reasoning.w_k_gpu_flat(),
                         self.reasoning.w_v.as_slice(),
                         self.reasoning.w_o.as_slice(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
-                        self.reasoning.a_log.as_slice(),
+                        &self.reasoning.a_log_gpu_flat(),
                         self.reasoning.norm_scale.as_slice(),
                         w_hist_shared_rm.as_slice(),
                         hist_slot_scale_rm.as_slice(),
@@ -686,9 +680,9 @@ impl Trainer {
                             &self.reasoning.w_in_gpu_flat(),
                             self.reasoning.w_x.as_slice(),
                             self.reasoning.w_out.as_slice(),
-                            self.reasoning.a_log.as_slice(),
+                            &self.reasoning.a_log_gpu_flat(),
                             self.reasoning.norm_scale.as_slice(),
-                            self.config.cg_iters as u32,
+                            self.config.adj_iters as u32,
                             needs_cg_upload,
                         ) {
                             self.gpu_cg_weights_uploaded = true;
@@ -704,7 +698,7 @@ impl Trainer {
                                 h,
                                 query,
                                 &dl_dh,
-                                self.config.cg_iters,
+                                self.config.adj_iters,
                             )
                         }
                     } else {
@@ -713,7 +707,7 @@ impl Trainer {
                             h,
                             query,
                             &dl_dh,
-                            self.config.cg_iters,
+                            self.config.adj_iters,
                         )
                     }
                 }
@@ -724,7 +718,7 @@ impl Trainer {
                         h,
                         query,
                         &dl_dh,
-                        self.config.cg_iters,
+                        self.config.adj_iters,
                     )
                 }
             };
@@ -1076,9 +1070,9 @@ impl Trainer {
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
-                    self.reasoning.a_log.as_slice(),
+                    &self.reasoning.a_log_gpu_flat(),
                     self.reasoning.norm_scale.as_slice(),
-                    self.config.cg_iters as u32,
+                    self.config.adj_iters as u32,
                     needs_cg_upload,
                 ) {
                     self.gpu_cg_weights_uploaded = true;
@@ -1229,6 +1223,15 @@ impl Trainer {
         } else {
             base_lr * self.training_config.lm_lr_mult
         };
+
+        // Sync CPU lm_head only when frozen/debug paths need it — not on every training step.
+        #[cfg(feature = "wgpu")]
+        if self.frozen_lm
+            || Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH")
+            || Self::env_flag("AIDEEN_LM_DLDH_PARITY")
+        {
+            self.sync_lm_head_from_gpu_if_needed();
+        }
 
         if let (Some(gpu), Some(gpu_lm), Some(gpu_emb)) =
             (gpu_ctx, self.gpu_lm.as_mut(), self.gpu_emb.as_ref())
@@ -1389,9 +1392,9 @@ impl Trainer {
                 let _ = gpu.run_staged_adjoint_picard_no_readback(
                     seq_len,
                     self.reasoning.damping,
-                    self.config.cg_iters as u32,
+                    self.config.adj_iters as u32,
                     Some(&gpu_lm.dl_dh_buf),
-                    false,
+                    true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                 );
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
@@ -1543,7 +1546,7 @@ impl Trainer {
                         &h_star,
                         &query_vec,
                         &dl_dh_vec,
-                        self.config.cg_iters,
+                        self.config.adj_iters,
                     );
                     Self::clip_grad_norm(&mut v, 1.0);
 
@@ -1577,14 +1580,14 @@ impl Trainer {
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
-                        self.reasoning.w_q.as_slice(),
-                        self.reasoning.w_k.as_slice(),
+                        &self.reasoning.w_q_gpu_flat(),
+                        &self.reasoning.w_k_gpu_flat(),
                         self.reasoning.w_v.as_slice(),
                         self.reasoning.w_o.as_slice(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
-                        self.reasoning.a_log.as_slice(),
+                        &self.reasoning.a_log_gpu_flat(),
                         self.reasoning.norm_scale.as_slice(),
                         w_hist_shared_rm.as_slice(),
                         hist_slot_scale_rm.as_slice(),
@@ -1699,7 +1702,7 @@ impl Trainer {
                     self.cg_res_hi_streak = 0;
                 }
                 if self.cg_res_hi_streak >= 3 {
-                    self.adaptive_cg_iters = (self.adaptive_cg_iters + 4).min(20);
+                    self.adaptive_adj_iters = (self.adaptive_adj_iters + 4).min(20);
                     self.cg_res_hi_streak = 0;
                 }
 
@@ -1890,6 +1893,34 @@ impl Trainer {
                     hist_wd
                 );
 
+                // GPU-SSM per-slot decay diagnostics (activar con AIDEEN_SSM_DEBUG=1).
+                if std::env::var("AIDEEN_SSM_DEBUG").as_deref() == Ok("1") {
+                    let carrier = gpu.read_hist_carrier_params_full();
+                    let d_r = self.config.d_r;
+                    let h_slots = self.config.h_slots;
+                    let a_offset = 2 * d_r * d_r; // after wx + wout
+                    if carrier.len() >= a_offset + h_slots * d_r {
+                        let mut a_means = Vec::with_capacity(h_slots);
+                        let mut a_spreads = Vec::with_capacity(h_slots);
+                        for s in 0..h_slots {
+                            let slice = &carrier[a_offset + s * d_r..a_offset + (s + 1) * d_r];
+                            let a_vals: Vec<f32> = slice.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+                            let mean = a_vals.iter().sum::<f32>() / d_r as f32;
+                            let spread = a_vals.iter().map(|&v| (v - mean).abs()).sum::<f32>() / d_r as f32;
+                            a_means.push(mean);
+                            a_spreads.push(spread);
+                        }
+                        let fmt_vec = |v: &[f32]| v.iter().map(|x| format!("{:.3}", x)).collect::<Vec<_>>().join(",");
+                        println!(
+                            "    \x1b[90m[GPU-SSM] Step {}: a_mean=[{}] a_spread=[{}] mamba_rms={:.3e}\x1b[0m",
+                            self.optimizer.step_count() % 100,
+                            fmt_vec(&a_means),
+                            fmt_vec(&a_spreads),
+                            mamba_rms,
+                        );
+                    }
+                }
+
                 // Per-token debug (slot 0) for small sequences.
                 let seq_len = heartbeat.max(1.0).round() as usize;
                 if seq_len > 0 && seq_len <= 16 {
@@ -1977,7 +2008,7 @@ impl Trainer {
                 (12, 16)
             };
             self.adaptive_max_iters = self.adaptive_max_iters.clamp(floor, cap);
-            self.config.cg_iters = if deq_progress < 0.25 {
+            self.config.adj_iters = if deq_progress < 0.25 {
                 6
             } else if deq_progress < 0.60 {
                 8
@@ -2180,11 +2211,12 @@ impl Trainer {
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
-                    self.reasoning.a_log.as_slice(),
+                    &self.reasoning.a_log_gpu_flat(),
                     self.reasoning.norm_scale.as_slice(),
                     needs_upload,
                 ) {
                     self.gpu_weights_uploaded = true;
+                    self.sync_lm_head_from_gpu_if_needed();
                     let d_r = self.config.d_r;
                     let last_h = h_pooled.chunks(d_r).last().unwrap();
                     let h_pooled = nalgebra::DVector::from_column_slice(last_h);
@@ -2305,11 +2337,12 @@ impl Trainer {
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
-                    self.reasoning.a_log.as_slice(),
+                    &self.reasoning.a_log_gpu_flat(),
                     self.reasoning.norm_scale.as_slice(),
                     needs_upload,
                 ) {
                     self.gpu_weights_uploaded = true;
+                    self.sync_lm_head_from_gpu_if_needed();
                     let d_r = self.config.d_r;
                     let last_h = h_pooled.chunks(d_r).last().unwrap();
                     let h_pooled = nalgebra::DVector::from_column_slice(last_h);
@@ -2471,7 +2504,7 @@ impl Trainer {
                 12
             };
             self.adaptive_max_iters = self.adaptive_max_iters.max(sched_floor);
-            self.config.cg_iters = if deq_progress < 0.25 {
+            self.config.adj_iters = if deq_progress < 0.25 {
                 4
             } else if deq_progress < 0.60 {
                 6
@@ -2850,8 +2883,8 @@ impl Trainer {
             self.adaptive_damping.to_string(),
         );
         model.metadata.insert(
-            "adaptive_cg_iters".to_string(),
-            self.adaptive_cg_iters.to_string(),
+            "adaptive_adj_iters".to_string(),
+            self.adaptive_adj_iters.to_string(),
         );
         model.metadata.insert(
             "damping_boost_left".to_string(),
@@ -2954,10 +2987,10 @@ impl Trainer {
         }
         if let Some(v) = model
             .metadata
-            .get("adaptive_cg_iters")
+            .get("adaptive_adj_iters")
             .and_then(|s| s.parse().ok())
         {
-            trainer.adaptive_cg_iters = v;
+            trainer.adaptive_adj_iters = v;
         }
         if let Some(v) = model
             .metadata
@@ -3001,8 +3034,15 @@ impl Trainer {
                     let d_r = self.config.d_r;
                     nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
                 };
-                self.reasoning.w_q = to_mat(wq);
-                self.reasoning.w_k = to_mat(wk);
+                // wq/wk contain [d*d matrix | h_slots*d bias] — split before assigning.
+                {
+                    let d_r = self.config.d_r;
+                    let h_slots = self.config.h_slots;
+                    self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(d_r, d_r, &wq[..d_r*d_r]);
+                    self.reasoning.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[d_r*d_r..]);
+                    self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &wk[..d_r*d_r]);
+                    self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[d_r*d_r..]);
+                }
                 self.reasoning.w_v = to_mat(wv);
                 self.reasoning.w_o = to_mat(wo);
                 // win is h_slots*d*d — average slots for CPU representation.
@@ -3022,7 +3062,11 @@ impl Trainer {
                 self.reasoning.w_in = to_mat(win_avg);
                 self.reasoning.w_x = to_mat(wx);
                 self.reasoning.w_out = to_mat(wout);
-                self.reasoning.a_log = nalgebra::DVector::from_column_slice(&alog);
+                {
+                    let h_slots = self.reasoning.config.h_slots;
+                    let d_r = self.reasoning.config.d_r;
+                    self.reasoning.a_log = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
+                }
                 self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
                 self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
                 self.gpu_cg_weights_uploaded = true;
@@ -3110,7 +3154,7 @@ mod tests {
         let tokens = tok.encode(text);
         let mut trainer = Trainer::from_tokenizer(tok, 0.01);
         trainer.config.max_deq_iters = 20;
-        trainer.config.cg_iters = 5;
+        trainer.config.adj_iters = 5;
         (trainer, tokens)
     }
 
