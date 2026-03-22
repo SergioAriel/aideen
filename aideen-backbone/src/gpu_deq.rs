@@ -1,4 +1,3 @@
-use aideen_block::cg_bridge::RustCgBridge;
 use aideen_block::deq_bridge::{
     DeqComputeShape, RustDeqBridge,
     aw_wqk_bytes, aw_wk_byte_off, aw_wv_byte_off, aw_wo_byte_off,
@@ -24,6 +23,13 @@ struct UpdateUniforms {
     grad_accum_mode: u32,  // 0=direct update, 1=accumulate into AllGradients
     n_accum: u32,          // accumulation count (for apply_grad_update_main)
     n_total_weights: u32,  // total AllWeights elements (for apply_grad_update_main)
+    batch_size: u32,       // number of sequences processed in parallel
+}
+
+/// Minimal buffers needed by the Picard adjoint path (replaces the old RustCgBridge).
+pub struct AdjointBuffers {
+    pub b_dl: wgpu::Buffer,    // ∂L/∂h input for the Picard adjoint (size: ctx_len × d_model)
+    pub b_v_out: wgpu::Buffer, // adjoint state v output       (size: ctx_len × h_slots × d_model)
 }
 
 /// Abstracción del DEQ vía GPU (WGPU).
@@ -34,7 +40,7 @@ pub struct GpuDeqBackend {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub bridge: RustDeqBridge,
-    pub cg_bridge: RustCgBridge,
+    pub adj_bufs: AdjointBuffers,
 
     // Fused update pipeline
     fused_adjoint_picard_pipeline: wgpu::ComputePipeline,
@@ -361,14 +367,13 @@ impl GpuDeqBackend {
             }
         };
 
-        // Forward DEQ and backward CG do not use the same geometry:
-        // - Forward DEQ processes one sequence as batch=1, seq_len=T
-        // - CG/fused backward processes per-token pooled gradients as batch=T
-        // Sizing both bridges with the same "safe_batch" corrupts the intended layout.
-        let forward_batch_cap = 1u32;
+        // Read batch_size from env — scales all forward+backward buffers.
+        let forward_batch_cap = std::env::var("AIDEEN_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1);
         let forward_seq_cap = config.ctx_len.max(1) as u32;
-        let cg_batch_cap = config.ctx_len.max(1) as u32;
-
         // RustDeqBridge::new(device, d_model, h_slots, max_batch_size, max_seq_len)
         let bridge = RustDeqBridge::new(
             &device,
@@ -378,12 +383,23 @@ impl GpuDeqBackend {
             forward_seq_cap,
         );
 
-        let cg_bridge = RustCgBridge::new(
-            &device,
-            config.d_r as u32,
-            config.h_slots as u32,
-            cg_batch_cap,
-        );
+        // AdjointBuffers: only the two buffers actually used by the Picard adjoint.
+        let adj_batch = forward_batch_cap as u64;
+        let adj_seq_cap = config.ctx_len.max(1) as u64;
+        let adj_d = config.d_r as u64;
+        let adj_h = config.h_slots as u64;
+        let adj_dl_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Adjoint b_dl"),
+            size: adj_batch * adj_seq_cap * adj_d * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let adj_v_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Adjoint b_v_out"),
+            size: adj_batch * adj_seq_cap * adj_h * adj_d * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         // Fused Update Pipeline setup
         let update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1101,7 +1117,7 @@ impl GpuDeqBackend {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let attn_entries = (config.ctx_len.max(1) * config.h_slots * config.d_r) as u64;
+        let attn_entries = (forward_batch_cap as usize * config.ctx_len.max(1) * config.h_slots * config.d_r) as u64;
         let fused_mix_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Mix Buffer"),
             size: attn_entries * 4,
@@ -1142,7 +1158,7 @@ impl GpuDeqBackend {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let gscore_entries = (config.ctx_len.max(1) * config.h_slots * config.h_slots) as u64;
+        let gscore_entries = (forward_batch_cap as usize * config.ctx_len.max(1) * config.h_slots * config.h_slots) as u64;
         let fused_gscore_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Gscore Buffer"),
             size: gscore_entries * 4,
@@ -1192,7 +1208,7 @@ impl GpuDeqBackend {
         });
         let tbptt_carry_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("TBPTT Carry Buffer"),
-            size: (config.h_slots as u64) * (config.d_r as u64) * 4u64,
+            size: (forward_batch_cap as u64) * (config.h_slots as u64) * (config.d_r as u64) * 4u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1222,7 +1238,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: cg_bridge.b_v_out.as_entire_binding(),
+                    resource: adj_v_out_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1238,7 +1254,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: cg_bridge.b_dl.as_entire_binding(),
+                    resource: adj_dl_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -1293,7 +1309,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: cg_bridge.b_v_out.as_entire_binding(),
+                    resource: adj_v_out_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1309,7 +1325,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: cg_bridge.b_dl.as_entire_binding(),
+                    resource: adj_dl_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -1435,7 +1451,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: cg_bridge.b_dl.as_entire_binding(),
+                    resource: adj_dl_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1443,7 +1459,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: cg_bridge.b_v_out.as_entire_binding(),
+                    resource: adj_v_out_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1510,7 +1526,7 @@ impl GpuDeqBackend {
             device: Arc::new(device),
             queue: Arc::new(queue),
             bridge,
-            cg_bridge,
+            adj_bufs: AdjointBuffers { b_dl: adj_dl_buf, b_v_out: adj_v_out_buf },
             fused_adjoint_picard_pipeline,
             staged_picard_init_pipeline,
             staged_picard_gcomb_pipeline,
@@ -1618,27 +1634,6 @@ impl GpuDeqBackend {
         }
     }
 
-    pub fn build_cg_shape(
-        &self,
-        batch_size: u32,
-        adj_iters: u32,
-    ) -> aideen_block::cg_bridge::CGComputeShape {
-        aideen_block::cg_bridge::CGComputeShape {
-            batch_size,
-            d_model: self.config.d_r as u32,
-            h_slots: self.config.h_slots as u32,
-            cg_iters: adj_iters,
-            epsilon: self.config.deq_epsilon,
-            damping: Self::picard_damping_from_env(),
-            curr_iter: 0,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
-            _pad3: 0,
-            _pad4: 0,
-        }
-    }
-
     // --- WEIGHTS ---
 
     pub fn upload_weights(
@@ -1710,13 +1705,6 @@ impl GpuDeqBackend {
                 in_min, in_max, in_abs
             );
         }
-        self.cg_bridge.sync_weights_from_all_weights_buf(
-            &self.device,
-            queue,
-            &self.bridge.all_weights_buf,
-            self.config.d_r as u32,
-            self.config.h_slots as u32,
-        );
     }
 
     // --- MÉTODOS DE EJECUCIÓN ---
@@ -1972,125 +1960,6 @@ impl GpuDeqBackend {
         Ok(())
     }
 
-    // --- BACKWARD ---
-
-    pub fn run_backward_deq(
-        &self,
-        batch_size: u32,
-        s_in: &[f32],
-        h_star: &[f32],
-        dl_dh_pooled: &[f32],
-        w_q: &[f32],
-        w_k: &[f32],
-        w_v: &[f32],
-        w_o: &[f32],
-        w_in: &[f32],
-        w_x: &[f32],
-        w_out: &[f32],
-        a_log: &[f32],
-        norm: &[f32],
-        adj_iters: u32,
-        update_weights: bool,
-    ) -> Result<Vec<f32>, String> {
-        let shape = self.build_cg_shape(batch_size, adj_iters);
-        self.cg_bridge.run_backward(
-            &self.device,
-            &self.queue,
-            &shape,
-            s_in,
-            h_star,
-            dl_dh_pooled,
-            w_q,
-            w_k,
-            w_v,
-            w_o,
-            w_in,
-            w_x,
-            w_out,
-            a_log,
-            norm,
-            update_weights,
-        )
-    }
-
-    pub fn run_backward_deq_from_forward_state(
-        &self,
-        batch_size: u32,
-        s_in: &[f32],
-        h_offset: u64,
-        dl_dh_pooled: &[f32],
-        w_q: &[f32],
-        w_k: &[f32],
-        w_v: &[f32],
-        w_o: &[f32],
-        w_in: &[f32],
-        w_x: &[f32],
-        w_out: &[f32],
-        a_log: &[f32],
-        norm: &[f32],
-        adj_iters: u32,
-        update_weights: bool,
-    ) -> Result<Vec<f32>, String> {
-        let shape = self.build_cg_shape(batch_size, adj_iters);
-        self.cg_bridge.run_backward_from_buffer(
-            &self.device,
-            &self.queue,
-            &shape,
-            s_in,
-            &self.bridge.hnext_buf,
-            h_offset,
-            dl_dh_pooled,
-            w_q,
-            w_k,
-            w_v,
-            w_o,
-            w_in,
-            w_x,
-            w_out,
-            a_log,
-            norm,
-            update_weights,
-        )
-    }
-
-    pub fn apply_deq_sgd_update_and_sync_cg(
-        &self,
-        lr: f32,
-        grad_mat: &[f32],
-        grad_vec: &[f32],
-    ) -> Result<(), String> {
-        self.bridge
-            .apply_sgd_update(&self.device, &self.queue, lr, grad_mat, grad_vec)
-            .map_err(|e| e.to_string())?;
-        self.cg_bridge.sync_weights_from_all_weights_buf(
-            &self.device,
-            &self.queue,
-            &self.bridge.all_weights_buf,
-            self.config.d_r as u32,
-            self.config.h_slots as u32,
-        );
-        Ok(())
-    }
-
-    pub fn run_backward_no_readback(
-        &self,
-        batch_size: u32,
-        _num_tokens: u32,
-        dl_dh_src: &wgpu::Buffer,
-        adj_iters: u32,
-    ) -> Result<(), String> {
-        let shape = self.build_cg_shape(batch_size, adj_iters);
-        let h_offset = 0;
-        self.cg_bridge.run_backward_no_readback(
-            &self.device,
-            &self.queue,
-            &shape,
-            &self.bridge.hcurr_buf,
-            h_offset,
-            dl_dh_src,
-        )
-    }
-
     pub fn run_fused_adjoint_picard_no_readback(
         &self,
         seq_len: u32,
@@ -2109,6 +1978,7 @@ impl GpuDeqBackend {
             grad_accum_mode: 0,
             n_accum: 1,
             n_total_weights: 0,
+            batch_size: 1,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2119,7 +1989,7 @@ impl GpuDeqBackend {
         let zero_len = (seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
         let zeros = vec![0.0f32; zero_len];
         self.queue
-            .write_buffer(&self.cg_bridge.b_v_out, 0, bytemuck::cast_slice(&zeros));
+            .write_buffer(&self.adj_bufs.b_v_out, 0, bytemuck::cast_slice(&zeros));
         self.queue
             .write_buffer(&self.fused_v_next_buf, 0, bytemuck::cast_slice(&zeros));
 
@@ -2150,6 +2020,7 @@ impl GpuDeqBackend {
         iters: u32,
         dl_dh_src: Option<&wgpu::Buffer>,
         clear_slot_rhs: bool,
+        batch_size: u32,
     ) -> Result<(), String> {
         let profile_picard = std::env::var("AIDEEN_PICARD_PROFILE")
             .ok()
@@ -2193,6 +2064,7 @@ impl GpuDeqBackend {
             grad_accum_mode: 0,
             n_accum: 1,
             n_total_weights: 0,
+            batch_size,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2204,18 +2076,18 @@ impl GpuDeqBackend {
         // the pooled upstream gradient source. Without this copy, Picard can
         // iterate on a stale/zero rhs even when the LM head produced dl/dh.
         if let Some(dl_dh_src) = dl_dh_src {
-            let dl_bytes = (seq_len as u64) * (self.config.d_r as u64) * 4;
+            let dl_bytes = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
             let mut dl_encoder =
                 self.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Staged Picard dl_dh Copy"),
                     });
-            dl_encoder.copy_buffer_to_buffer(dl_dh_src, 0, &self.cg_bridge.b_dl, 0, dl_bytes);
+            dl_encoder.copy_buffer_to_buffer(dl_dh_src, 0, &self.adj_bufs.b_dl, 0, dl_bytes);
             self.queue.submit(Some(dl_encoder.finish()));
         }
 
         let prep_t0 = std::time::Instant::now();
-        let attn_len = (seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
+        let attn_len = (batch_size * seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
         let zero_t0 = std::time::Instant::now();
         let mut zero_encoder = self
             .device
@@ -2224,7 +2096,7 @@ impl GpuDeqBackend {
             });
         // Picard adjoint must start from v_state = 0 each call to solve (I - J^T)v = b.
         // Leaving b_v_out stale carries state across steps and breaks the linear solve.
-        zero_encoder.clear_buffer(&self.cg_bridge.b_v_out, 0, None);
+        zero_encoder.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
         zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
         // `fused_mix_buf` carries the staged Picard `g_comb` output when we come from the
         // precomputed adjoint path. Hist-gated temporal kernels consume that signal first;
@@ -2242,7 +2114,7 @@ impl GpuDeqBackend {
         let zero_ms = zero_t0.elapsed().as_millis();
         let prep_ms = prep_t0.elapsed().as_millis();
 
-        let n_entries = seq_len * self.config.h_slots as u32;
+        let n_entries = batch_size * seq_len * self.config.h_slots as u32;
         let d = self.config.d_r as u32;
         let init_t0 = std::time::Instant::now();
         {
@@ -2269,7 +2141,7 @@ impl GpuDeqBackend {
             encoder.copy_buffer_to_buffer(
                 &self.fused_weighted_h_buf,
                 0,
-                &self.cg_bridge.b_v_out,
+                &self.adj_bufs.b_v_out,
                 0,
                 bytes,
             );
@@ -2279,12 +2151,12 @@ impl GpuDeqBackend {
         if picard_internal_probe {
             let sample_t = (seq_len as usize / 2).max(1).min(seq_len.saturating_sub(1) as usize);
             let dl = self.read_storage_buffer(
-                &self.cg_bridge.b_dl,
+                &self.adj_bufs.b_dl,
                 seq_len as usize * self.config.d_r,
                 "Picard Probe b_dl Readback",
             );
             let v_state = self.read_storage_buffer(
-                &self.cg_bridge.b_v_out,
+                &self.adj_bufs.b_v_out,
                 attn_len,
                 "Picard Probe v_state Readback",
             );
@@ -2429,7 +2301,7 @@ impl GpuDeqBackend {
                 encoder.copy_buffer_to_buffer(
                     &self.fused_weighted_h_buf,
                     0,
-                    &self.cg_bridge.b_v_out,
+                    &self.adj_bufs.b_v_out,
                     0,
                     bytes,
                 );
@@ -2467,7 +2339,7 @@ impl GpuDeqBackend {
                 encoder.copy_buffer_to_buffer(
                     &self.fused_weighted_h_buf,
                     0,
-                    &self.cg_bridge.b_v_out,
+                    &self.adj_bufs.b_v_out,
                     0,
                     bytes,
                 );
@@ -2524,6 +2396,7 @@ impl GpuDeqBackend {
         damping: f32,
         grad_accum_mode: u32,
         n_accum: u32,
+        batch_size: u32,
     ) -> Result<(), String> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
@@ -2542,6 +2415,7 @@ impl GpuDeqBackend {
             grad_accum_mode,
             n_accum,
             n_total_weights,
+            batch_size,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2596,7 +2470,7 @@ impl GpuDeqBackend {
         zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
         // b_v_out y fused_v_next_buf ya no se usan — eran output del inline Picard.
         // if !use_precomputed_adjoint {
-        //     zero_encoder.clear_buffer(&self.cg_bridge.b_v_out, 0, None);
+        //     zero_encoder.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
         //     zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
         // }
         self.queue.submit(Some(zero_encoder.finish()));
@@ -2604,7 +2478,7 @@ impl GpuDeqBackend {
             self.device.poll(wgpu::Maintain::Wait);
         }
         let d = self.config.d_r as u32;
-        let n = seq_len * self.config.h_slots as u32;
+        let n = batch_size * seq_len * self.config.h_slots as u32;
         let hs = self.config.h_slots as u32;
 
         let run_stage = |device: &wgpu::Device,
@@ -2727,7 +2601,7 @@ impl GpuDeqBackend {
                     &self.fused_update_hist_tbptt_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
-                    hs,
+                    batch_size * hs,
                     1,
                     profile_fused,
                 );
@@ -2841,7 +2715,7 @@ impl GpuDeqBackend {
                     &self.fused_update_hist_tbptt_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
-                    hs,
+                    batch_size * hs,
                     1,
                     profile_fused,
                 );
@@ -2968,13 +2842,6 @@ impl GpuDeqBackend {
         if !profile_fused {
             self.device.poll(wgpu::Maintain::Poll);
         }
-        self.cg_bridge.sync_weights_from_all_weights_buf(
-            &self.device,
-            &self.queue,
-            &self.bridge.all_weights_buf,
-            self.config.d_r as u32,
-            self.config.h_slots as u32,
-        );
         Ok(())
     }
 
@@ -3003,6 +2870,7 @@ impl GpuDeqBackend {
             grad_accum_mode: 0, // unused by apply_grad_update_main but set for clarity
             n_accum,
             n_total_weights,
+            batch_size: 1,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3026,18 +2894,10 @@ impl GpuDeqBackend {
         }
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
-        self.cg_bridge.sync_weights_from_all_weights_buf(
-            &self.device,
-            &self.queue,
-            &self.bridge.all_weights_buf,
-            d as u32,
-            h as u32,
-        );
         Ok(())
     }
 
-    /// Spectral renormalization fully on GPU: power iteration on W_q..W_out,
-    /// then syncs updated weights to the CG bridge.
+    /// Spectral renormalization fully on GPU.
     pub fn renormalize_spectral(&self) -> Result<(), String> {
         let attn_threshold = Self::env_f32("AIDEEN_DEQ_ATTN_THRESHOLD")
             .unwrap_or(0.10)
@@ -3059,13 +2919,6 @@ impl GpuDeqBackend {
             wv_threshold,
             wo_threshold,
             12,
-        );
-        self.cg_bridge.sync_weights_from_all_weights_buf(
-            &self.device,
-            &self.queue,
-            &self.bridge.all_weights_buf,
-            self.config.d_r as u32,
-            self.config.h_slots as u32,
         );
         Ok(())
     }
@@ -3096,10 +2949,6 @@ impl GpuDeqBackend {
 
     pub fn read_scratch_buffer(&self) -> Vec<f32> {
         self.bridge.read_scratch_buffer(&self.device, &self.queue)
-    }
-
-    pub fn read_cg_debug_buffer(&self) -> Vec<f32> {
-        self.cg_bridge.read_debug_buffer(&self.device, &self.queue)
     }
 
     fn read_storage_buffer_at(&self, buffer: &wgpu::Buffer, src_offset: u64, n_floats: usize, label: &str) -> Vec<f32> {
@@ -3213,18 +3062,18 @@ impl GpuDeqBackend {
         (mean, max, nz)
     }
 
-    pub fn read_cg_v_out(&self, seq_len: u32) -> Vec<f32> {
+    pub fn read_adj_v_out(&self, seq_len: u32) -> Vec<f32> {
         let n_floats = seq_len as usize * self.config.h_slots * self.config.d_r;
-        self.read_storage_buffer(&self.cg_bridge.b_v_out, n_floats, "CG V_out Readback Staging")
+        self.read_storage_buffer(&self.adj_bufs.b_v_out, n_floats, "Adjoint V_out Readback")
     }
 
     pub fn read_dl_dh(&self, seq_len: u32) -> Vec<f32> {
         let n_floats = seq_len as usize * self.config.d_r;
-        self.read_storage_buffer(&self.cg_bridge.b_dl, n_floats, "dl_dh Readback Staging")
+        self.read_storage_buffer(&self.adj_bufs.b_dl, n_floats, "dl_dh Readback")
     }
 
     /// Reads h_star (hnext_buf) from GPU for the first batch sample.
-    /// Returns Vec<f32> of length h_slots * d_r. Used by CPU CG in strict path.
+    /// Returns Vec<f32> of length h_slots * d_r.
     pub fn read_hnext(&self) -> Vec<f32> {
         let d_r = self.config.d_r;
         let h_slots = self.config.h_slots;

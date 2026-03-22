@@ -27,7 +27,7 @@ fn make_config() -> ArchitectureConfig {
     cfg.d_r = 96;
     cfg.h_slots = 8;
     cfg.max_deq_iters = 12;
-    cfg.cg_iters = 8;
+    cfg.adj_iters = 8;
     cfg.train_deq = true;
     cfg.deq_epsilon = 1e-4;
     cfg.deq_grad_scale = 0.01;
@@ -414,7 +414,7 @@ fn test_update_direction(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult
         &h,
         &query,
         &dl_dh_cpu,
-        cfg.cg_iters,
+        cfg.adj_iters,
     );
     cpu.frozen_deq = true;
 
@@ -483,7 +483,7 @@ fn test_update_direction(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult
         &h_star_gpu,
         &gpu_query,
         &dl_dh_gpu,
-        cfg.cg_iters,
+        cfg.adj_iters,
     );
 
     let grad_wx_gpu: Vec<f32> = (v_gpu.clone() * gpu_query.transpose() * gs)
