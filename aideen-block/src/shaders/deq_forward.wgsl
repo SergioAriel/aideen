@@ -515,15 +515,14 @@ fn deq_forward_main(
                         var v = 0.0;
                         for (var j = 0u; j < d_model; j = j + 1u) {
                             let h_val = H_curr[h_base + off + j];
-                            let w_idx = j * d_model + d_out;
+                            let w_idx = s * d_model * d_model + j * d_model + d_out;
                             q = q + W_q[w_idx] * h_val;
                             k = k + W_k[w_idx] * h_val;
-                            if (!v_fixed && !v_lag) { v = v + W_v[w_idx] * h_val; }
+                            if (!v_fixed && !v_lag) { v = v + W_v[j * d_model + d_out] * h_val; }
                         }
-                        // Per-slot Q/K bias: appended to W_q/W_k buffers at offset d_model*d_model.
-                        // Breaks slot symmetry so attn_ent can fall below log(h_slots).
-                        q = q + W_q[d_model * d_model + s * d_model + d_out];
-                        k = k + W_k[d_model * d_model + s * d_model + d_out];
+                        // Per-slot Q/K bias: appended after h_slots matrices in W_q/W_k buffers.
+                        q = q + W_q[h_slots * d_model * d_model + s * d_model + d_out];
+                        k = k + W_k[h_slots * d_model * d_model + s * d_model + d_out];
                         Scratch[q_base + off + d_out] = q;
                         Scratch[k_base + off + d_out] = k;
                         if (!v_fixed && !v_lag) {
