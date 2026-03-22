@@ -325,9 +325,9 @@ impl RustDeqBridge {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // W_q/W_k buffers include per-slot bias appended after the d×d matrix.
-        // Layout: [d_model*d_model floats (matrix)] ++ [h_slots*d_model floats (bias)]
-        let wqk_buf_size = ((d_model * d_model + h_slots * d_model) * 4) as u64;
+        // W_q/W_k buffers: h_slots per-slot matrices followed by h_slots per-slot biases.
+        // Layout: [h_slots * d_model*d_model floats (matrices)] ++ [h_slots*d_model floats (biases)]
+        let wqk_buf_size = ((h_slots * d_model * d_model + h_slots * d_model) * 4) as u64;
         let wq_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("W_q"),
             size: wqk_buf_size,
@@ -845,7 +845,9 @@ impl RustDeqBridge {
     ) {
         let h_slots = self.h_slots;
         let mat_count = 6 + h_slots;
-        for mat_idx in 0..mat_count {
+        // Skip mat_idx 0 (W_q) and 1 (W_k): they are now per-slot h_slots×d×d buffers,
+        // incompatible with single-matrix spectral renorm. Start from W_v=2.
+        for mat_idx in 2..mat_count {
             let params = SpectralParams {
                 d_model,
                 n_iters,
@@ -901,8 +903,8 @@ impl RustDeqBridge {
         &'static str,
     > {
         let mat_size = (d_model * d_model * 4) as u64;
-        // W_q/W_k buffers include per-slot bias: matrix + h_slots*d_model extra floats
-        let wqk_size = ((d_model * d_model + self.h_slots * d_model) * 4) as u64;
+        // W_q/W_k buffers: h_slots matrices + h_slots biases
+        let wqk_size = ((self.h_slots * d_model * d_model + self.h_slots * d_model) * 4) as u64;
         let win_size = (self.h_slots * d_model * d_model * 4) as u64;
         let vec_size = (d_model * 4) as u64;
         let a_vec_size = (self.h_slots * d_model * 4) as u64; // per-slot A_log
