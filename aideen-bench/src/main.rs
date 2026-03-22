@@ -169,7 +169,7 @@ fn build_aideen(vocab_size: usize, vocab: Vec<char>, seed: u64, backend: Backend
     cfg.vocab_size = vocab_size;
     cfg.ctx_len = CTX_LEN;
     cfg.max_deq_iters = 6;
-    cfg.cg_iters = 4;
+    cfg.adj_iters = 4;
     cfg.train_deq = true;
     cfg.deq_grad_scale = 0.01;
     cfg.renorm_every_steps = 50;
