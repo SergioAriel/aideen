@@ -108,6 +108,10 @@ pub struct Trainer {
 
     // --- Gradient Accumulation ---
     grad_accum_counter: u32,  // steps accumulated so far in the current window
+
+    // --- TPS tracking for GPU-DEBUG log ---
+    debug_last_time: Option<std::time::Instant>,
+    debug_tokens_accum: u32,   // tokens processed since last GPU-DEBUG print
 }
 
 impl Trainer {
@@ -254,6 +258,8 @@ impl Trainer {
             force_renorm_done: false,
             m_prev: None,
             grad_accum_counter: 0,
+            debug_last_time: None,
+            debug_tokens_accum: 0,
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -313,6 +319,8 @@ impl Trainer {
             force_renorm_done: false,
             m_prev: None,
             grad_accum_counter: 0,
+            debug_last_time: None,
+            debug_tokens_accum: 0,
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -349,7 +357,8 @@ impl Trainer {
         }
 
         if self.gpu_emb.is_none() {
-            let safe_ctx = self.config.ctx_len.max(1024);
+            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let safe_ctx = self.config.ctx_len.max(1024) * batch_size;
             self.gpu_emb = Some(GpuEmbeddingTrainer::new(
                 &gpu.device,
                 self.tokenizer.vocab_size(),
@@ -457,9 +466,19 @@ impl Trainer {
             let out = (|| {
                 self.ensure_gpu_trainers(&gpu);
 
-                // Arreglo defensivo para evitar underflow si seq_len < ctx_len
+                // Arreglo defensivo para evitar underflow si seq_len < ctx_len.
+                // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
+                let fwd_batch_size_ts: usize = std::env::var("AIDEEN_BATCH_SIZE")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1)
+                    .max(1);
                 let seq_len = tokens.len().min(targets.len());
-                let actual_ctx_len = seq_len.min(self.config.ctx_len);
+                let actual_ctx_len = if fwd_batch_size_ts > 1 {
+                    seq_len
+                } else {
+                    seq_len.min(self.config.ctx_len)
+                };
                 let ctx = &tokens[seq_len - actual_ctx_len..];
                 let ctx_targets = &targets[seq_len - actual_ctx_len..];
 
@@ -586,6 +605,13 @@ impl Trainer {
             let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
             // 1. Prepare DEQ input on GPU
+            let fwd_batch_size = std::env::var("AIDEEN_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1);
+            // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
+            let per_seq_len = (num_tokens as u32) / fwd_batch_size;
             let single_query_mode = query.len() == self.config.d_r && num_tokens == 1;
             if single_query_mode {
                 // train_step path: match CPU semantics by feeding the pooled query vector.
@@ -617,26 +643,27 @@ impl Trainer {
                 if emb_needs_upload {
                     self.gpu_emb_weights_uploaded = true;
                 }
+                // Copy all B sequences' embeddings (already flat in seq_buf) to s_buf in one copy.
                 let mut conn_enc =
                     gpu.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("Connect Embedding -> DEQ Encoder"),
                         });
-                let copy_size = (num_tokens as u64) * (self.config.d_r as u64) * 4;
+                let total_emb_bytes = (num_tokens as u64) * (self.config.d_r as u64) * 4;
                 conn_enc.copy_buffer_to_buffer(
                     &gpu_emb.seq_buf,
                     0,
                     &gpu.bridge.s_buf,
                     0,
-                    copy_size,
+                    total_emb_bytes,
                 );
                 gpu.queue.submit(Some(conn_enc.finish()));
             }
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
             let _ = gpu.run_forward(
-                1,
-                num_tokens as u32,
+                fwd_batch_size,
+                per_seq_len,
                 self.adaptive_max_iters,
                 damping_eff,
                 epsilon,
@@ -692,13 +719,15 @@ impl Trainer {
                 self.gpu_lm_weights_uploaded = true;
             }
 
+            // targets_u32 already covers all B*seq_len positions (training loop provides B chunks).
+            let batch_targets_u32 = targets_u32.clone();
             let current_loss = gpu_lm
                 .train_step_no_readback(
                     &gpu.device,
                     &gpu.queue,
                     &gpu.bridge.hpooled_buf,
                     0,
-                    &targets_u32,
+                    &batch_targets_u32,
                     lm_lr,
                     self.optimizer.step_count() as u32,
                     self.training_config.ternary,
@@ -722,13 +751,14 @@ impl Trainer {
                 // forward pass are unreliable (∂L/∂θ via implicit diff requires h* to exist).
                 // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
                 // aplica el weight update completo en GPU. Un solo path, siempre correcto.
-                let seq_len = targets_u32.len() as u32;
+                let batch_size = fwd_batch_size;
                 let _ = gpu.run_staged_adjoint_picard_no_readback(
-                    seq_len,
+                    per_seq_len,
                     self.reasoning.damping,
                     self.config.adj_iters as u32,
                     Some(&gpu_lm.dl_dh_buf),
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
+                    batch_size,
                 );
                 let grad_accum = std::env::var("AIDEEN_GRAD_ACCUM")
                     .ok()
@@ -744,10 +774,11 @@ impl Trainer {
                     self.config.deq_grad_scale,
                     self.training_config.ternary,
                     self.config.weight_decay,
-                    seq_len,
+                    per_seq_len,
                     self.reasoning.damping,
                     mode,
                     grad_accum,
+                    batch_size,
                 );
                 self.grad_accum_counter += 1;
                 if self.grad_accum_counter >= grad_accum {
@@ -980,6 +1011,9 @@ impl Trainer {
                 self.gpu_emb_weights_uploaded = true;
             }
 
+            // --- TPS tracking ---
+            self.debug_tokens_accum += num_tokens as u32;
+
             // --- DIAGNÓSTICOS GPU (v13.1 Auto-Healing) ---
             if self.optimizer.step_count() % 10 == 0 {
                 let fw = gpu.read_debug_buffer();
@@ -1021,6 +1055,14 @@ impl Trainer {
                 let hist_loop_force_nomamba = if fw.len() > 111 { fw[111] } else { 0.0 };
 
                 let trunc_str = if trunc_flag >= 0.5 { "TRUNC" } else { "OK" };
+
+                let now = std::time::Instant::now();
+                let tps_debug = if let Some(t) = self.debug_last_time {
+                    let elapsed = t.elapsed().as_secs_f32();
+                    if elapsed > 0.0 { self.debug_tokens_accum as f32 / elapsed } else { 0.0 }
+                } else { 0.0 };
+                self.debug_last_time = Some(now);
+                self.debug_tokens_accum = 0;
 
                 if std::env::var("AIDEEN_DEQ_WV_DEBUG").ok().as_deref() == Some("1") {
                     if let Ok((_, _, wv, _, _, _, _, _, _)) = gpu.read_weights() {
@@ -1178,7 +1220,7 @@ impl Trainer {
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
                 let hit_i = hit.round() as i32;
                 println!(
-                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
+                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
                     hit_i,
                     seq,
@@ -1191,6 +1233,7 @@ impl Trainer {
                     damping_eff,
                     mode_str,
                     conv_str,
+                    tps_debug,
                     max_h,
                     inj_rms,
                     hist_rms,
@@ -1374,9 +1417,11 @@ impl Trainer {
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
             let ctx_len = self.config.ctx_len.max(1);
+            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let step = ctx_len * batch_size;
 
-            for i in (0..train_tokens.len()).step_by(ctx_len) {
-                let end = (i + ctx_len).min(train_tokens.len());
+            for i in (0..train_tokens.len()).step_by(step) {
+                let end = (i + step).min(train_tokens.len());
                 let batch_ctx = &train_tokens[i..end];
                 let batch_tgt = &targets[i..end];
                 if epoch % log_every == 0 && i == 0 {
