@@ -8,6 +8,9 @@ struct UpdateUniforms {
     seq_len: u32,
     damping: f32,
     residual_alpha: f32,
+    grad_accum_mode: u32,  // 0=direct update, 1=accumulate into AllGradients
+    n_accum: u32,          // accumulation count (for apply_grad_update_main)
+    n_total_weights: u32,  // total AllWeights elements (for apply_grad_update_main bounds)
 };
 
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
@@ -25,6 +28,8 @@ struct UpdateUniforms {
 @group(0) @binding(12) var<storage, read_write> hist_ctx_buf: array<f32>;
 @group(0) @binding(13) var<storage, read_write> hist_delta_buf: array<f32>;
 @group(0) @binding(14) var<storage, read_write> tbptt_carry_buf: array<f32>;
+
+@group(0) @binding(15) var<storage, read_write> AllGradients: array<f32>;
 
 @group(1) @binding(0) var<storage, read_write> AllWeights: array<f32>;
 
@@ -375,24 +380,38 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     g_wo = g_wo * seq_scale;
 
     let clip = 0.5;
-    let s_wv = clamp(lr * g_wv * grad_scale, -clip, clip);
-    let s_wo = clamp(lr * g_wo * grad_scale, -clip, clip);
+    let raw_wv = lr * g_wv * grad_scale;
+    let raw_wo = lr * g_wo * grad_scale;
 
     // Per-slot W_q / W_k update
     for (var s = 0u; s < h_slots; s = s + 1u) {
-        let s_wq = clamp(lr * g_wq[s] * seq_scale * grad_scale, -clip, clip);
-        let s_wk = clamp(lr * g_wk[s] * seq_scale * grad_scale, -clip, clip);
+        let raw_wq = lr * g_wq[s] * seq_scale * grad_scale;
+        let raw_wk = lr * g_wk[s] * seq_scale * grad_scale;
         let per_idx = s * d * d + idx;
-        AllWeights[aw_wq_base(params.d_model, params.h_slots) +per_idx] = AllWeights[aw_wq_base(params.d_model, params.h_slots) +per_idx] * wd_factor - s_wq;
-        AllWeights[aw_wk_base(params.d_model, params.h_slots) +per_idx] = AllWeights[aw_wk_base(params.d_model, params.h_slots) +per_idx] * wd_factor - s_wk;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[aw_wq_base(params.d_model, params.h_slots) +per_idx] += raw_wq;
+            AllGradients[aw_wk_base(params.d_model, params.h_slots) +per_idx] += raw_wk;
+        } else {
+            AllWeights[aw_wq_base(params.d_model, params.h_slots) +per_idx] = AllWeights[aw_wq_base(params.d_model, params.h_slots) +per_idx] * wd_factor - clamp(raw_wq, -clip, clip);
+            AllWeights[aw_wk_base(params.d_model, params.h_slots) +per_idx] = AllWeights[aw_wk_base(params.d_model, params.h_slots) +per_idx] * wd_factor - clamp(raw_wk, -clip, clip);
+        }
     }
-    AllWeights[aw_wv_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wv_base(params.d_model, params.h_slots) +idx] * wd_factor - s_wv;
-    AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] * wd_factor - s_wo;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_wv_base(params.d_model, params.h_slots) +idx] += raw_wv;
+        AllGradients[aw_wo_base(params.d_model, params.h_slots) +idx] += raw_wo;
+    } else {
+        AllWeights[aw_wv_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wv_base(params.d_model, params.h_slots) +idx] * wd_factor - clamp(raw_wv, -clip, clip);
+        AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] * wd_factor - clamp(raw_wo, -clip, clip);
+    }
     // Per-slot W_in update: each slot's matrix at offset s * d * d
     for (var s = 0u; s < h_slots; s = s + 1u) {
         let g_win_s = g_win[s] * seq_scale;
-        let s_win_s = clamp(lr * g_win_s * grad_scale, -clip, clip);
-        AllWeights[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] = AllWeights[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] * wd_factor - s_win_s;
+        let raw_win = lr * g_win_s * grad_scale;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] += raw_win;
+        } else {
+            AllWeights[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] = AllWeights[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] * wd_factor - clamp(raw_win, -clip, clip);
+        }
     }
 
     // Per-slot Q/K bias gradient (one thread per col, guarded by row==0).
@@ -414,10 +433,15 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         for (var sb = 0u; sb < h_slots; sb = sb + 1u) {
-            let s_qb = clamp(lr * g_qbias[sb] * seq_scale * grad_scale, -clip, clip);
-            let s_kb = clamp(lr * g_kbias[sb] * seq_scale * grad_scale, -clip, clip);
-            AllWeights[aw_wq_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] = AllWeights[aw_wq_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] * wd_factor - s_qb;
-            AllWeights[aw_wk_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] = AllWeights[aw_wk_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] * wd_factor - s_kb;
+            let raw_qb = lr * g_qbias[sb] * seq_scale * grad_scale;
+            let raw_kb = lr * g_kbias[sb] * seq_scale * grad_scale;
+            if (params.grad_accum_mode == 1u) {
+                AllGradients[aw_wq_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] += raw_qb;
+                AllGradients[aw_wk_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] += raw_kb;
+            } else {
+                AllWeights[aw_wq_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] = AllWeights[aw_wq_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] * wd_factor - clamp(raw_qb, -clip, clip);
+                AllWeights[aw_wk_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] = AllWeights[aw_wk_base(params.d_model, params.h_slots) +h_slots * d * d + sb * d + col] * wd_factor - clamp(raw_kb, -clip, clip);
+            }
         }
     }
 
@@ -596,18 +620,23 @@ fn fused_hist_stage_mat_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = row * d + col;
     let clip = 0.5;
     let token_norm = 1.0 / max(1.0, f32(n_tokens));
-    let step = clamp(params.lr * (grad * token_norm) * params.grad_scale, -clip, clip);
-    let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
-    let after = before - step;
-    AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
-    if (row == 0u && col == 0u) {
-        debug_log[64] = grad;
-        debug_log[65] = step;
-        debug_log[66] = before;
-        debug_log[67] = after;
-        debug_log[80] = params.lr;
-        debug_log[81] = params.grad_scale;
-        debug_log[82] = params.weight_decay;
+    let raw_step = params.lr * (grad * token_norm) * params.grad_scale;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(params.d_model, params.h_slots) +idx] += raw_step;
+    } else {
+        let step = clamp(raw_step, -clip, clip);
+        let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
+        let after = before - step;
+        AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
+        if (row == 0u && col == 0u) {
+            debug_log[64] = grad;
+            debug_log[65] = step;
+            debug_log[66] = before;
+            debug_log[67] = after;
+            debug_log[80] = params.lr;
+            debug_log[81] = params.grad_scale;
+            debug_log[82] = params.weight_decay;
+        }
     }
 }
 
@@ -638,8 +667,12 @@ fn fused_hist_stage_scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let clip = 0.5;
     let n_tokens = max(1u, params.seq_len) - 1u;
     let token_norm = 1.0 / max(1.0, f32(n_tokens));
-    let step = clamp(params.lr * (grad * token_norm) * params.grad_scale, -clip, clip);
-    AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] - step;
+    let raw_step = params.lr * (grad * token_norm) * params.grad_scale;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(params.d_model, params.h_slots) +idx] += raw_step;
+    } else {
+        AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] - clamp(raw_step, -clip, clip);
+    }
 }
 
 @compute
@@ -660,8 +693,12 @@ fn fused_hist_stage_bias_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     grad = grad / max(1.0, f32(params.seq_len));
     let idx = hist_bias_base(d, h_slots) + slot * d + dim;
     let clip = 0.5;
-    let step = clamp(params.lr * grad * params.grad_scale, -clip, clip);
-    AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] - step;
+    let raw_step = params.lr * grad * params.grad_scale;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(params.d_model, params.h_slots) +idx] += raw_step;
+    } else {
+        AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] - clamp(raw_step, -clip, clip);
+    }
 }
 
 @compute
@@ -686,15 +723,20 @@ fn fused_hist_stage_gate_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let token_norm = 1.0 / max(1.0, f32(params.seq_len) * f32(d));
     let gate_grad = 0.20 * sigma * (1.0 - sigma) * grad * token_norm;
     let clip = 0.5;
-    let step = clamp(params.lr * gate_grad * params.grad_scale, -clip, clip);
-    let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
-    let after = before - step;
-    AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
-    if (slot == 0u) {
-        debug_log[68] = gate_grad;
-        debug_log[69] = step;
-        debug_log[70] = before;
-        debug_log[71] = after;
+    let raw_step = params.lr * gate_grad * params.grad_scale;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(params.d_model, params.h_slots) +idx] += raw_step;
+    } else {
+        let step = clamp(raw_step, -clip, clip);
+        let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
+        let after = before - step;
+        AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
+        if (slot == 0u) {
+            debug_log[68] = gate_grad;
+            debug_log[69] = step;
+            debug_log[70] = before;
+            debug_log[71] = after;
+        }
     }
 }
 
@@ -1172,18 +1214,23 @@ fn fused_hist_stage_wout_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = row * d + col;
     let clip = 0.5;
     let wd_factor = 1.0 - params.lr * params.weight_decay;
-    let step = clamp(params.lr * grad, -clip, clip);
-    let before = AllWeights[aw_wout_base(params.d_model, params.h_slots) +idx];
-    let after = before * wd_factor - step;
-    AllWeights[aw_wout_base(params.d_model, params.h_slots) +idx] = after;
-    if (row == 0u && col == 0u) {
-        debug_log[83] = grad;
-        debug_log[84] = step;
-        debug_log[85] = before;
-        debug_log[86] = after;
-        debug_log[87] = params.lr;
-        debug_log[88] = params.grad_scale;
-        debug_log[89] = params.weight_decay;
+    let raw_step = params.lr * grad;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_wout_base(params.d_model, params.h_slots) +idx] += raw_step;
+    } else {
+        let step = clamp(raw_step, -clip, clip);
+        let before = AllWeights[aw_wout_base(params.d_model, params.h_slots) +idx];
+        let after = before * wd_factor - step;
+        AllWeights[aw_wout_base(params.d_model, params.h_slots) +idx] = after;
+        if (row == 0u && col == 0u) {
+            debug_log[83] = grad;
+            debug_log[84] = step;
+            debug_log[85] = before;
+            debug_log[86] = after;
+            debug_log[87] = params.lr;
+            debug_log[88] = params.grad_scale;
+            debug_log[89] = params.weight_decay;
+        }
     }
 }
 
@@ -1218,10 +1265,16 @@ fn fused_hist_stage_wx_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let wx_scale = hist_wx_max();
         let wx_tanh = tanh(wx_raw);
         let wx_grad = grad * wx_scale * (1.0 - wx_tanh * wx_tanh);
-        let step = clamp(params.lr * wx_grad, -clip, clip);
-        AllWeights[aw_wx_base(params.d_model, params.h_slots) +idx] = wx_raw * wd_factor - step;
+        let raw_step = params.lr * wx_grad;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[aw_wx_base(params.d_model, params.h_slots) +idx] += raw_step;
+        } else {
+            AllWeights[aw_wx_base(params.d_model, params.h_slots) +idx] = wx_raw * wd_factor - clamp(raw_step, -clip, clip);
+        }
     } else {
-        AllWeights[aw_wx_base(params.d_model, params.h_slots) +idx] = 0.0;
+        if (params.grad_accum_mode != 1u) {
+            AllWeights[aw_wx_base(params.d_model, params.h_slots) +idx] = 0.0;
+        }
     }
 }
 
@@ -1250,15 +1303,20 @@ fn fused_hist_stage_wdelta_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         grad = grad / n_norm;
         let idx = hist_delta_base(d, h_slots) + slot * d * d + row * d + col;
         let clip = 0.5;
-        let step = clamp(params.lr * grad, -clip, clip);
-        let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
-        let after = before - step;
-        AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
-        if (slot == 0u && row == 0u && col == 0u) {
-            debug_log[72] = grad;
-            debug_log[73] = step;
-            debug_log[74] = before;
-            debug_log[75] = after;
+        let raw_step = params.lr * grad;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[aw_hist_base(params.d_model, params.h_slots) +idx] += raw_step;
+        } else {
+            let step = clamp(raw_step, -clip, clip);
+            let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
+            let after = before - step;
+            AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
+            if (slot == 0u && row == 0u && col == 0u) {
+                debug_log[72] = grad;
+                debug_log[73] = step;
+                debug_log[74] = before;
+                debug_log[75] = after;
+            }
         }
     }
 }
@@ -1284,15 +1342,20 @@ fn fused_hist_stage_bdelta_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Same rationale as W_Δ: keep the accumulated selective signal intact.
     let idx = hist_delta_bias_base(d, h_slots) + dim;
     let clip = 0.5;
-    let step = clamp(params.lr * grad, -clip, clip);
-    let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
-    let after = before - step;
-    AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
-    if (dim == 0u) {
-        debug_log[76] = grad;
-        debug_log[77] = step;
-        debug_log[78] = before;
-        debug_log[79] = after;
+    let raw_step = params.lr * grad;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(params.d_model, params.h_slots) +idx] += raw_step;
+    } else {
+        let step = clamp(raw_step, -clip, clip);
+        let before = AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx];
+        let after = before - step;
+        AllWeights[aw_hist_base(params.d_model, params.h_slots) +idx] = after;
+        if (dim == 0u) {
+            debug_log[76] = grad;
+            debug_log[77] = step;
+            debug_log[78] = before;
+            debug_log[79] = after;
+        }
     }
 }
 
@@ -1350,7 +1413,31 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         grad = grad / n_norm;
         let clip = 0.5;
-        let step = clamp(params.lr * grad, -clip, clip);
-        AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] = AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] - step;
+        let raw_step = params.lr * grad;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] += raw_step;
+        } else {
+            AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] = AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] - clamp(raw_step, -clip, clip);
+        }
     }
+}
+
+// ---- Gradient Apply ----
+// Applies accumulated gradients from AllGradients to AllWeights.
+// Called once after n_accum accumulation passes (mode=1).
+// Weight decay is applied to main weights (indices < aw_hist_base); not to hist params.
+@compute
+@workgroup_size(256, 1, 1)
+fn apply_grad_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.n_total_weights) { return; }
+    let d = params.d_model;
+    let h = params.h_slots;
+    let clip = 0.5;
+    let hist_start = aw_hist_base(d, h);
+    // Main weights (W_q..NormScale) get weight decay; hist params do not.
+    let wd_mult = select(1.0, 1.0 - params.lr * params.weight_decay, i < hist_start);
+    let avg_step = AllGradients[i] / f32(params.n_accum);
+    AllWeights[i] = AllWeights[i] * wd_mult - clamp(avg_step, -clip, clip);
+    AllGradients[i] = 0.0;
 }

@@ -105,6 +105,9 @@ pub struct Trainer {
 
     // --- v14 Temporal Memory State ---
     pub m_prev: Option<HSlots>,
+
+    // --- Gradient Accumulation ---
+    grad_accum_counter: u32,  // steps accumulated so far in the current window
 }
 
 impl Trainer {
@@ -250,6 +253,7 @@ impl Trainer {
             contractivity_hi_streak: 0,
             force_renorm_done: false,
             m_prev: None,
+            grad_accum_counter: 0,
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -308,6 +312,7 @@ impl Trainer {
             contractivity_hi_streak: 0,
             force_renorm_done: false,
             m_prev: None,
+            grad_accum_counter: 0,
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -1396,6 +1401,15 @@ impl Trainer {
                     Some(&gpu_lm.dl_dh_buf),
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                 );
+                let grad_accum = std::env::var("AIDEEN_GRAD_ACCUM")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                // Cross-step gradient accumulation:
+                // Each train_step() call accumulates gradients from a different sequence.
+                // Weight update is applied only every grad_accum steps.
+                let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
                     self.config.deq_grad_scale,
@@ -1403,7 +1417,18 @@ impl Trainer {
                     self.config.weight_decay,
                     seq_len,
                     self.reasoning.damping,
+                    mode,
+                    grad_accum,
                 );
+                self.grad_accum_counter += 1;
+                if self.grad_accum_counter >= grad_accum {
+                    let _ = gpu.apply_gradient_update(
+                        base_lr,
+                        self.config.weight_decay,
+                        grad_accum,
+                    );
+                    self.grad_accum_counter = 0;
+                }
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
