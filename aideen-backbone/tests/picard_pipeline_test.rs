@@ -1029,7 +1029,7 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
     let dl = vec![0.05f32; d];
     gpu.queue
         .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
         .expect("Staged Picard adjoint dispatch failed");
     let v_picard = gpu.read_cg_v_out(seq_len);
     let h_star = gpu.read_hnext();
@@ -1124,7 +1124,7 @@ fn test_staged_picard_perf_smoke_no_mamba() {
     let mono_ms = t0.elapsed().as_millis();
 
     let t1 = std::time::Instant::now();
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
         .expect("Staged Picard failed");
     let staged_ms = t1.elapsed().as_millis();
 
@@ -1190,7 +1190,7 @@ fn test_staged_picard_only_perf_smoke_no_mamba() {
         .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
         .expect("Staged Picard failed");
     let staged_ms = t0.elapsed().as_millis();
 
@@ -1252,7 +1252,7 @@ fn run_staged_picard_perf_case(seq_len: u32, d: usize, h_slots: usize, iters: u3
         .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, iters, None, true)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, iters, None, true, 1)
         .expect("Staged Picard failed");
     let elapsed = t0.elapsed().as_millis();
 
