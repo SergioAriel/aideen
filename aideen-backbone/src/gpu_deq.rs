@@ -3,7 +3,7 @@ use aideen_block::deq_bridge::{
     DeqComputeShape, RustDeqBridge,
     aw_wqk_bytes, aw_wk_byte_off, aw_wv_byte_off, aw_wo_byte_off,
     aw_win_byte_off, aw_wx_byte_off, aw_wout_byte_off,
-    aw_alog_byte_off, aw_nscale_byte_off, aw_hist_byte_off,
+    aw_alog_byte_off, aw_nscale_byte_off, aw_hist_byte_off, aw_total_bytes,
 };
 use aideen_core::state::ArchitectureConfig;
 use bytemuck::{Pod, Zeroable};
@@ -21,6 +21,9 @@ struct UpdateUniforms {
     seq_len: u32,
     damping: f32, // v14: Crucial for Picard Adjoint stability
     residual_alpha: f32,
+    grad_accum_mode: u32,  // 0=direct update, 1=accumulate into AllGradients
+    n_accum: u32,          // accumulation count (for apply_grad_update_main)
+    n_total_weights: u32,  // total AllWeights elements (for apply_grad_update_main)
 }
 
 /// Abstracción del DEQ vía GPU (WGPU).
@@ -62,6 +65,7 @@ pub struct GpuDeqBackend {
     fused_update_hist_alog_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wdelta_pipeline: wgpu::ComputePipeline,
     fused_update_hist_bdelta_pipeline: wgpu::ComputePipeline,
+    fused_update_apply_grad_pipeline: wgpu::ComputePipeline,
     fused_adjoint_bg: wgpu::BindGroup,
     fused_adjoint_weights_bg: wgpu::BindGroup,
     staged_picard_bg: wgpu::BindGroup,
@@ -82,6 +86,7 @@ pub struct GpuDeqBackend {
     staged_wv_t_buf: wgpu::Buffer,
     staged_wo_t_buf: wgpu::Buffer,
     tbptt_carry_buf: wgpu::Buffer,
+    pub all_gradients_buf: wgpu::Buffer,
 }
 
 impl GpuDeqBackend {
@@ -628,6 +633,16 @@ impl GpuDeqBackend {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -978,6 +993,15 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let fused_update_apply_grad_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Apply Gradient Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("apply_grad_update_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let fused_adjoint_picard_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Fused Picard Adjoint Pipeline"),
@@ -1172,6 +1196,22 @@ impl GpuDeqBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // AllGradients: same layout as AllWeights; accumulates raw gradients across
+        // n_accum forward passes in mode=1. Zero-initialized (GPU zero-inits storage buffers).
+        let ag_d64 = config.d_r as u64;
+        let ag_h64 = config.h_slots as u64;
+        let ag_hist_len = (config.h_slots + 1) * config.d_r * config.d_r
+            + 3 * config.h_slots * config.d_r
+            + config.h_slots
+            + config.d_r
+            + 21;
+        let all_gradients_size = aw_total_bytes(ag_d64, ag_h64, ag_hist_len as u64);
+        let all_gradients_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("AllGradients"),
+            size: all_gradients_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let fused_update_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Fused Update BG0"),
             layout: &bg0_layout,
@@ -1235,6 +1275,10 @@ impl GpuDeqBackend {
                 wgpu::BindGroupEntry {
                     binding: 14,
                     resource: tbptt_carry_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: all_gradients_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1302,6 +1346,10 @@ impl GpuDeqBackend {
                 wgpu::BindGroupEntry {
                     binding: 14,
                     resource: tbptt_carry_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: all_gradients_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1491,6 +1539,7 @@ impl GpuDeqBackend {
             fused_update_hist_alog_pipeline,
             fused_update_hist_wdelta_pipeline,
             fused_update_hist_bdelta_pipeline,
+            fused_update_apply_grad_pipeline,
             fused_adjoint_bg,
             fused_adjoint_weights_bg,
             staged_picard_bg,
@@ -1511,6 +1560,7 @@ impl GpuDeqBackend {
             staged_wv_t_buf,
             staged_wo_t_buf,
             tbptt_carry_buf,
+            all_gradients_buf,
         })
     }
 
@@ -2056,6 +2106,9 @@ impl GpuDeqBackend {
             seq_len,
             damping,
             residual_alpha: Self::residual_alpha_from_env(),
+            grad_accum_mode: 0,
+            n_accum: 1,
+            n_total_weights: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2137,6 +2190,9 @@ impl GpuDeqBackend {
             seq_len,
             damping,
             residual_alpha: Self::residual_alpha_from_env(),
+            grad_accum_mode: 0,
+            n_accum: 1,
+            n_total_weights: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2466,10 +2522,16 @@ impl GpuDeqBackend {
         weight_decay: f32,
         seq_len: u32,
         damping: f32,
+        grad_accum_mode: u32,
+        n_accum: u32,
     ) -> Result<(), String> {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let hist_len = Self::history_params_len(d, h);
+        let n_total_weights = (aw_hist_byte_off(d as u64, h as u64) / 4) as u32 + hist_len as u32;
         let params = UpdateUniforms {
-            d_model: self.config.d_r as u32,
-            h_slots: self.config.h_slots as u32,
+            d_model: d as u32,
+            h_slots: h as u32,
             lr,
             grad_scale,
             ternary_flag: if ternary { 1 } else { 0 },
@@ -2477,6 +2539,9 @@ impl GpuDeqBackend {
             seq_len,
             damping,
             residual_alpha: Self::residual_alpha_from_env(),
+            grad_accum_mode,
+            n_accum,
+            n_total_weights,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2909,6 +2974,64 @@ impl GpuDeqBackend {
             &self.bridge.all_weights_buf,
             self.config.d_r as u32,
             self.config.h_slots as u32,
+        );
+        Ok(())
+    }
+
+    /// Applies accumulated gradients (from AllGradients) to AllWeights and zeroes AllGradients.
+    /// Called once after n_accum passes of apply_fused_deq_update with grad_accum_mode=1.
+    pub fn apply_gradient_update(
+        &self,
+        lr: f32,
+        weight_decay: f32,
+        n_accum: u32,
+    ) -> Result<(), String> {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let hist_len = Self::history_params_len(d, h);
+        let n_total_weights = (aw_hist_byte_off(d as u64, h as u64) / 4) as u32 + hist_len as u32;
+        let params = UpdateUniforms {
+            d_model: d as u32,
+            h_slots: h as u32,
+            lr,
+            grad_scale: 1.0,
+            ternary_flag: 0,
+            weight_decay,
+            seq_len: 1,
+            damping: 0.0,
+            residual_alpha: Self::residual_alpha_from_env(),
+            grad_accum_mode: 0, // unused by apply_grad_update_main but set for clarity
+            n_accum,
+            n_total_weights,
+        };
+        self.queue.write_buffer(
+            &self.fused_update_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Apply Gradient Update"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Apply Gradient Update"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fused_update_apply_grad_pipeline);
+            pass.set_bind_group(0, &self.fused_update_bg0, &[]);
+            pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+            pass.dispatch_workgroups(n_total_weights.div_ceil(256), 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        self.cg_bridge.sync_weights_from_all_weights_buf(
+            &self.device,
+            &self.queue,
+            &self.bridge.all_weights_buf,
+            d as u32,
+            h as u32,
         );
         Ok(())
     }
