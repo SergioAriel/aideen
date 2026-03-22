@@ -1396,14 +1396,68 @@ impl Trainer {
                     Some(&gpu_lm.dl_dh_buf),
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                 );
-                let _ = gpu.apply_fused_deq_update(
-                    base_lr,
-                    self.config.deq_grad_scale,
-                    self.training_config.ternary,
-                    self.config.weight_decay,
-                    seq_len,
-                    self.reasoning.damping,
-                );
+                let grad_accum = std::env::var("AIDEEN_GRAD_ACCUM")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                if grad_accum == 1 {
+                    let _ = gpu.apply_fused_deq_update(
+                        base_lr,
+                        self.config.deq_grad_scale,
+                        self.training_config.ternary,
+                        self.config.weight_decay,
+                        seq_len,
+                        self.reasoning.damping,
+                        0, // mode=0: direct update
+                        1,
+                    );
+                } else {
+                    // First accumulation pass (adjoint already run above).
+                    let _ = gpu.apply_fused_deq_update(
+                        base_lr,
+                        self.config.deq_grad_scale,
+                        self.training_config.ternary,
+                        self.config.weight_decay,
+                        seq_len,
+                        self.reasoning.damping,
+                        1, // mode=1: accumulate
+                        grad_accum,
+                    );
+                    // Additional passes: re-run forward + adjoint on the same sequence.
+                    for _ in 1..grad_accum {
+                        let _ = gpu.run_forward(
+                            1,
+                            seq_len,
+                            self.adaptive_max_iters,
+                            damping_eff,
+                            epsilon,
+                        );
+                        let _ = gpu.run_staged_adjoint_picard_no_readback(
+                            seq_len,
+                            self.reasoning.damping,
+                            self.config.adj_iters as u32,
+                            Some(&gpu_lm.dl_dh_buf),
+                            true,
+                        );
+                        let _ = gpu.apply_fused_deq_update(
+                            base_lr,
+                            self.config.deq_grad_scale,
+                            self.training_config.ternary,
+                            self.config.weight_decay,
+                            seq_len,
+                            self.reasoning.damping,
+                            1, // mode=1: accumulate
+                            grad_accum,
+                        );
+                    }
+                    // Apply accumulated gradients.
+                    let _ = gpu.apply_gradient_update(
+                        base_lr,
+                        self.config.weight_decay,
+                        grad_accum,
+                    );
+                }
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
