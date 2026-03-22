@@ -24,6 +24,7 @@ struct UpdateUniforms {
 @group(0) @binding(11) var<storage, read_write> qgrad_buf: array<f32>;
 @group(0) @binding(12) var<storage, read_write> hist_ctx_buf: array<f32>;
 @group(0) @binding(13) var<storage, read_write> hist_delta_buf: array<f32>;
+@group(0) @binding(14) var<storage, read_write> tbptt_carry_buf: array<f32>;
 
 @group(1) @binding(0) var<storage, read_write> W_q: array<f32>;
 @group(1) @binding(1) var<storage, read_write> W_k: array<f32>;
@@ -69,7 +70,7 @@ fn hist_delta_base(d: u32, h_slots: u32) -> u32 {
 }
 
 fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 {
-    return hist_delta_base(d, h_slots) + d * d;
+    return hist_delta_base(d, h_slots) + h_slots * d * d;
 }
 
 fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 {
@@ -387,6 +388,32 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let g_win_s = g_win[s] * seq_scale;
         let s_win_s = clamp(lr * g_win_s * grad_scale, -clip, clip);
         W_in[s * d * d + idx] = W_in[s * d * d + idx] * wd_factor - s_win_s;
+    }
+
+    // Per-slot Q/K bias gradient (one thread per col, guarded by row==0).
+    // q_bias[s,col] lives at W_q[d*d + s*d + col]; same layout for W_k.
+    if (row == 0u) {
+        var g_qbias: array<f32, 16>;  // zero-initialized per WGSL spec
+        var g_kbias: array<f32, 16>;
+        for (var entry2 = 0u; entry2 < n_entries; entry2 = entry2 + 1u) {
+            let t2     = entry2 / h_slots;
+            let qs2    = entry2 % h_slots;
+            let off2   = entry_base(entry2, d);
+            let sstr2  = d * (h_slots * 7u) + h_slots * h_slots;
+            let qbase2 = t2 * sstr2;
+            g_qbias[qs2] = g_qbias[qs2] + qgrad_buf[off2 + col];
+            for (var ks2 = 0u; ks2 < h_slots; ks2 = ks2 + 1u) {
+                g_kbias[ks2] = g_kbias[ks2]
+                    + scale * gscore_buf[entry2 * h_slots + ks2]
+                    * Scratch[qbase2 + qs2 * d + col];
+            }
+        }
+        for (var sb = 0u; sb < h_slots; sb = sb + 1u) {
+            let s_qb = clamp(lr * g_qbias[sb] * seq_scale * grad_scale, -clip, clip);
+            let s_kb = clamp(lr * g_kbias[sb] * seq_scale * grad_scale, -clip, clip);
+            W_q[d * d + sb * d + col] = W_q[d * d + sb * d + col] * wd_factor - s_qb;
+            W_k[d * d + sb * d + col] = W_k[d * d + sb * d + col] * wd_factor - s_kb;
+        }
     }
 
     if (idx == 0u) {
@@ -795,7 +822,7 @@ fn fused_hist_stage_tbptt_main(
 
     let off = slot * d;
     for (var dim = lane; dim < d; dim = dim + 64u) {
-        hist_carry_vec[dim] = 0.0;
+        hist_carry_vec[dim] = tbptt_carry_buf[off + dim];
     }
     workgroupBarrier();
 
@@ -844,7 +871,7 @@ fn fused_hist_stage_tbptt_main(
         workgroupBarrier();
 
         for (var dim = lane; dim < d; dim = dim + 64u) {
-            let a_base = 1.0 / (1.0 + exp(A_log[dim]));
+            let a_base = 1.0 / (1.0 + exp(A_log[slot * d + dim]));
             var a_t = a_base;
             var x_proj = qgrad_buf[hist_out + dim];
             let wx = hist_wx_max() * tanh(W_x[dim * d + dim]);
@@ -854,7 +881,7 @@ fn fused_hist_stage_tbptt_main(
                 var delta_pre = HistParams[hist_delta_bias_base(d, h_slots) + dim];
                 for (var j = 0u; j < d; j = j + 1u) {
                     delta_pre = delta_pre
-                        + HistParams[hist_delta_base(d, h_slots) + j * d + dim]
+                        + HistParams[hist_delta_base(d, h_slots) + slot * d * d + j * d + dim]
                         * qgrad_buf[hist_out + j];
                 }
                 // delta_factor in [0.5, 1.5], a_core = a_base^{delta_factor}, default a_core=a_base.
@@ -883,7 +910,7 @@ fn fused_hist_stage_tbptt_main(
             if (selective) {
                 for (var out = 0u; out < d; out = out + 1u) {
                     g_h_unit = g_h_unit
-                        + HistParams[hist_delta_base(d, h_slots) + dim * d + out]
+                        + HistParams[hist_delta_base(d, h_slots) + slot * d * d + dim * d + out]
                         * hist_delta_buf[hist_out + out];
                 }
             }
@@ -911,12 +938,12 @@ fn fused_hist_stage_tbptt_main(
             let g_h_unit = hist_total_vec[dim];
             hist_ctx_buf[dst_off + dim] = (g_h_unit / h_rms)
                 - (h_val * dot_gh_h / denom);
-            let a_base = 1.0 / (1.0 + exp(A_log[dim]));
+            let a_base = 1.0 / (1.0 + exp(A_log[slot * d + dim]));
             var a_t = a_base;
             if (selective) {
                 var delta_pre = HistParams[hist_delta_bias_base(d, h_slots) + dim];
                 for (var j = 0u; j < d; j = j + 1u) {
-                    delta_pre = delta_pre + HistParams[hist_delta_base(d, h_slots) + j * d + dim]
+                    delta_pre = delta_pre + HistParams[hist_delta_base(d, h_slots) + slot * d * d + j * d + dim]
                         * qgrad_buf[hist_out + j];
                 }
                 let delta = log(1.0 + exp(delta_pre));
@@ -942,7 +969,7 @@ fn fused_hist_stage_tbptt_main(
             var sum_at = 0.0;
             var sum_loga = 0.0;
             for (var dim = 0u; dim < d; dim = dim + 1u) {
-                let a_base = 1.0 / (1.0 + exp(A_log[dim]));
+                let a_base = 1.0 / (1.0 + exp(A_log[slot * d + dim]));
                 let log_a = log(max(a_base, 1.0e-6));
                 var x_proj = qgrad_buf[hist_out + dim];
                 let wx = hist_wx_max() * tanh(W_x[dim * d + dim]);
@@ -951,7 +978,7 @@ fn fused_hist_stage_tbptt_main(
                 var delta_pre = HistParams[hist_delta_bias_base(d, h_slots) + dim];
                 for (var j = 0u; j < d; j = j + 1u) {
                     delta_pre = delta_pre
-                        + HistParams[hist_delta_base(d, h_slots) + j * d + dim]
+                        + HistParams[hist_delta_base(d, h_slots) + slot * d * d + j * d + dim]
                         * qgrad_buf[hist_out + j];
                 }
                 let delta = log(1.0 + exp(delta_pre));
@@ -991,6 +1018,11 @@ fn fused_hist_stage_tbptt_main(
             debug_log[63] = 0.0;
         }
     }
+    // Write cross-sequence TBPTT carry: hist_carry_vec = ∂L/∂M_0 for this sequence.
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        tbptt_carry_buf[off + dim] = hist_carry_vec[dim];
+    }
+    workgroupBarrier();
 }
 
 @compute
@@ -1039,7 +1071,7 @@ fn fused_hist_stage_xprep_main(
             for (var out = 0u; out < d; out = out + 1u) {
                 g_x = g_x + W_out[dim * d + out] * gmix_buf[hist_out + out];
             }
-        let a = 1.0 / (1.0 + exp(A_log[dim]));
+        let a = 1.0 / (1.0 + exp(A_log[slot * d + dim]));
         weighted_h_buf[hist_out + dim] = (1.0 - a) * g_x;
         qgrad_buf[hist_out + dim] = h_star[prev_h_base + dim] / h_rms;
     }
@@ -1198,31 +1230,31 @@ fn fused_hist_stage_wdelta_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (col >= d || row >= d || !hist_selective_enabled(d, h_slots)) { return; }
 
     let n_temporal_tokens = max(1u, params.seq_len - 1u);
-    let n_temporal_entries = max(1.0, f32(n_temporal_tokens * h_slots));
-    var grad = 0.0;
-    for (var t = 1u; t < params.seq_len; t = t + 1u) {
-        for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
+    let n_norm = max(1.0, f32(n_temporal_tokens));
+
+    // Per-slot W_delta: each slot accumulates its own gradient independently.
+    for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
+        var grad = 0.0;
+        for (var t = 1u; t < params.seq_len; t = t + 1u) {
             let entry = t * h_slots + slot;
             grad = grad
                 + qgrad_buf[entry_base(entry, d) + row]
                 * hist_delta_buf[entry_base(entry, d) + col];
         }
-    }
 
-    // The selective temporal branch already accumulates over the exact sequence
-    // positions where the signal exists. Further averaging drives W_Δ updates to
-    // numerical zero before the branch can specialize.
-    let idx = hist_delta_base(d, h_slots) + row * d + col;
-    let clip = 0.5;
-    let step = clamp(params.lr * grad, -clip, clip);
-    let before = HistParams[idx];
-    let after = before - step;
-    HistParams[idx] = after;
-    if (row == 0u && col == 0u) {
-        debug_log[72] = grad;
-        debug_log[73] = step;
-        debug_log[74] = before;
-        debug_log[75] = after;
+        grad = grad / n_norm;
+        let idx = hist_delta_base(d, h_slots) + slot * d * d + row * d + col;
+        let clip = 0.5;
+        let step = clamp(params.lr * grad, -clip, clip);
+        let before = HistParams[idx];
+        let after = before - step;
+        HistParams[idx] = after;
+        if (slot == 0u && row == 0u && col == 0u) {
+            debug_log[72] = grad;
+            debug_log[73] = step;
+            debug_log[74] = before;
+            debug_log[75] = after;
+        }
     }
 }
 
@@ -1268,33 +1300,35 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dim >= d) { return; }
 
     let n_temporal_tokens = max(1u, params.seq_len - 1u);
-    let n_temporal_entries = max(1.0, f32(n_temporal_tokens * h_slots));
-    var grad = 0.0;
+    let n_norm = max(1.0, f32(n_temporal_tokens));
     let selective = hist_selective_enabled(d, h_slots);
-    for (var t = 1u; t < params.seq_len; t = t + 1u) {
-        for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
+
+    // Per-slot A_log: each slot accumulates its own gradient independently.
+    for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
+        var grad = 0.0;
+        let off = slot * d;
+        for (var t = 1u; t < params.seq_len; t = t + 1u) {
             let entry = t * h_slots + slot;
-            let off = slot * d;
             var g_m_inner = gmix_buf[entry_base(entry, d) + dim];
             for (var out = 0u; out < d; out = out + 1u) {
                 g_m_inner = g_m_inner + W_out[dim * d + out] * gmix_buf[entry_base(entry, d) + out];
             }
 
-                var x_proj = qgrad_buf[entry_base(entry, d) + dim];
-                let wx = hist_wx_max() * tanh(W_x[dim * d + dim]);
-                x_proj = x_proj + wx * qgrad_buf[entry_base(entry, d) + dim];
+            var x_proj = qgrad_buf[entry_base(entry, d) + dim];
+            let wx = hist_wx_max() * tanh(W_x[dim * d + dim]);
+            x_proj = x_proj + wx * qgrad_buf[entry_base(entry, d) + dim];
 
             var m_prev = 0.0;
             if (t > 1u) {
                 m_prev = Scratch[token_mamba_base(t - 2u, d, h_slots) + off + dim];
             }
 
-            let a_base = 1.0 / (1.0 + exp(A_log[dim]));
+            let a_base = 1.0 / (1.0 + exp(A_log[slot * d + dim]));
             if (selective) {
                 var delta_pre = HistParams[hist_delta_bias_base(d, h_slots) + dim];
                 for (var j = 0u; j < d; j = j + 1u) {
                     delta_pre = delta_pre
-                        + HistParams[hist_delta_base(d, h_slots) + j * d + dim]
+                        + HistParams[hist_delta_base(d, h_slots) + slot * d * d + j * d + dim]
                         * qgrad_buf[entry_base(entry, d) + j];
                 }
                 let delta_factor = 1.0 + 0.5 * tanh(delta_pre);
@@ -1308,12 +1342,10 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 grad = grad - a_base * (1.0 - a_base) * (m_prev - x_proj) * g_m_inner;
             }
         }
-    }
 
-    // A_log is also shared across slots, so keep the same normalization
-    // convention as the carrier matrices.
-    grad = grad / n_temporal_entries;
-    let clip = 0.5;
-    let step = clamp(params.lr * grad, -clip, clip);
-    A_log[dim] = A_log[dim] - step;
+        grad = grad / n_norm;
+        let clip = 0.5;
+        let step = clamp(params.lr * grad, -clip, clip);
+        A_log[slot * d + dim] = A_log[slot * d + dim] - step;
+    }
 }
