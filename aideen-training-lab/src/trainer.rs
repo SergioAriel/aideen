@@ -3034,14 +3034,21 @@ impl Trainer {
                     let d_r = self.config.d_r;
                     nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
                 };
-                // wq/wk contain [d*d matrix | h_slots*d bias] — split before assigning.
+                // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
                 {
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
-                    self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(d_r, d_r, &wq[..d_r*d_r]);
-                    self.reasoning.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[d_r*d_r..]);
-                    self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &wk[..d_r*d_r]);
-                    self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[d_r*d_r..]);
+                    let mat_total = h_slots * d_r * d_r;
+                    // Average per-slot matrices into CPU prototype (used for checkpoint only)
+                    let avg_mat = |flat: &[f32]| -> Vec<f32> {
+                        (0..d_r * d_r)
+                            .map(|i| (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>() / h_slots as f32)
+                            .collect()
+                    };
+                    self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
+                    self.reasoning.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
+                    self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
+                    self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
                 }
                 self.reasoning.w_v = to_mat(wv);
                 self.reasoning.w_o = to_mat(wo);
