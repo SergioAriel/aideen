@@ -21,7 +21,7 @@
 
 - **Regex:** `ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}|gho_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|ghr_[A-Za-z0-9]{36}`
 - **Replacement:** `<REDACTED_GITHUB_TOKEN>`
-- **Example:** `ghp_ABCDEFghijklmnopqrstuvwxyz0123456789` -> `<REDACTED_GITHUB_TOKEN>`
+- **Example:** `ghp_[36-alphanumeric-chars]` -> `<REDACTED_GITHUB_TOKEN>`
 
 ## Generic API Keys
 
@@ -45,7 +45,7 @@
 
 - **Regex:** `(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/[^\s'"]+`
 - **Replacement:** `<REDACTED_CONNECTION_STRING>`
-- **Example:** `postgres://admin:s3cret@db.host.com:5432/mydb` -> `<REDACTED_CONNECTION_STRING>`
+- **Example:** `postgres://[user]:[password]@db.host.com:5432/mydb` -> `<REDACTED_CONNECTION_STRING>`
 
 ## Bearer Tokens
 
