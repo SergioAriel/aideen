@@ -228,7 +228,10 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
         });
 
         // External Mamba state update across tokens: m_t = a*m_{t-1} + (1-a)*W_x*h_pool
-        let a = trainer.reasoning.a_log.map(|v| 1.0 / (1.0 + v.exp()));
+        // Use slot-0 decay (single shared state, legacy diagnostic mode).
+        let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
+            1.0 / (1.0 + trainer.reasoning.a_log[(0, d)].exp())
+        });
         let x = &trainer.reasoning.w_x * &h_pool;
         m_state = a.zip_map(&m_state, |aa, mm| aa * mm)
             + a.map(|aa| 1.0 - aa).zip_map(&x, |bb, xx| bb * xx);
@@ -267,8 +270,10 @@ fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
         });
 
         // Actualizar cada estado Mamba por slot independientemente
-        let a = trainer.reasoning.a_log.map(|v| 1.0 / (1.0 + v.exp()));
         for k in 0..h_slots {
+            let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
+                1.0 / (1.0 + trainer.reasoning.a_log[(k, d)].exp())
+            });
             let h_k = h_star.slot(k);
             let x = &trainer.reasoning.w_x * &h_k;
             let new_state = a.zip_map(&m_states[k], |aa, mm| aa * mm)

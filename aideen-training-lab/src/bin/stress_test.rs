@@ -50,6 +50,9 @@ fn main() {
         2e-4
     });
     config.deq_grad_scale = 0.01;
+    if let Some(ctx) = env_u32("AIDEEN_STRESS_CTX_LEN") {
+        config.ctx_len = ctx as usize;
+    }
     let stress_iters = env_u32("AIDEEN_STRESS_ITERS").unwrap_or(20) as usize;
     let lr = env_f32("AIDEEN_STRESS_LR").unwrap_or(if force_global { 0.0007 } else { 0.0003 });
     let seed = env_u64("AIDEEN_STRESS_SEED").unwrap_or(42);
@@ -70,8 +73,15 @@ fn main() {
         }
     );
 
-    let tok = Tokenizer::from_text(PROMPT, config.clone());
-    let tokens = tok.encode(PROMPT);
+    let source_text: String = if let Ok(path) = env::var("AIDEEN_STRESS_FILE") {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| { eprintln!("[STRESS-TEST] ERROR leyendo {}: {}", path, e); PROMPT.to_string() })
+    } else {
+        PROMPT.to_string()
+    };
+    let tok = Tokenizer::from_text(&source_text, config.clone());
+    let tokens = tok.encode(&source_text);
+    println!("[STRESS-TEST] Corpus: {} chars → {} tokens (vocab={})", source_text.len(), tokens.len(), tok.vocab_size());
     let mut train_tokens = &tokens[..tokens.len() - 1];
     let mut targets = &tokens[1..];
     if let Some(seq_len) = env_u32("AIDEEN_STRESS_SEQ_LEN") {
