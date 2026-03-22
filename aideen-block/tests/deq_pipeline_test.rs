@@ -105,7 +105,7 @@ async fn test_cg_solver_wgpu_dispatch() {
         batch_size: b as u32,
         d_model: d as u32,
         h_slots: h as u32,
-        cg_iters: 5,
+        adj_iters: 5,
         epsilon: 1e-3,
         curr_iter: 0,
         _pad0: 0,
