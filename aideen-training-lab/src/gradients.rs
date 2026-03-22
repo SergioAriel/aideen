@@ -43,7 +43,7 @@ pub fn deq_implicit_grad<R: Reasoning>(
     h_star: &HSlots,
     query: &DVector<f32>,
     dl_dh_pooled: &DVector<f32>,
-    cg_iters: usize,
+    adj_iters: usize,
 ) -> DVector<f32> {
     let config = reasoning.config();
     let d_r = config.d_r;
@@ -85,7 +85,7 @@ pub fn deq_implicit_grad<R: Reasoning>(
     let mut p = r.clone();
     let mut rs_old = r.dot(&r);
 
-    for _ in 0..cg_iters {
+    for _ in 0..adj_iters {
         let ap = apply_i_minus_jt(&p);
         let p_dot_ap = p.dot(&ap);
         if p_dot_ap.abs() < 1e-12 {
