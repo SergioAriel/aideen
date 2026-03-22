@@ -1,0 +1,6 @@
+version: 2
+
+ignore-paths:
+  # Sanitization patterns doc contains regex examples that look like secrets
+  # but are documentation artifacts, not real credentials
+  - .agents/skills/learn-by-mistake/references/sanitization-patterns.md
