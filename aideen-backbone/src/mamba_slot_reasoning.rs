@@ -325,17 +325,38 @@ impl MambaSlotReasoning {
         Self::matrix_to_row_major(&self.a_log)
     }
 
-    /// GPU flat layout for W_q: [d_r×d_r matrix (column-major, same as .as_slice()) | h_slots×d_r q_bias (row-major)].
-    /// The shader accesses bias at W_q[d_model*d_model + s*d_model + d_out].
+    /// GPU flat layout for W_q: [h_slots × d_r×d_r matrices | h_slots×d_r q_bias (row-major)].
+    /// Each slot matrix is the shared w_q plus a deterministic per-slot jitter for symmetry breaking.
+    /// Shader accesses slot s matrix: W_q[s*d*d + j*d + d_out].
+    /// Bias: W_q[h_slots*d*d + s*d + d_out].
     pub fn w_q_gpu_flat(&self) -> Vec<f32> {
-        let mut v = self.w_q.as_slice().to_vec();  // column-major, consistent with existing uploads
-        v.extend_from_slice(&Self::matrix_to_row_major(&self.q_bias));  // row-major: q_bias[s*d+col]
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let base = self.w_q.as_slice();  // column-major, d*d floats
+        let mut v = Vec::with_capacity(h * d * d + h * d);
+        for s in 0..h {
+            for (i, &x) in base.iter().enumerate() {
+                // Deterministic jitter: sin(index) * scale — same for same init, different per slot
+                let jitter = ((s * d * d + i) as f32 * 0.0001_f32).sin() * 0.05_f32;
+                v.push(x + jitter);
+            }
+        }
+        v.extend_from_slice(&Self::matrix_to_row_major(&self.q_bias));
         v
     }
 
-    /// GPU flat layout for W_k: [d_r×d_r matrix (column-major) | h_slots×d_r k_bias (row-major)].
+    /// GPU flat layout for W_k: [h_slots × d_r×d_r matrices | h_slots×d_r k_bias (row-major)].
     pub fn w_k_gpu_flat(&self) -> Vec<f32> {
-        let mut v = self.w_k.as_slice().to_vec();
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let base = self.w_k.as_slice();
+        let mut v = Vec::with_capacity(h * d * d + h * d);
+        for s in 0..h {
+            for (i, &x) in base.iter().enumerate() {
+                let jitter = ((s * d * d + i) as f32 * 0.0001_f32).sin() * 0.05_f32;
+                v.push(x + jitter);
+            }
+        }
         v.extend_from_slice(&Self::matrix_to_row_major(&self.k_bias));
         v
     }

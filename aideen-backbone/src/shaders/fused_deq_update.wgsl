@@ -341,8 +341,8 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var g_wo = 0.0;
     var g_wv = 0.0;
     var g_win: array<f32, 16>;  // per-slot W_in gradient (max 16 slots), zero-initialized
-    var g_wq = 0.0;
-    var g_wk = 0.0;
+    var g_wq: array<f32, 16>;  // per-slot W_q gradient (max 16 slots), zero-initialized
+    var g_wk: array<f32, 16>;  // per-slot W_k gradient
     let scale = inverseSqrt(max(1.0, f32(d)));
 
     for (var entry = 0u; entry < n_entries; entry = entry + 1u) {
@@ -359,28 +359,30 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Per-slot W_in gradient: dL/dW_in_s[row,col] += x[t,row] * adjoint[t,s,col]
         g_win[qs] = g_win[qs] + q_input[t * d + row] * g_attn_col;
         let q_src = h_star[t * h_slots * d + q_off + col];
-        g_wq = g_wq + qgrad_buf[off + row] * q_src;
+        g_wq[qs] = g_wq[qs] + qgrad_buf[off + row] * q_src;
         let q_row = Scratch[q_base + q_off + row];
         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
             let hk_col = h_star[t * h_slots * d + ks * d + col];
-            g_wk = g_wk + scale * gscore_buf[entry * h_slots + ks] * q_row * hk_col;
+            g_wk[ks] = g_wk[ks] + scale * gscore_buf[entry * h_slots + ks] * q_row * hk_col;
         }
     }
 
     let seq_scale = 1.0 / max(1.0, f32(n_entries));
     g_wv = g_wv * seq_scale;
     g_wo = g_wo * seq_scale;
-    g_wq = g_wq * seq_scale;
-    g_wk = g_wk * seq_scale;
 
     let clip = 0.5;
     let s_wv = clamp(lr * g_wv * grad_scale, -clip, clip);
     let s_wo = clamp(lr * g_wo * grad_scale, -clip, clip);
-    let s_wq = clamp(lr * g_wq * grad_scale, -clip, clip);
-    let s_wk = clamp(lr * g_wk * grad_scale, -clip, clip);
 
-    W_q[idx] = W_q[idx] * wd_factor - s_wq;
-    W_k[idx] = W_k[idx] * wd_factor - s_wk;
+    // Per-slot W_q / W_k update
+    for (var s = 0u; s < h_slots; s = s + 1u) {
+        let s_wq = clamp(lr * g_wq[s] * seq_scale * grad_scale, -clip, clip);
+        let s_wk = clamp(lr * g_wk[s] * seq_scale * grad_scale, -clip, clip);
+        let per_idx = s * d * d + idx;
+        W_q[per_idx] = W_q[per_idx] * wd_factor - s_wq;
+        W_k[per_idx] = W_k[per_idx] * wd_factor - s_wk;
+    }
     W_v[idx] = W_v[idx] * wd_factor - s_wv;
     W_o[idx] = W_o[idx] * wd_factor - s_wo;
     // Per-slot W_in update: each slot's matrix at offset s * d * d
@@ -411,18 +413,18 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var sb = 0u; sb < h_slots; sb = sb + 1u) {
             let s_qb = clamp(lr * g_qbias[sb] * seq_scale * grad_scale, -clip, clip);
             let s_kb = clamp(lr * g_kbias[sb] * seq_scale * grad_scale, -clip, clip);
-            W_q[d * d + sb * d + col] = W_q[d * d + sb * d + col] * wd_factor - s_qb;
-            W_k[d * d + sb * d + col] = W_k[d * d + sb * d + col] * wd_factor - s_kb;
+            W_q[h_slots * d * d + sb * d + col] = W_q[h_slots * d * d + sb * d + col] * wd_factor - s_qb;
+            W_k[h_slots * d * d + sb * d + col] = W_k[h_slots * d * d + sb * d + col] * wd_factor - s_kb;
         }
     }
 
     if (idx == 0u) {
         debug_log[8] = 204.0;
-        debug_log[40] = g_wq;
+        debug_log[40] = g_wq[0];
         debug_log[41] = g_wo;
         debug_log[42] = g_wv;
         debug_log[43] = g_win[0]; // log slot-0 gradient for diagnostics
-        debug_log[44] = g_wk;
+        debug_log[44] = g_wk[0];
     }
 }
 
