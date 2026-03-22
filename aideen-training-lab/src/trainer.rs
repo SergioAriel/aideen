@@ -105,6 +105,13 @@ pub struct Trainer {
 
     // --- v14 Temporal Memory State ---
     pub m_prev: Option<HSlots>,
+
+    // --- Gradient Accumulation ---
+    grad_accum_counter: u32,  // steps accumulated so far in the current window
+
+    // --- TPS tracking for GPU-DEBUG log ---
+    debug_last_time: Option<std::time::Instant>,
+    debug_tokens_accum: u32,   // tokens processed since last GPU-DEBUG print
 }
 
 impl Trainer {
@@ -250,6 +257,9 @@ impl Trainer {
             contractivity_hi_streak: 0,
             force_renorm_done: false,
             m_prev: None,
+            grad_accum_counter: 0,
+            debug_last_time: None,
+            debug_tokens_accum: 0,
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -308,6 +318,9 @@ impl Trainer {
             contractivity_hi_streak: 0,
             force_renorm_done: false,
             m_prev: None,
+            grad_accum_counter: 0,
+            debug_last_time: None,
+            debug_tokens_accum: 0,
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -344,7 +357,8 @@ impl Trainer {
         }
 
         if self.gpu_emb.is_none() {
-            let safe_ctx = self.config.ctx_len.max(1024);
+            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let safe_ctx = self.config.ctx_len.max(1024) * batch_size;
             self.gpu_emb = Some(GpuEmbeddingTrainer::new(
                 &gpu.device,
                 self.tokenizer.vocab_size(),
@@ -420,35 +434,7 @@ impl Trainer {
                 return out;
             }
         }
-        // CPU fallback real: forward DEQ + backward/update en CPU.
-        let query = self.tokenizer.embed_context(context, self.config.ctx_len);
-        let damping_eff = self.damping_eff();
-        self.reasoning.damping = damping_eff;
-
-        let mut h = if let Some(m) = &self.m_prev {
-            m.clone()
-        } else {
-            self.reasoning.init(&query)
-        };
-
-        for _ in 0..self.adaptive_max_iters.max(1) {
-            h = self.reasoning.step(&h, &query, None);
-        }
-
-        let m_next = self.reasoning.temporal_step(
-            self.m_prev.as_ref().unwrap_or(&self.reasoning.init(&query)),
-            &h,
-        );
-        self.m_prev = Some(m_next);
-
-        #[cfg(feature = "wgpu")]
-        {
-            self.apply_training_update(context, target, &query, &h, None)
-        }
-        #[cfg(not(feature = "wgpu"))]
-        {
-            self.apply_training_update(context, target, &query, &h, None)
-        }
+        0.0
     }
 
     /// Paso de entrenamiento para una secuencia completa (Sequence Fusing).
@@ -480,9 +466,19 @@ impl Trainer {
             let out = (|| {
                 self.ensure_gpu_trainers(&gpu);
 
-                // Arreglo defensivo para evitar underflow si seq_len < ctx_len
+                // Arreglo defensivo para evitar underflow si seq_len < ctx_len.
+                // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
+                let fwd_batch_size_ts: usize = std::env::var("AIDEEN_BATCH_SIZE")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1)
+                    .max(1);
                 let seq_len = tokens.len().min(targets.len());
-                let actual_ctx_len = seq_len.min(self.config.ctx_len);
+                let actual_ctx_len = if fwd_batch_size_ts > 1 {
+                    seq_len
+                } else {
+                    seq_len.min(self.config.ctx_len)
+                };
                 let ctx = &tokens[seq_len - actual_ctx_len..];
                 let ctx_targets = &targets[seq_len - actual_ctx_len..];
 
@@ -567,641 +563,6 @@ impl Trainer {
         }
     }
 
-    fn apply_training_update(
-        &mut self,
-        context: &[u32],
-        target: u32,
-        query: &nalgebra::DVector<f32>,
-        h: &HSlots,
-        #[cfg(feature = "wgpu")] gpu_ctx: Option<&GpuDeqBackend>,
-        #[cfg(not(feature = "wgpu"))] _gpu_ctx: Option<()>,
-    ) -> f32 {
-        // ③ Forward LmHead: H* → logits
-        let logits = self.lm_head.forward(h);
-
-        // ④ Loss
-        let current_loss = loss::cross_entropy(&logits, target);
-
-        // ⑤ Backward LmHead
-        let dl_dlogits = loss::cross_entropy_grad(&logits, target);
-        let h_pooled = self.lm_head.pool_h_star(h);
-        let (lm_grads, dl_dh) =
-            gradients::lmhead_backward(&dl_dlogits, &h_pooled, &self.lm_head.w, &self.lm_head.g);
-
-        // Actualizar LmHead
-        self.optimizer.tick();
-        self.optimizer
-            .step_matrix("lm_w", &mut self.lm_head.w, &lm_grads.dw);
-        self.optimizer
-            .step_vector("lm_b", &mut self.lm_head.b, &lm_grads.db);
-        self.optimizer
-            .step_vector("lm_g", &mut self.lm_head.g, &lm_grads.dg);
-        #[cfg(feature = "wgpu")]
-        {
-            self.gpu_lm_weights_uploaded = false;
-            self.lm_head_cpu_stale = false;
-        }
-
-        #[cfg(feature = "wgpu")]
-        {
-            if let (Some(gpu), Some(gpu_emb)) = (gpu_ctx, self.gpu_emb.as_ref()) {
-                let emb_lr = self.optimizer.lr * self.training_config.emb_lr_mult;
-                if gpu_emb
-                    .apply_embedding_update(
-                        &gpu.device,
-                        &gpu.queue,
-                        context,
-                        self.config.ctx_len,
-                        dl_dh.as_slice(),
-                        emb_lr,
-                        self.optimizer.beta1,
-                        self.optimizer.beta2,
-                        self.optimizer.eps,
-                        self.optimizer.step_count() as u32,
-                        self.training_config.ternary,
-                    )
-                    .is_ok()
-                {
-                    self.gpu_emb_weights_uploaded = true;
-                } else {
-                    self.gpu_emb_weights_uploaded = false;
-                    return 0.0;
-                }
-            } else {
-                // Fallback CPU cuando el build tiene `wgpu` pero el backend activo es CPU.
-                let ctx_start = context.len().saturating_sub(self.config.ctx_len);
-                let ctx = &context[ctx_start..];
-                let ctx_len_f = ctx.len().max(1) as f32;
-                let emb_lr = self.optimizer.lr * self.training_config.emb_lr_mult;
-                for (pos, &tok) in ctx.iter().enumerate() {
-                    let pos_weight = (pos + 1) as f32 / ctx_len_f;
-                    for d in 0..self.config.d_r {
-                        self.tokenizer.embeddings[(tok as usize, d)] -=
-                            emb_lr * pos_weight * dl_dh[d];
-                    }
-                }
-            }
-        }
-        #[cfg(not(feature = "wgpu"))]
-        {
-            let ctx_start = context.len().saturating_sub(self.config.ctx_len);
-            let ctx = &context[ctx_start..];
-            let ctx_len_f = ctx.len().max(1) as f32;
-            let emb_lr = self.optimizer.lr * self.training_config.emb_lr_mult;
-            for (pos, &tok) in ctx.iter().enumerate() {
-                let pos_weight = (pos + 1) as f32 / ctx_len_f;
-                for d in 0..self.config.d_r {
-                    self.tokenizer.embeddings[(tok as usize, d)] -= emb_lr * pos_weight * dl_dh[d];
-                }
-            }
-        }
-
-        // ⑥ Backward DEQ (Picard Adjoint)
-        if self.config.train_deq {
-            #[cfg(feature = "wgpu")]
-            let mut deq_updated_on_gpu = false;
-            #[cfg(feature = "wgpu")]
-            let mut deq_touched_on_cpu = false;
-            let v = {
-                #[cfg(feature = "wgpu")]
-                {
-                    if let Some(gpu) = gpu_ctx {
-                        let needs_cg_upload = !self.gpu_cg_weights_uploaded;
-                        let h_star_flat = h.to_flat();
-                        if let Ok(v_gpu_flat) = gpu.run_backward_deq(
-                            1,
-                            query.as_slice(),
-                            &h_star_flat,
-                            dl_dh.as_slice(),
-                            self.reasoning.w_q.as_slice(),
-                            self.reasoning.w_k.as_slice(),
-                            self.reasoning.w_v.as_slice(),
-                            self.reasoning.w_o.as_slice(),
-                            &self.reasoning.w_in_gpu_flat(),
-                            self.reasoning.w_x.as_slice(),
-                            self.reasoning.w_out.as_slice(),
-                            &self.reasoning.a_log_gpu_flat(),
-                            self.reasoning.norm_scale.as_slice(),
-                            self.config.adj_iters as u32,
-                            needs_cg_upload,
-                        ) {
-                            self.gpu_cg_weights_uploaded = true;
-                            let d_r = self.config.d_r;
-                            nalgebra::DVector::from_iterator(
-                                d_r,
-                                v_gpu_flat.iter().take(d_r).copied(),
-                            )
-                        } else {
-                            self.gpu_cg_weights_uploaded = false;
-                            gradients::deq_implicit_grad(
-                                &self.reasoning,
-                                h,
-                                query,
-                                &dl_dh,
-                                self.config.adj_iters,
-                            )
-                        }
-                    } else {
-                        gradients::deq_implicit_grad(
-                            &self.reasoning,
-                            h,
-                            query,
-                            &dl_dh,
-                            self.config.adj_iters,
-                        )
-                    }
-                }
-                #[cfg(not(feature = "wgpu"))]
-                {
-                    gradients::deq_implicit_grad(
-                        &self.reasoning,
-                        h,
-                        query,
-                        &dl_dh,
-                        self.config.adj_iters,
-                    )
-                }
-            };
-
-            let grad_mat = v.clone() * query.transpose() * self.config.deq_grad_scale;
-            let grad_vec = v * self.config.deq_grad_scale;
-
-            #[cfg(feature = "wgpu")]
-            if let Some(gpu) = gpu_ctx {
-                let deq_lr_mult = Self::env_f32_default(
-                    "AIDEEN_DEQ_LR_MULT",
-                    self.training_config.deq_lr_mult,
-                );
-                let deq_lr = self.optimizer.lr * deq_lr_mult;
-                if gpu
-                    .apply_deq_sgd_update_and_sync_cg(
-                        deq_lr,
-                        grad_mat.as_slice(),
-                        grad_vec.as_slice(),
-                    )
-                    .is_ok()
-                {
-                    self.gpu_weights_uploaded = true;
-                    self.gpu_cg_weights_uploaded = true;
-                    deq_updated_on_gpu = true;
-                } else {
-                    self.optimizer
-                        .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                    self.optimizer.step_vector(
-                        "deq_norm",
-                        &mut self.reasoning.norm_scale,
-                        &grad_vec,
-                    );
-                    deq_touched_on_cpu = true;
-                }
-            } else {
-                self.optimizer
-                    .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                self.optimizer
-                    .step_vector("deq_norm", &mut self.reasoning.norm_scale, &grad_vec);
-                #[cfg(feature = "wgpu")]
-                {
-                    deq_touched_on_cpu = true;
-                }
-            }
-
-            #[cfg(not(feature = "wgpu"))]
-            {
-                self.optimizer
-                    .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                self.optimizer
-                    .step_vector("deq_norm", &mut self.reasoning.norm_scale, &grad_vec);
-            }
-
-            #[cfg(feature = "wgpu")]
-            {
-                let renorm_every = self.config.renorm_every_steps.max(1);
-                if self.optimizer.step_count() % renorm_every == 0 {
-                    if deq_updated_on_gpu {
-                        // Evita desync CPU<->GPU: no renormalizar en CPU si DEQ vive en VRAM.
-                    } else {
-                        self.reasoning.renormalize_weights();
-                        deq_touched_on_cpu = true;
-                    }
-                }
-                if deq_touched_on_cpu {
-                    self.gpu_weights_uploaded = false;
-                    self.gpu_cg_weights_uploaded = false;
-                }
-            }
-
-            #[cfg(not(feature = "wgpu"))]
-            {
-                let renorm_every = self.config.renorm_every_steps.max(1);
-                if self.optimizer.step_count() % renorm_every == 0 {
-                    self.reasoning.renormalize_weights();
-                }
-            }
-        }
-
-        current_loss
-    }
-
-    fn apply_training_update_from_pooled(
-        &mut self,
-        context: &[u32],
-        targets: &[u32],
-        query: &nalgebra::DVector<f32>,
-        h_pooled: &[f32],
-        #[cfg(feature = "wgpu")] gpu_ctx: Option<&GpuDeqBackend>,
-        #[cfg(not(feature = "wgpu"))] _gpu_ctx: Option<()>,
-    ) -> f32 {
-        self.optimizer.tick();
-
-        let num_tokens = targets.len();
-        if num_tokens == 0 {
-            return 0.0;
-        }
-        let d_r = self.config.d_r;
-        #[cfg(feature = "wgpu")]
-        let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
-
-        let (current_loss, dl_dh) = {
-            #[cfg(feature = "wgpu")]
-            if let (Some(gpu), Some(gpu_lm)) = (gpu_ctx, self.gpu_lm.as_mut()) {
-                let upload_w = !self.gpu_lm_weights_uploaded;
-                let lm_lr = self.optimizer.lr * self.training_config.lm_lr_mult;
-                if let Ok((loss, dl_bytes)) = gpu_lm.train_step_from_buffer(
-                    &gpu.device,
-                    &gpu.queue,
-                    &gpu.bridge.hpooled_buf,
-                    0, // We read the whole sequence from the buffer
-                    &targets_u32,
-                    lm_lr,
-                    self.optimizer.step_count() as u32,
-                    self.lm_head.w.as_slice(),
-                    self.lm_head.b.as_slice(),
-                    self.lm_head.g.as_slice(),
-                    upload_w,
-                    self.training_config.ternary,
-                ) {
-                    self.gpu_lm_weights_uploaded = true;
-                    self.lm_head_cpu_stale = true;
-                    let dl: Vec<f32> = bytemuck::cast_slice(&dl_bytes).to_vec();
-                    (loss, nalgebra::DVector::from_vec(dl))
-                } else {
-                    // CPU fallback loop
-                    let mut sum_loss = 0.0;
-                    let mut accum_dl_dh = nalgebra::DVector::zeros(d_r);
-                    let mut accum_dw =
-                        nalgebra::DMatrix::zeros(self.lm_head.w.nrows(), self.lm_head.w.ncols());
-                    let mut accum_db = nalgebra::DVector::zeros(self.lm_head.b.nrows());
-                    let mut accum_dg = nalgebra::DVector::zeros(self.lm_head.g.nrows());
-
-                    for i in 0..num_tokens {
-                        let target = targets[i];
-                        let h_slice = &h_pooled[i * d_r..(i + 1) * d_r];
-                        let h_vec = nalgebra::DVector::from_column_slice(h_slice);
-                        let logits = &self.lm_head.w * &h_vec + &self.lm_head.b;
-                        sum_loss += loss::cross_entropy(&logits, target);
-                        let dl_dlogits = loss::cross_entropy_grad(&logits, target);
-                        let (lm_grads, dl_dh_t) = gradients::lmhead_backward(
-                            &dl_dlogits,
-                            &h_vec,
-                            &self.lm_head.w,
-                            &self.lm_head.g,
-                        );
-                        accum_dl_dh += dl_dh_t;
-                        accum_dw += lm_grads.dw;
-                        accum_db += lm_grads.db;
-                        accum_dg += lm_grads.dg;
-                    }
-
-                    let norm = 1.0 / (num_tokens as f32);
-                    sum_loss *= norm;
-                    accum_dl_dh *= norm;
-                    accum_dw *= norm;
-                    accum_db *= norm;
-                    accum_dg *= norm;
-
-                    self.optimizer
-                        .step_matrix("lm_w", &mut self.lm_head.w, &accum_dw);
-                    self.optimizer
-                        .step_vector("lm_b", &mut self.lm_head.b, &accum_db);
-                    self.optimizer
-                        .step_vector("lm_g", &mut self.lm_head.g, &accum_dg);
-                    self.lm_head_cpu_stale = false;
-                    (sum_loss, accum_dl_dh)
-                }
-            } else {
-                let mut sum_loss = 0.0;
-                let mut accum_dl_dh = nalgebra::DVector::zeros(d_r);
-                let mut accum_dw =
-                    nalgebra::DMatrix::zeros(self.lm_head.w.nrows(), self.lm_head.w.ncols());
-                let mut accum_db = nalgebra::DVector::zeros(self.lm_head.b.nrows());
-                let mut accum_dg = nalgebra::DVector::zeros(self.lm_head.g.nrows());
-
-                for i in 0..num_tokens {
-                    let target = targets[i];
-                    let h_slice = &h_pooled[i * d_r..(i + 1) * d_r];
-                    let h_vec = nalgebra::DVector::from_column_slice(h_slice);
-                    let logits = &self.lm_head.w * &h_vec + &self.lm_head.b;
-                    sum_loss += loss::cross_entropy(&logits, target);
-                    let dl_dlogits = loss::cross_entropy_grad(&logits, target);
-                    let (lm_grads, dl_dh_t) = gradients::lmhead_backward(
-                        &dl_dlogits,
-                        &h_vec,
-                        &self.lm_head.w,
-                        &self.lm_head.g,
-                    );
-                    accum_dl_dh += dl_dh_t;
-                    accum_dw += lm_grads.dw;
-                    accum_db += lm_grads.db;
-                    accum_dg += lm_grads.dg;
-                }
-
-                let norm = 1.0 / (num_tokens as f32);
-                sum_loss *= norm;
-                accum_dl_dh *= norm;
-                accum_dw *= norm;
-                accum_db *= norm;
-                accum_dg *= norm;
-
-                self.optimizer
-                    .step_matrix("lm_w", &mut self.lm_head.w, &accum_dw);
-                self.optimizer
-                    .step_vector("lm_b", &mut self.lm_head.b, &accum_db);
-                self.optimizer
-                    .step_vector("lm_g", &mut self.lm_head.g, &accum_dg);
-                self.lm_head_cpu_stale = false;
-                (sum_loss, accum_dl_dh)
-            }
-            #[cfg(not(feature = "wgpu"))]
-            {
-                let mut sum_loss = 0.0;
-                let mut accum_dl_dh = nalgebra::DVector::zeros(d_r);
-                let mut accum_dw =
-                    nalgebra::DMatrix::zeros(self.lm_head.w.nrows(), self.lm_head.w.ncols());
-                let mut accum_db = nalgebra::DVector::zeros(self.lm_head.b.nrows());
-                let mut accum_dg = nalgebra::DVector::zeros(self.lm_head.g.nrows());
-
-                for i in 0..num_tokens {
-                    let target = targets[i];
-                    let h_slice = &h_pooled[i * d_r..(i + 1) * d_r];
-                    let h_vec = nalgebra::DVector::from_column_slice(h_slice);
-                    let logits = &self.lm_head.w * &h_vec + &self.lm_head.b;
-                    sum_loss += loss::cross_entropy(&logits, target);
-                    let dl_dlogits = loss::cross_entropy_grad(&logits, target);
-                    let (lm_grads, dl_dh_t) = gradients::lmhead_backward(
-                        &dl_dlogits,
-                        &h_vec,
-                        &self.lm_head.w,
-                        &self.lm_head.g,
-                    );
-                    accum_dl_dh += dl_dh_t;
-                    accum_dw += lm_grads.dw;
-                    accum_db += lm_grads.db;
-                    accum_dg += lm_grads.dg;
-                }
-
-                let norm = 1.0 / (num_tokens as f32);
-                sum_loss *= norm;
-                accum_dl_dh *= norm;
-                accum_dw *= norm;
-                accum_db *= norm;
-                accum_dg *= norm;
-
-                self.optimizer
-                    .step_matrix("lm_w", &mut self.lm_head.w, &accum_dw);
-                self.optimizer
-                    .step_vector("lm_b", &mut self.lm_head.b, &accum_db);
-                self.optimizer
-                    .step_vector("lm_g", &mut self.lm_head.g, &accum_dg);
-                (sum_loss, accum_dl_dh)
-            }
-        };
-
-        #[cfg(feature = "wgpu")]
-        {
-            if let (Some(gpu), Some(gpu_emb)) = (gpu_ctx, self.gpu_emb.as_ref()) {
-                let emb_lr = self.optimizer.lr * self.training_config.emb_lr_mult;
-                if gpu_emb
-                    .apply_embedding_update(
-                        &gpu.device,
-                        &gpu.queue,
-                        context,
-                        self.config.ctx_len,
-                        dl_dh.as_slice(),
-                        emb_lr,
-                        self.optimizer.beta1,
-                        self.optimizer.beta2,
-                        self.optimizer.eps,
-                        self.optimizer.step_count() as u32,
-                        self.training_config.ternary,
-                    )
-                    .is_ok()
-                {
-                    self.gpu_emb_weights_uploaded = true;
-                } else {
-                    self.gpu_emb_weights_uploaded = false;
-                    return 0.0;
-                }
-            } else {
-                return 0.0;
-            }
-        }
-        #[cfg(not(feature = "wgpu"))]
-        {
-            let ctx_start = context.len().saturating_sub(self.config.ctx_len);
-            let ctx = &context[ctx_start..];
-            let ctx_len_f = ctx.len().max(1) as f32;
-            let emb_lr = self.optimizer.lr * 0.5;
-            for (pos, &tok) in ctx.iter().enumerate() {
-                let pos_weight = (pos + 1) as f32 / ctx_len_f;
-                for d in 0..self.config.d_r {
-                    self.tokenizer.embeddings[(tok as usize, d)] -= emb_lr * pos_weight * dl_dh[d];
-                }
-            }
-        }
-
-        // Global Gradient Clipping (Safety Barrier)
-        let mut dl_dh = dl_dh;
-        Self::clip_grad_norm(&mut dl_dh, 1.0);
-
-        if self.config.train_deq {
-            #[cfg(feature = "wgpu")]
-            let mut deq_updated_on_gpu = false;
-            #[cfg(feature = "wgpu")]
-            let mut deq_touched_on_cpu = false;
-            #[cfg(feature = "wgpu")]
-            let v = if let Some(gpu) = gpu_ctx {
-                let needs_cg_upload = !self.gpu_cg_weights_uploaded;
-                let num_tokens = context.len();
-                let h_offset = (num_tokens.saturating_sub(1) * self.config.d_r * 4) as u64;
-
-                if let Ok(v_gpu_flat) = gpu.run_backward_deq_from_forward_state(
-                    1,
-                    query.as_slice(),
-                    h_offset,
-                    dl_dh.as_slice(),
-                    self.reasoning.w_q.as_slice(),
-                    self.reasoning.w_k.as_slice(),
-                    self.reasoning.w_v.as_slice(),
-                    self.reasoning.w_o.as_slice(),
-                    &self.reasoning.w_in_gpu_flat(),
-                    self.reasoning.w_x.as_slice(),
-                    self.reasoning.w_out.as_slice(),
-                    &self.reasoning.a_log_gpu_flat(),
-                    self.reasoning.norm_scale.as_slice(),
-                    self.config.adj_iters as u32,
-                    needs_cg_upload,
-                ) {
-                    self.gpu_cg_weights_uploaded = true;
-                    nalgebra::DVector::from_iterator(
-                        self.config.d_r,
-                        v_gpu_flat.iter().take(self.config.d_r).copied(),
-                    )
-                } else {
-                    self.gpu_cg_weights_uploaded = false;
-                    dl_dh.clone()
-                }
-            } else {
-                dl_dh.clone()
-            };
-
-            #[cfg(feature = "wgpu")]
-            let v = {
-                let mut v = v;
-                Self::clip_grad_norm(&mut v, 1.0);
-                v
-            };
-
-            #[cfg(not(feature = "wgpu"))]
-            let v = {
-                let mut v = dl_dh.clone();
-                Self::clip_grad_norm(&mut v, 1.0);
-                v
-            };
-
-            let grad_mat = v.clone() * query.transpose() * self.config.deq_grad_scale;
-            let grad_vec = v * self.config.deq_grad_scale;
-
-            #[cfg(feature = "wgpu")]
-            if let Some(gpu) = gpu_ctx {
-            let deq_lr_mult = Self::env_f32_default(
-                "AIDEEN_DEQ_LR_MULT",
-                self.training_config.deq_lr_mult,
-            );
-            let deq_lr = self.optimizer.lr * deq_lr_mult;
-                if gpu
-                    .apply_deq_sgd_update_and_sync_cg(
-                        deq_lr,
-                        grad_mat.as_slice(),
-                        grad_vec.as_slice(),
-                    )
-                    .is_ok()
-                {
-                    self.gpu_weights_uploaded = true;
-                    self.gpu_cg_weights_uploaded = true;
-                    deq_updated_on_gpu = true;
-                } else {
-                    self.optimizer
-                        .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                    self.optimizer.step_vector(
-                        "deq_norm",
-                        &mut self.reasoning.norm_scale,
-                        &grad_vec,
-                    );
-                    deq_touched_on_cpu = true;
-                }
-            } else {
-                self.optimizer
-                    .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                self.optimizer
-                    .step_vector("deq_norm", &mut self.reasoning.norm_scale, &grad_vec);
-                deq_touched_on_cpu = true;
-            }
-
-            #[cfg(not(feature = "wgpu"))]
-            {
-                self.optimizer
-                    .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                self.optimizer
-                    .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                self.optimizer
-                    .step_vector("deq_norm", &mut self.reasoning.norm_scale, &grad_vec);
-            }
-            #[cfg(feature = "wgpu")]
-            {
-                let renorm_every = self.config.renorm_every_steps.max(1);
-                if self.optimizer.step_count() % renorm_every == 0 {
-                    if deq_updated_on_gpu {
-                        // Evita desync CPU<->GPU: no renormalizar en CPU si DEQ vive en VRAM.
-                    } else {
-                        self.reasoning.renormalize_weights();
-                        deq_touched_on_cpu = true;
-                    }
-                }
-                if deq_touched_on_cpu {
-                    self.gpu_weights_uploaded = false;
-                    self.gpu_cg_weights_uploaded = false;
-                }
-                // LM head ya se actualizó en GPU; mantener cache viva.
-            }
-
-            #[cfg(not(feature = "wgpu"))]
-            {
-                let renorm_every = self.config.renorm_every_steps.max(1);
-                if self.optimizer.step_count() % renorm_every == 0 {
-                    self.reasoning.renormalize_weights();
-                }
-            }
-        }
-        // REMOVED: sync_inference_weights() — This triggered 196MB uploads every chunk!
-        current_loss
-    }
-
     #[cfg(feature = "wgpu")]
     fn apply_training_update_from_gpu_buffers(
         &mut self,
@@ -1244,12 +605,18 @@ impl Trainer {
             let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
             // 1. Prepare DEQ input on GPU
+            let fwd_batch_size = std::env::var("AIDEEN_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1);
+            // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
+            let per_seq_len = (num_tokens as u32) / fwd_batch_size;
             let single_query_mode = query.len() == self.config.d_r && num_tokens == 1;
             if single_query_mode {
                 // train_step path: match CPU semantics by feeding the pooled query vector.
                 let q_bytes = bytemuck::cast_slice(query.as_slice());
                 gpu.queue.write_buffer(&gpu.bridge.s_buf, 0, q_bytes);
-                gpu.queue.write_buffer(&gpu.cg_bridge.b_sin, 0, q_bytes);
                 // Align DEQ init with CPU `reasoning.init(query)`: broadcast query to all slots.
                 // Without this, GPU starts from zeroed H_curr after reset and diverges in h* parity.
                 let d_r = self.config.d_r;
@@ -1276,33 +643,27 @@ impl Trainer {
                 if emb_needs_upload {
                     self.gpu_emb_weights_uploaded = true;
                 }
+                // Copy all B sequences' embeddings (already flat in seq_buf) to s_buf in one copy.
                 let mut conn_enc =
                     gpu.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("Connect Embedding -> DEQ Encoder"),
                         });
-                let copy_size = (num_tokens as u64) * (self.config.d_r as u64) * 4;
+                let total_emb_bytes = (num_tokens as u64) * (self.config.d_r as u64) * 4;
                 conn_enc.copy_buffer_to_buffer(
                     &gpu_emb.seq_buf,
                     0,
                     &gpu.bridge.s_buf,
                     0,
-                    copy_size,
-                );
-                conn_enc.copy_buffer_to_buffer(
-                    &gpu_emb.seq_buf,
-                    0,
-                    &gpu.cg_bridge.b_sin,
-                    0,
-                    copy_size,
+                    total_emb_bytes,
                 );
                 gpu.queue.submit(Some(conn_enc.finish()));
             }
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
             let _ = gpu.run_forward(
-                1,
-                num_tokens as u32,
+                fwd_batch_size,
+                per_seq_len,
                 self.adaptive_max_iters,
                 damping_eff,
                 epsilon,
@@ -1358,13 +719,15 @@ impl Trainer {
                 self.gpu_lm_weights_uploaded = true;
             }
 
+            // targets_u32 already covers all B*seq_len positions (training loop provides B chunks).
+            let batch_targets_u32 = targets_u32.clone();
             let current_loss = gpu_lm
                 .train_step_no_readback(
                     &gpu.device,
                     &gpu.queue,
                     &gpu.bridge.hpooled_buf,
                     0,
-                    &targets_u32,
+                    &batch_targets_u32,
                     lm_lr,
                     self.optimizer.step_count() as u32,
                     self.training_config.ternary,
@@ -1388,22 +751,44 @@ impl Trainer {
                 // forward pass are unreliable (∂L/∂θ via implicit diff requires h* to exist).
                 // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
                 // aplica el weight update completo en GPU. Un solo path, siempre correcto.
-                let seq_len = targets_u32.len() as u32;
+                let batch_size = fwd_batch_size;
                 let _ = gpu.run_staged_adjoint_picard_no_readback(
-                    seq_len,
+                    per_seq_len,
                     self.reasoning.damping,
                     self.config.adj_iters as u32,
                     Some(&gpu_lm.dl_dh_buf),
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
+                    batch_size,
                 );
+                let grad_accum = std::env::var("AIDEEN_GRAD_ACCUM")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                // Cross-step gradient accumulation:
+                // Each train_step() call accumulates gradients from a different sequence.
+                // Weight update is applied only every grad_accum steps.
+                let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
                     self.config.deq_grad_scale,
                     self.training_config.ternary,
                     self.config.weight_decay,
-                    seq_len,
+                    per_seq_len,
                     self.reasoning.damping,
+                    mode,
+                    grad_accum,
+                    batch_size,
                 );
+                self.grad_accum_counter += 1;
+                if self.grad_accum_counter >= grad_accum {
+                    let _ = gpu.apply_gradient_update(
+                        base_lr,
+                        self.config.weight_decay,
+                        grad_accum,
+                    );
+                    self.grad_accum_counter = 0;
+                }
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
@@ -1626,13 +1011,14 @@ impl Trainer {
                 self.gpu_emb_weights_uploaded = true;
             }
 
+            // --- TPS tracking ---
+            self.debug_tokens_accum += num_tokens as u32;
+
             // --- DIAGNÓSTICOS GPU (v13.1 Auto-Healing) ---
             if self.optimizer.step_count() % 10 == 0 {
-                let d = gpu.read_cg_debug_buffer();
                 let fw = gpu.read_debug_buffer();
 
-                let _b0 = if d.len() > 1 { d[0] } else { 0.0 };
-                let rs_cg = if d.len() > 2 { d[2] } else { 0.0 };
+                let rs_cg = 0.0f32;
 
                 let heartbeat = if fw.len() > 10 { fw[10] } else { 0.0 }; // seq
                 let max_h = if fw.len() > 11 { fw[11] } else { 0.0 };
@@ -1669,6 +1055,14 @@ impl Trainer {
                 let hist_loop_force_nomamba = if fw.len() > 111 { fw[111] } else { 0.0 };
 
                 let trunc_str = if trunc_flag >= 0.5 { "TRUNC" } else { "OK" };
+
+                let now = std::time::Instant::now();
+                let tps_debug = if let Some(t) = self.debug_last_time {
+                    let elapsed = t.elapsed().as_secs_f32();
+                    if elapsed > 0.0 { self.debug_tokens_accum as f32 / elapsed } else { 0.0 }
+                } else { 0.0 };
+                self.debug_last_time = Some(now);
+                self.debug_tokens_accum = 0;
 
                 if std::env::var("AIDEEN_DEQ_WV_DEBUG").ok().as_deref() == Some("1") {
                     if let Ok((_, _, wv, _, _, _, _, _, _)) = gpu.read_weights() {
@@ -1826,7 +1220,7 @@ impl Trainer {
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
                 let hit_i = hit.round() as i32;
                 println!(
-                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
+                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
                     hit_i,
                     seq,
@@ -1839,6 +1233,7 @@ impl Trainer {
                     damping_eff,
                     mode_str,
                     conv_str,
+                    tps_debug,
                     max_h,
                     inj_rms,
                     hist_rms,
@@ -2022,9 +1417,11 @@ impl Trainer {
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
             let ctx_len = self.config.ctx_len.max(1);
+            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let step = ctx_len * batch_size;
 
-            for i in (0..train_tokens.len()).step_by(ctx_len) {
-                let end = (i + ctx_len).min(train_tokens.len());
+            for i in (0..train_tokens.len()).step_by(step) {
+                let end = (i + step).min(train_tokens.len());
                 let batch_ctx = &train_tokens[i..end];
                 let batch_tgt = &targets[i..end];
                 if epoch % log_every == 0 && i == 0 {
@@ -3034,14 +2431,21 @@ impl Trainer {
                     let d_r = self.config.d_r;
                     nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
                 };
-                // wq/wk contain [d*d matrix | h_slots*d bias] — split before assigning.
+                // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
                 {
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
-                    self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(d_r, d_r, &wq[..d_r*d_r]);
-                    self.reasoning.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[d_r*d_r..]);
-                    self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &wk[..d_r*d_r]);
-                    self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[d_r*d_r..]);
+                    let mat_total = h_slots * d_r * d_r;
+                    // Average per-slot matrices into CPU prototype (used for checkpoint only)
+                    let avg_mat = |flat: &[f32]| -> Vec<f32> {
+                        (0..d_r * d_r)
+                            .map(|i| (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>() / h_slots as f32)
+                            .collect()
+                    };
+                    self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
+                    self.reasoning.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
+                    self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
+                    self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
                 }
                 self.reasoning.w_v = to_mat(wv);
                 self.reasoning.w_o = to_mat(wo);

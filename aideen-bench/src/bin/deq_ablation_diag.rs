@@ -36,7 +36,7 @@ fn make_config() -> ArchitectureConfig {
     cfg.d_r = 96;
     cfg.h_slots = 8;
     cfg.max_deq_iters = 12;
-    cfg.cg_iters = 8;
+    cfg.adj_iters = 8;
     cfg.train_deq = true;
     cfg.deq_epsilon = 1e-4;
     cfg
@@ -215,9 +215,11 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
     }
 
     let mut mamba_total = 0.0f32;
-    let a_bar = trainer.reasoning.a_log.map(|a| 1.0 / (1.0 + a.exp()));
-    let b_bar = a_bar.map(|a| 1.0 - a);
     for k in 0..h_slots {
+        let a_bar = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
+            1.0 / (1.0 + trainer.reasoning.a_log[(k, d)].exp())
+        });
+        let b_bar = a_bar.map(|a| 1.0 - a);
         let hs = h.slot(k);
         let x_proj = &trainer.reasoning.w_x * &hs;
         let y = a_bar.zip_map(&hs, |a, hv| a * hv) + b_bar.zip_map(&x_proj, |b, xv| b * xv);

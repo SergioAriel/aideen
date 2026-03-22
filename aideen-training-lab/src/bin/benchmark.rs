@@ -58,7 +58,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     trainer.config.train_deq = true;
     trainer.training_config.epochs = if quick_bench { 8 } else { 200 }; // 200 épocas
     trainer.config.max_deq_iters = if quick_bench { 4 } else { 18 };
-    trainer.config.cg_iters = if quick_bench { 4 } else { 15 };
+    trainer.config.adj_iters = if quick_bench { 4 } else { 15 };
     trainer.config.deq_epsilon = if quick_bench { 1e-4 } else { 1e-4 };
     trainer.config.deq_grad_scale = if quick_bench { 0.001 } else { 0.01 };
     trainer.config.renorm_every_steps = if quick_bench { 8 } else { 16 };
