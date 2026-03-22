@@ -666,6 +666,40 @@ impl RustCgBridge {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Sync cg_bridge weight buffers from the packed AllWeights buffer.
+    pub fn sync_weights_from_all_weights_buf(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        all_weights: &wgpu::Buffer,
+        d_model: u32,
+        h_slots: u32,
+    ) {
+        use crate::deq_bridge::{
+            aw_wk_byte_off, aw_wv_byte_off, aw_wo_byte_off,
+            aw_win_byte_off, aw_wx_byte_off, aw_wout_byte_off,
+            aw_alog_byte_off, aw_nscale_byte_off,
+        };
+        let d = d_model as u64;
+        let h = h_slots as u64;
+        let mat_bytes = d * d * 4;
+        let vec_bytes = d * 4;
+        let win_bytes = self.b_win.size();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("CG Sync Weights From AllWeights"),
+        });
+        encoder.copy_buffer_to_buffer(all_weights, 0, &self.b_wq, 0, mat_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_wk_byte_off(d, h), &self.b_wk, 0, mat_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_wv_byte_off(d, h), &self.b_wv, 0, mat_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_wo_byte_off(d, h), &self.b_wo, 0, mat_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_win_byte_off(d, h), &self.b_win, 0, win_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_wx_byte_off(d, h), &self.b_wx, 0, mat_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_wout_byte_off(d, h), &self.b_wout, 0, mat_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_alog_byte_off(d, h), &self.b_alog, 0, vec_bytes);
+        encoder.copy_buffer_to_buffer(all_weights, aw_nscale_byte_off(d, h), &self.b_norm, 0, vec_bytes);
+        queue.submit(Some(encoder.finish()));
+    }
+
     pub fn sync_weights_from_deq_buffers(
         &self,
         device: &wgpu::Device,
