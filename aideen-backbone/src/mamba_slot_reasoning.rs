@@ -25,6 +25,16 @@ pub struct MambaSlotReasoning {
     pub w_k: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
     pub(crate) w_k: DMatrix<f32>,
+    // Per-slot bias for Q and K: [h_slots × d_r], appended to W_q/W_k GPU buffers.
+    // Breaks permutation symmetry so slots can develop distinct attention roles.
+    #[cfg(feature = "lab")]
+    pub q_bias: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) q_bias: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub k_bias: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) k_bias: DMatrix<f32>,
     #[cfg(feature = "lab")]
     pub w_v: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
@@ -64,9 +74,9 @@ pub struct MambaSlotReasoning {
 
     // ── Mamba SSM por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
-    pub a_log: DVector<f32>,
+    pub a_log: DMatrix<f32>,   // [h_slots × d_r] row-major, per-slot decay
     #[cfg(not(feature = "lab"))]
-    pub(crate) a_log: DVector<f32>,
+    pub(crate) a_log: DMatrix<f32>,
     #[cfg(feature = "lab")]
     pub w_x: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
@@ -173,10 +183,11 @@ impl MambaSlotReasoning {
         let mut w_v = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_o = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_in = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
-        // Historical interface: start with a small identity (0.1*I) so history is real but
-        // does not dominate early contractivity. Jitter (0.01) breaks symmetry.
+        // Historical interface: 0.15*I — increased from 0.05 after DEQ stabilization (contr≈0.21).
+        // hist_ctx has ∂/∂h=0 so W_hist does not enter the Jacobian; increasing it is safe.
+        // Target: hist/inj ≈ 0.25 (up from 0.08) for meaningful SSM gradient path.
         let w_hist_shared =
-            Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.05_f32, 0.01_f32);
+            Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.15_f32, 0.01_f32);
         // The temporal carrier is applied as a residual around identity:
         //   x_proj = h_unit + W_x h_unit
         //   M_t    = m_inner + W_out m_inner
@@ -184,8 +195,11 @@ impl MambaSlotReasoning {
         // the carrier alive by construction while still allowing learned deviations later.
         let w_x = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.0f32, 0.01f32);
         let w_out = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.0f32, 0.01f32);
-        // Selective branch starts neutral: delta=0 => a_t = a_base.
-        let w_delta = DMatrix::zeros(d_r, d_r);
+        // Per-slot W_delta: random small init to break slot symmetry.
+        // zeros would give delta_input[s]=W_delta[s]*M=0 for all slots → identical M trajectories
+        // → identical A_log gradients → slots never specialize regardless of training length.
+        // Small random noise gives distinct delta_input per slot from token 2 onward.
+        let w_delta = DMatrix::from_fn(h_slots * d_r, d_r, |_, _| rng.gen_range(-0.01_f32..0.01_f32));
 
         // DEQ requiere σ(J_f) < 1 desde la inicialización.
         // El Jacobiano compuesto de atención (W_o · softmax · W_v · W_q) puede superar 1
@@ -234,12 +248,27 @@ impl MambaSlotReasoning {
             hist_slot_bias,
             hist_gate_logit,
             slot_anchor,
-            a_log: DVector::from_element(d_r, -0.5_f32), // keep frozen in production path
+            // Mamba-style timescale prior: decay spread a ∈ [0.20, 0.80] across slots.
+            // Same approach as Mamba's A init across a log-linear timescale range.
+            // Not a patch — it's an inductive bias that places slots in the useful part of
+            // the timescale space. Gradient from W_hist reinforces or shifts these priors.
+            a_log: DMatrix::from_fn(h_slots, d_r, |slot, _| {
+                let a_min = 0.20_f32;
+                let a_max = 0.80_f32;
+                let alpha = if h_slots <= 1 { 0.5 } else { slot as f32 / (h_slots - 1) as f32 };
+                let a = a_min + alpha * (a_max - a_min);
+                (a / (1.0 - a)).ln() // logit(a): slot 0 = -1.39 (fast), slot 7 = +1.39 (slow)
+            }),
             w_x,
             w_out,
             w_delta,
             b_delta: DVector::zeros(d_r),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
+            // Q/K per-slot bias: random init to immediately break slot symmetry.
+            // Zero init would give gscore=0 (uniform attn → zero gradient → saddle point forever).
+            // randn×0.2 gives distinct Q/K per slot from step 1 → attn_ent can fall below log(K).
+            q_bias: DMatrix::from_fn(h_slots, d_r, |_, _| rng.gen_range(-0.2_f32..0.2_f32)),
+            k_bias: DMatrix::from_fn(h_slots, d_r, |_, _| rng.gen_range(-0.2_f32..0.2_f32)),
             backend: RefCell::new(None),
             damping: 0.70_f32,
             residual_alpha: 0.0_f32,
@@ -289,6 +318,26 @@ impl MambaSlotReasoning {
             out.extend_from_slice(&Self::matrix_to_row_major(&mat));
         }
         out
+    }
+
+    /// Row-major flat slice of a_log for GPU upload: [h_slots × d_r].
+    pub fn a_log_gpu_flat(&self) -> Vec<f32> {
+        Self::matrix_to_row_major(&self.a_log)
+    }
+
+    /// GPU flat layout for W_q: [d_r×d_r matrix (column-major, same as .as_slice()) | h_slots×d_r q_bias (row-major)].
+    /// The shader accesses bias at W_q[d_model*d_model + s*d_model + d_out].
+    pub fn w_q_gpu_flat(&self) -> Vec<f32> {
+        let mut v = self.w_q.as_slice().to_vec();  // column-major, consistent with existing uploads
+        v.extend_from_slice(&Self::matrix_to_row_major(&self.q_bias));  // row-major: q_bias[s*d+col]
+        v
+    }
+
+    /// GPU flat layout for W_k: [d_r×d_r matrix (column-major) | h_slots×d_r k_bias (row-major)].
+    pub fn w_k_gpu_flat(&self) -> Vec<f32> {
+        let mut v = self.w_k.as_slice().to_vec();
+        v.extend_from_slice(&Self::matrix_to_row_major(&self.k_bias));
+        v
     }
 
     pub fn renormalize_weights(&mut self) {
@@ -351,6 +400,14 @@ impl MambaSlotReasoning {
             Self::matrix_to_row_major(&self.w_k),
         );
         weights.insert(
+            "reasoning.q_bias".to_string(),
+            Self::matrix_to_row_major(&self.q_bias),
+        );
+        weights.insert(
+            "reasoning.k_bias".to_string(),
+            Self::matrix_to_row_major(&self.k_bias),
+        );
+        weights.insert(
             "reasoning.w_v".to_string(),
             Self::matrix_to_row_major(&self.w_v),
         );
@@ -400,7 +457,7 @@ impl MambaSlotReasoning {
         );
         weights.insert(
             "reasoning.a_log".to_string(),
-            self.a_log.as_slice().to_vec(),
+            Self::matrix_to_row_major(&self.a_log),
         );
         weights.insert(
             "reasoning.norm_scale".to_string(),
@@ -459,6 +516,18 @@ impl MambaSlotReasoning {
 
         self.w_q = get_mat("reasoning.w_q")?;
         self.w_k = get_mat("reasoning.w_k")?;
+        // q_bias/k_bias: graceful fallback to zeros for checkpoints that predate this feature.
+        let h_slots = self.config.h_slots;
+        if let Some(data) = weights.get("reasoning.q_bias") {
+            if data.len() == h_slots * d_r {
+                self.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+            }
+        }
+        if let Some(data) = weights.get("reasoning.k_bias") {
+            if data.len() == h_slots * d_r {
+                self.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+            }
+        }
         self.w_v = get_mat("reasoning.w_v")?;
         self.w_o = get_mat("reasoning.w_o")?;
         self.w_in = get_mat("reasoning.w_in")?;
@@ -514,7 +583,27 @@ impl MambaSlotReasoning {
         }
         self.w_x = get_mat("reasoning.w_x")?;
         self.w_out = get_mat("reasoning.w_out")?;
-        self.w_delta = get_mat("reasoning.w_delta")?;
+        {
+            let h_slots = self.config.h_slots;
+            let data = weights
+                .get("reasoning.w_delta")
+                .ok_or("reasoning.w_delta not found")?;
+            self.w_delta = if data.len() == d_r * d_r {
+                // Legacy checkpoint: broadcast single matrix to all slots.
+                let base = nalgebra::DMatrix::from_row_slice(d_r, d_r, data);
+                let flat: Vec<f32> = (0..h_slots)
+                    .flat_map(|_| Self::matrix_to_row_major(&base))
+                    .collect();
+                nalgebra::DMatrix::from_row_slice(h_slots * d_r, d_r, &flat)
+            } else if data.len() == h_slots * d_r * d_r {
+                nalgebra::DMatrix::from_row_slice(h_slots * d_r, d_r, data)
+            } else {
+                return Err(format!(
+                    "reasoning.w_delta size mismatch: expected {} or {}, got {}",
+                    d_r * d_r, h_slots * d_r * d_r, data.len()
+                ));
+            };
+        }
         self.b_delta = nalgebra::DVector::from_vec(
             weights
                 .get("reasoning.b_delta")
@@ -522,12 +611,25 @@ impl MambaSlotReasoning {
                 .clone(),
         );
 
-        self.a_log = nalgebra::DVector::from_vec(
-            weights
+        {
+            let h_slots = self.config.h_slots;
+            let d_r = self.config.d_r;
+            let data = weights
                 .get("reasoning.a_log")
-                .ok_or("reasoning.a_log not found")?
-                .clone(),
-        );
+                .ok_or("reasoning.a_log not found")?;
+            self.a_log = if data.len() == d_r {
+                // Legacy checkpoint: broadcast single row to all slots.
+                let flat: Vec<f32> = (0..h_slots).flat_map(|_| data.iter().copied()).collect();
+                nalgebra::DMatrix::from_row_slice(h_slots, d_r, &flat)
+            } else if data.len() == h_slots * d_r {
+                nalgebra::DMatrix::from_row_slice(h_slots, d_r, data)
+            } else {
+                return Err(format!(
+                    "reasoning.a_log size mismatch: expected {} or {}, got {}",
+                    d_r, h_slots * d_r, data.len()
+                ));
+            };
+        }
         self.norm_scale = nalgebra::DVector::from_vec(
             weights
                 .get("reasoning.norm_scale")
@@ -574,7 +676,7 @@ impl MambaSlotReasoning {
         w_out: nalgebra::DMatrix<f32>,
         w_delta: nalgebra::DMatrix<f32>,
         b_delta: nalgebra::DVector<f32>,
-        a_log: nalgebra::DVector<f32>,
+        a_log: nalgebra::DMatrix<f32>,
         norm_scale: nalgebra::DVector<f32>,
         damping: f32,
         residual_alpha: f32,
@@ -596,6 +698,8 @@ impl MambaSlotReasoning {
             b_delta,
             a_log,
             norm_scale,
+            q_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
+            k_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             backend: RefCell::new(None),
             damping,
             residual_alpha,
@@ -705,7 +809,9 @@ impl Reasoning for MambaSlotReasoning {
             // The temporal carrier should depend on the content of H*, not on the raw amplitude
             // of the fixed point. As the DEQ learns, ||H*|| can contract substantially; using the
             // unit-RMS slot state keeps the external memory alive without changing Picard itself.
-            let a_bar = self.a_log.map(|a| 1.0 / (1.0 + a.exp()));
+            let a_bar = DVector::from_fn(self.config.d_r, |d, _| {
+                1.0 / (1.0 + self.a_log[(k, d)].exp())
+            });
             let b_bar = a_bar.map(|a| 1.0 - a);
             let mut x_proj = h_unit.clone_owned();
             let wx_max = 0.5_f32;

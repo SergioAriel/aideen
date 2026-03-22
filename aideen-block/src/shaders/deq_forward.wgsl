@@ -44,7 +44,7 @@ var<workgroup> avg_hist_ratio_sum: f32;
 var<workgroup> wg_pool_w: array<f32, 16>; // attention-received pooling weights (max 16 slots)
 
 fn hist_cap_mult() -> f32 {
-    return 0.08;
+    return 0.25;
 }
 
 fn hist_cap_floor_mult() -> f32 {
@@ -169,7 +169,7 @@ fn deq_forward_main(
         let hist_gate_base = hist_bias_base + h_slots * d_model;
         let slot_anchor_base = hist_gate_base + h_slots;
         let hist_delta_base = slot_anchor_base + h_slots * d_model;
-        let hist_delta_bias_base = hist_delta_base + d_model * d_model;
+        let hist_delta_bias_base = hist_delta_base + h_slots * d_model * d_model;
         let hist_selective_flag_base = hist_delta_bias_base + d_model;
         let hist_warmup_base = hist_selective_flag_base + 1u;
         let hist_rms_floor_base = hist_warmup_base + 1u;
@@ -287,12 +287,15 @@ fn deq_forward_main(
                 let off = s * d_model;
                 var local_prev_sumsq = 0.0;
                 for (var j = tid; j < d_model; j = j + WG_SIZE) {
-                    var prev_v = 0.0;
+                    var prev_v: f32;
                     if (t > 0u) {
                         let prev_mamba =
                             (batch_idx * shape.seq_len + t - 1u) * scratch_stride
                             + h_slots * 4u * d_model;
                         prev_v = Scratch[prev_mamba + off + j];
+                    } else {
+                        // M carry lives in the second half of H_curr buffer.
+                        prev_v = H_curr[shape.batch_size * total_elements + batch_idx * total_elements + off + j];
                     }
                     local_prev_sumsq = local_prev_sumsq + prev_v * prev_v;
                 }
@@ -322,6 +325,14 @@ fn deq_forward_main(
                         }
                         u = u + HistParams[hist_scale_base + off + d_out]
                             * (Scratch[prev_mamba + off + d_out] / prev_rms);
+                    } else {
+                        let carry_base = shape.batch_size * total_elements + batch_idx * total_elements + off;
+                        for (var j = 0u; j < d_model; j = j + 1u) {
+                            let prev_v = H_curr[carry_base + j] / prev_rms;
+                            u = u + HistParams[d_out * d_model + j] * prev_v;
+                        }
+                        u = u + HistParams[hist_scale_base + off + d_out]
+                            * (H_curr[carry_base + d_out] / prev_rms);
                     }
                     Scratch[m_inner_base + off + d_out] = u;
                     local_hist_sumsq = local_hist_sumsq + u * u;
@@ -509,6 +520,10 @@ fn deq_forward_main(
                             k = k + W_k[w_idx] * h_val;
                             if (!v_fixed && !v_lag) { v = v + W_v[w_idx] * h_val; }
                         }
+                        // Per-slot Q/K bias: appended to W_q/W_k buffers at offset d_model*d_model.
+                        // Breaks slot symmetry so attn_ent can fall below log(h_slots).
+                        q = q + W_q[d_model * d_model + s * d_model + d_out];
+                        k = k + W_k[d_model * d_model + s * d_model + d_out];
                         Scratch[q_base + off + d_out] = q;
                         Scratch[k_base + off + d_out] = k;
                         if (!v_fixed && !v_lag) {
@@ -947,23 +962,25 @@ fn deq_forward_main(
                     + (hist_alpha_min_target() - hist_alpha_min_start()) * warmup;
                 // 1. x_proj = (I + W_x) * RMSUnit(H^*)
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                    // Safe temporal reading: zero initialize on first token
-                    var m_prev = 0.0;
+                    // Safe temporal reading: use cross-sequence carry on first token
+                    var m_prev: f32;
                     if (t > 0u) {
                         let prev_mamba = (batch_idx * shape.seq_len + t - 1u) * scratch_stride + h_slots * 4u * d_model;
                         m_prev = Scratch[prev_mamba + off + d];
+                    } else {
+                        m_prev = H_curr[shape.batch_size * total_elements + batch_idx * total_elements + off + d];
                     }
                     var x_proj = H_curr[h_base + off + d] / h_rms;
                     for (var j = 0u; j < d_model; j = j + 1u) {
                         x_proj = x_proj + W_x[d * d_model + j]
                             * (H_curr[h_base + off + j] / h_rms);
                     }
-                    var a = 1.0 / (1.0 + exp(A_log[d]));
+                    var a = 1.0 / (1.0 + exp(A_log[s * d_model + d]));
                     if (hist_selective) {
                        var delta_pre = HistParams[hist_delta_bias_base + d];
                         for (var j = 0u; j < d_model; j = j + 1u) {
                             delta_pre = delta_pre
-                                + HistParams[hist_delta_base + d * d_model + j]
+                                + HistParams[hist_delta_base + s * d_model * d_model + d * d_model + j]
                                 * (H_curr[h_base + off + j] / h_rms);
                         }
                         // Center delta so that delta_pre=0 => a_core = a_base (neutral).
@@ -992,6 +1009,9 @@ fn deq_forward_main(
                         out = out + W_out[d_out * d_model + j] * Scratch[m_inner_base + off + j];
                     }
                     Scratch[mamba_base + off + d_out] = out;
+                    if (t == shape.seq_len - 1u) {
+                        H_curr[shape.batch_size * total_elements + batch_idx * total_elements + off + d_out] = out;
+                    }
                     local_out_sumsq = local_out_sumsq + out * out;
                     // [LEGACY — NO UTILIZADO] full_mamba_mode sobreescribe h_curr con M_t
                     // post-convergencia, acoplando el SSM directamente al estado DEQ.
@@ -1084,7 +1104,7 @@ fn deq_forward_main(
         let hist_gate_base_dbg = hist_bias_base_dbg + h_slots * d_model;
         let slot_anchor_base_dbg = hist_gate_base_dbg + h_slots;
         let hist_delta_base_dbg = slot_anchor_base_dbg + h_slots * d_model;
-        let hist_delta_bias_base_dbg = hist_delta_base_dbg + d_model * d_model;
+        let hist_delta_bias_base_dbg = hist_delta_base_dbg + h_slots * d_model * d_model;
         let hist_selective_flag_base_dbg = hist_delta_bias_base_dbg + d_model;
         let hist_warmup_base_dbg = hist_selective_flag_base_dbg + 1u;
         let hist_rms_floor_base_dbg = hist_warmup_base_dbg + 1u;
