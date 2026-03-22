@@ -20,8 +20,8 @@ pub struct ArchitectureConfig {
     pub max_deq_iters: usize,
     /// Epsilon de convergencia DEQ.
     pub deq_epsilon: f32,
-    /// Iteraciones del Gradiente Conjugado (Retropropagación Implícita).
-    pub cg_iters: usize,
+    /// Iteraciones del adjoint Picard (Retropropagación Implícita).
+    pub adj_iters: usize,
     /// ¿Entrenar el núcleo DEQ?
     pub train_deq: bool,
     /// Escala del gradiente DEQ.
@@ -42,12 +42,12 @@ impl Default for ArchitectureConfig {
             d_c: 256,
             d_e: 256,
             d_sim: 1024,
-            h_slots: 4,        // 4 Slots = Alta velocidad + Razonamiento paralelo
+            h_slots: 8,        // 8 Slots — especialización temporal multi-escala
             vocab_size: 50257, // DEBE coincidir con tu tokenizer.json
             ctx_len: 256,      // Ventana de memoria para chat
             max_deq_iters: 16, // v14 (Optimizado tras sweep: garantiza 100% conv con alpha=0)
             deq_epsilon: 1e-4,
-            cg_iters: 8, // Mejor estabilidad del gradiente implícito
+            adj_iters: 6, // contr≈0.20 → error residual 0.20^6≈6e-5, prácticamente exacto
             train_deq: true,
             deq_grad_scale: 0.01,
             renorm_every_steps: 4,  // Cada 4 steps: ~0.25x overhead vs inline, σ controlada en ventana corta

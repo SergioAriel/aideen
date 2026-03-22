@@ -39,10 +39,10 @@ fn main() {
     } else {
         14
     }) as usize;
-    config.cg_iters = env_u32("AIDEEN_STRESS_CG_ITERS").unwrap_or(if force_global {
-        10
+    config.adj_iters = env_u32("AIDEEN_STRESS_ADJ_ITERS").unwrap_or(if force_global {
+        8
     } else {
-        12
+        6
     }) as usize;
     config.deq_epsilon = env_f32("AIDEEN_STRESS_EPS").unwrap_or(if force_global {
         1e-4
@@ -55,12 +55,12 @@ fn main() {
     let seed = env_u64("AIDEEN_STRESS_SEED").unwrap_or(42);
 
     println!(
-        "[STRESS-TEST] Config: d_r={} h_slots={} total={} max_iters={} cg_iters={} eps={} lr={} ({})",
+        "[STRESS-TEST] Config: d_r={} h_slots={} total={} max_iters={} adj_iters={} eps={} lr={} ({})",
         config.d_r,
         config.h_slots,
         config.d_r * config.h_slots,
         config.max_deq_iters,
-        config.cg_iters,
+        config.adj_iters,
         config.deq_epsilon,
         lr,
         if force_global {
@@ -108,16 +108,29 @@ fn main() {
     }
 
     println!("[STRESS-TEST] Ejecutando ráfagas de entrenamiento...");
+    let seq_tokens = train_tokens.len();
+    let mut total_ms = 0u128;
     for i in 0..stress_iters {
         let t = Instant::now();
         let loss = trainer.train_sequence(train_tokens, targets, true, trainer.config.deq_epsilon);
+        let elapsed_ms = t.elapsed().as_millis();
+        total_ms += elapsed_ms;
+        let tps = (seq_tokens * (i + 1)) as f64 / (total_ms as f64 / 1000.0);
         println!(
-            "[STRESS-TEST] Iter {:>2} | Loss: {:.4} | Time: {:>4}ms",
+            "[STRESS-TEST] Iter {:>2} | Loss: {:.4} | Time: {:>4}ms | TPS: {:>6.1}",
             i + 1,
             loss,
-            t.elapsed().as_millis()
+            elapsed_ms,
+            tps,
         );
     }
+    println!(
+        "[STRESS-TEST] TPS promedio: {:.1} ({} tokens × {} iters en {:.2}s)",
+        (seq_tokens * stress_iters) as f64 / (total_ms as f64 / 1000.0),
+        seq_tokens,
+        stress_iters,
+        total_ms as f64 / 1000.0,
+    );
 
     if env::var("AIDEEN_MAMBA_HIST_PROFILE").ok().is_some() {
         #[cfg(feature = "wgpu")]
@@ -150,5 +163,5 @@ fn main() {
     println!("  - Si 'mode' es NORMAL/BOOST y 'conv' es OK -> El Sync de Memoria Global funciona.");
     println!("  - Si 'rs_cg' es bajo -> La escalabilidad del CG Solver funciona.");
     println!("  - Para forzar d_r=1024: AIDEEN_STRESS_FORCE_GLOBAL=1");
-    println!("  - Overrides: AIDEEN_STRESS_DR, AIDEEN_STRESS_HSLOTS, AIDEEN_STRESS_MAX_ITERS, AIDEEN_STRESS_CG_ITERS, AIDEEN_STRESS_EPS, AIDEEN_STRESS_LR, AIDEEN_STRESS_ITERS");
+    println!("  - Overrides: AIDEEN_STRESS_DR, AIDEEN_STRESS_HSLOTS, AIDEEN_STRESS_MAX_ITERS, AIDEEN_STRESS_ADJ_ITERS, AIDEEN_STRESS_EPS, AIDEEN_STRESS_LR, AIDEEN_STRESS_ITERS");
 }

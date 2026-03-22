@@ -76,6 +76,7 @@ pub struct GpuDeqBackend {
     staged_wk_t_buf: wgpu::Buffer,
     staged_wv_t_buf: wgpu::Buffer,
     staged_wo_t_buf: wgpu::Buffer,
+    tbptt_carry_buf: wgpu::Buffer,
 }
 
 impl GpuDeqBackend {
@@ -98,8 +99,9 @@ impl GpuDeqBackend {
         wo: &[f32],
     ) {
         let d = self.config.d_r;
-        let wq_t = Self::transpose_square(wq, d);
-        let wk_t = Self::transpose_square(wk, d);
+        // wq/wk may include per-slot bias appended after d*d matrix — use only matrix portion.
+        let wq_t = Self::transpose_square(&wq[..d*d], d);
+        let wk_t = Self::transpose_square(&wk[..d*d], d);
         let wv_t = Self::transpose_square(wv, d);
         let wo_t = Self::transpose_square(wo, d);
         queue.write_buffer(&self.staged_wq_t_buf, 0, bytemuck::cast_slice(&wq_t));
@@ -232,13 +234,13 @@ impl GpuDeqBackend {
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
-        2 * d * d + 3 * h * d + h + d + 21
+        (h + 1) * d * d + 3 * h * d + h + d + 21
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let base = 2 * d * d + 3 * h * d + h + d;
+        let base = (h + 1) * d * d + 3 * h * d + h + d;
         let idx = base + 1; // warmup is the second scalar after hist_selective flag
         self.queue
             .write_buffer(&self.bridge.hist_params_buf, (idx * 4) as u64, bytemuck::bytes_of(&factor));
@@ -600,6 +602,16 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -1130,6 +1142,12 @@ impl GpuDeqBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tbptt_carry_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TBPTT Carry Buffer"),
+            size: (config.h_slots as u64) * (config.d_r as u64) * 4u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let fused_update_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Fused Update BG0"),
             layout: &bg0_layout,
@@ -1189,6 +1207,10 @@ impl GpuDeqBackend {
                 wgpu::BindGroupEntry {
                     binding: 13,
                     resource: fused_hist_delta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: tbptt_carry_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1252,6 +1274,10 @@ impl GpuDeqBackend {
                 wgpu::BindGroupEntry {
                     binding: 13,
                     resource: fused_hist_delta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: tbptt_carry_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1461,6 +1487,7 @@ impl GpuDeqBackend {
             staged_wk_t_buf,
             staged_wv_t_buf,
             staged_wo_t_buf,
+            tbptt_carry_buf,
         })
     }
 
@@ -1481,6 +1508,9 @@ impl GpuDeqBackend {
         // v14: En wgsl, utilizamos Scratch[mamba_base] como M_t persistente.
         // Es estrictamente necesario limpiar Scratch al iniciar nueva secuencia.
         encoder.clear_buffer(&self.bridge.scratch_buf, 0, None);
+        // Clear TBPTT carry on document reset.
+        // M_carry lives in second half of hcurr_buf — already cleared above.
+        encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -1518,13 +1548,13 @@ impl GpuDeqBackend {
     pub fn build_cg_shape(
         &self,
         batch_size: u32,
-        cg_iters: u32,
+        adj_iters: u32,
     ) -> aideen_block::cg_bridge::CGComputeShape {
         aideen_block::cg_bridge::CGComputeShape {
             batch_size,
             d_model: self.config.d_r as u32,
             h_slots: self.config.h_slots as u32,
-            cg_iters,
+            cg_iters: adj_iters,
             epsilon: self.config.deq_epsilon,
             damping: Self::picard_damping_from_env(),
             curr_iter: 0,
@@ -1898,10 +1928,10 @@ impl GpuDeqBackend {
         w_out: &[f32],
         a_log: &[f32],
         norm: &[f32],
-        cg_iters: u32,
+        adj_iters: u32,
         update_weights: bool,
     ) -> Result<Vec<f32>, String> {
-        let shape = self.build_cg_shape(batch_size, cg_iters);
+        let shape = self.build_cg_shape(batch_size, adj_iters);
         self.cg_bridge.run_backward(
             &self.device,
             &self.queue,
@@ -1937,10 +1967,10 @@ impl GpuDeqBackend {
         w_out: &[f32],
         a_log: &[f32],
         norm: &[f32],
-        cg_iters: u32,
+        adj_iters: u32,
         update_weights: bool,
     ) -> Result<Vec<f32>, String> {
-        let shape = self.build_cg_shape(batch_size, cg_iters);
+        let shape = self.build_cg_shape(batch_size, adj_iters);
         self.cg_bridge.run_backward_from_buffer(
             &self.device,
             &self.queue,
@@ -1993,9 +2023,9 @@ impl GpuDeqBackend {
         batch_size: u32,
         _num_tokens: u32,
         dl_dh_src: &wgpu::Buffer,
-        cg_iters: u32,
+        adj_iters: u32,
     ) -> Result<(), String> {
-        let shape = self.build_cg_shape(batch_size, cg_iters);
+        let shape = self.build_cg_shape(batch_size, adj_iters);
         let h_offset = 0;
         self.cg_bridge.run_backward_no_readback(
             &self.device,
@@ -2672,50 +2702,6 @@ impl GpuDeqBackend {
                         self.config.h_slots * self.config.d_r,
                     );
                 }
-                let picard_t0 = std::time::Instant::now();
-                // Rerun Picard for hist temporal updates: rhs_slot must be zero.
-                // Otherwise the historical RHS feeds back into the adjoint solve and
-                // explodes g_comb.
-                self.run_staged_adjoint_picard_no_readback(seq_len, damping, 1, None, true)?;
-                // The staged Picard helper reuses the same uniform buffer and writes a
-                // solver-only UpdateUniforms payload with lr/grad_scale/weight_decay = 0.
-                // All subsequent history/fused update kernels must see the original
-                // training update params, otherwise HistParams/W_x/W_out/W_delta steps
-                // collapse to exact zero despite nonzero gradients.
-                self.queue.write_buffer(
-                    &self.fused_update_params_buf,
-                    0,
-                    bytemuck::bytes_of(&params),
-                );
-                if profile_fused {
-                    eprintln!(
-                        "[FUSED-PROFILE] hist_picard_rerun: {} ms",
-                        picard_t0.elapsed().as_millis()
-                    );
-                }
-                if hist_internal_probe {
-                    let sample_t =
-                        (seq_len as usize / 2).max(1).min(seq_len.saturating_sub(1) as usize);
-                    let rerun_gcomb = self.read_storage_buffer(
-                        &self.fused_mix_buf,
-                        seq_len as usize * self.config.h_slots * self.config.d_r,
-                        "Hist Probe Rerun GComb Readback",
-                    );
-                    let (rerun_mean, rerun_max, rerun_nz) = Self::summarize_token_block(
-                        &rerun_gcomb,
-                        sample_t,
-                        self.config.h_slots,
-                        self.config.d_r,
-                    );
-                    eprintln!(
-                        "[HIST-INTERNAL] post-rerun sample_t={} gcomb(mean/max/nz)={:.6e}/{:.6e}/{}/{}",
-                        sample_t,
-                        rerun_mean,
-                        rerun_max,
-                        rerun_nz,
-                        self.config.h_slots * self.config.d_r,
-                    );
-                }
                 run_stage(
                     &self.device,
                     &self.queue,
@@ -3289,7 +3275,7 @@ impl GpuDeqBackend {
         let hist_gate_base = hist_bias_base + h_slots * d;
         let slot_anchor_base = hist_gate_base + h_slots;
         let w_delta_base = slot_anchor_base + h_slots * d;
-        let b_delta_base = w_delta_base + d * d;
+        let b_delta_base = w_delta_base + h_slots * d * d;
         let stats = |slice: &[f32]| -> (f32, f32) {
             if slice.is_empty() {
                 return (0.0, 0.0);
@@ -3309,7 +3295,8 @@ impl GpuDeqBackend {
         let wx = self.read_storage_buffer(&self.bridge.wx_buf, d * d, "Hist Carrier W_x Readback");
         let wout =
             self.read_storage_buffer(&self.bridge.wout_buf, d * d, "Hist Carrier W_out Readback");
-        let a_log = self.read_storage_buffer(&self.bridge.a_buf, d, "Hist Carrier ALog Readback");
+        let h_slots = self.config.h_slots;
+        let a_log = self.read_storage_buffer(&self.bridge.a_buf, h_slots * d, "Hist Carrier ALog Readback");
         let mut out = Vec::with_capacity(wx.len() + wout.len() + a_log.len());
         out.extend_from_slice(&wx);
         out.extend_from_slice(&wout);
@@ -3355,7 +3342,7 @@ impl GpuDeqBackend {
         let hist_params = self.read_hist_params_full();
         let a_log = self.read_storage_buffer(
             &self.bridge.a_buf,
-            d,
+            h_slots * d,
             "Hist Selective ALog Readback Staging",
         );
 
@@ -3365,7 +3352,7 @@ impl GpuDeqBackend {
         let hist_gate_base = hist_bias_base + h_slots * d;
         let slot_anchor_base = hist_gate_base + h_slots;
         let w_delta_base = slot_anchor_base + h_slots * d;
-        let b_delta_base = w_delta_base + d * d;
+        let b_delta_base = w_delta_base + h_slots * d * d;
 
         let mut delta_sum = 0.0f32;
         let mut delta_max = 0.0f32;
@@ -3386,7 +3373,7 @@ impl GpuDeqBackend {
                 for dim in 0..d {
                     let mut delta_pre = hist_params[b_delta_base + dim];
                     for j in 0..d {
-                        delta_pre += hist_params[w_delta_base + j * d + dim]
+                        delta_pre += hist_params[w_delta_base + slot * d * d + j * d + dim]
                             * (h_seq[base + j] / h_rms);
                     }
                     let delta = (1.0 + delta_pre.exp()).ln();
