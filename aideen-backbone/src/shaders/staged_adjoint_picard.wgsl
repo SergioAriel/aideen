@@ -8,6 +8,10 @@ struct UpdateUniforms {
     seq_len: u32,
     damping: f32,
     residual_alpha: f32,
+    grad_accum_mode: u32,
+    n_accum: u32,
+    n_total_weights: u32,
+    batch_size: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
@@ -107,7 +111,7 @@ fn picard_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let entry = gid.y;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (dim >= d || entry >= n_entries) { return; }
 
     let t = entry / h_slots;
@@ -138,10 +142,11 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
     let entry = wid.x;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (entry >= n_entries) { return; }
 
     let t = entry / h_slots;
+    let t_within = t % params.seq_len;
     let qs = entry % h_slots;
     let q_off = qs * d;
     let t_off = t * h_slots * d;
@@ -158,7 +163,8 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
     var prev_rms = 1.0;
     if (hist_gated_mode) {
         // Match forward: normalize previous M by its RMS before applying W_hist.
-        if (t > 0u) {
+        // t_within guards against cross-sequence contamination when batch_size > 1.
+        if (t_within > 0u) {
             let prev_mamba = token_mamba_base(t - 1u, d, h_slots);
             var prev_sumsq = 0.0;
             for (var dim = 0u; dim < d; dim = dim + 1u) {
@@ -170,7 +176,7 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
         for (var dim = 0u; dim < d; dim = dim + 1u) {
             let inj = Scratch[signal_base + q_off + dim];
             inj_sumsq = inj_sumsq + inj * inj;
-            if (t > 0u) {
+            if (t_within > 0u) {
                 let prev_mamba = token_mamba_base(t - 1u, d, h_slots);
                 var u = HistParams[hist_scale_base(d, h_slots) + q_off + dim]
                     * (Scratch[prev_mamba + q_off + dim] / prev_rms);
@@ -194,7 +200,7 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
     var coeff = 0.0;
     for (var dim = 0u; dim < d; dim = dim + 1u) {
         var hist_ctx = 0.0;
-        if (hist_gated_mode && t > 0u) {
+        if (hist_gated_mode && t_within > 0u) {
             let prev_mamba = token_mamba_base(t - 1u, d, h_slots);
             var u = HistParams[hist_scale_base(d, h_slots) + q_off + dim]
                 * (Scratch[prev_mamba + q_off + dim] / prev_rms);
@@ -216,7 +222,7 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var hist_ctx = 0.0;
-        if (hist_gated_mode && t > 0u) {
+        if (hist_gated_mode && t_within > 0u) {
             let prev_mamba = token_mamba_base(t - 1u, d, h_slots);
             var u = HistParams[hist_scale_base(d, h_slots) + q_off + dim]
                 * (Scratch[prev_mamba + q_off + dim] / prev_rms);
@@ -244,7 +250,7 @@ fn picard_gmix_main(@builtin(local_invocation_id) lid: vec3<u32>,
     let entry = wid.x;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (entry >= n_entries) { return; }
 
     for (var dim = lane; dim < d; dim = dim + 64u) {
@@ -263,7 +269,7 @@ fn picard_gscore_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let entry = gid.y;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (ks >= h_slots || entry >= n_entries) { return; }
 
     let t = entry / h_slots;
@@ -316,7 +322,7 @@ fn picard_accum_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let entry = gid.y;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (dim >= d || entry >= n_entries) { return; }
 
     let t = entry / h_slots;
@@ -375,7 +381,7 @@ fn picard_accum_v_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let entry = gid.y;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (dim >= d || entry >= n_entries) { return; }
 
     let t = entry / h_slots;
@@ -404,7 +410,7 @@ fn picard_accum_k_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let entry = gid.y;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (dim >= d || entry >= n_entries) { return; }
 
     let t = entry / h_slots;
@@ -433,7 +439,7 @@ fn picard_accum_q_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let entry = gid.y;
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.seq_len * h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
     if (dim >= d || entry >= n_entries) { return; }
 
     let t = entry / h_slots;

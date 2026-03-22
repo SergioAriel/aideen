@@ -1,5 +1,4 @@
 pub mod async_bridge;
-pub mod cg_bridge;
 pub mod deq_bridge;
 pub mod mamba;
 pub mod model;
