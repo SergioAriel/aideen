@@ -148,7 +148,6 @@ impl RustDeqBridge {
             },
             count: None,
         });
-
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("DEQ Core Bind Group Layout"),
             entries: &entries,
@@ -326,9 +325,12 @@ impl RustDeqBridge {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // W_q/W_k buffers include per-slot bias appended after the d×d matrix.
+        // Layout: [d_model*d_model floats (matrix)] ++ [h_slots*d_model floats (bias)]
+        let wqk_buf_size = ((d_model * d_model + h_slots * d_model) * 4) as u64;
         let wq_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("W_q"),
-            size: (d_model * d_model * 4) as u64,
+            size: wqk_buf_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -336,7 +338,7 @@ impl RustDeqBridge {
         });
         let wk_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("W_k"),
-            size: (d_model * d_model * 4) as u64,
+            size: wqk_buf_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -367,7 +369,7 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
         let hist_params_len =
-            2u32 * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 21u32;
+            (h_slots + 1u32) * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 21u32;
         let hist_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Hist Params"),
             size: (hist_params_len * 4) as u64,
@@ -394,7 +396,7 @@ impl RustDeqBridge {
         });
         let a_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("A_log"),
-            size: (d_model * 4) as u64,
+            size: (h_slots * d_model * 4) as u64, // [h_slots × d_model] per-slot
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -429,9 +431,10 @@ impl RustDeqBridge {
 
         let h_bytes =
             (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
+        // hcurr_buf is doubled: first half = H_curr, second half = M_carry (cross-sequence SSM state).
         let hcurr_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_curr"),
-            size: h_bytes,
+            size: h_bytes * 2,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -503,7 +506,6 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DEQ Forward Persistent Bind Group"),
             layout: &bind_group_layout,
@@ -899,8 +901,11 @@ impl RustDeqBridge {
         &'static str,
     > {
         let mat_size = (d_model * d_model * 4) as u64;
+        // W_q/W_k buffers include per-slot bias: matrix + h_slots*d_model extra floats
+        let wqk_size = ((d_model * d_model + self.h_slots * d_model) * 4) as u64;
         let win_size = (self.h_slots * d_model * d_model * 4) as u64;
         let vec_size = (d_model * 4) as u64;
+        let a_vec_size = (self.h_slots * d_model * 4) as u64; // per-slot A_log
 
         let create_staging = |size| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -911,28 +916,28 @@ impl RustDeqBridge {
             })
         };
 
-        let st_q = create_staging(mat_size);
-        let st_k = create_staging(mat_size);
+        let st_q = create_staging(wqk_size);
+        let st_k = create_staging(wqk_size);
         let st_v = create_staging(mat_size);
         let st_o = create_staging(mat_size);
         let st_in = create_staging(win_size);
         let st_x = create_staging(mat_size);
         let st_out = create_staging(mat_size);
-        let st_a = create_staging(vec_size);
+        let st_a = create_staging(a_vec_size);
         let st_n = create_staging(vec_size);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("DEQ Readback Encoder"),
         });
 
-        encoder.copy_buffer_to_buffer(&self.wq_buf, 0, &st_q, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.wk_buf, 0, &st_k, 0, mat_size);
+        encoder.copy_buffer_to_buffer(&self.wq_buf, 0, &st_q, 0, wqk_size);
+        encoder.copy_buffer_to_buffer(&self.wk_buf, 0, &st_k, 0, wqk_size);
         encoder.copy_buffer_to_buffer(&self.wv_buf, 0, &st_v, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.wo_buf, 0, &st_o, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.win_buf, 0, &st_in, 0, win_size);
         encoder.copy_buffer_to_buffer(&self.wx_buf, 0, &st_x, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.wout_buf, 0, &st_out, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.a_buf, 0, &st_a, 0, vec_size);
+        encoder.copy_buffer_to_buffer(&self.a_buf, 0, &st_a, 0, a_vec_size);
         encoder.copy_buffer_to_buffer(&self.n_buf, 0, &st_n, 0, vec_size);
 
         queue.submit(Some(encoder.finish()));
