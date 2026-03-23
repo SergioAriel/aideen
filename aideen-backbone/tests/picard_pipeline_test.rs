@@ -548,7 +548,7 @@ fn test_hist_gated_forward_uses_prev_mamba_carrier() {
 
     let w_q = vec![0.0f32; len_sq];
     let w_k = vec![0.0f32; len_sq];
-    let w_v = vec![0.0f32; len_sq];
+    let w_v = vec![0.0f32; h * len_sq]; // per-slot: h_slots * d*d
     let w_o = vec![0.0f32; len_sq];
     let mut w_in = vec![0.0f32; len_sq];
     let w_x = vec![0.0f32; len_sq];
@@ -562,6 +562,9 @@ fn test_hist_gated_forward_uses_prev_mamba_carrier() {
     let slot_anchor = vec![0.0f32; h * d];
     let w_delta = vec![0.0f32; len_sq];
     let b_delta = vec![0.0f32; d];
+    let w_gate_hist = vec![0.0f32; h * d];
+    let w_forget = vec![0.0f32; h * d];
+    let b_forget = vec![3.0f32; h];
 
     for i in 0..d {
         w_in[i * d + i] = 1.0;
@@ -586,6 +589,9 @@ fn test_hist_gated_forward_uses_prev_mamba_carrier() {
         &slot_anchor,
         &w_delta,
         &b_delta,
+        &w_gate_hist,
+        &w_forget,
+        &b_forget,
     );
 
     gpu.run_forward_deq_no_readback(
@@ -676,7 +682,8 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
     let weights = reasoning.export_weights();
     let w_q = weights.get("reasoning.w_q").expect("w_q missing");
     let w_k = weights.get("reasoning.w_k").expect("w_k missing");
-    let w_v = weights.get("reasoning.w_v").expect("w_v missing");
+    let w_v_flat = reasoning.w_v_gpu_flat();
+    let w_v = &w_v_flat;
     let w_o = weights.get("reasoning.w_o").expect("w_o missing");
     let w_in = weights.get("reasoning.w_in").expect("w_in missing");
     let w_x = weights.get("reasoning.w_x").expect("w_x missing");
@@ -706,11 +713,15 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
     let b_delta = weights
         .get("reasoning.b_delta")
         .expect("b_delta missing");
+    let d = config.d_r;
+    let h = config.h_slots;
+    let w_gate_hist_zeros = vec![0.0f32; h * d];
+    let w_gate_hist = weights.get("reasoning.w_gate_hist").unwrap_or(&w_gate_hist_zeros);
+    let w_forget_zeros = vec![0.0f32; h * d];
+    let b_forget_init = vec![3.0f32; h];
     let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
 
     let seq_len = 3u32;
-    let d = config.d_r;
-    let h = config.h_slots;
     let damping = 0.9f32;
     let mut s_in = vec![0.0f32; seq_len as usize * d];
     s_in[0] = 1.0;
@@ -735,6 +746,9 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
         slot_anchor,
         w_delta,
         b_delta,
+        w_gate_hist,
+        &w_forget_zeros,
+        &b_forget_init,
     );
 
     std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");

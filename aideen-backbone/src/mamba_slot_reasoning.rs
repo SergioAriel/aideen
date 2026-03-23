@@ -94,6 +94,25 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) b_delta: DVector<f32>,
 
+    // ── Dynamic history gate (h^k-dependent slot query) ───────────────────────
+    #[cfg(feature = "lab")]
+    pub w_gate_hist: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_gate_hist: DMatrix<f32>,
+
+    // ── Forget gate for M state ───────────────────────────────────────────────
+    // f[s] = σ(b_f[s] + dot(W_f[s,:], H_curr) / √d)
+    // M_t = a * f[s] * m_prev + (1-a) * x_proj
+    // W_f zeros + b_f=3.0 → f≈0.95 (near-identity at init, ∂/∂h=0)
+    #[cfg(feature = "lab")]
+    pub w_forget: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_forget: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub b_forget: DVector<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) b_forget: DVector<f32>,
+
     // ── LayerNorm por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
     pub norm_scale: DVector<f32>,
@@ -248,21 +267,26 @@ impl MambaSlotReasoning {
             hist_slot_bias,
             hist_gate_logit,
             slot_anchor,
-            // Mamba-style timescale prior: decay spread a ∈ [0.20, 0.80] across slots.
-            // Same approach as Mamba's A init across a log-linear timescale range.
-            // Not a patch — it's an inductive bias that places slots in the useful part of
-            // the timescale space. Gradient from W_hist reinforces or shifts these priors.
+            // Mamba-style timescale prior: decay spread a ∈ [0.80, 0.999] across slots.
+            // Biased toward long-term memory so the forget gate has useful history to gate.
+            // Gradient + forget gate can push individual slots faster if needed.
             a_log: DMatrix::from_fn(h_slots, d_r, |slot, _| {
-                let a_min = 0.20_f32;
-                let a_max = 0.80_f32;
+                let a_min = 0.80_f32;
+                let a_max = 0.999_f32;
                 let alpha = if h_slots <= 1 { 0.5 } else { slot as f32 / (h_slots - 1) as f32 };
                 let a = a_min + alpha * (a_max - a_min);
-                (a / (1.0 - a)).ln() // logit(a): slot 0 = -1.39 (fast), slot 7 = +1.39 (slow)
+                (a / (1.0 - a)).ln() // logit(a): slot 0 = 1.39 (moderate), slot 7 = 6.91 (very slow)
             }),
             w_x,
             w_out,
             w_delta,
             b_delta: DVector::zeros(d_r),
+            // W_gate_hist: zeros init → hist_mod = 1+tanh(0) = 1 at step 0 (identity behavior).
+            w_gate_hist: DMatrix::zeros(h_slots, d_r),
+            // Forget gate: W_f=zeros, b_f=3.0 → f≈0.95 (near-identity at init).
+            // Allows model to learn to forget selectively once training establishes gradients.
+            w_forget: DMatrix::zeros(h_slots, d_r),
+            b_forget: DVector::from_element(h_slots, 3.0_f32),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: random init to immediately break slot symmetry.
             // Zero init would give gscore=0 (uniform attn → zero gradient → saddle point forever).
@@ -323,6 +347,24 @@ impl MambaSlotReasoning {
     /// Row-major flat slice of a_log for GPU upload: [h_slots × d_r].
     pub fn a_log_gpu_flat(&self) -> Vec<f32> {
         Self::matrix_to_row_major(&self.a_log)
+    }
+
+    /// GPU flat layout for W_v: [h_slots × d_r×d_r matrices] (no bias — W_o absorbs output bias).
+    /// Each slot matrix is the shared w_v plus a deterministic per-slot jitter (smaller than Q/K).
+    /// Shader accesses slot s: W_v[s*d*d + j*d + d_out].
+    pub fn w_v_gpu_flat(&self) -> Vec<f32> {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let base = self.w_v.as_slice();  // column-major, d*d floats
+        let mut v = Vec::with_capacity(h * d * d);
+        for s in 0..h {
+            for (i, &x) in base.iter().enumerate() {
+                // Smaller jitter than Q/K (0.03 vs 0.05) to keep V more stable
+                let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.3_f32).sin() * 0.03_f32;
+                v.push(x + jitter);
+            }
+        }
+        v
     }
 
     /// GPU flat layout for W_q: [h_slots × d_r×d_r matrices | h_slots×d_r q_bias (row-major)].
@@ -477,6 +519,18 @@ impl MambaSlotReasoning {
             self.b_delta.as_slice().to_vec(),
         );
         weights.insert(
+            "reasoning.w_gate_hist".to_string(),
+            Self::matrix_to_row_major(&self.w_gate_hist),
+        );
+        weights.insert(
+            "reasoning.w_forget".to_string(),
+            Self::matrix_to_row_major(&self.w_forget),
+        );
+        weights.insert(
+            "reasoning.b_forget".to_string(),
+            self.b_forget.as_slice().to_vec(),
+        );
+        weights.insert(
             "reasoning.a_log".to_string(),
             Self::matrix_to_row_major(&self.a_log),
         );
@@ -503,6 +557,9 @@ impl MambaSlotReasoning {
         Vec<f32>,
         Vec<f32>,
         Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
     ) {
         (
             Self::matrix_to_row_major(&self.w_hist_shared),
@@ -512,6 +569,9 @@ impl MambaSlotReasoning {
             Self::matrix_to_row_major(&self.slot_anchor),
             Self::matrix_to_row_major(&self.w_delta),
             self.b_delta.as_slice().to_vec(),
+            Self::matrix_to_row_major(&self.w_gate_hist),
+            Self::matrix_to_row_major(&self.w_forget),
+            self.b_forget.as_slice().to_vec(),
         )
     }
 
@@ -631,6 +691,29 @@ impl MambaSlotReasoning {
                 .ok_or("reasoning.b_delta not found")?
                 .clone(),
         );
+        // w_gate_hist: optional — zeros for old checkpoints that predate this feature.
+        {
+            let h_slots = self.config.h_slots;
+            if let Some(data) = weights.get("reasoning.w_gate_hist") {
+                if data.len() == h_slots * d_r {
+                    self.w_gate_hist = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+                }
+            }
+        }
+        // w_forget / b_forget: optional — zeros + bias 3.0 for old checkpoints.
+        {
+            let h_slots = self.config.h_slots;
+            if let Some(data) = weights.get("reasoning.w_forget") {
+                if data.len() == h_slots * d_r {
+                    self.w_forget = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+                }
+            }
+            if let Some(data) = weights.get("reasoning.b_forget") {
+                if data.len() == h_slots {
+                    self.b_forget = nalgebra::DVector::from_vec(data.clone());
+                }
+            }
+        }
 
         {
             let h_slots = self.config.h_slots;
@@ -717,10 +800,13 @@ impl MambaSlotReasoning {
             w_out,
             w_delta,
             b_delta,
+            w_gate_hist: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             a_log,
             norm_scale,
             q_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             k_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
+            w_forget: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
+            b_forget: nalgebra::DVector::from_element(config.h_slots, 3.0_f32),
             backend: RefCell::new(None),
             damping,
             residual_alpha,

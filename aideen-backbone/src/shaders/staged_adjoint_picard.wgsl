@@ -40,7 +40,7 @@ fn entry_base(entry: u32, d: u32) -> u32 {
 }
 
 fn scratch_stride(d: u32, h_slots: u32) -> u32 {
-    return d * (h_slots * 7u) + h_slots * h_slots;
+    return d * (h_slots * 7u) + h_slots * h_slots + h_slots;
 }
 
 fn hist_mat_len(d: u32) -> u32 {
@@ -350,7 +350,7 @@ fn picard_accum_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             var dot_v = 0.0;
             for (var vd = 0u; vd < d; vd = vd + 1u) {
-                dot_v = dot_v + W_v[dim * d + vd] * gmix_buf[src_off + vd];
+                dot_v = dot_v + W_v[target_slot * d * d + dim * d + vd] * gmix_buf[src_off + vd];
             }
             v_path_acc = v_path_acc + alpha_qt * dot_v;
 
@@ -396,7 +396,7 @@ fn picard_accum_v_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let alpha_qt = Scratch[attn_weight_base + qs * h_slots + target_slot];
         var dot_v = 0.0;
         for (var vd = 0u; vd < d; vd = vd + 1u) {
-            dot_v = dot_v + W_v[vd * d + dim] * gmix_buf[src_off + vd];
+            dot_v = dot_v + W_v[target_slot * d * d + vd * d + dim] * gmix_buf[src_off + vd];
         }
         v_path_acc = v_path_acc + alpha_qt * dot_v;
     }
