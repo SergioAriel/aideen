@@ -72,7 +72,7 @@ pub struct RustDeqBridge {
 pub fn aw_wqk_bytes(d: u64, h: u64) -> u64 { (h * d * d + h * d) * 4 }
 pub fn aw_wk_byte_off(d: u64, h: u64) -> u64 { aw_wqk_bytes(d, h) }
 pub fn aw_wv_byte_off(d: u64, h: u64) -> u64 { 2 * aw_wqk_bytes(d, h) }
-pub fn aw_wo_byte_off(d: u64, h: u64) -> u64 { aw_wv_byte_off(d, h) + d * d * 4 }
+pub fn aw_wo_byte_off(d: u64, h: u64) -> u64 { aw_wv_byte_off(d, h) + h * d * d * 4 }
 pub fn aw_win_byte_off(d: u64, h: u64) -> u64 { aw_wo_byte_off(d, h) + d * d * 4 }
 pub fn aw_wx_byte_off(d: u64, h: u64) -> u64 { aw_win_byte_off(d, h) + h * d * d * 4 }
 pub fn aw_wout_byte_off(d: u64, h: u64) -> u64 { aw_wx_byte_off(d, h) + d * d * 4 }
@@ -332,7 +332,7 @@ impl RustDeqBridge {
         });
         // Single AllWeights buffer: W_q | W_k | W_v | W_o | W_in | W_x | W_out | A_log | NormScale | HistParams
         let hist_params_len =
-            (h_slots + 1u32) * d_model * d_model + 3u32 * h_slots * d_model + h_slots + d_model + 21u32;
+            (h_slots + 1u32) * d_model * d_model + 5u32 * h_slots * d_model + 2u32 * h_slots + d_model + 21u32;
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
@@ -408,7 +408,7 @@ impl RustDeqBridge {
         // BUG (viejo): scratch_stride = d_model * (h_slots * 6 + 1) + h_slots * h_slots;
         // Faltaba la región m_inner [h*d] y "signal [d]" era incorrecto (es [h*d] con W_in per-slot).
         // Para d=512, h=8: viejo=25152 floats/token, correcto=28736. Escrituras de attn_weights OOB.
-        let scratch_stride = d_model * h_slots * 7 + h_slots * h_slots;
+        let scratch_stride = d_model * h_slots * 7 + h_slots * h_slots + h_slots;
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
             size: (max_batch_size as u64)
@@ -847,7 +847,8 @@ impl RustDeqBridge {
 
         let st_q = create_staging(wqk_size);
         let st_k = create_staging(wqk_size);
-        let st_v = create_staging(mat_size);
+        let wv_size = h * mat_size;
+        let st_v = create_staging(wv_size);
         let st_o = create_staging(mat_size);
         let st_in = create_staging(win_size);
         let st_x = create_staging(mat_size);
@@ -861,7 +862,7 @@ impl RustDeqBridge {
 
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, 0, &st_q, 0, wqk_size);
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wk_byte_off(d, h), &st_k, 0, wqk_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wv_byte_off(d, h), &st_v, 0, mat_size);
+        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wv_byte_off(d, h), &st_v, 0, wv_size);
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wo_byte_off(d, h), &st_o, 0, mat_size);
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_win_byte_off(d, h), &st_in, 0, win_size);
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wx_byte_off(d, h), &st_x, 0, mat_size);

@@ -23,7 +23,7 @@ struct RunUniforms {
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h*d*d + h*d; }
 fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d,h) + h*d*d + h*d; }
-fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d,h) + d*d; }
+fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d,h) + h*d*d; }
 fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d,h) + d*d; }
 fn aw_wx_base(d: u32, h: u32) -> u32 { return aw_win_base(d,h) + h*d*d; }
 fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d,h) + d*d; }
@@ -167,7 +167,7 @@ fn deq_forward_main(
 
     for (var t = 0u; t < shape.seq_len; t = t + 1u) {
         // --- Per-token Memory Striding for BPTT ---
-        let scratch_stride = d_model * (h_slots * 7u) + h_slots * h_slots;
+        let scratch_stride = d_model * (h_slots * 7u) + h_slots * h_slots + h_slots;
         let batch_scratch_t = (batch_idx * shape.seq_len + t) * scratch_stride;
         let q_base = batch_scratch_t;
         let k_base = q_base + h_slots * d_model;
@@ -177,6 +177,7 @@ fn deq_forward_main(
         let signal_base = mamba_base + h_slots * d_model;
         let m_inner_base = signal_base + h_slots * d_model;
         let attn_weight_base = m_inner_base + h_slots * d_model;
+        let f_gate_scratch_base = attn_weight_base + h_slots * h_slots;
         let hist_mat_len = d_model * d_model;
         let hist_scale_base = hist_mat_len;
         let hist_bias_base = hist_scale_base + h_slots * d_model;
@@ -205,6 +206,12 @@ fn deq_forward_main(
         let v_gate_bias_base = v_gate_scale_base + 1u;
         let v_norm_base = v_gate_bias_base + 1u;
         let v_norm_scale_base = v_norm_base + 1u;
+        // W_gate_hist: h_slots × d_model dynamic gate query matrix (follows 21 scalars)
+        let hist_gate_query_base = v_norm_scale_base + 1u;
+        // W_forget: h_slots × d_model forget gate query (follows W_gate_hist)
+        let w_forget_base = hist_gate_query_base + h_slots * d_model;
+        // b_forget: h_slots bias for forget gate (follows W_forget)
+        let b_forget_base = w_forget_base + h_slots * d_model;
 
         let h_base_t = (batch_idx * shape.seq_len + t) * total_elements;
 
@@ -372,6 +379,44 @@ fn deq_forward_main(
                     Scratch[m_inner_base + off + d_out] =
                         alpha * Scratch[m_inner_base + off + d_out] * hist_scale;
                 }
+                // Dynamic gate: query h*_{t-1} (carry in H_curr) against W_gate_hist[s].
+                // Computed once per token/slot in prelude → zero overhead in DEQ loop.
+                // gate_dyn = dot(W_gate_hist[s], h_{t-1}) / sqrt(d); hist_mod = 1+tanh(gate_dyn).
+                var local_wgate = 0.0;
+                for (var dj = tid; dj < d_model; dj = dj + WG_SIZE) {
+                    local_wgate += AllWeights[aw_hist + hist_gate_query_base + off + dj]
+                                   * H_curr[h_base + off + dj];
+                }
+                shared_vals[tid] = local_wgate;
+                workgroupBarrier();
+                for (var wg_stride = WG_SIZE / 2u; wg_stride > 0u; wg_stride = wg_stride >> 1u) {
+                    if (tid < wg_stride) { shared_vals[tid] += shared_vals[tid + wg_stride]; }
+                    workgroupBarrier();
+                }
+                let gate_dyn = shared_vals[0] / sqrt(f32(d_model));
+                let hist_mod = 1.0 + tanh(gate_dyn);
+                for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+                    Scratch[m_inner_base + off + d_out] *= hist_mod;
+                }
+                // Forget gate: f[s] = σ(b_f[s] + dot(W_f[s,:], H_curr[t-1,s,:]) / sqrt(d))
+                // Uses H_curr (h*_{t-1}), ∂/∂h=0. Applied in post-convergence SSM recurrence.
+                var local_wf = AllWeights[aw_hist + b_forget_base + s]; // bias b_f[s]
+                for (var dj = tid; dj < d_model; dj = dj + WG_SIZE) {
+                    local_wf += AllWeights[aw_hist + w_forget_base + off + dj]
+                                * H_curr[h_base + off + dj];
+                }
+                shared_vals[tid] = local_wf;
+                workgroupBarrier();
+                for (var wf_stride = WG_SIZE / 2u; wf_stride > 0u; wf_stride = wf_stride >> 1u) {
+                    if (tid < wf_stride) { shared_vals[tid] += shared_vals[tid + wf_stride]; }
+                    workgroupBarrier();
+                }
+                let f_logit = shared_vals[0] / sqrt(f32(d_model));
+                let f_gate = 1.0 / (1.0 + exp(-f_logit));
+                if (tid == 0u) {
+                    Scratch[f_gate_scratch_base + s] = f_gate;
+                }
+                workgroupBarrier();
                 if (tid == 0u) {
                     if (s == 0u) {
                         avg_inj_rms_sum = avg_inj_rms_sum + inj_rms;
@@ -468,7 +513,7 @@ fn deq_forward_main(
                         let slot_bias = AllWeights[aw_hist +slot_anchor_base + off + j];
                         let signal = Scratch[signal_base + off + j];
                         let src = signal + slot_bias;
-                        v = v + AllWeights[aw_wv +j * d_model + d_out] * src;
+                        v = v + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * src;
                     }
                     Scratch[v_base + off + d_out] = v;
                 }
@@ -482,7 +527,7 @@ fn deq_forward_main(
                     var v = 0.0;
                     for (var j = 0u; j < d_model; j = j + 1u) {
                         let h_val = H_curr[h_base + off + j];
-                        v = v + AllWeights[aw_wv +j * d_model + d_out] * h_val;
+                        v = v + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val;
                     }
                     let v_scale = AllWeights[aw_hist +v_scale_base];
                     Scratch[v_base + off + d_out] = v * v_scale;
@@ -532,7 +577,7 @@ fn deq_forward_main(
                             let w_idx = s * d_model * d_model + j * d_model + d_out;
                             q = q + AllWeights[aw_wq +w_idx] * h_val;
                             k = k + AllWeights[aw_wk +w_idx] * h_val;
-                            if (!v_fixed && !v_lag) { v = v + AllWeights[aw_wv +j * d_model + d_out] * h_val; }
+                            if (!v_fixed && !v_lag) { v = v + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val; }
                         }
                         // Per-slot Q/K bias: appended after h_slots matrices in W_q/W_k buffers.
                         q = q + AllWeights[aw_wq +h_slots * d_model * d_model + s * d_model + d_out];
@@ -680,7 +725,7 @@ fn deq_forward_main(
                             var v_next = 0.0;
                             for (var j = 0u; j < d_model; j = j + 1u) {
                                 let h_val = H_curr[h_base + off + j];
-                                v_next = v_next + AllWeights[aw_wv +j * d_model + d_out] * h_val;
+                                v_next = v_next + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val;
                             }
                             let v_scale = AllWeights[aw_hist +v_scale_base];
                             Scratch[v_base + off + d_out] = v_next * v_scale;
@@ -828,6 +873,7 @@ fn deq_forward_main(
                 let hist_force_nomamba = AllWeights[aw_hist +hist_force_nomamba_base];
                 let hist_loop_force_nomamba = AllWeights[aw_hist +hist_loop_force_nomamba_base];
                 let hist_minner_zero = AllWeights[aw_hist +hist_minner_zero_base];
+
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     var hist_ctx = 0.0;
                     if (hist_gated_mode && hist_inject > 0.5 && hist_minner_zero < 0.5) {
@@ -1010,7 +1056,9 @@ fn deq_forward_main(
                         }
                     }
                     // Keep temporal inner state separate from attention Q/K/V buffers.
-                    Scratch[m_inner_base + off + d] = a * m_prev + (1.0 - a) * x_proj;
+                    // f_gate: scalar forget gate per-slot, computed in prelude from H_curr (∂/∂h=0).
+                    let f_g = Scratch[f_gate_scratch_base + s];
+                    Scratch[m_inner_base + off + d] = a * f_g * m_prev + (1.0 - a) * x_proj;
                 }
                 workgroupBarrier();
 
@@ -1140,7 +1188,7 @@ fn deq_forward_main(
 
         // Per-token debug (slot 0) when seq_len is small: H_rms, V_rms, attn_rms.
         if (tid == 0u && shape.seq_len <= 16u) {
-            let scratch_stride = d_model * h_slots * 7u + h_slots * h_slots;
+            let scratch_stride = d_model * h_slots * 7u + h_slots * h_slots + h_slots;
             let base_out = 200u; // leave room for existing debug slots
             for (var t = 0u; t < shape.seq_len; t = t + 1u) {
                 let h_base_t = (t * h_slots) * d_model;
