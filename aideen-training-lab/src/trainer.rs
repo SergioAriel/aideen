@@ -496,12 +496,15 @@ impl Trainer {
                         slot_anchor_rm,
                         w_delta_rm,
                         b_delta,
+                        w_gate_hist_rm,
+                        w_forget_rm,
+                        b_forget_rm,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
                         &self.reasoning.w_q_gpu_flat(),
                         &self.reasoning.w_k_gpu_flat(),
-                        self.reasoning.w_v.as_slice(),
+                        &self.reasoning.w_v_gpu_flat(),
                         self.reasoning.w_o.as_slice(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
@@ -515,6 +518,9 @@ impl Trainer {
                         slot_anchor_rm.as_slice(),
                         w_delta_rm.as_slice(),
                         b_delta.as_slice(),
+                        w_gate_hist_rm.as_slice(),
+                        w_forget_rm.as_slice(),
+                        b_forget_rm.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -962,12 +968,15 @@ impl Trainer {
                         slot_anchor_rm,
                         w_delta_rm,
                         b_delta,
+                        w_gate_hist_rm,
+                        w_forget_rm,
+                        b_forget_rm,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
                         &self.reasoning.w_q_gpu_flat(),
                         &self.reasoning.w_k_gpu_flat(),
-                        self.reasoning.w_v.as_slice(),
+                        &self.reasoning.w_v_gpu_flat(),
                         self.reasoning.w_o.as_slice(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
@@ -981,6 +990,9 @@ impl Trainer {
                         slot_anchor_rm.as_slice(),
                         w_delta_rm.as_slice(),
                         b_delta.as_slice(),
+                        w_gate_hist_rm.as_slice(),
+                        w_forget_rm.as_slice(),
+                        b_forget_rm.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -1603,7 +1615,7 @@ impl Trainer {
                     &s_sequence,
                     self.reasoning.w_q.as_slice(),
                     self.reasoning.w_k.as_slice(),
-                    self.reasoning.w_v.as_slice(),
+                    &self.reasoning.w_v_gpu_flat(),
                     self.reasoning.w_o.as_slice(),
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
@@ -1729,7 +1741,7 @@ impl Trainer {
                     &s_sequence,
                     self.reasoning.w_q.as_slice(),
                     self.reasoning.w_k.as_slice(),
-                    self.reasoning.w_v.as_slice(),
+                    &self.reasoning.w_v_gpu_flat(),
                     self.reasoning.w_o.as_slice(),
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
@@ -2447,7 +2459,15 @@ impl Trainer {
                     self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
                     self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
                 }
-                self.reasoning.w_v = to_mat(wv);
+                {
+                    let d_r = self.config.d_r;
+                    let h_slots = self.config.h_slots;
+                    // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
+                    let avg: Vec<f32> = (0..d_r * d_r)
+                        .map(|i| (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>() / h_slots as f32)
+                        .collect();
+                    self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
+                }
                 self.reasoning.w_o = to_mat(wo);
                 // win is h_slots*d*d — average slots for CPU representation.
                 let d_r = self.config.d_r;
