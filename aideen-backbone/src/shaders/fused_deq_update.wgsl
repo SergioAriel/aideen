@@ -38,7 +38,7 @@ struct UpdateUniforms {
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h*d*d + h*d; }
 fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d,h) + h*d*d + h*d; }
-fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d,h) + d*d; }
+fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d,h) + h*d*d; }
 fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d,h) + d*d; }
 fn aw_wx_base(d: u32, h: u32) -> u32 { return aw_win_base(d,h) + h*d*d; }
 fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d,h) + d*d; }
@@ -51,7 +51,7 @@ fn entry_base(entry: u32, d: u32) -> u32 {
 }
 
 fn scratch_stride(d: u32, h_slots: u32) -> u32 {
-    return d * (h_slots * 7u) + h_slots * h_slots;
+    return d * (h_slots * 7u) + h_slots * h_slots + h_slots;
 }
 
 fn hist_mat_len(d: u32) -> u32 {
@@ -132,6 +132,26 @@ fn attn_uniform_base(d: u32, h_slots: u32) -> u32 {
 
 fn attn_freeze_base(d: u32, h_slots: u32) -> u32 {
     return attn_uniform_base(d, h_slots) + 1u;
+}
+
+// W_gate_hist follows the 21 scalars (hist_selective_flag .. v_norm_scale)
+fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 {
+    return hist_selective_flag_base(d, h_slots) + 21u;
+}
+
+// W_forget: h_slots × d_model forget gate query (follows W_gate_hist)
+fn w_forget_base(d: u32, h: u32) -> u32 {
+    return hist_gate_query_base(d, h) + h * d;
+}
+
+// b_forget: h_slots bias for forget gate (follows W_forget)
+fn b_forget_base(d: u32, h: u32) -> u32 {
+    return w_forget_base(d, h) + h * d;
+}
+
+// f_gate scratch offset: 1 value per (t_abs, slot) stored after attn_weight region
+fn token_forget_base(t: u32, d: u32, h_slots: u32) -> u32 {
+    return token_scratch_base(t, d, h_slots) + 7u * d * h_slots + h_slots * h_slots;
 }
 
 fn hist_alpha_min_target() -> f32 {
@@ -247,7 +267,7 @@ fn fused_attn_stage1b_main(
     let t_abs = entry / h_slots;
     let t = t_abs % params.seq_len;
     let qs = entry % h_slots;
-    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
+    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots + h_slots;
     let base = t_abs * scratch_stride;
     let v_base = base + h_slots * d * 2u;
     let signal_base = base + d * (h_slots * 5u);
@@ -285,7 +305,7 @@ fn fused_attn_stage2_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t_abs = entry / h_slots;
     let t = t_abs % params.seq_len;
     let qs = entry % h_slots;
-    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
+    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots + h_slots;
     let base = t_abs * scratch_stride;
     let v_base = base + h_slots * d * 2u;
     let signal_base = base + d * (h_slots * 5u);
@@ -326,7 +346,7 @@ fn fused_attn_stage3_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t_abs = entry / h_slots;
     let t = t_abs % params.seq_len;
     let scale = inverseSqrt(max(1.0, f32(d)));
-    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
+    let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots + h_slots;
     let base = t_abs * scratch_stride;
     let k_base = base + h_slots * d;
     var gq = 0.0;
@@ -352,7 +372,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let grad_scale = params.grad_scale;
 
     var g_wo = 0.0;
-    var g_wv = 0.0;
+    var g_wv: array<f32, 16>;  // per-slot W_v gradient (max 16 slots), zero-initialized
     var g_win: array<f32, 16>;  // per-slot W_in gradient (max 16 slots), zero-initialized
     var g_wq: array<f32, 16>;  // per-slot W_q gradient (max 16 slots), zero-initialized
     var g_wk: array<f32, 16>;  // per-slot W_k gradient
@@ -363,12 +383,21 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let qs = entry % h_slots;
         let q_off = qs * d;
         let off = entry_base(entry, d);
-        let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots;
+        let scratch_stride = d * (h_slots * 7u) + h_slots * h_slots + h_slots;
         let base = t_abs * scratch_stride;
         let q_base = base;
         let g_attn_col = v_adjoint[t_abs * h_slots * d + q_off + col];
         g_wo = g_wo + g_attn_col * mix_buf[off + row];
-        g_wv = g_wv + weighted_h_buf[off + row] * gmix_buf[off + col];
+        // Per-slot W_v gradient: dL/dW_v_ks[row,col] += src[ks,row] * a[qs,ks] * gmix[qs,col]
+        let gmix_col = gmix_buf[off + col];
+        let signal_base_t = base + d * (h_slots * 5u);
+        let attn_weight_base_t = signal_base_t + 2u * h_slots * d;
+        for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+            let a_val = Scratch[attn_weight_base_t + qs * h_slots + ks];
+            let src_row = Scratch[signal_base_t + ks * d + row]
+                        + AllWeights[aw_hist_base(d, h_slots) + slot_anchor_base(d, h_slots) + ks * d + row];
+            g_wv[ks] = g_wv[ks] + src_row * a_val * gmix_col;
+        }
         // Per-slot W_in gradient: dL/dW_in_s[row,col] += x[t,row] * adjoint[t,s,col]
         g_win[qs] = g_win[qs] + q_input[t_abs * d + row] * g_attn_col;
         let q_src = h_star[t_abs * h_slots * d + q_off + col];
@@ -381,11 +410,9 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let seq_scale = 1.0 / max(1.0, f32(n_entries));
-    g_wv = g_wv * seq_scale;
     g_wo = g_wo * seq_scale;
 
     let clip = 0.5;
-    let raw_wv = lr * g_wv * grad_scale;
     let raw_wo = lr * g_wo * grad_scale;
 
     // Per-slot W_q / W_k update
@@ -401,11 +428,19 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             AllWeights[aw_wk_base(params.d_model, params.h_slots) +per_idx] = AllWeights[aw_wk_base(params.d_model, params.h_slots) +per_idx] * wd_factor - clamp(raw_wk, -clip, clip);
         }
     }
+    // Per-slot W_v update
+    for (var ks_v = 0u; ks_v < h_slots; ks_v = ks_v + 1u) {
+        let raw_wv = lr * g_wv[ks_v] * seq_scale * grad_scale;
+        let wv_idx = aw_wv_base(params.d_model, params.h_slots) + ks_v * d * d + idx;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[wv_idx] += raw_wv;
+        } else {
+            AllWeights[wv_idx] = AllWeights[wv_idx] * wd_factor - clamp(raw_wv, -clip, clip);
+        }
+    }
     if (params.grad_accum_mode == 1u) {
-        AllGradients[aw_wv_base(params.d_model, params.h_slots) +idx] += raw_wv;
         AllGradients[aw_wo_base(params.d_model, params.h_slots) +idx] += raw_wo;
     } else {
-        AllWeights[aw_wv_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wv_base(params.d_model, params.h_slots) +idx] * wd_factor - clamp(raw_wv, -clip, clip);
         AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] * wd_factor - clamp(raw_wo, -clip, clip);
     }
     // Per-slot W_in update: each slot's matrix at offset s * d * d
@@ -454,7 +489,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         debug_log[8] = 204.0;
         debug_log[40] = g_wq[0];
         debug_log[41] = g_wo;
-        debug_log[42] = g_wv;
+        debug_log[42] = g_wv[0];  // slot-0 W_v gradient for diagnostics
         debug_log[43] = g_win[0]; // log slot-0 gradient for diagnostics
         debug_log[44] = g_wk[0];
     }
@@ -1451,11 +1486,15 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         grad = grad / n_norm;
         let clip = 0.5;
-        let raw_step = params.lr * grad;
+        // A_log gets 100× higher LR so timescales can adapt quickly.
+        let raw_step = params.lr * 100.0 * grad;
+        let idx_alog = aw_alog_base(params.d_model, params.h_slots) + slot * d + dim;
         if (params.grad_accum_mode == 1u) {
-            AllGradients[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] += raw_step;
+            AllGradients[idx_alog] += raw_step;
         } else {
-            AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] = AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim] - clamp(raw_step, -clip, clip);
+            let updated = AllWeights[idx_alog] - clamp(raw_step, -clip, clip);
+            // Clamp A_log to [-1.0, 9.0]: keeps a_actual = sigmoid(-A_log) in [0.0001, 0.73].
+            AllWeights[idx_alog] = clamp(updated, -1.0, 9.0);
         }
     }
 }
@@ -1478,4 +1517,122 @@ fn apply_grad_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let avg_step = AllGradients[i] / f32(params.n_accum);
     AllWeights[i] = AllWeights[i] * wd_mult - clamp(avg_step, -clip, clip);
     AllGradients[i] = 0.0;
+}
+
+// W_gate_hist gradient: ∂L/∂W_gate_hist[s,j] = Σ_t [ inner_dot(t,s) * h_star[t,s,j] ] / sqrt(d)
+// where inner_dot(t,s) = dot(weighted_h[t,s,:], m_inner[t,s,:])  (sech²≈1 approximation at init)
+@compute
+@workgroup_size(16, 16, 1)
+fn fused_hist_stage_wgate_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;   // W_gate_hist dim j
+    let slot = gid.y;  // slot s
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    if (col >= d || slot >= h_slots) { return; }
+
+    let off = slot * d;
+    var grad = 0.0;
+
+    for (var b = 0u; b < params.batch_size; b = b + 1u) {
+        for (var t = 0u; t < params.seq_len; t = t + 1u) {
+            let t_abs = b * params.seq_len + t;
+            let entry = t_abs * h_slots + slot;
+
+            // inner_dot = dot(weighted_h[t,s,:], m_inner[t,s,:])
+            var inner_dot = 0.0;
+            for (var dim = 0u; dim < d; dim = dim + 1u) {
+                let wh = weighted_h_buf[entry_base(entry, d) + dim];
+                let mi = Scratch[token_minner_base(t_abs, d, h_slots) + off + dim];
+                inner_dot = inner_dot + wh * mi;
+            }
+
+            // h_star[t,s,j] at fixed point
+            let h_star_val = h_star[t_abs * h_slots * d + off + col];
+            grad = grad + inner_dot * h_star_val;
+        }
+    }
+
+    let n_tokens = max(1u, params.batch_size * params.seq_len);
+    let token_norm = 1.0 / max(1.0, f32(n_tokens));
+    let idx = hist_gate_query_base(d, h_slots) + off + col;
+    let clip = 0.5;
+    let raw_step = params.lr * grad * inverseSqrt(f32(d)) * token_norm * params.grad_scale;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(params.d_model, params.h_slots) + idx] += raw_step;
+    } else {
+        AllWeights[aw_hist_base(params.d_model, params.h_slots) + idx] =
+            AllWeights[aw_hist_base(params.d_model, params.h_slots) + idx] - clamp(raw_step, -clip, clip);
+    }
+}
+
+// Forget gate gradient: ∂L/∂W_f[s,j] and ∂L/∂b_f[s].
+// g_scalar[t,s] = Σ_d weighted_h_buf[t,s,d] * exp(-A_log[s,d]) * m_prev[t-1,s,d] * f*(1-f)
+// Note: a/(1-a) = exp(-A_log) is exact for non-selective case.
+// ∂L/∂W_f[s,j] = Σ_{b,t} g_scalar[b,t,s] * h_star[b,t-1,s,j] / sqrt(d)
+// ∂L/∂b_f[s]   = Σ_{b,t} g_scalar[b,t,s]
+@compute
+@workgroup_size(16, 16, 1)
+fn fused_hist_stage_forget_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;   // W_forget dim j
+    let slot = gid.y;  // slot s
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    if (col >= d || slot >= h_slots) { return; }
+
+    let off = slot * d;
+    var wf_grad = 0.0;
+    var bf_grad = 0.0;
+
+    for (var b = 0u; b < params.batch_size; b = b + 1u) {
+        for (var t = 1u; t < params.seq_len; t = t + 1u) {
+            let t_abs = b * params.seq_len + t;
+            let entry = t_abs * h_slots + slot;
+
+            // g_scalar = Σ_d weighted_h * (a/(1-a)) * m_prev * f*(1-f)
+            // weighted_h_buf = (1-a) * hist_ginner, so weighted_h * exp(-A_log) = a * hist_ginner
+            var g_scalar = 0.0;
+            for (var dim = 0u; dim < d; dim = dim + 1u) {
+                let a_logit = AllWeights[aw_alog_base(d, h_slots) + slot * d + dim];
+                // a = sigmoid(-a_logit), a/(1-a) = exp(-a_logit)
+                let a_ratio = exp(-a_logit);
+                let m_prev = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+                g_scalar += weighted_h_buf[entry_base(entry, d) + dim] * a_ratio * m_prev;
+            }
+
+            // f_gate stored in Scratch at token_forget_base
+            let f_val = Scratch[token_forget_base(t_abs, d, h_slots) + slot];
+            g_scalar = g_scalar * f_val * (1.0 - f_val);
+
+            // Accumulate W_f gradient using h_star at previous token (h*_{t-1})
+            let t_prev_abs = b * params.seq_len + t - 1u;
+            let h_prev_val = h_star[t_prev_abs * h_slots * d + off + col];
+            wf_grad += g_scalar * h_prev_val;
+            // b_f gradient (only one thread per slot updates it)
+            if (col == 0u) {
+                bf_grad += g_scalar;
+            }
+        }
+    }
+
+    let n_tokens = max(1u, params.batch_size * params.seq_len);
+    let token_norm = 1.0 / max(1.0, f32(n_tokens) * f32(d));
+    let clip = 0.5;
+
+    let wf_idx = w_forget_base(d, h_slots) + off + col;
+    let wf_step = params.lr * wf_grad * inverseSqrt(f32(d)) * token_norm * params.grad_scale;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[aw_hist_base(d, h_slots) + wf_idx] += wf_step;
+    } else {
+        AllWeights[aw_hist_base(d, h_slots) + wf_idx] -= clamp(wf_step, -clip, clip);
+    }
+
+    if (col == 0u) {
+        let bf_idx = b_forget_base(d, h_slots) + slot;
+        let bf_step = params.lr * bf_grad * token_norm * params.grad_scale;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[aw_hist_base(d, h_slots) + bf_idx] += bf_step;
+        } else {
+            AllWeights[aw_hist_base(d, h_slots) + bf_idx] -= clamp(bf_step, -clip, clip);
+        }
+    }
 }
