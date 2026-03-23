@@ -71,6 +71,8 @@ pub struct GpuDeqBackend {
     fused_update_hist_alog_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wdelta_pipeline: wgpu::ComputePipeline,
     fused_update_hist_bdelta_pipeline: wgpu::ComputePipeline,
+    fused_update_hist_wgate_pipeline: wgpu::ComputePipeline,
+    fused_update_hist_forget_pipeline: wgpu::ComputePipeline,
     fused_update_apply_grad_pipeline: wgpu::ComputePipeline,
     fused_adjoint_bg: wgpu::BindGroup,
     fused_adjoint_weights_bg: wgpu::BindGroup,
@@ -116,9 +118,14 @@ impl GpuDeqBackend {
     ) {
         let d = self.config.d_r;
         // wq/wk may include per-slot bias appended after d*d matrix — use only matrix portion.
+        let h = self.config.h_slots;
         let wq_t = Self::transpose_square(&wq[..d*d], d);
         let wk_t = Self::transpose_square(&wk[..d*d], d);
-        let wv_t = Self::transpose_square(wv, d);
+        // W_v is now per-slot: h_slots blocks of d×d, each must be transposed separately.
+        let mut wv_t = Vec::with_capacity(h * d * d);
+        for s in 0..h {
+            wv_t.extend_from_slice(&Self::transpose_square(&wv[s*d*d..(s+1)*d*d], d));
+        }
         let wo_t = Self::transpose_square(wo, d);
         queue.write_buffer(&self.staged_wq_t_buf, 0, bytemuck::cast_slice(&wq_t));
         queue.write_buffer(&self.staged_wk_t_buf, 0, bytemuck::cast_slice(&wk_t));
@@ -135,6 +142,9 @@ impl GpuDeqBackend {
         slot_anchor: &[f32],
         w_delta: &[f32],
         b_delta: &[f32],
+        w_gate_hist: &[f32],
+        w_forget: &[f32],
+        b_forget: &[f32],
     ) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
@@ -246,11 +256,16 @@ impl GpuDeqBackend {
         let v_norm_scale = Self::env_f32("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
         out.push(v_norm);
         out.push(v_norm_scale);
+        // W_gate_hist: h_slots × d_model dynamic gate query matrix (after 21 scalars)
+        out.extend_from_slice(w_gate_hist);
+        // Forget gate parameters: W_forget (h×d) and b_forget (h)
+        out.extend_from_slice(w_forget);
+        out.extend_from_slice(b_forget);
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
-        (h + 1) * d * d + 3 * h * d + h + d + 21
+        (h + 1) * d * d + 5 * h * d + 2 * h + d + 21
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -1009,6 +1024,24 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let fused_update_hist_wgate_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Hist WGate Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_hist_stage_wgate_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_hist_forget_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Hist Forget Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_hist_stage_forget_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let fused_update_apply_grad_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Fused DEQ Apply Gradient Pipeline"),
@@ -1182,6 +1215,7 @@ impl GpuDeqBackend {
             mapped_at_creation: false,
         });
         let w_mat_bytes = (config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
+        let wv_mat_bytes = (config.h_slots * config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
         let staged_wq_t_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staged Picard Wq^T Buffer"),
             size: w_mat_bytes,
@@ -1196,7 +1230,7 @@ impl GpuDeqBackend {
         });
         let staged_wv_t_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staged Picard Wv^T Buffer"),
-            size: w_mat_bytes,
+            size: wv_mat_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1217,8 +1251,8 @@ impl GpuDeqBackend {
         let ag_d64 = config.d_r as u64;
         let ag_h64 = config.h_slots as u64;
         let ag_hist_len = (config.h_slots + 1) * config.d_r * config.d_r
-            + 3 * config.h_slots * config.d_r
-            + config.h_slots
+            + 5 * config.h_slots * config.d_r
+            + 2 * config.h_slots
             + config.d_r
             + 21;
         let all_gradients_size = aw_total_bytes(ag_d64, ag_h64, ag_hist_len as u64);
@@ -1372,13 +1406,14 @@ impl GpuDeqBackend {
         let d64 = config.d_r as u64;
         let h64 = config.h_slots as u64;
         let aw_mat_sz = std::num::NonZeroU64::new(d64 * d64 * 4);
+        let aw_wv_sz = std::num::NonZeroU64::new(h64 * d64 * d64 * 4);
         let aw_wqk_sz = std::num::NonZeroU64::new(aw_wqk_bytes(d64, h64));
         let aw_win_sz = std::num::NonZeroU64::new(h64 * d64 * d64 * 4);
         let aw_alog_sz = std::num::NonZeroU64::new(h64 * d64 * 4);
         let aw_nscale_sz = std::num::NonZeroU64::new(d64 * 4);
         let aw_hist_len = (config.h_slots + 1) * config.d_r * config.d_r
-            + 3 * config.h_slots * config.d_r
-            + config.h_slots
+            + 5 * config.h_slots * config.d_r
+            + 2 * config.h_slots
             + config.d_r
             + 21;
         let aw_hist_sz = std::num::NonZeroU64::new(aw_hist_len as u64 * 4);
@@ -1497,7 +1532,7 @@ impl GpuDeqBackend {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bridge.all_weights_buf, offset: aw_wv_byte_off(d64, h64), size: aw_mat_sz,
+                        buffer: &bridge.all_weights_buf, offset: aw_wv_byte_off(d64, h64), size: aw_wv_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
@@ -1555,6 +1590,8 @@ impl GpuDeqBackend {
             fused_update_hist_alog_pipeline,
             fused_update_hist_wdelta_pipeline,
             fused_update_hist_bdelta_pipeline,
+            fused_update_hist_wgate_pipeline,
+            fused_update_hist_forget_pipeline,
             fused_update_apply_grad_pipeline,
             fused_adjoint_bg,
             fused_adjoint_weights_bg,
@@ -1655,6 +1692,9 @@ impl GpuDeqBackend {
         slot_anchor: &[f32],
         w_delta: &[f32],
         b_delta: &[f32],
+        w_gate_hist: &[f32],
+        w_forget: &[f32],
+        b_forget: &[f32],
     ) {
         let d = self.config.d_r as u64;
         let h = self.config.h_slots as u64;
@@ -1676,6 +1716,9 @@ impl GpuDeqBackend {
             slot_anchor,
             w_delta,
             b_delta,
+            w_gate_hist,
+            w_forget,
+            b_forget,
         );
         queue.write_buffer(
             &self.bridge.all_weights_buf,
@@ -2696,6 +2739,17 @@ impl GpuDeqBackend {
                 hs.div_ceil(16),
                 profile_fused,
             );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "hist_wgate",
+                &self.fused_update_hist_wgate_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                hs.div_ceil(16),
+                profile_fused,
+            );
             if train_hist_temporal {
                 run_stage(
                     &self.device,
@@ -2717,6 +2771,18 @@ impl GpuDeqBackend {
                     &self.fused_update_bg1,
                     batch_size * hs,
                     1,
+                    profile_fused,
+                );
+                // Forget gate backward: uses weighted_h_buf from hist_tbptt_final.
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "hist_forget",
+                    &self.fused_update_hist_forget_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    hs.div_ceil(16),
                     profile_fused,
                 );
                 if train_hist_alog {
