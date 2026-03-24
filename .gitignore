@@ -43,6 +43,30 @@ data/
 *.swp
 *.swo
 
-# Bench result logs (CSVs kept, raw logs excluded)
+# Bench result logs
 aideen-bench/results/deq_no_mamba_tune*/
 aideen-bench/results/invalid
+
+# Internal docs (not for public repo)
+docs/internal/
+docs/ChatGPT-*
+
+# Scripts (local dev tooling, not part of the engine)
+build_val_set.py
+download_corpus.py
+prepare_training_corpus.py
+plot_training.py
+check_training.sh
+resume_training.sh
+scaling_experiment.sh
+fit_scaling_law.py
+
+# Dataset source files
+aideen-backbone/dataset_genesis.txt
+aideen-backbone/dataset_genesis.txt.tokens.bin
+aideen-backbone/dataset.txt.tokens.bin
+# Agent skills (local tooling)
+.agents/
+aideen.code-workspace
+build_dataset.py
+prepare_aideen_data.py
