@@ -233,10 +233,18 @@ fn main() {
     }
 
     let (g_wo, g_wv, g_wq, g_wk) = analytical_grads(&r, &h, &upstream);
-    let fd_wo = finite_diff_grad(&r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wo", eps);
-    let fd_wv = finite_diff_grad(&r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wv", eps);
-    let fd_wq = finite_diff_grad(&r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wq", eps);
-    let fd_wk = finite_diff_grad(&r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wk", eps);
+    let fd_wo = finite_diff_grad(
+        &r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wo", eps,
+    );
+    let fd_wv = finite_diff_grad(
+        &r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wv", eps,
+    );
+    let fd_wq = finite_diff_grad(
+        &r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wq", eps,
+    );
+    let fd_wk = finite_diff_grad(
+        &r.w_q, &r.w_k, &r.w_v, &r.w_o, &h, &upstream, &cfg, "wk", eps,
+    );
 
     println!("DEQ attention grad check");
     println!(

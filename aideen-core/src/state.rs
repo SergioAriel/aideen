@@ -50,7 +50,7 @@ impl Default for ArchitectureConfig {
             adj_iters: 6, // contr≈0.20 → error residual 0.20^6≈6e-5, prácticamente exacto
             train_deq: true,
             deq_grad_scale: 0.01,
-            renorm_every_steps: 4,  // Cada 4 steps: ~0.25x overhead vs inline, σ controlada en ventana corta
+            renorm_every_steps: 4, // Cada 4 steps: ~0.25x overhead vs inline, σ controlada en ventana corta
             num_samples: 512,
             weight_decay: 0.01,
         }

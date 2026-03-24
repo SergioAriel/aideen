@@ -141,8 +141,8 @@ mod tests {
 
     #[test]
     fn lmhead_grad_reduces_loss() {
-        use aideen_backbone::lm_head::LmHead;
         use crate::loss;
+        use aideen_backbone::lm_head::LmHead;
 
         let mut config = ArchitectureConfig::default();
         config.vocab_size = 32;

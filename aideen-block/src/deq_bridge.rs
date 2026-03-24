@@ -69,17 +69,39 @@ pub struct RustDeqBridge {
 
 /// AllWeights flat-buffer byte offsets (verified 256-byte aligned for d=512, h=8).
 /// Layout: W_q | W_k | W_v | W_o | W_in | W_x | W_out | A_log | NormScale | HistParams
-pub fn aw_wqk_bytes(d: u64, h: u64) -> u64 { (h * d * d + h * d) * 4 }
-pub fn aw_wk_byte_off(d: u64, h: u64) -> u64 { aw_wqk_bytes(d, h) }
-pub fn aw_wv_byte_off(d: u64, h: u64) -> u64 { 2 * aw_wqk_bytes(d, h) }
-pub fn aw_wo_byte_off(d: u64, h: u64) -> u64 { aw_wv_byte_off(d, h) + h * d * d * 4 }
-pub fn aw_win_byte_off(d: u64, h: u64) -> u64 { aw_wo_byte_off(d, h) + d * d * 4 }
-pub fn aw_wx_byte_off(d: u64, h: u64) -> u64 { aw_win_byte_off(d, h) + h * d * d * 4 }
-pub fn aw_wout_byte_off(d: u64, h: u64) -> u64 { aw_wx_byte_off(d, h) + d * d * 4 }
-pub fn aw_alog_byte_off(d: u64, h: u64) -> u64 { aw_wout_byte_off(d, h) + d * d * 4 }
-pub fn aw_nscale_byte_off(d: u64, h: u64) -> u64 { aw_alog_byte_off(d, h) + h * d * 4 }
-pub fn aw_hist_byte_off(d: u64, h: u64) -> u64 { aw_nscale_byte_off(d, h) + d * 4 }
-pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 { aw_hist_byte_off(d, h) + hist_len * 4 }
+pub fn aw_wqk_bytes(d: u64, h: u64) -> u64 {
+    (h * d * d + h * d) * 4
+}
+pub fn aw_wk_byte_off(d: u64, h: u64) -> u64 {
+    aw_wqk_bytes(d, h)
+}
+pub fn aw_wv_byte_off(d: u64, h: u64) -> u64 {
+    2 * aw_wqk_bytes(d, h)
+}
+pub fn aw_wo_byte_off(d: u64, h: u64) -> u64 {
+    aw_wv_byte_off(d, h) + h * d * d * 4
+}
+pub fn aw_win_byte_off(d: u64, h: u64) -> u64 {
+    aw_wo_byte_off(d, h) + d * d * 4
+}
+pub fn aw_wx_byte_off(d: u64, h: u64) -> u64 {
+    aw_win_byte_off(d, h) + h * d * d * 4
+}
+pub fn aw_wout_byte_off(d: u64, h: u64) -> u64 {
+    aw_wx_byte_off(d, h) + d * d * 4
+}
+pub fn aw_alog_byte_off(d: u64, h: u64) -> u64 {
+    aw_wout_byte_off(d, h) + d * d * 4
+}
+pub fn aw_nscale_byte_off(d: u64, h: u64) -> u64 {
+    aw_alog_byte_off(d, h) + h * d * 4
+}
+pub fn aw_hist_byte_off(d: u64, h: u64) -> u64 {
+    aw_nscale_byte_off(d, h) + d * 4
+}
+pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 {
+    aw_hist_byte_off(d, h) + hist_len * 4
+}
 
 impl RustDeqBridge {
     pub fn new(
@@ -331,8 +353,11 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
         // Single AllWeights buffer: W_q | W_k | W_v | W_o | W_in | W_x | W_out | A_log | NormScale | HistParams
-        let hist_params_len =
-            (h_slots + 1u32) * d_model * d_model + 5u32 * h_slots * d_model + 2u32 * h_slots + d_model + 21u32;
+        let hist_params_len = (h_slots + 1u32) * d_model * d_model
+            + 5u32 * h_slots * d_model
+            + 2u32 * h_slots
+            + d_model
+            + 21u32;
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
@@ -363,8 +388,7 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
 
-        let h_bytes =
-            (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
+        let h_bytes = (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
         // hcurr_buf is doubled: first half = H_curr, second half = M_carry (cross-sequence SSM state).
         let hcurr_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_curr"),
@@ -411,10 +435,7 @@ impl RustDeqBridge {
         let scratch_stride = d_model * h_slots * 7 + h_slots * h_slots + h_slots;
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
-            size: (max_batch_size as u64)
-                * (max_seq_len as u64)
-                * (scratch_stride as u64)
-                * 4u64,
+            size: (max_batch_size as u64) * (max_seq_len as u64) * (scratch_stride as u64) * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -422,10 +443,7 @@ impl RustDeqBridge {
         });
         let hpooled_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_pooled"),
-            size: (max_batch_size as u64)
-                * (max_seq_len as u64)
-                * (d_model as u64)
-                * 4u64,
+            size: (max_batch_size as u64) * (max_seq_len as u64) * (d_model as u64) * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -502,55 +520,73 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: 0, size: wqk_sz,
+                        buffer: &all_weights_buf,
+                        offset: 0,
+                        size: wqk_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wk_byte_off(d64, h64), size: wqk_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wk_byte_off(d64, h64),
+                        size: wqk_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wv_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wv_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wo_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wo_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_win_byte_off(d64, h64), size: win_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_win_byte_off(d64, h64),
+                        size: win_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wx_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wx_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wout_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wout_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_alog_byte_off(d64, h64), size: alog_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_alog_byte_off(d64, h64),
+                        size: alog_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_nscale_byte_off(d64, h64), size: nscale_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_nscale_byte_off(d64, h64),
+                        size: nscale_sz,
                     }),
                 },
             ],
@@ -640,43 +676,57 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: 0, size: wqk_sz,
+                        buffer: &all_weights_buf,
+                        offset: 0,
+                        size: wqk_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wk_byte_off(d64, h64), size: wqk_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wk_byte_off(d64, h64),
+                        size: wqk_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wv_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wv_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wo_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wo_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_win_byte_off(d64, h64), size: win_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_win_byte_off(d64, h64),
+                        size: win_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wx_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wx_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wout_byte_off(d64, h64), size: mat_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wout_byte_off(d64, h64),
+                        size: mat_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
@@ -861,14 +911,62 @@ impl RustDeqBridge {
         });
 
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, 0, &st_q, 0, wqk_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wk_byte_off(d, h), &st_k, 0, wqk_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wv_byte_off(d, h), &st_v, 0, wv_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wo_byte_off(d, h), &st_o, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_win_byte_off(d, h), &st_in, 0, win_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wx_byte_off(d, h), &st_x, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wout_byte_off(d, h), &st_out, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_alog_byte_off(d, h), &st_a, 0, a_vec_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_nscale_byte_off(d, h), &st_n, 0, vec_size);
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wk_byte_off(d, h),
+            &st_k,
+            0,
+            wqk_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wv_byte_off(d, h),
+            &st_v,
+            0,
+            wv_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wo_byte_off(d, h),
+            &st_o,
+            0,
+            mat_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_win_byte_off(d, h),
+            &st_in,
+            0,
+            win_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wx_byte_off(d, h),
+            &st_x,
+            0,
+            mat_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wout_byte_off(d, h),
+            &st_out,
+            0,
+            mat_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_alog_byte_off(d, h),
+            &st_a,
+            0,
+            a_vec_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_nscale_byte_off(d, h),
+            &st_n,
+            0,
+            vec_size,
+        );
 
         queue.submit(Some(encoder.finish()));
 
@@ -1285,14 +1383,46 @@ impl RustDeqBridge {
             let d = shape.d_model as u64;
             let h = shape.h_slots as u64;
             queue.write_buffer(&self.all_weights_buf, 0, bytemuck::cast_slice(w_q));
-            queue.write_buffer(&self.all_weights_buf, aw_wk_byte_off(d, h), bytemuck::cast_slice(w_k));
-            queue.write_buffer(&self.all_weights_buf, aw_wv_byte_off(d, h), bytemuck::cast_slice(w_v));
-            queue.write_buffer(&self.all_weights_buf, aw_wo_byte_off(d, h), bytemuck::cast_slice(w_o));
-            queue.write_buffer(&self.all_weights_buf, aw_win_byte_off(d, h), bytemuck::cast_slice(w_in));
-            queue.write_buffer(&self.all_weights_buf, aw_wx_byte_off(d, h), bytemuck::cast_slice(w_x));
-            queue.write_buffer(&self.all_weights_buf, aw_wout_byte_off(d, h), bytemuck::cast_slice(w_out));
-            queue.write_buffer(&self.all_weights_buf, aw_alog_byte_off(d, h), bytemuck::cast_slice(a_log));
-            queue.write_buffer(&self.all_weights_buf, aw_nscale_byte_off(d, h), bytemuck::cast_slice(norm_scale));
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_wk_byte_off(d, h),
+                bytemuck::cast_slice(w_k),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_wv_byte_off(d, h),
+                bytemuck::cast_slice(w_v),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_wo_byte_off(d, h),
+                bytemuck::cast_slice(w_o),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_win_byte_off(d, h),
+                bytemuck::cast_slice(w_in),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_wx_byte_off(d, h),
+                bytemuck::cast_slice(w_x),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_wout_byte_off(d, h),
+                bytemuck::cast_slice(w_out),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_alog_byte_off(d, h),
+                bytemuck::cast_slice(a_log),
+            );
+            queue.write_buffer(
+                &self.all_weights_buf,
+                aw_nscale_byte_off(d, h),
+                bytemuck::cast_slice(norm_scale),
+            );
         }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
