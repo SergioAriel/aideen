@@ -42,3 +42,7 @@ data/
 .vscode/
 *.swp
 *.swo
+
+# Bench result logs (CSVs kept, raw logs excluded)
+aideen-bench/results/deq_no_mamba_tune*/
+aideen-bench/results/invalid
