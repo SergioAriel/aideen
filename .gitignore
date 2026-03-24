@@ -2,12 +2,43 @@
 /loxi-training-lab/
 **/*.rs.bk
 .DS_Store
-*.aidn
-dataset.txt
 
 # Model checkpoints and binary data
+*.aidn
 *.opt
 *.bin
+*.safetensors
+
+# Training corpus files (large — users download separately)
+corpus_combined.txt
+corpus_fineweb_50m.txt
+corpus_italian_wiki.txt
+val_fineweb.txt
+train_aideen.txt
+dataset.txt
+*.tokens.bin
+
+# Training logs and runtime artifacts
+training_logs/
+run_*.log
+*.log.bak
+model_large*
+model.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Data directory
+data/
 
 # Claude memory files
 .claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
