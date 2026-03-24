@@ -255,7 +255,10 @@ fn run_large_file(
     };
 
     tok.config.vocab_size = tok.vocab_size();
-    tok.config.ctx_len = 256;
+    tok.config.ctx_len = env::var("AIDEEN_CTX_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
     tok.config.train_deq = true;
 
     let vocab_size = tok.vocab_size();
