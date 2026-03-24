@@ -251,7 +251,10 @@ fn eval_tf(tf: &CandleTransformer, val: &[u32]) -> f32 {
         return f32::NAN;
     }
     let sum: f32 = (0..n)
-        .map(|i| tf.val_loss(&val[i * stride..i * stride + stride]).unwrap_or(f32::NAN))
+        .map(|i| {
+            tf.val_loss(&val[i * stride..i * stride + stride])
+                .unwrap_or(f32::NAN)
+        })
         .filter(|v| v.is_finite())
         .sum();
     sum / n as f32
@@ -336,8 +339,7 @@ fn train_loop(
         };
         if ai_active {
             let t0 = Instant::now();
-            let loss =
-                aideen.train_sequence(tokens_in, targets, true, aideen.config.deq_epsilon);
+            let loss = aideen.train_sequence(tokens_in, targets, true, aideen.config.deq_epsilon);
             let dt = t0.elapsed();
             if loss.is_finite() {
                 ai.tokens_total += n;
@@ -372,10 +374,8 @@ fn train_loop(
         }
 
         // ── Eval checkpoint ──────────────────────────────────────────────────
-        let ai_eval = ai_tok_int > 0
-            && ai.tokens_total.saturating_sub(last_ai_eval) >= eval_every;
-        let tf_eval = tf_tok_int > 0
-            && tfr.tokens_total.saturating_sub(last_tf_eval) >= eval_every;
+        let ai_eval = ai_tok_int > 0 && ai.tokens_total.saturating_sub(last_ai_eval) >= eval_every;
+        let tf_eval = tf_tok_int > 0 && tfr.tokens_total.saturating_sub(last_tf_eval) >= eval_every;
 
         if ai_eval || tf_eval {
             let wall = wall_start.elapsed().as_secs_f64();
@@ -432,8 +432,7 @@ fn print_curve(ai: &ModelRun, tf: &ModelRun, x_is_tokens: bool) {
     println!();
     println!(
         "  {:>10} │ {:^10} {:^10} {:^8} │ {:^10} {:^10} {:^8} │ {}",
-        x_label, "AI-val", "AI-train", "AI t/s",
-        "TF-val", "TF-train", "TF t/s", "win"
+        x_label, "AI-val", "AI-train", "AI t/s", "TF-val", "TF-train", "TF t/s", "win"
     );
     println!("  {}", "─".repeat(80));
 
@@ -458,7 +457,13 @@ fn print_curve(ai: &ModelRun, tf: &ModelRun, x_is_tokens: bool) {
         let tf_tps = tf_p.map_or(0.0, |p| p.tps);
 
         let win = match (ai_val.is_finite(), tf_val.is_finite()) {
-            (true, true) => if ai_val < tf_val { "AI ←" } else { "TF →" },
+            (true, true) => {
+                if ai_val < tf_val {
+                    "AI ←"
+                } else {
+                    "TF →"
+                }
+            }
             _ => "    ",
         };
 
@@ -475,11 +480,17 @@ fn print_curve(ai: &ModelRun, tf: &ModelRun, x_is_tokens: bool) {
     );
     println!(
         "  t_training │ {:>10} {:^30} │ {:>10} {:^30} │",
-        fmt_secs(ai.secs_train), "", fmt_secs(tf.secs_train), ""
+        fmt_secs(ai.secs_train),
+        "",
+        fmt_secs(tf.secs_train),
+        ""
     );
     println!(
         "  tok_seen   │ {:>10} {:^30} │ {:>10} {:^30} │",
-        fmt_tokens(ai.tokens_total), "", fmt_tokens(tf.tokens_total), ""
+        fmt_tokens(ai.tokens_total),
+        "",
+        fmt_tokens(tf.tokens_total),
+        ""
     );
 }
 
@@ -507,7 +518,10 @@ fn inference_metrics(aideen: &Trainer, tf: &CandleTransformer, val: &[u32]) -> I
     let t0 = Instant::now();
     let tf_nll: f32 = {
         let sum: f32 = (0..n_chunks)
-            .map(|i| tf.val_loss(&val[i * stride..i * stride + stride]).unwrap_or(f32::NAN))
+            .map(|i| {
+                tf.val_loss(&val[i * stride..i * stride + stride])
+                    .unwrap_or(f32::NAN)
+            })
             .filter(|v| v.is_finite())
             .sum();
         if n_chunks > 0 {
@@ -578,7 +592,10 @@ fn inference_bench(aideen: &Trainer, tf: &CandleTransformer, val: &[u32]) {
             100.0 * nll_delta.abs() / m.ai_nll
         );
     } else {
-        println!("  NLL: estadísticamente similar (|delta|={:.4} nats)", nll_delta.abs());
+        println!(
+            "  NLL: estadísticamente similar (|delta|={:.4} nats)",
+            nll_delta.abs()
+        );
     }
 }
 
@@ -637,7 +654,11 @@ fn parse_seeds() -> Vec<u64> {
 }
 
 fn parse_backend_env(name: &str, default: Backend) -> Backend {
-    match env::var(name).unwrap_or_else(|_| default.as_str().to_string()).to_lowercase().as_str() {
+    match env::var(name)
+        .unwrap_or_else(|_| default.as_str().to_string())
+        .to_lowercase()
+        .as_str()
+    {
         "cpu" => Backend::Cpu,
         "gpu" => Backend::Gpu,
         other => {
@@ -795,7 +816,12 @@ fn run_single_seed(
     }
 
     // EXP 2: iso-time
-    let mut aideen2 = build_aideen(vocab_size, ds.vocab.clone(), seed.wrapping_add(2), ai_backend);
+    let mut aideen2 = build_aideen(
+        vocab_size,
+        ds.vocab.clone(),
+        seed.wrapping_add(2),
+        ai_backend,
+    );
     let mut tf2 =
         CandleTransformer::new(cfg_tf.clone(), LR as f64, tf_cb).expect("tf candle init exp2");
     let mut ai2 = ModelRun::new("AIDEEN", aideen_params(vocab_size));
@@ -917,7 +943,10 @@ fn main() {
     );
     println!(
         "  Transformer: {} params  (d={}, {}-layer GPT, ctx={})",
-        fmt_tokens(tf_p), cfg_tf.d_model, cfg_tf.n_layers, CTX_LEN
+        fmt_tokens(tf_p),
+        cfg_tf.d_model,
+        cfg_tf.n_layers,
+        CTX_LEN
     );
     let param_diff_pct = 100.0 * (ai_p as f32 - tf_p as f32).abs() / tf_p as f32;
     println!(
@@ -936,9 +965,16 @@ fn main() {
     let mut results = Vec::new();
     for (i, seed) in seeds.iter().enumerate() {
         println!();
-        println!("══════════ Seed {} / {} ({}) ══════════", i + 1, seeds.len(), seed);
+        println!(
+            "══════════ Seed {} / {} ({}) ══════════",
+            i + 1,
+            seeds.len(),
+            seed
+        );
         let verbose = i == 0;
-        let r = run_single_seed(*seed, &ds, &cfg_tf, bench_cfg, ai_backend, tf_backend, verbose);
+        let r = run_single_seed(
+            *seed, &ds, &cfg_tf, bench_cfg, ai_backend, tf_backend, verbose,
+        );
         results.push(r);
     }
 

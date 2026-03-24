@@ -107,11 +107,11 @@ pub struct Trainer {
     pub m_prev: Option<HSlots>,
 
     // --- Gradient Accumulation ---
-    grad_accum_counter: u32,  // steps accumulated so far in the current window
+    grad_accum_counter: u32, // steps accumulated so far in the current window
 
     // --- TPS tracking for GPU-DEBUG log ---
     debug_last_time: Option<std::time::Instant>,
-    debug_tokens_accum: u32,   // tokens processed since last GPU-DEBUG print
+    debug_tokens_accum: u32, // tokens processed since last GPU-DEBUG print
 }
 
 impl Trainer {
@@ -788,11 +788,8 @@ impl Trainer {
                 );
                 self.grad_accum_counter += 1;
                 if self.grad_accum_counter >= grad_accum {
-                    let _ = gpu.apply_gradient_update(
-                        base_lr,
-                        self.config.weight_decay,
-                        grad_accum,
-                    );
+                    let _ =
+                        gpu.apply_gradient_update(base_lr, self.config.weight_decay, grad_accum);
                     self.grad_accum_counter = 0;
                 }
                 self.gpu_weights_uploaded = true;
@@ -892,16 +889,10 @@ impl Trainer {
 
                     if parity_check {
                         // Compare GPU dl_dh with CPU reference to detect LM backward mismatch.
-                        let dl_dh_cpu = dl_dh_cpu_parity_opt
-                            .as_ref()
-                            .or(dl_dh_cpu_opt.as_ref());
+                        let dl_dh_cpu = dl_dh_cpu_parity_opt.as_ref().or(dl_dh_cpu_opt.as_ref());
                         if let Some(dl_dh_cpu) = dl_dh_cpu {
                             let dl_dh_gpu = if self.frozen_lm || force_cpu_lm_dldh {
-                                match gpu_lm.read_dl_dh(
-                                    &gpu.device,
-                                    &gpu.queue,
-                                    self.config.d_r,
-                                ) {
+                                match gpu_lm.read_dl_dh(&gpu.device, &gpu.queue, self.config.d_r) {
                                     Ok(v) => nalgebra::DVector::from_vec(v),
                                     Err(_) => nalgebra::DVector::zeros(self.config.d_r),
                                 }
@@ -1071,8 +1062,14 @@ impl Trainer {
                 let now = std::time::Instant::now();
                 let tps_debug = if let Some(t) = self.debug_last_time {
                     let elapsed = t.elapsed().as_secs_f32();
-                    if elapsed > 0.0 { self.debug_tokens_accum as f32 / elapsed } else { 0.0 }
-                } else { 0.0 };
+                    if elapsed > 0.0 {
+                        self.debug_tokens_accum as f32 / elapsed
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 self.debug_last_time = Some(now);
                 self.debug_tokens_accum = 0;
 
@@ -1311,13 +1308,20 @@ impl Trainer {
                         let mut a_spreads = Vec::with_capacity(h_slots);
                         for s in 0..h_slots {
                             let slice = &carrier[a_offset + s * d_r..a_offset + (s + 1) * d_r];
-                            let a_vals: Vec<f32> = slice.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+                            let a_vals: Vec<f32> =
+                                slice.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
                             let mean = a_vals.iter().sum::<f32>() / d_r as f32;
-                            let spread = a_vals.iter().map(|&v| (v - mean).abs()).sum::<f32>() / d_r as f32;
+                            let spread =
+                                a_vals.iter().map(|&v| (v - mean).abs()).sum::<f32>() / d_r as f32;
                             a_means.push(mean);
                             a_spreads.push(spread);
                         }
-                        let fmt_vec = |v: &[f32]| v.iter().map(|x| format!("{:.3}", x)).collect::<Vec<_>>().join(",");
+                        let fmt_vec = |v: &[f32]| {
+                            v.iter()
+                                .map(|x| format!("{:.3}", x))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        };
                         println!(
                             "    \x1b[90m[GPU-SSM] Step {}: a_mean=[{}] a_spread=[{}] mamba_rms={:.3e}\x1b[0m",
                             self.optimizer.step_count() % 100,
@@ -1340,7 +1344,10 @@ impl Trainer {
                         let a_rms = if fw.len() > idx + 2 { fw[idx + 2] } else { 0.0 };
                         let _ = std::fmt::Write::write_fmt(
                             &mut per_token,
-                            format_args!(" t{:02} h={:.3e} v={:.3e} a={:.3e}", t, h_rms, v_rms, a_rms),
+                            format_args!(
+                                " t{:02} h={:.3e} v={:.3e} a={:.3e}",
+                                t, h_rms, v_rms, a_rms
+                            ),
                         );
                     }
                     println!("    \x1b[90m[GPU-TOKENS]{}\x1b[0m", per_token);
@@ -2451,20 +2458,30 @@ impl Trainer {
                     // Average per-slot matrices into CPU prototype (used for checkpoint only)
                     let avg_mat = |flat: &[f32]| -> Vec<f32> {
                         (0..d_r * d_r)
-                            .map(|i| (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>() / h_slots as f32)
+                            .map(|i| {
+                                (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                    / h_slots as f32
+                            })
                             .collect()
                     };
-                    self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
-                    self.reasoning.q_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
-                    self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
-                    self.reasoning.k_bias = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
+                    self.reasoning.w_q =
+                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
+                    self.reasoning.q_bias =
+                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
+                    self.reasoning.w_k =
+                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
+                    self.reasoning.k_bias =
+                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
                 }
                 {
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
                     // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
                     let avg: Vec<f32> = (0..d_r * d_r)
-                        .map(|i| (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>() / h_slots as f32)
+                        .map(|i| {
+                            (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
+                                / h_slots as f32
+                        })
                         .collect();
                     self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
                 }

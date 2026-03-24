@@ -8,7 +8,10 @@
 //!   cargo run --release --features wgpu -p aideen-training --bin chat -- --model model_large --max-tokens 80
 
 use aideen_training::trainer::Trainer;
-use std::{env, io::{self, BufRead, Write}};
+use std::{
+    env,
+    io::{self, BufRead, Write},
+};
 
 const DEFAULT_MODEL: &str = "model_large";
 const DEFAULT_MAX_TOKENS: usize = 120;
@@ -21,11 +24,11 @@ const CTX_WINDOW: usize = 512; // caracteres máximos del historial de conversac
 fn main() {
     // ── Parse args ──────────────────────────────────────────────────────────
     let args: Vec<String> = env::args().collect();
-    let mut model_base  = DEFAULT_MODEL.to_string();
-    let mut max_tokens  = DEFAULT_MAX_TOKENS;
+    let mut model_base = DEFAULT_MODEL.to_string();
+    let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut temperature = DEFAULT_TEMPERATURE;
-    let mut top_p       = DEFAULT_TOP_P;
-    let mut top_k       = DEFAULT_TOP_K;
+    let mut top_p = DEFAULT_TOP_P;
+    let mut top_k = DEFAULT_TOP_K;
     let mut rep_penalty = DEFAULT_REP_PENALTY;
 
     let mut i = 1;
@@ -33,27 +36,39 @@ fn main() {
         match args[i].as_str() {
             "--model" | "-m" => {
                 i += 1;
-                if let Some(v) = args.get(i) { model_base = v.clone(); }
+                if let Some(v) = args.get(i) {
+                    model_base = v.clone();
+                }
             }
             "--max-tokens" | "-n" => {
                 i += 1;
-                if let Some(v) = args.get(i) { max_tokens = v.parse().unwrap_or(DEFAULT_MAX_TOKENS); }
+                if let Some(v) = args.get(i) {
+                    max_tokens = v.parse().unwrap_or(DEFAULT_MAX_TOKENS);
+                }
             }
             "--temperature" | "-t" => {
                 i += 1;
-                if let Some(v) = args.get(i) { temperature = v.parse().unwrap_or(DEFAULT_TEMPERATURE); }
+                if let Some(v) = args.get(i) {
+                    temperature = v.parse().unwrap_or(DEFAULT_TEMPERATURE);
+                }
             }
             "--top-p" => {
                 i += 1;
-                if let Some(v) = args.get(i) { top_p = v.parse().unwrap_or(DEFAULT_TOP_P); }
+                if let Some(v) = args.get(i) {
+                    top_p = v.parse().unwrap_or(DEFAULT_TOP_P);
+                }
             }
             "--top-k" => {
                 i += 1;
-                if let Some(v) = args.get(i) { top_k = v.parse().unwrap_or(DEFAULT_TOP_K); }
+                if let Some(v) = args.get(i) {
+                    top_k = v.parse().unwrap_or(DEFAULT_TOP_K);
+                }
             }
             "--rep-penalty" => {
                 i += 1;
-                if let Some(v) = args.get(i) { rep_penalty = v.parse().unwrap_or(DEFAULT_REP_PENALTY); }
+                if let Some(v) = args.get(i) {
+                    rep_penalty = v.parse().unwrap_or(DEFAULT_REP_PENALTY);
+                }
             }
             _ => {}
         }
@@ -104,13 +119,18 @@ fn main() {
 
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
-            Ok(0) => break,          // Ctrl+D / EOF
+            Ok(0) => break, // Ctrl+D / EOF
             Ok(_) => {}
-            Err(e) => { eprintln!("Error leyendo stdin: {e}"); break; }
+            Err(e) => {
+                eprintln!("Error leyendo stdin: {e}");
+                break;
+            }
         }
 
         let input = line.trim();
-        if input.is_empty() { continue; }
+        if input.is_empty() {
+            continue;
+        }
 
         // Comandos especiales
         match input {
@@ -126,8 +146,14 @@ fn main() {
                     println!("  (vacío)");
                 } else {
                     // Mostrar últimas líneas del contexto
-                    let preview: String = context.chars().rev().take(200).collect::<String>()
-                        .chars().rev().collect();
+                    let preview: String = context
+                        .chars()
+                        .rev()
+                        .take(200)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
                     println!("  ...{preview}");
                 }
                 println!();

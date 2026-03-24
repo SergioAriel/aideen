@@ -172,7 +172,9 @@ fn test_forward_parity(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult {
 
 fn test_cpu_residual_curve(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult {
     let t = make_trainer(13, Backend::Cpu, cfg);
-    let q = t.tokenizer.embed_context(&tokens[0..cfg.ctx_len], cfg.ctx_len);
+    let q = t
+        .tokenizer
+        .embed_context(&tokens[0..cfg.ctx_len], cfg.ctx_len);
     let mut h = t.reasoning.init(&q);
     let mut deltas = Vec::new();
 
@@ -188,10 +190,7 @@ fn test_cpu_residual_curve(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResu
 
     let first = deltas.first().copied().unwrap_or(0.0);
     let last = deltas.last().copied().unwrap_or(0.0);
-    let non_inc = deltas
-        .windows(2)
-        .filter(|w| w[1] <= w[0] * 1.05)
-        .count();
+    let non_inc = deltas.windows(2).filter(|w| w[1] <= w[0] * 1.05).count();
     let ratio_non_inc = non_inc as f32 / (deltas.len().saturating_sub(1).max(1) as f32);
     let pass = last < first && ratio_non_inc >= 0.6;
 
@@ -254,7 +253,10 @@ fn test_tiny_overfit(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult {
 
     let gpu_ok_and_metrics: (bool, Option<(f32, f32)>) = if gpu.gpu_deq.is_some() {
         let (g0, g1) = tiny_overfit_run(&mut gpu, seq, targets, 60, 1e-4);
-        (g1 < g0 * 0.90 && g0.is_finite() && g1.is_finite(), Some((g0, g1)))
+        (
+            g1 < g0 * 0.90 && g0.is_finite() && g1.is_finite(),
+            Some((g0, g1)),
+        )
     } else {
         (true, None)
     };
@@ -419,9 +421,7 @@ fn test_update_direction(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult
     cpu.frozen_deq = true;
 
     let gs = cfg.deq_grad_scale;
-    let grad_wx_cpu: Vec<f32> = (v_cpu.clone() * query.transpose() * gs)
-        .as_slice()
-        .to_vec();
+    let grad_wx_cpu: Vec<f32> = (v_cpu.clone() * query.transpose() * gs).as_slice().to_vec();
     let grad_alog_cpu: Vec<f32> = (v_cpu.clone() * gs).as_slice().to_vec();
 
     // ── GPU intermediates ──────────────────────────────────────────────────────
@@ -543,7 +543,7 @@ fn test_deq_step_parity(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult 
     let s_in: Vec<f32> = query.as_slice().to_vec();
 
     // ── CPU: 1 step ──────────────────────────────────────────────────────────
-    let h_init = t.reasoning.init(&query);            // broadcast query → all slots
+    let h_init = t.reasoning.init(&query); // broadcast query → all slots
     let h_new_cpu = t.reasoning.step(&h_init, &query, None);
     let h_new_cpu_flat = h_new_cpu.to_flat();
 
@@ -558,9 +558,9 @@ fn test_deq_step_parity(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult 
 
     let damping = t.reasoning.damping; // same β as CPU damped_update
     let _ = gpu_deq.run_forward_deq_no_readback(
-        1,                           // batch_size
-        1,                           // seq_len
-        1,                           // max_iters = 1 (single step)
+        1, // batch_size
+        1, // seq_len
+        1, // max_iters = 1 (single step)
         cfg.deq_epsilon,
         damping,
         &s_in,
@@ -706,7 +706,10 @@ fn main() {
 
     println!();
     println!("AIDEEN DEQ Diagnostics");
-    println!("config: d_r={} h_slots={} ctx_len={}", cfg.d_r, cfg.h_slots, cfg.ctx_len);
+    println!(
+        "config: d_r={} h_slots={} ctx_len={}",
+        cfg.d_r, cfg.h_slots, cfg.ctx_len
+    );
     println!("{}", "-".repeat(92));
     println!("{:<34} {:<8} {}", "test", "status", "detail");
     println!("{}", "-".repeat(92));
