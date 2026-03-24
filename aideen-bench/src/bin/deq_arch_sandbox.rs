@@ -59,7 +59,9 @@ fn make_cpu_trainer(seed: u64, cfg: &ArchitectureConfig) -> Trainer {
 }
 
 fn synth_tokens(n: usize, vocab: usize) -> Vec<u32> {
-    (0..n).map(|i| ((i * 11 + i / 3 + 17) % vocab) as u32).collect()
+    (0..n)
+        .map(|i| ((i * 11 + i / 3 + 17) % vocab) as u32)
+        .collect()
 }
 
 fn rms_norm(x: &DVector<f32>, scale: &DVector<f32>) -> DVector<f32> {
@@ -73,9 +75,15 @@ fn cross_slot_attn(trainer: &Trainer, h: &HSlots) -> HSlots {
     let h_slots = trainer.config.h_slots;
     let scale = (d_r as f32).sqrt().recip();
 
-    let qs: Vec<DVector<f32>> = (0..h_slots).map(|k| &trainer.reasoning.w_q * h.slot(k)).collect();
-    let ks: Vec<DVector<f32>> = (0..h_slots).map(|k| &trainer.reasoning.w_k * h.slot(k)).collect();
-    let vs: Vec<DVector<f32>> = (0..h_slots).map(|k| &trainer.reasoning.w_v * h.slot(k)).collect();
+    let qs: Vec<DVector<f32>> = (0..h_slots)
+        .map(|k| &trainer.reasoning.w_q * h.slot(k))
+        .collect();
+    let ks: Vec<DVector<f32>> = (0..h_slots)
+        .map(|k| &trainer.reasoning.w_k * h.slot(k))
+        .collect();
+    let vs: Vec<DVector<f32>> = (0..h_slots)
+        .map(|k| &trainer.reasoning.w_v * h.slot(k))
+        .collect();
 
     let mut next = HSlots::zeros(&trainer.config);
     for q_idx in 0..h_slots {
@@ -126,7 +134,11 @@ fn pooled(h: &HSlots, cfg: &ArchitectureConfig) -> DVector<f32> {
     acc / cfg.h_slots as f32
 }
 
-fn run_picard_current(trainer: &Trainer, h0: &HSlots, q: &DVector<f32>) -> (HSlots, usize, f32, f32) {
+fn run_picard_current(
+    trainer: &Trainer,
+    h0: &HSlots,
+    q: &DVector<f32>,
+) -> (HSlots, usize, f32, f32) {
     let mut h = h0.clone();
     let mut prev_delta = 0.0f32;
     let mut contr = 0.0f32;
@@ -308,8 +320,13 @@ fn run_sweep(trainer: &mut Trainer, tokens: &[u32]) {
                 let s = run_pure_per_slot(trainer, tokens);
                 println!(
                     "{:<8.2} {:<6.2} {:<6}  {:<8.4} {:<10.3e} {:<8.3} {:<7.1}%",
-                    alpha, damp, max_iters,
-                    s.mean_loss, s.mean_delta, s.mean_contr, s.conv_ratio * 100.0
+                    alpha,
+                    damp,
+                    max_iters,
+                    s.mean_loss,
+                    s.mean_delta,
+                    s.mean_contr,
+                    s.conv_ratio * 100.0
                 );
             }
         }
@@ -356,7 +373,11 @@ fn run_init_sweep(cfg: &ArchitectureConfig, tokens: &[u32]) {
             let s = run_pure_per_slot(&t, tokens);
             println!(
                 "{:<8.2} {:<8.2}  {:<8.4} {:<10.3e} {:<8.3} {:<7.1}%",
-                threshold, alpha, s.mean_loss, s.mean_delta, s.mean_contr,
+                threshold,
+                alpha,
+                s.mean_loss,
+                s.mean_delta,
+                s.mean_contr,
                 s.conv_ratio * 100.0
             );
         }

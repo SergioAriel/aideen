@@ -24,31 +24,20 @@ fn env_u64(name: &str) -> Option<u64> {
 fn main() {
     println!("\n[STRESS-TEST] Iniciando Auditoría de Integridad v13.2...");
 
-    let force_global = env::var("AIDEEN_STRESS_FORCE_GLOBAL")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let force_global = env::var("AIDEEN_STRESS_FORCE_GLOBAL").ok().as_deref() == Some("1");
     let _deq_only = env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1");
     let _no_mamba = env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1");
 
     let mut config = ArchitectureConfig::default();
-    config.d_r = env_u32("AIDEEN_STRESS_DR").unwrap_or(if force_global { 1024 } else { 512 }) as usize;
+    config.d_r =
+        env_u32("AIDEEN_STRESS_DR").unwrap_or(if force_global { 1024 } else { 512 }) as usize;
     config.h_slots = env_u32("AIDEEN_STRESS_HSLOTS").unwrap_or(8) as usize;
-    config.max_deq_iters = env_u32("AIDEEN_STRESS_MAX_ITERS").unwrap_or(if force_global {
-        12
-    } else {
-        14
-    }) as usize;
-    config.adj_iters = env_u32("AIDEEN_STRESS_ADJ_ITERS").unwrap_or(if force_global {
-        8
-    } else {
-        6
-    }) as usize;
-    config.deq_epsilon = env_f32("AIDEEN_STRESS_EPS").unwrap_or(if force_global {
-        1e-4
-    } else {
-        2e-4
-    });
+    config.max_deq_iters =
+        env_u32("AIDEEN_STRESS_MAX_ITERS").unwrap_or(if force_global { 12 } else { 14 }) as usize;
+    config.adj_iters =
+        env_u32("AIDEEN_STRESS_ADJ_ITERS").unwrap_or(if force_global { 8 } else { 6 }) as usize;
+    config.deq_epsilon =
+        env_f32("AIDEEN_STRESS_EPS").unwrap_or(if force_global { 1e-4 } else { 2e-4 });
     config.deq_grad_scale = 0.01;
     if let Some(ctx) = env_u32("AIDEEN_STRESS_CTX_LEN") {
         config.ctx_len = ctx as usize;
@@ -74,14 +63,21 @@ fn main() {
     );
 
     let source_text: String = if let Ok(path) = env::var("AIDEEN_STRESS_FILE") {
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| { eprintln!("[STRESS-TEST] ERROR leyendo {}: {}", path, e); PROMPT.to_string() })
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("[STRESS-TEST] ERROR leyendo {}: {}", path, e);
+            PROMPT.to_string()
+        })
     } else {
         PROMPT.to_string()
     };
     let tok = Tokenizer::from_text(&source_text, config.clone());
     let tokens = tok.encode(&source_text);
-    println!("[STRESS-TEST] Corpus: {} chars → {} tokens (vocab={})", source_text.len(), tokens.len(), tok.vocab_size());
+    println!(
+        "[STRESS-TEST] Corpus: {} chars → {} tokens (vocab={})",
+        source_text.len(),
+        tokens.len(),
+        tok.vocab_size()
+    );
     let mut train_tokens = &tokens[..tokens.len() - 1];
     let mut targets = &tokens[1..];
     if let Some(seq_len) = env_u32("AIDEEN_STRESS_SEQ_LEN") {
@@ -146,8 +142,11 @@ fn main() {
         #[cfg(feature = "wgpu")]
         if let Some(gpu) = trainer.gpu_deq.as_ref() {
             let seq_len = targets.len() as u32;
-            let ((w_hist_mean, w_hist_max), (w_delta_mean, w_delta_max), (b_delta_mean, b_delta_max)) =
-                gpu.read_hist_selective_param_stats();
+            let (
+                (w_hist_mean, w_hist_max),
+                (w_delta_mean, w_delta_max),
+                (b_delta_mean, b_delta_max),
+            ) = gpu.read_hist_selective_param_stats();
             let ((fwd_delta_mean, fwd_delta_max, fwd_delta_nz), (fwd_a_mean, fwd_a_min, fwd_a_max)) =
                 gpu.read_hist_selective_forward_stats(seq_len);
             eprintln!(

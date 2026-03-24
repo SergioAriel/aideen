@@ -3,7 +3,8 @@
 /// Descarga ~1MB desde GitHub, construye vocab de 65 chars,
 /// y devuelve splits train/val como Vec<u32>.
 
-const URL: &str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
+const URL: &str =
+    "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 const CACHE: &str = "aideen-bench/tinyshakespeare.txt";
 
 pub struct Dataset {
@@ -70,7 +71,11 @@ fn load_text() -> String {
 
 fn build(text: String) -> Dataset {
     // Construir vocab char-level ordenado
-    let mut vocab: Vec<char> = text.chars().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut vocab: Vec<char> = text
+        .chars()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     vocab.sort();
 
     let tokens: Vec<u32> = text

@@ -8,9 +8,9 @@ use aideen_core::{
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::cell::RefCell;
 
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
 pub struct MambaSlotReasoning {
@@ -74,7 +74,7 @@ pub struct MambaSlotReasoning {
 
     // ── Mamba SSM por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
-    pub a_log: DMatrix<f32>,   // [h_slots × d_r] row-major, per-slot decay
+    pub a_log: DMatrix<f32>, // [h_slots × d_r] row-major, per-slot decay
     #[cfg(not(feature = "lab"))]
     pub(crate) a_log: DMatrix<f32>,
     #[cfg(feature = "lab")]
@@ -205,8 +205,7 @@ impl MambaSlotReasoning {
         // Historical interface: 0.15*I — increased from 0.05 after DEQ stabilization (contr≈0.21).
         // hist_ctx has ∂/∂h=0 so W_hist does not enter the Jacobian; increasing it is safe.
         // Target: hist/inj ≈ 0.25 (up from 0.08) for meaningful SSM gradient path.
-        let w_hist_shared =
-            Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.15_f32, 0.01_f32);
+        let w_hist_shared = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.15_f32, 0.01_f32);
         // The temporal carrier is applied as a residual around identity:
         //   x_proj = h_unit + W_x h_unit
         //   M_t    = m_inner + W_out m_inner
@@ -218,7 +217,9 @@ impl MambaSlotReasoning {
         // zeros would give delta_input[s]=W_delta[s]*M=0 for all slots → identical M trajectories
         // → identical A_log gradients → slots never specialize regardless of training length.
         // Small random noise gives distinct delta_input per slot from token 2 onward.
-        let w_delta = DMatrix::from_fn(h_slots * d_r, d_r, |_, _| rng.gen_range(-0.01_f32..0.01_f32));
+        let w_delta = DMatrix::from_fn(h_slots * d_r, d_r, |_, _| {
+            rng.gen_range(-0.01_f32..0.01_f32)
+        });
 
         // DEQ requiere σ(J_f) < 1 desde la inicialización.
         // El Jacobiano compuesto de atención (W_o · softmax · W_v · W_q) puede superar 1
@@ -273,7 +274,11 @@ impl MambaSlotReasoning {
             a_log: DMatrix::from_fn(h_slots, d_r, |slot, _| {
                 let a_min = 0.80_f32;
                 let a_max = 0.999_f32;
-                let alpha = if h_slots <= 1 { 0.5 } else { slot as f32 / (h_slots - 1) as f32 };
+                let alpha = if h_slots <= 1 {
+                    0.5
+                } else {
+                    slot as f32 / (h_slots - 1) as f32
+                };
                 let a = a_min + alpha * (a_max - a_min);
                 (a / (1.0 - a)).ln() // logit(a): slot 0 = 1.39 (moderate), slot 7 = 6.91 (very slow)
             }),
@@ -355,12 +360,13 @@ impl MambaSlotReasoning {
     pub fn w_v_gpu_flat(&self) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let base = self.w_v.as_slice();  // column-major, d*d floats
+        let base = self.w_v.as_slice(); // column-major, d*d floats
         let mut v = Vec::with_capacity(h * d * d);
         for s in 0..h {
             for (i, &x) in base.iter().enumerate() {
                 // Smaller jitter than Q/K (0.03 vs 0.05) to keep V more stable
-                let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.3_f32).sin() * 0.03_f32;
+                let jitter =
+                    ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.3_f32).sin() * 0.03_f32;
                 v.push(x + jitter);
             }
         }
@@ -374,7 +380,7 @@ impl MambaSlotReasoning {
     pub fn w_q_gpu_flat(&self) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let base = self.w_q.as_slice();  // column-major, d*d floats
+        let base = self.w_q.as_slice(); // column-major, d*d floats
         let mut v = Vec::with_capacity(h * d * d + h * d);
         for s in 0..h {
             for (i, &x) in base.iter().enumerate() {
@@ -681,7 +687,9 @@ impl MambaSlotReasoning {
             } else {
                 return Err(format!(
                     "reasoning.w_delta size mismatch: expected {} or {}, got {}",
-                    d_r * d_r, h_slots * d_r * d_r, data.len()
+                    d_r * d_r,
+                    h_slots * d_r * d_r,
+                    data.len()
                 ));
             };
         }
@@ -730,7 +738,9 @@ impl MambaSlotReasoning {
             } else {
                 return Err(format!(
                     "reasoning.a_log size mismatch: expected {} or {}, got {}",
-                    d_r, h_slots * d_r, data.len()
+                    d_r,
+                    h_slots * d_r,
+                    data.len()
                 ));
             };
         }

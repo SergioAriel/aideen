@@ -128,7 +128,10 @@ impl CandleTransformer {
             }
             let mask = Tensor::from_slice(mask.as_slice(), (t, t), &self.device)?;
 
-            let scores = qh.matmul(&kh.t()?)?.affine(scale, 0.)?.broadcast_add(&mask)?;
+            let scores = qh
+                .matmul(&kh.t()?)?
+                .affine(scale, 0.)?
+                .broadcast_add(&mask)?;
             let probs = candle_nn::ops::softmax(&scores, 1)?;
             let out = probs.matmul(&vh)?;
             heads.push(out);

@@ -150,11 +150,7 @@ fn estimate_local_jac_gain(
         }
 
         let h0 = h.to_flat();
-        let h_pert: Vec<f32> = h0
-            .iter()
-            .zip(v.iter())
-            .map(|(a, b)| a + eps * b)
-            .collect();
+        let h_pert: Vec<f32> = h0.iter().zip(v.iter()).map(|(a, b)| a + eps * b).collect();
         let h_pert_slots = HSlots::from_flat(&h_pert, &trainer.config);
         let y_pert = flatten_step(trainer, &h_pert_slots, s);
         let gain = diff_l2(&y_pert, &base) / eps.max(1e-12);
@@ -181,10 +177,7 @@ fn run_picard(
     }
     let first = *deltas.first().unwrap_or(&0.0);
     let last = *deltas.last().unwrap_or(&0.0);
-    let non_inc = deltas
-        .windows(2)
-        .filter(|w| w[1] <= w[0] * 1.02)
-        .count();
+    let non_inc = deltas.windows(2).filter(|w| w[1] <= w[0] * 1.02).count();
     let ratio = non_inc as f32 / (deltas.len().saturating_sub(1).max(1) as f32);
     (h.to_flat(), first, last, ratio, h)
 }
@@ -194,9 +187,15 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
     let h_slots = trainer.config.h_slots;
     let scale = (d_r as f32).sqrt().recip();
 
-    let qs: Vec<DVector<f32>> = (0..h_slots).map(|k| &trainer.reasoning.w_q * h.slot(k)).collect();
-    let ks: Vec<DVector<f32>> = (0..h_slots).map(|k| &trainer.reasoning.w_k * h.slot(k)).collect();
-    let vs: Vec<DVector<f32>> = (0..h_slots).map(|k| &trainer.reasoning.w_v * h.slot(k)).collect();
+    let qs: Vec<DVector<f32>> = (0..h_slots)
+        .map(|k| &trainer.reasoning.w_q * h.slot(k))
+        .collect();
+    let ks: Vec<DVector<f32>> = (0..h_slots)
+        .map(|k| &trainer.reasoning.w_k * h.slot(k))
+        .collect();
+    let vs: Vec<DVector<f32>> = (0..h_slots)
+        .map(|k| &trainer.reasoning.w_v * h.slot(k))
+        .collect();
 
     let mut attn_total = 0.0f32;
     for q_idx in 0..h_slots {
@@ -232,7 +231,8 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
     let mut resid_total = 0.0f32;
     for k in 0..h_slots {
         let hs = h.slot(k);
-        resid_total += hs.dot(&hs) * trainer.reasoning.residual_alpha * trainer.reasoning.residual_alpha;
+        resid_total +=
+            hs.dot(&hs) * trainer.reasoning.residual_alpha * trainer.reasoning.residual_alpha;
     }
 
     (
@@ -256,8 +256,12 @@ fn run_stage(cfg: &ArchitectureConfig, stage: AblationStage) -> StageResult {
     let mut trainer = make_cpu_trainer(123, cfg);
     apply_stage(&mut trainer, stage);
 
-    let tokens1: Vec<u32> = (0..cfg.ctx_len).map(|i| ((i * 7 + 3) % cfg.vocab_size) as u32).collect();
-    let tokens2: Vec<u32> = (0..cfg.ctx_len).map(|i| ((i * 13 + 19) % cfg.vocab_size) as u32).collect();
+    let tokens1: Vec<u32> = (0..cfg.ctx_len)
+        .map(|i| ((i * 7 + 3) % cfg.vocab_size) as u32)
+        .collect();
+    let tokens2: Vec<u32> = (0..cfg.ctx_len)
+        .map(|i| ((i * 13 + 19) % cfg.vocab_size) as u32)
+        .collect();
     let s1 = trainer.tokenizer.embed_context(&tokens1, cfg.ctx_len);
     let s2 = trainer.tokenizer.embed_context(&tokens2, cfg.ctx_len);
 
@@ -339,4 +343,3 @@ fn main() {
     println!("{}", "-".repeat(148));
     println!("note: jac_gain is empirical local ||J_f|| via finite-difference probes (higher => less contractive).");
 }
-

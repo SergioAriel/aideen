@@ -193,10 +193,7 @@ fn cpu_forward_map_no_mamba(
             }
             scores[ks] = (score * scale).clamp(-4.0, 4.0);
         }
-        let max_s = scores
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum_exp = 0.0;
         for ks in 0..h_slots {
             let e = (scores[ks] - max_s).exp();
@@ -346,18 +343,7 @@ fn run_picard_vs_numeric_case(
     let b_rep = v_ref.clone();
     for _ in 0..8 {
         let jt_v = numeric_jt_v_no_mamba(
-            &h_star,
-            &v_ref,
-            &s_in,
-            &w_q,
-            &w_k,
-            &w_v,
-            &w_o,
-            &w_in,
-            &norm,
-            damping,
-            h,
-            d,
+            &h_star, &v_ref, &s_in, &w_q, &w_k, &w_v, &w_o, &w_in, &norm, damping, h, d,
         );
         for i in 0..v_ref.len() {
             v_ref[i] = b_rep[i] + jt_v[i];
@@ -368,12 +354,7 @@ fn run_picard_vs_numeric_case(
     cosine(&v_picard, &v_ref)
 }
 
-fn run_cg_vs_picard_case(
-    w_q_scale: f32,
-    w_k_scale: f32,
-    w_v_scale: f32,
-    w_o_scale: f32,
-) -> f32 {
+fn run_cg_vs_picard_case(w_q_scale: f32, w_k_scale: f32, w_v_scale: f32, w_o_scale: f32) -> f32 {
     std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
 
     let mut config = ArchitectureConfig::default();
@@ -707,16 +688,14 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
     let slot_anchor = weights
         .get("reasoning.slot_anchor")
         .expect("slot_anchor missing");
-    let w_delta = weights
-        .get("reasoning.w_delta")
-        .expect("w_delta missing");
-    let b_delta = weights
-        .get("reasoning.b_delta")
-        .expect("b_delta missing");
+    let w_delta = weights.get("reasoning.w_delta").expect("w_delta missing");
+    let b_delta = weights.get("reasoning.b_delta").expect("b_delta missing");
     let d = config.d_r;
     let h = config.h_slots;
     let w_gate_hist_zeros = vec![0.0f32; h * d];
-    let w_gate_hist = weights.get("reasoning.w_gate_hist").unwrap_or(&w_gate_hist_zeros);
+    let w_gate_hist = weights
+        .get("reasoning.w_gate_hist")
+        .unwrap_or(&w_gate_hist_zeros);
     let w_forget_zeros = vec![0.0f32; h * d];
     let b_forget_init = vec![3.0f32; h];
     let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
@@ -963,18 +942,7 @@ fn test_picard_matches_numeric_reference_no_mamba_small() {
     let b_rep = v_ref.clone();
     for _ in 0..8 {
         let jt_v = numeric_jt_v_no_mamba(
-            &h_star,
-            &v_ref,
-            &s_in,
-            &w_q,
-            &w_k,
-            &w_v,
-            &w_o,
-            &w_in,
-            &norm,
-            damping,
-            h,
-            d,
+            &h_star, &v_ref, &s_in, &w_q, &w_k, &w_v, &w_o, &w_in, &norm, damping, h, d,
         );
         for i in 0..v_ref.len() {
             v_ref[i] = b_rep[i] + jt_v[i];
@@ -1052,18 +1020,7 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
     let b_rep = v_ref.clone();
     for _ in 0..8 {
         let jt_v = numeric_jt_v_no_mamba(
-            &h_star,
-            &v_ref,
-            &s_in,
-            &w_q,
-            &w_k,
-            &w_v,
-            &w_o,
-            &w_in,
-            &norm,
-            damping,
-            h,
-            d,
+            &h_star, &v_ref, &s_in, &w_q, &w_k, &w_v, &w_o, &w_in, &norm, damping, h, d,
         );
         for i in 0..v_ref.len() {
             v_ref[i] = b_rep[i] + jt_v[i];
