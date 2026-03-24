@@ -1,131 +1,89 @@
-# aideen-ai
+# AIDEEN — Decentralized AI Engine for Consumer Hardware
 
-Repositorio privado — motor de inteligencia artificial del sistema aideen.
+Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Mamba-style selective state memory (SSM)** instead of stacked transformer layers — achieving comparable quality with significantly fewer parameters.
 
-**Protocolo v1.0** — `VOCAB_SIZE=64_000`, `D_GLOBAL=2048`
+Designed to run on consumer GPUs (AMD, Intel, NVIDIA) via [wgpu](https://wgpu.rs/) / WebGPU, without dependence on CUDA or cloud providers.
 
----
-
-## Crates
-
-| Crate | Estado | Descripción |
-|-------|--------|-------------|
-| `aideen-runtime` | ✅ Completo | GPU runtime (Metal/Vulkan/DX12/WebGPU) con wgpu |
-| `aideen-backbone` | ✅ Completo | Nodo backbone — routing semántico, C+D dynamics |
-| `aideen-training` | ✅ Completo | Pipeline de entrenamiento federado (4 fases) |
-
-## Grafo de dependencias
-
-```
-aideen-backbone ──→ aideen-runtime
-aideen-training ──→ aideen-runtime
-aideen-runtime  ──→ (sin deps internas)
-```
+**License:** MIT
 
 ---
 
-## Setup rápido
+## Architecture
+
+AIDEEN uses a single reusable parameter block refined via Picard iteration (fixed-point solving), instead of stacking 16-96 transformer layers. The Mamba SSM provides temporal memory across tokens but operates **outside** the DEQ convergence loop — a key design decision that preserves the contractivity required for stable fixed-point convergence.
+
+Key components:
+- **DEQ fixed-point solver** with Picard iteration and spectral normalization
+- **Multi-slot attention** (h_slots parallel reasoning heads with per-slot Q/K/V/W_in)
+- **Mamba SSM** with selective state (input-dependent decay), forget gate, and dynamic history gating
+- **Picard adjoint** backward pass via implicit differentiation (O(1) memory)
+- **29 WGSL GPU compute shaders** for training and inference
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
+
+## Current Status (March 2026)
+
+- **GPU training pipeline:** Fully operational on AMD Radeon 780M (integrated GPU, 2 GB VRAM, Vulkan)
+- **Model configuration:** d_r=512, h_slots=8, vocab_size=50,257 (BPE tokenizer)
+- **Training results:** Validation loss reduced from 5.97 (random init) to 4.08 over 2,860 gradient steps on a 3.76M token corpus (Rust Book + arXiv ML papers + SmolTalk)
+- **Stability:** 12+ hours continuous GPU training at 11.8 tokens/second with automatic checkpointing
+- **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens, English + Spanish) tokenized and prepared for larger-scale training
+
+## Workspace Structure
+
+| Crate | Purpose |
+|-------|---------|
+| `aideen-core` | Public contracts, cryptographic types, sealed protocol constants |
+| `aideen-backbone` | Model architecture (DEQ + Mamba composition), tokenizer, generation |
+| `aideen-block` | GPU compute block (wgpu shaders for forward/backward/update) |
+| `aideen-training-lab` | Training pipeline, optimizer, checkpointing |
+| `aideen-engine` | GPU compute runtime |
+| `aideen-node` | P2P network node (QUIC, WebTransport) |
+| `aideen-coordinator` | Cryptographic governance, key delegation |
+| `aideen-reasoning` | Trainable reasoning engine |
+| `aideen-critic` | Quality evaluation module (non-trainable, safety) |
+| `aideen-bench` | Benchmarking: DEQ+SSM vs Transformer (iso-parameter comparison) |
+
+## Quick Start
 
 ```bash
-# Build de todo el workspace
-cargo build-all
+# Build everything
+cargo build --release --workspace
 
-# Tests
-cargo test-all
+# Run tests (CPU-only crates)
+cargo test --workspace --exclude aideen-block --exclude aideen-engine
+
+# Train on a text file (requires GPU via wgpu)
+cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --epochs 5
+
+# Resume from checkpoint
+cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --resume model_large --epochs 5
+
+# Interactive chat with a trained model
+cargo run --release --features wgpu -p aideen-training --bin chat -- --model model_large
 ```
 
-## Entrenamiento
+### Environment Variables
 
-### Fase 1 + 2 — Local (Decomposer + Backbone)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AIDEEN_CTX_LEN` | 256 | Context window length (tokens) |
+| `AIDEEN_BATCH_SIZE` | 1 | Sequences per gradient step |
+| `AIDEEN_DEQ_HIST_GATED` | 1 | Enable history-gated mode |
 
-```bash
-# Requiere: data/tokenizer/tokenizer.json (BPE 64K multilingual)
-#           data/corpus/ (archivos .txt o .jsonl multilingüe)
+## Project History
 
-cargo train-local
+Development began in early 2025 as a private research project exploring DEQ architectures for efficient AI. The repository was migrated to GitHub in February 2026 for open-source release. Prior work included iterative prototyping of the DEQ solver, Mamba integration experiments, and the transition from Conjugate Gradient to Picard Adjoint for the backward pass. The current codebase (~15,000 lines of Rust + 5,679 lines of WGSL) represents approximately one year of cumulative R&D by two developers.
 
-# O por fases separadas:
-cargo run --release --bin train -- --phase decomposer
-cargo run --release --bin train -- --phase backbone   # SOLO en M1 dueño
-```
+## Team
 
-### Fase 3 — Federado (Expertos)
+- **Juan Patricio Marchetto** ([@JuanMarchetto](https://github.com/JuanMarchetto)) — System architect, training infrastructure. Italian citizen.
+- **Sergio Ariel Solis** ([@SergioAriel](https://github.com/SergioAriel)) — GPU compute, mathematical innovations (Mamba-outside-DEQ, Picard adjoint).
 
-```bash
-# Requiere: data/experts/{domain}/train.jsonl
-#           weights/aideen_backbone_weights.safetensors (de Fase 2)
+## Funding
 
-# Un dominio
-cargo run --release --bin train_expert -- --domain math
+AIDEEN has been self-funded to date. We are applying for [NGI Zero Commons Fund](https://nlnet.nl/commonsfund/) (EU) to support scaling experiments, published benchmarks, and a browser-based inference demo via WebGPU.
 
-# Todos los dominios
-cargo train-experts
+## Contributing
 
-# Con Architect remoto (C+D sync)
-cargo run --release --bin train_expert -- --domain all --architect 192.168.1.10:9000
-```
-
-### Fase 4 — Destilación (Expert → Backbone)
-
-```bash
-# SOLO en M1 dueño del backbone
-cargo distill
-```
-
-## Dominios de expertos (18 total)
-
-**Conocimiento:**
-`math` `code` `logic` `nlp` `science` `creative`
-`legal` `medical` `history` `finance` `philosophy` `multilingual`
-
-**Razonamiento meta:**
-`reasoning` `planning`
-
-**Infraestructura cognitiva** (sin entrenamiento manual):
-`memory` `synthesis` `critic` `general`
-
-## Constantes de protocolo (NO cambiar sin versionar)
-
-```rust
-VOCAB_SIZE   = 64_000   // multilingual BPE — congelado v1.0
-D_GLOBAL     = 2048     // dimensión del estado cognitivo global S_g
-D_LOCAL      = 4096     // dimensión local (no sale del nodo)
-MEMORY_SLOTS = 16       // slots de memoria de sesión M_t
-MEMORY_DIM   = 2048     // = D_GLOBAL
-```
-
-Cambiar cualquiera de estas constantes **rompe la compatibilidad** con todos los nodos
-de la red y requiere incrementar la versión mayor del protocolo (`v2.0`).
-
----
-
-## Ética — invariantes no negociables
-
-- `EthicsKernel` nunca recibe gradientes (`∂L/∂θ_ethics = 0`)
-- No está en el optimizer — es un módulo separado cargado en runtime
-- Se aplica a **todo** output antes de enviarlo al usuario
-- No puede ser modificado por entrenamiento ni por configuración
-
----
-
-## Estructura de archivos de pesos
-
-```
-weights/
-├── aideen_backbone_weights.safetensors      ← Fase 2
-├── aideen_decomposer_weights.safetensors    ← Fase 1
-├── aideen_expert_math_weights.safetensors   ← Fase 3
-├── aideen_expert_code_weights.safetensors
-├── aideen_expert_logic_weights.safetensors
-├── aideen_expert_nlp_weights.safetensors
-├── aideen_expert_science_weights.safetensors
-├── aideen_expert_creative_weights.safetensors
-├── aideen_expert_legal_weights.safetensors
-├── aideen_expert_medical_weights.safetensors
-├── aideen_expert_history_weights.safetensors
-├── aideen_expert_finance_weights.safetensors
-├── aideen_expert_philosophy_weights.safetensors
-├── aideen_expert_multilingual_weights.safetensors
-├── aideen_expert_reasoning_weights.safetensors
-└── aideen_expert_planning_weights.safetensors
-```
+Contributions welcome. Please open an issue before submitting large PRs. See [ARCHITECTURE.md](ARCHITECTURE.md) for technical context.

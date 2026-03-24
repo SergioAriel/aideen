@@ -13,7 +13,7 @@ aideen-training  = { path = "../aideen-training-lab", features = ["wgpu"] }
 aideen-core      = { path = "../aideen-core" }
 nalgebra         = "0.32"
 rand             = "0.8.5"
-candle-core      = { version = "0.8.4", features = ["metal"] }
-candle-nn        = { version = "0.8.4", features = ["metal"] }
+candle-core      = "0.8.4"
+candle-nn        = "0.8.4"
 statrs           = "0.18"
 bytemuck         = "1"

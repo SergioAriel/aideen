@@ -1,0 +1,10 @@
+AIDEEN Training Summary
+==================================================
+Steps:             2,860
+Tokens processed:  732,160
+Train loss:        4.7584 -> 4.0824
+Val loss:          5.9699 -> 4.4970
+Val loss (best):   0.6255
+Throughput:        11.7 tps
+Wall time:         12.9h
+Hardware:          Ryzen 9 8945HS + Radeon 780M (Vulkan)
