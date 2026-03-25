@@ -35,7 +35,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 - **Picard convergence:** 100% of tokens converge within 5-6 iterations (cap 20), contractivity < 0.85
 - **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens, English + Spanish) tokenized and prepared for larger-scale training
 
-For the key architectural insight (why Mamba runs outside the DEQ loop), see [docs/blog/001-why-mamba-outside-deq.md](docs/blog/001-why-mamba-outside-deq.md).
+For the key architectural insight (why Mamba runs outside the DEQ loop), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Workspace Structure
 
