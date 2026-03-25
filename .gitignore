@@ -67,6 +67,7 @@ aideen-backbone/dataset_genesis.txt.tokens.bin
 aideen-backbone/dataset.txt.tokens.bin
 # Agent skills (local tooling)
 .agents/
+skills-lock.json
 aideen.code-workspace
 build_dataset.py
 prepare_aideen_data.py
