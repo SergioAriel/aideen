@@ -129,6 +129,7 @@ impl Trainer {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
     }
 
+    #[allow(dead_code)]
     fn env_f32_default(name: &str, default: f32) -> f32 {
         Self::env_f32(name).unwrap_or(default)
     }
@@ -482,7 +483,7 @@ impl Trainer {
                 let ctx = &tokens[seq_len - actual_ctx_len..];
                 let ctx_targets = &targets[seq_len - actual_ctx_len..];
 
-                let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+                let Some(_gpu_emb) = self.gpu_emb.as_ref() else {
                     return 0.0;
                 };
 
