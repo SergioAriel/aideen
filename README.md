@@ -78,6 +78,15 @@ cargo run --release -p aideen-bench
 | `AIDEEN_BATCH_SIZE` | 1 | Sequences per gradient step |
 | `AIDEEN_DEQ_HIST_GATED` | 1 | Enable history-gated mode |
 
+## Distribution
+
+**From source** (current): Clone and `cargo build --release`. Single static binary, no runtime dependencies beyond GPU drivers.
+
+**Planned:**
+- **Browser inference:** WebGPU via `wasm32-unknown-unknown` target (Phase 2 deliverable — requires model trained first)
+- **Pre-built binaries:** GitHub Releases with Linux/macOS/Windows builds (post v0.1.0)
+- **Container:** Dockerfile for reproducible builds (post v0.1.0)
+
 ## Project History
 
 Development began in early 2025 as a private research project exploring DEQ architectures for efficient AI. The repository was migrated to GitHub in February 2026 for open-source release. Prior work included iterative prototyping of the DEQ solver, Mamba integration experiments, and the transition from Conjugate Gradient to Picard Adjoint for the backward pass. The current codebase (~35,000 lines of Rust + 5,679 lines of WGSL across 10 crates) represents approximately one year of cumulative R&D by two developers.
