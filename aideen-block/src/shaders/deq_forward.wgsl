@@ -90,6 +90,10 @@ fn hist_alpha_max() -> f32 {
 var<workgroup> attn_w: array<f32, 64>;
 // Tiled cache for mix vector during W_o * mix projection.
 var<workgroup> mix_tile: array<f32, MIX_TILE>;
+// Tiled cache for H_curr during fused Q/K/V matmul.
+var<workgroup> h_tile: array<f32, WG_SIZE>;
+// Tiled cache for prev_mamba / carry during W_hist prelude matmul.
+var<workgroup> prev_tile: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(256, 1, 1)
 fn deq_forward_main(
@@ -331,28 +335,46 @@ fn deq_forward_main(
                 let prev_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                 var local_hist_sumsq = 0.0;
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
-                    // Hist-gated product route: history must come from M_{t-1}, not from a
-                    // permanent additive bias. A non-zero bias keeps the historical channel
-                    // "on" even when the temporal carrier is empty and breaks the intended
-                    // semantics of the interface.
                     var u = 0.0;
                     if (t > 0u) {
                         let prev_mamba =
                             (batch_idx * shape.seq_len + t - 1u) * scratch_stride
                             + h_slots * 4u * d_model;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let prev_v = Scratch[prev_mamba + off + j] / prev_rms;
-                            u = u + AllWeights[aw_hist +d_out * d_model + j] * prev_v;
+                        // Tiled matmul: load prev[tile] cooperatively, accumulate W_hist * prev
+                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                            let j_load = tile + tid;
+                            if (j_load < d_model) {
+                                prev_tile[tid] = Scratch[prev_mamba + off + j_load] / prev_rms;
+                            } else {
+                                prev_tile[tid] = 0.0;
+                            }
+                            workgroupBarrier();
+                            let tile_lim = min(WG_SIZE, d_model - tile);
+                            for (var tj = 0u; tj < tile_lim; tj = tj + 1u) {
+                                u = u + AllWeights[aw_hist + d_out * d_model + tile + tj] * prev_tile[tj];
+                            }
+                            workgroupBarrier();
                         }
-                        u = u + AllWeights[aw_hist +hist_scale_base + off + d_out]
+                        u = u + AllWeights[aw_hist + hist_scale_base + off + d_out]
                             * (Scratch[prev_mamba + off + d_out] / prev_rms);
                     } else {
                         let carry_base = shape.batch_size * total_elements + batch_idx * total_elements + off;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let prev_v = H_curr[carry_base + j] / prev_rms;
-                            u = u + AllWeights[aw_hist +d_out * d_model + j] * prev_v;
+                        // Tiled matmul: load carry[tile] cooperatively, accumulate W_hist * carry
+                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                            let j_load = tile + tid;
+                            if (j_load < d_model) {
+                                prev_tile[tid] = H_curr[carry_base + j_load] / prev_rms;
+                            } else {
+                                prev_tile[tid] = 0.0;
+                            }
+                            workgroupBarrier();
+                            let tile_lim = min(WG_SIZE, d_model - tile);
+                            for (var tj = 0u; tj < tile_lim; tj = tj + 1u) {
+                                u = u + AllWeights[aw_hist + d_out * d_model + tile + tj] * prev_tile[tj];
+                            }
+                            workgroupBarrier();
                         }
-                        u = u + AllWeights[aw_hist +hist_scale_base + off + d_out]
+                        u = u + AllWeights[aw_hist + hist_scale_base + off + d_out]
                             * (H_curr[carry_base + d_out] / prev_rms);
                     }
                     Scratch[m_inner_base + off + d_out] = u;
@@ -564,24 +586,46 @@ fn deq_forward_main(
                 }
                 workgroupBarrier();
 
-                // Q/K/V per slot
+                // Q/K/V per slot — Fused Tiled MatMul
+                // Loads H_curr[off + j] once per tile into h_tile (shared memory),
+                // then accumulates Q, K, V from the same tile in a single pass.
+                // Index layout unchanged: w_idx = s * d² + j * d + d_out.
                 for (var s = 0u; s < h_slots; s = s + 1u) {
                     let off = s * d_model;
+                    let w_base = s * d_model * d_model;
                     var v_sum = 0.0;
                     for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                         var q = 0.0;
                         var k = 0.0;
                         var v = 0.0;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let h_val = H_curr[h_base + off + j];
-                            let w_idx = s * d_model * d_model + j * d_model + d_out;
-                            q = q + AllWeights[aw_wq +w_idx] * h_val;
-                            k = k + AllWeights[aw_wk +w_idx] * h_val;
-                            if (!v_fixed && !v_lag) { v = v + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val; }
+                        // --- Fused tile loop: load H_curr once, compute Q/K/V ---
+                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                            // Cooperative load of H_curr tile into shared memory
+                            let j_load = tile + tid;
+                            if (j_load < d_model) {
+                                h_tile[tid] = H_curr[h_base + off + j_load];
+                            } else {
+                                h_tile[tid] = 0.0;
+                            }
+                            workgroupBarrier();
+
+                            // Accumulate Q, K, V from the cached tile
+                            let tile_limit = min(WG_SIZE, d_model - tile);
+                            for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                                let j = tile + tj;
+                                let h_val = h_tile[tj];
+                                let w_idx = w_base + j * d_model + d_out;
+                                q = q + AllWeights[aw_wq + w_idx] * h_val;
+                                k = k + AllWeights[aw_wk + w_idx] * h_val;
+                                if (!v_fixed && !v_lag) {
+                                    v = v + AllWeights[aw_wv + w_idx] * h_val;
+                                }
+                            }
+                            workgroupBarrier();
                         }
-                        // Per-slot Q/K bias: appended after h_slots matrices in W_q/W_k buffers.
-                        q = q + AllWeights[aw_wq +h_slots * d_model * d_model + s * d_model + d_out];
-                        k = k + AllWeights[aw_wk +h_slots * d_model * d_model + s * d_model + d_out];
+                        // Per-slot Q/K bias
+                        q = q + AllWeights[aw_wq + h_slots * d_model * d_model + s * d_model + d_out];
+                        k = k + AllWeights[aw_wk + h_slots * d_model * d_model + s * d_model + d_out];
                         Scratch[q_base + off + d_out] = q;
                         Scratch[k_base + off + d_out] = k;
                         if (!v_fixed && !v_lag) {
@@ -590,9 +634,6 @@ fn deq_forward_main(
                         }
                     }
                     if (!v_fixed && !v_lag) {
-                        // Workgroup reduction to get the global v_rms (not per-thread partial).
-                        // Bug: original code used per-thread v_sum (2 elements / 512) giving
-                        // v_rms ≈ v_global / 16 and v_gain ≈ 16× correct → Jacobian ≫ 1.
                         shared_vals[tid] = v_sum;
                         workgroupBarrier();
                         for (var stride_vr = WG_SIZE / 2u; stride_vr > 0u; stride_vr = stride_vr >> 1u) {
@@ -602,8 +643,8 @@ fn deq_forward_main(
                             workgroupBarrier();
                         }
                         let v_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-12);
-                        let v_scale = AllWeights[aw_hist +v_scale_base];
-                        let v_norm_scale = AllWeights[aw_hist +v_norm_scale_base];
+                        let v_scale = AllWeights[aw_hist + v_scale_base];
+                        let v_norm_scale = AllWeights[aw_hist + v_norm_scale_base];
                         let v_cap = max(1e-6, inj_rms_curr);
                         let v_gain = (v_scale * v_norm_scale) * (v_cap / max(v_rms, 1e-6));
                         for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
@@ -613,6 +654,7 @@ fn deq_forward_main(
                         workgroupBarrier();
                     }
                 }
+
                 workgroupBarrier();
 
                 // Precompute score matrix once per iter (independent of d_out).
