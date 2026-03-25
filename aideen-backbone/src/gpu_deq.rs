@@ -1708,6 +1708,7 @@ impl GpuDeqBackend {
         }
     }
 
+    #[allow(dead_code)]
     fn picard_damping_from_env() -> f32 {
         // Damping for Picard fixed-point iterations (was: cg_damping_from_env).
         // hist_gated is default, so 0.90 is the default damping.

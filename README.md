@@ -17,7 +17,7 @@ Key components:
 - **Multi-slot attention** (h_slots parallel reasoning heads with per-slot Q/K/V/W_in)
 - **Mamba SSM** with selective state (input-dependent decay), forget gate, and dynamic history gating
 - **Picard adjoint** backward pass via implicit differentiation (O(1) memory)
-- **29 WGSL GPU compute shaders** for training and inference
+- **25 WGSL GPU compute shaders** for training and inference
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 
@@ -46,21 +46,28 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 
 ## Quick Start
 
+**Prerequisites:** Rust toolchain (stable), a GPU with Vulkan/Metal/DX12 support (for training/inference). No Python, no CUDA required.
+
 ```bash
-# Build everything
+# Clone and build
+git clone https://github.com/SergioAriel/aideen.git
+cd aideen
 cargo build --release --workspace
 
-# Run tests (CPU-only crates)
-cargo test --workspace --exclude aideen-block --exclude aideen-engine
+# Run tests (CPU-only — no GPU needed)
+cargo test --workspace --exclude aideen-block --exclude aideen-engine --exclude aideen-node
 
 # Train on a text file (requires GPU via wgpu)
-cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --epochs 5
+cargo run --release -p aideen-training --features aideen-training/wgpu --bin train -- --file corpus.txt --epochs 5
 
 # Resume from checkpoint
-cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --resume model_large --epochs 5
+cargo run --release -p aideen-training --features aideen-training/wgpu --bin train -- --file corpus.txt --resume model_large --epochs 1
 
 # Interactive chat with a trained model
-cargo run --release --features wgpu -p aideen-training --bin chat -- --model model_large
+cargo run --release -p aideen-training --features aideen-training/wgpu --bin chat -- --model model_large
+
+# Run DEQ vs Transformer benchmarks (CPU, no GPU needed)
+cargo run --release -p aideen-bench
 ```
 
 ### Environment Variables
@@ -73,7 +80,7 @@ cargo run --release --features wgpu -p aideen-training --bin chat -- --model mod
 
 ## Project History
 
-Development began in early 2025 as a private research project exploring DEQ architectures for efficient AI. The repository was migrated to GitHub in February 2026 for open-source release. Prior work included iterative prototyping of the DEQ solver, Mamba integration experiments, and the transition from Conjugate Gradient to Picard Adjoint for the backward pass. The current codebase (~15,000 lines of Rust + 5,679 lines of WGSL) represents approximately one year of cumulative R&D by two developers.
+Development began in early 2025 as a private research project exploring DEQ architectures for efficient AI. The repository was migrated to GitHub in February 2026 for open-source release. Prior work included iterative prototyping of the DEQ solver, Mamba integration experiments, and the transition from Conjugate Gradient to Picard Adjoint for the backward pass. The current codebase (~35,000 lines of Rust + 5,679 lines of WGSL across 10 crates) represents approximately one year of cumulative R&D by two developers.
 
 ## Team
 
