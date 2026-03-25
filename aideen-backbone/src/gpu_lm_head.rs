@@ -52,6 +52,7 @@ pub struct GpuLmHeadTrainer {
     s_h_rms_buf: wgpu::Buffer,
     last_sampled_indices: Vec<u32>,
     last_num_samples: u32,
+    sampled_indices_reuse: Vec<u32>, // pre-alloc to avoid heap alloc per training step
 }
 
 impl GpuLmHeadTrainer {
@@ -600,6 +601,7 @@ impl GpuLmHeadTrainer {
             s_h_rms_buf,
             last_sampled_indices: Vec::new(),
             last_num_samples: 0,
+            sampled_indices_reuse: Vec::new(),
         }
     }
 
@@ -632,40 +634,31 @@ impl GpuLmHeadTrainer {
             // println!("Warning: h_pooled dimension mismatch (expected {}, got {})", d_r * seq_len, h_pooled.len());
         }
 
-        // Sampled Softmax: targets + random negatives — zero allocs
+        // Sampled Softmax: targets + random negatives — reuse buffer to avoid heap alloc per step.
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
-        let mut sampled_indices = Vec::with_capacity(max_samples);
-        sampled_indices.extend_from_slice(targets);
-        if sampled_indices.len() > max_samples {
-            sampled_indices.truncate(max_samples);
-        } else {
-            let needed = max_samples - sampled_indices.len();
-            for _ in 0..needed {
-                use rand::Rng;
-                sampled_indices.push(rng.gen_range(0..self.vocab_size as u32));
-            }
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse.reserve(max_samples + targets.len());
+        self.sampled_indices_reuse.extend_from_slice(targets);
+        self.sampled_indices_reuse.truncate(max_samples);
+        let needed = max_samples.saturating_sub(self.sampled_indices_reuse.len());
+        for _ in 0..needed {
+            use rand::Rng;
+            self.sampled_indices_reuse.push(rng.gen_range(0..self.vocab_size as u32));
         }
-        sampled_indices.sort_unstable();
-        sampled_indices.dedup();
-        // Final guard to ensure we don't exceed the buffer if dedup didn't shrink it enough
-        if sampled_indices.len() > max_samples {
-            sampled_indices.truncate(max_samples);
-        }
-        let actual_num_samples = sampled_indices.len() as u32;
-        self.last_sampled_indices = sampled_indices.clone();
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
+        self.sampled_indices_reuse.truncate(max_samples);
+        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        std::mem::swap(&mut self.sampled_indices_reuse, &mut self.last_sampled_indices);
         self.last_num_samples = actual_num_samples;
+        let sampled_indices = &self.last_sampled_indices;
 
-        let lm_batch_cap = std::env::var("AIDEEN_BATCH_SIZE")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
-        if seq_len > self.config.ctx_len * lm_batch_cap {
+        if seq_len > self.config.ctx_len {
             return Err(format!(
                 "seq_len {} exceeds architectural limit of {}",
                 seq_len,
-                self.config.ctx_len * lm_batch_cap
+                self.config.ctx_len
             ));
         }
 
@@ -818,20 +811,26 @@ impl GpuLmHeadTrainer {
 
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
-        let mut sampled_indices = Vec::with_capacity(max_samples + targets.len());
-        sampled_indices.extend_from_slice(targets);
+        // Reuse pre-allocated buffer to avoid heap allocation per training step.
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse.reserve(max_samples + targets.len());
+        self.sampled_indices_reuse.extend_from_slice(targets);
         let needed = max_samples.saturating_sub(targets.len());
         for _ in 0..needed {
             use rand::Rng;
-            sampled_indices.push(rng.gen_range(0..self.vocab_size as u32));
+            self.sampled_indices_reuse
+                .push(rng.gen_range(0..self.vocab_size as u32));
         }
-        sampled_indices.sort_unstable();
-        sampled_indices.dedup();
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
         // Truncar a max_samples para no desbordar sampled_indices_buf.
-        sampled_indices.truncate(max_samples);
-        let actual_num_samples = sampled_indices.len() as u32;
-        self.last_sampled_indices = sampled_indices.clone();
+        self.sampled_indices_reuse.truncate(max_samples);
+        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        // Swap buffers: sampled_indices_reuse ↔ last_sampled_indices (no copy, just pointer swap).
+        std::mem::swap(&mut self.sampled_indices_reuse, &mut self.last_sampled_indices);
         self.last_num_samples = actual_num_samples;
+        // Use last_sampled_indices for the rest of this call.
+        let sampled_indices = &self.last_sampled_indices;
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -852,7 +851,7 @@ impl GpuLmHeadTrainer {
         queue.write_buffer(
             &self.sampled_indices_buf,
             0,
-            bytemuck::cast_slice(&sampled_indices),
+            bytemuck::cast_slice(sampled_indices),
         );
         if upload_weights {
             queue.write_buffer(&self.w_buf, 0, bytemuck::cast_slice(w_cpu));
@@ -982,20 +981,24 @@ impl GpuLmHeadTrainer {
 
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
-        let mut sampled_indices = Vec::with_capacity(max_samples + targets.len());
-        sampled_indices.extend_from_slice(targets);
+        // Reuse pre-allocated buffer to avoid heap allocation per training step.
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse.reserve(max_samples + targets.len());
+        self.sampled_indices_reuse.extend_from_slice(targets);
         let needed = max_samples.saturating_sub(targets.len());
         for _ in 0..needed {
             use rand::Rng;
-            sampled_indices.push(rng.gen_range(0..self.vocab_size as u32));
+            self.sampled_indices_reuse.push(rng.gen_range(0..self.vocab_size as u32));
         }
-        sampled_indices.sort_unstable();
-        sampled_indices.dedup();
-        // Truncar a max_samples para no desbordar sampled_indices_buf
-        sampled_indices.truncate(max_samples);
-        let actual_num_samples = sampled_indices.len() as u32;
-        self.last_sampled_indices = sampled_indices.clone();
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
+        self.sampled_indices_reuse.truncate(max_samples);
+        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        // Swap buffers: sampled_indices_reuse ↔ last_sampled_indices (no copy, just pointer swap).
+        std::mem::swap(&mut self.sampled_indices_reuse, &mut self.last_sampled_indices);
         self.last_num_samples = actual_num_samples;
+        // Use last_sampled_indices for the rest of this call.
+        let sampled_indices = &self.last_sampled_indices;
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,

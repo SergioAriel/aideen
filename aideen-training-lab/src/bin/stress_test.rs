@@ -27,6 +27,12 @@ fn main() {
     let force_global = env::var("AIDEEN_STRESS_FORCE_GLOBAL").ok().as_deref() == Some("1");
     let _deq_only = env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1");
     let _no_mamba = env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1");
+    let gpu_debug_on = env::var("AIDEEN_DEQ_GPU_DEBUG").ok().as_deref() == Some("1");
+    if !gpu_debug_on {
+        // Avoid GPU→CPU debug readback in stress runs when debug is off.
+        // This keeps TPS measurement clean (no device.poll on debug buffer).
+        env::set_var("AIDEEN_DEBUG_SAMPLE", "1000000000");
+    }
 
     let mut config = ArchitectureConfig::default();
     config.d_r =

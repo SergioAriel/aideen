@@ -162,14 +162,17 @@ fn run_small_dataset(
         tok.vocab_size()
     );
 
-    let lr = 0.0001;
+    let lr = std::env::var("AIDEEN_LR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.0001);
 
     let mut trainer = if let Some(ref base) = resume_path {
         println!("  Resumiendo desde checkpoint: {base}");
         Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
     } else {
         let mut t = Trainer::from_tokenizer(tok, lr);
-        t.training_config.lr_min = 0.0001;
+        t.training_config.lr_min = lr / 10.0;
         t.training_config.warmup_epochs = 3;
         t.training_config.epochs = epochs;
         // FASE 1: Entrenar en float32 hasta que los resultados sean buenos.
@@ -255,9 +258,9 @@ fn run_large_file(
     };
 
     tok.config.vocab_size = tok.vocab_size();
-    tok.config.ctx_len = env::var("AIDEEN_CTX_LEN")
+    tok.config.ctx_len = std::env::var("AIDEEN_CTX_LEN")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
     tok.config.train_deq = true;
 
@@ -289,7 +292,10 @@ fn run_large_file(
         );
     }
 
-    let lr = 0.0001;
+    let lr = std::env::var("AIDEEN_LR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.0001);
     let checkpoint_base = "model_large";
 
     let mut trainer = if let Some(ref base) = resume_path {
@@ -297,7 +303,7 @@ fn run_large_file(
         Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
     } else {
         let mut t = Trainer::from_tokenizer(tok, lr);
-        t.training_config.lr_min = 0.00001;
+        t.training_config.lr_min = lr / 10.0;
         t.training_config.warmup_epochs = 0;
         t.training_config.epochs = epochs;
         t.training_config.ternary = false;

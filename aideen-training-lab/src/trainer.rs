@@ -111,7 +111,23 @@ pub struct Trainer {
 
     // --- TPS tracking for GPU-DEBUG log ---
     debug_last_time: Option<std::time::Instant>,
-    debug_tokens_accum: u32, // tokens processed since last GPU-DEBUG print
+    debug_tokens_accum: u32,   // tokens processed since last GPU-DEBUG print
+
+    // --- Debug buffer cache (avoid blocking GPU readback every step) ---
+    // read_debug_buffer() calls device.poll(Maintain::Wait) — blocks CPU until GPU finishes.
+    // Now deferred to end-of-step (after apply_gradient_update) so GPU is already idle.
+    cached_debug_buf: Vec<f32>,
+
+    // --- Cached hot-path env vars (parsed once at construction) ---
+    // Avoids ~26 env::var syscalls per training step.
+    cfg_fwd_batch_size: u32,       // AIDEEN_BATCH_SIZE (for forward dispatch)
+    cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
+    cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
+    cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
+    cfg_wv_debug: bool,            // AIDEEN_DEQ_WV_DEBUG
+    cfg_ssm_debug: bool,           // AIDEEN_SSM_DEBUG
+    cfg_max_chunks: usize,         // AIDEEN_MAX_CHUNKS
+    cfg_adj_iters_override: Option<u32>, // AIDEEN_ADJ_ITERS_OVERRIDE
 }
 
 impl Trainer {
@@ -127,10 +143,6 @@ impl Trainer {
 
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
-    }
-
-    fn env_f32_default(name: &str, default: f32) -> f32 {
-        Self::env_f32(name).unwrap_or(default)
     }
 
     fn lmhead_backward_sampled(
@@ -260,6 +272,24 @@ impl Trainer {
             grad_accum_counter: 0,
             debug_last_time: None,
             debug_tokens_accum: 0,
+            cached_debug_buf: Vec::new(),
+            cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
+                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+            cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4),
+            cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
+                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+            cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
+                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(20).max(1),
+            cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
+            cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
+            cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(usize::MAX),
+            cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -321,6 +351,24 @@ impl Trainer {
             grad_accum_counter: 0,
             debug_last_time: None,
             debug_tokens_accum: 0,
+            cached_debug_buf: Vec::new(),
+            cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
+                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+            cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4),
+            cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
+                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+            cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
+                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(20).max(1),
+            cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
+            cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
+            cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(usize::MAX),
+            cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -357,7 +405,7 @@ impl Trainer {
         }
 
         if self.gpu_emb.is_none() {
-            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
             let safe_ctx = self.config.ctx_len.max(1024) * batch_size;
             self.gpu_emb = Some(GpuEmbeddingTrainer::new(
                 &gpu.device,
@@ -453,7 +501,7 @@ impl Trainer {
 
         // hist_gated is default — always enforce min_iters for stable history injection.
         {
-            let min_iters = Self::env_u32("AIDEEN_HIST_MIN_ITERS").unwrap_or(20);
+            let min_iters = self.cfg_hist_min_iters;
             if self.adaptive_max_iters < min_iters {
                 self.adaptive_max_iters = min_iters;
             }
@@ -468,11 +516,7 @@ impl Trainer {
 
                 // Arreglo defensivo para evitar underflow si seq_len < ctx_len.
                 // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
-                let fwd_batch_size_ts: usize = std::env::var("AIDEEN_BATCH_SIZE")
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(1)
-                    .max(1);
+                let fwd_batch_size_ts: usize = self.cfg_fwd_batch_size.max(1) as usize;
                 let seq_len = tokens.len().min(targets.len());
                 let actual_ctx_len = if fwd_batch_size_ts > 1 {
                     seq_len
@@ -482,7 +526,7 @@ impl Trainer {
                 let ctx = &tokens[seq_len - actual_ctx_len..];
                 let ctx_targets = &targets[seq_len - actual_ctx_len..];
 
-                let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+                let Some(_gpu_emb) = self.gpu_emb.as_ref() else {
                     return 0.0;
                 };
 
@@ -505,7 +549,7 @@ impl Trainer {
                         &self.reasoning.w_q_gpu_flat(),
                         &self.reasoning.w_k_gpu_flat(),
                         &self.reasoning.w_v_gpu_flat(),
-                        self.reasoning.w_o.as_slice(),
+                        &self.reasoning.w_o_gpu_flat(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
@@ -611,11 +655,7 @@ impl Trainer {
             let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
             // 1. Prepare DEQ input on GPU
-            let fwd_batch_size = std::env::var("AIDEEN_BATCH_SIZE")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1);
+            let fwd_batch_size = self.cfg_fwd_batch_size;
             // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
             let per_seq_len = (num_tokens as u32) / fwd_batch_size;
             let single_query_mode = query.len() == self.config.d_r && num_tokens == 1;
@@ -639,42 +679,33 @@ impl Trainer {
             } else {
                 // train_sequence path: use token sequence embeddings.
                 let emb_needs_upload = !self.gpu_emb_weights_uploaded;
-                let _ = gpu_emb.gather_only(
+                let _ = gpu_emb.gather_only_to_sbuf(
                     &gpu.queue,
                     &gpu.device,
                     context,
                     self.tokenizer.embeddings.as_slice(),
                     emb_needs_upload,
+                    &gpu.bridge.s_buf,
                 );
                 if emb_needs_upload {
                     self.gpu_emb_weights_uploaded = true;
                 }
-                // Copy all B sequences' embeddings (already flat in seq_buf) to s_buf in one copy.
-                let mut conn_enc =
-                    gpu.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Connect Embedding -> DEQ Encoder"),
-                        });
-                let total_emb_bytes = (num_tokens as u64) * (self.config.d_r as u64) * 4;
-                conn_enc.copy_buffer_to_buffer(
-                    &gpu_emb.seq_buf,
-                    0,
-                    &gpu.bridge.s_buf,
-                    0,
-                    total_emb_bytes,
-                );
-                gpu.queue.submit(Some(conn_enc.finish()));
             }
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
+            let debug_enable =
+                self.optimizer.step_count() % self.cfg_debug_sample_every == 0;
             let _ = gpu.run_forward(
                 fwd_batch_size,
                 per_seq_len,
                 self.adaptive_max_iters,
                 damping_eff,
                 epsilon,
+                debug_enable,
             );
-            let fw = gpu.read_debug_buffer();
+            // Use cached debug buffer — refresh deferred to end of step (after GPU is idle).
+            // The DEQ-INVALID streak check needs 3 consecutive failures, so 1-step lag is safe.
+            let fw = self.cached_debug_buf.clone();
             let heartbeat = if fw.len() > 10 { fw[10] } else { 1.0 };
             let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
             let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
@@ -725,21 +756,24 @@ impl Trainer {
                 self.gpu_lm_weights_uploaded = true;
             }
 
-            // targets_u32 already covers all B*seq_len positions (training loop provides B chunks).
-            let batch_targets_u32 = targets_u32.clone();
-            let current_loss = gpu_lm
+            // Submit LM forward+backward without blocking for loss readback.
+            // For eval_mode (validation) we still read synchronously since there's no adjoint.
+            // For train mode, loss is read after apply_gradient_update when GPU is already idle.
+            let read_loss_now = self.eval_mode;
+            let current_loss_sync = gpu_lm
                 .train_step_no_readback(
                     &gpu.device,
                     &gpu.queue,
                     &gpu.bridge.hpooled_buf,
                     0,
-                    &batch_targets_u32,
+                    &targets_u32,
                     lm_lr,
                     self.optimizer.step_count() as u32,
                     self.training_config.ternary,
-                    true, // read_loss = true: pérdida síncrona del paso actual
+                    read_loss_now,
                 )
                 .unwrap_or(0.0);
+            let mut current_loss = current_loss_sync; // will be updated after GPU idle for train path
             if lm_lr > 0.0 {
                 self.lm_head_cpu_stale = true;
             }
@@ -766,15 +800,12 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
-                let grad_accum = std::env::var("AIDEEN_GRAD_ACCUM")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .unwrap_or(1)
-                    .max(1);
+                let grad_accum = self.cfg_grad_accum;
                 // Cross-step gradient accumulation:
                 // Each train_step() call accumulates gradients from a different sequence.
                 // Weight update is applied only every grad_accum steps.
                 let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
+                let apply_accum = grad_accum == 1 || self.grad_accum_counter + 1 >= grad_accum;
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
                     self.config.deq_grad_scale,
@@ -785,12 +816,26 @@ impl Trainer {
                     mode,
                     grad_accum,
                     batch_size,
+                    apply_accum,
                 );
                 self.grad_accum_counter += 1;
                 if self.grad_accum_counter >= grad_accum {
-                    let _ =
-                        gpu.apply_gradient_update(base_lr, self.config.weight_decay, grad_accum);
                     self.grad_accum_counter = 0;
+                    // GPU is now idle after fused apply_grad pass (if apply_accum=true).
+                    // Read deferred results — both calls are near-instant since GPU is idle.
+                    if !self.eval_mode {
+                        current_loss = gpu_lm.read_cached_loss(&gpu.device);
+                    }
+                    // Refresh debug buffer cache if this is a sample step.
+                    if self.optimizer.step_count() % self.cfg_debug_sample_every == 0 {
+                        self.cached_debug_buf = gpu.read_debug_buffer();
+                    }
+                } else {
+                    // Intermediate grad_accum step: no weight update poll yet.
+                    // Read loss now (will cause one poll but GPU is nearly done with fused_update).
+                    if !self.eval_mode {
+                        current_loss = gpu_lm.read_cached_loss(&gpu.device);
+                    }
                 }
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
@@ -968,7 +1013,7 @@ impl Trainer {
                         &self.reasoning.w_q_gpu_flat(),
                         &self.reasoning.w_k_gpu_flat(),
                         &self.reasoning.w_v_gpu_flat(),
-                        self.reasoning.w_o.as_slice(),
+                        &self.reasoning.w_o_gpu_flat(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
@@ -1018,8 +1063,12 @@ impl Trainer {
             self.debug_tokens_accum += num_tokens as u32;
 
             // --- DIAGNÓSTICOS GPU (v13.1 Auto-Healing) ---
-            if self.optimizer.step_count() % 10 == 0 {
-                let fw = gpu.read_debug_buffer();
+            // Reuse cached debug buffer to avoid blocking GPU every diagnostic step.
+            if self.optimizer.step_count() % self.cfg_debug_sample_every == 0 {
+                self.cached_debug_buf = gpu.read_debug_buffer();
+            }
+            if !self.cached_debug_buf.is_empty() {
+                let fw = &self.cached_debug_buf;
 
                 let rs_cg = 0.0f32;
 
@@ -1073,7 +1122,7 @@ impl Trainer {
                 self.debug_last_time = Some(now);
                 self.debug_tokens_accum = 0;
 
-                if std::env::var("AIDEEN_DEQ_WV_DEBUG").ok().as_deref() == Some("1") {
+                if self.cfg_wv_debug {
                     if let Ok((_, _, wv, _, _, _, _, _, _)) = gpu.read_weights() {
                         let mut max_abs = 0.0f32;
                         let mut sum_abs = 0.0f32;
@@ -1298,7 +1347,7 @@ impl Trainer {
                 );
 
                 // GPU-SSM per-slot decay diagnostics (activar con AIDEEN_SSM_DEBUG=1).
-                if std::env::var("AIDEEN_SSM_DEBUG").as_deref() == Ok("1") {
+                if self.cfg_ssm_debug {
                     let carrier = gpu.read_hist_carrier_params_full();
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
@@ -1436,7 +1485,7 @@ impl Trainer {
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
             let ctx_len = self.config.ctx_len.max(1);
-            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
             let step = ctx_len * batch_size;
 
             for i in (0..train_tokens.len()).step_by(step) {
@@ -1620,10 +1669,10 @@ impl Trainer {
                     self.config.deq_epsilon,
                     self.reasoning.damping,
                     &s_sequence,
-                    self.reasoning.w_q.as_slice(),
-                    self.reasoning.w_k.as_slice(),
+                    &self.reasoning.w_q_gpu_flat(),
+                    &self.reasoning.w_k_gpu_flat(),
                     &self.reasoning.w_v_gpu_flat(),
-                    self.reasoning.w_o.as_slice(),
+                    &self.reasoning.w_o_gpu_flat(),
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
@@ -1746,10 +1795,10 @@ impl Trainer {
                     self.config.deq_epsilon,
                     self.reasoning.damping,
                     &s_sequence,
-                    self.reasoning.w_q.as_slice(),
-                    self.reasoning.w_k.as_slice(),
+                    &self.reasoning.w_q_gpu_flat(),
+                    &self.reasoning.w_k_gpu_flat(),
                     &self.reasoning.w_v_gpu_flat(),
-                    self.reasoning.w_o.as_slice(),
+                    &self.reasoning.w_o_gpu_flat(),
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
@@ -1904,6 +1953,13 @@ impl Trainer {
         let stride = (ctx_len / 2).max(1);
         let chunk_tokens = ctx_len + 1;
         let chunk_bytes = chunk_tokens * 4;
+        // Batch accumulation: collect batch_size chunks before training.
+        // Without this, AIDEEN_BATCH_SIZE=N with 256-token chunks would give per_seq_len=256/N=32,
+        // training on 32-token windows instead of 256. Fix: accumulate N chunks → N×256 tokens →
+        // per_seq_len = (N×256)/N = 256 (correct).
+        let batch_size_file = self.cfg_fwd_batch_size.max(1) as usize;
+        let mut batch_train_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
+        let mut batch_tgt_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
 
         for epoch in 0..epochs {
             let t_start = std::time::Instant::now();
@@ -1927,38 +1983,45 @@ impl Trainer {
             } else {
                 8
             };
+            if let Some(adj) = self.cfg_adj_iters_override {
+                let adj_usize = (adj.max(1)) as usize;
+                self.config.adj_iters = adj_usize;
+                self.adaptive_adj_iters = adj_usize as u32;
+            }
 
             let mut file = std::fs::File::open(path)?;
             let mut epoch_loss = 0.0f32;
             let mut num_chunks = 0usize;
             let mut total_tokens = 0usize;
             // Buffer de tokens no consumidos del chunk anterior (para ventana solapada).
-            let mut carry: Vec<u32> = Vec::new();
+            let mut carry: Vec<u32> = Vec::with_capacity(stride);
+            // Pre-allocate read buffer and token window to avoid per-chunk heap allocations.
+            let mut read_buf: Vec<u8> = vec![0u8; chunk_bytes];
+            let mut tokens: Vec<u32> = Vec::with_capacity(chunk_tokens + stride);
             let mut last_save_time = std::time::Instant::now();
 
             loop {
                 // Prepend carry del chunk anterior + leer nuevos bytes
                 let carry_bytes = carry.len() * 4;
                 let need_bytes = chunk_bytes.saturating_sub(carry_bytes);
-                let mut buf = vec![0u8; need_bytes];
-                let n = file.read(&mut buf)?;
+                let n = file.read(&mut read_buf[..need_bytes])?;
                 if n == 0 && carry.is_empty() {
                     break;
                 }
 
                 // Reset de estado estricto en límites de documento (opcional según eos_token)
-                if eos_token != 0 && carry.len() > 0 && carry[0] == eos_token {
+                if eos_token != 0 && !carry.is_empty() && carry[0] == eos_token {
                     self.reset_state();
                 }
 
-                let new_tokens: Vec<u32> = if n > 0 {
-                    bytemuck::cast_slice(&buf[..n & !3]).to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                let mut tokens: Vec<u32> = carry.drain(..).collect();
-                tokens.extend_from_slice(&new_tokens);
+                // Reuse pre-allocated tokens buffer to avoid per-chunk allocation.
+                tokens.clear();
+                tokens.extend_from_slice(&carry);
+                carry.clear();
+                if n > 0 {
+                    let aligned = n & !3;
+                    tokens.extend_from_slice(bytemuck::cast_slice(&read_buf[..aligned]));
+                }
 
                 if tokens.len() < 2 {
                     break;
@@ -1981,28 +2044,74 @@ impl Trainer {
                         let tgt_seg = tokens.get(seg_start + 1..tgt_end).unwrap_or(&[]);
 
                         if !train_seg.is_empty() {
-                            // --- VALIDATION PATH (Every 20 segments) ---
-                            let is_val = num_chunks % 20 == 0;
-                            if is_val {
-                                self.eval_mode = true;
+                            // Accumulate chunks for batch training.
+                            // Each call contributes one ctx_len-sized segment; once batch_size_file
+                            // segments are collected (or EOS forces a flush), train on the batch.
+                            let max_batch_tokens = batch_size_file * ctx_len;
+                            let seg_len = train_seg.len().min(tgt_seg.len());
+                            let mut offset = 0usize;
+                            while offset < seg_len {
+                                let remaining = max_batch_tokens.saturating_sub(batch_train_buf.len());
+                                if remaining == 0 {
+                                    // Flush full batch before consuming more.
+                                    let is_val = num_chunks % 20 == 0;
+                                    if is_val {
+                                        self.eval_mode = true;
+                                    }
+                                    let eps = self.progressive_epsilon(epoch, epochs);
+                                    let loss = self.train_sequence(
+                                        &batch_train_buf,
+                                        &batch_tgt_buf,
+                                        seg_start > 0,
+                                        eps,
+                                    );
+                                    if is_val {
+                                        self.eval_mode = false;
+                                        println!(
+                                            "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
+                                            num_chunks, loss
+                                        );
+                                    } else {
+                                        epoch_loss += loss;
+                                    }
+                                    num_chunks += 1;
+                                    total_tokens += batch_train_buf.len();
+                                    batch_train_buf.clear();
+                                    batch_tgt_buf.clear();
+                                    continue;
+                                }
+
+                                let take = remaining.min(seg_len - offset);
+                                batch_train_buf.extend_from_slice(&train_seg[offset..offset + take]);
+                                batch_tgt_buf.extend_from_slice(&tgt_seg[offset..offset + take]);
+                                offset += take;
                             }
 
-                            // reset_state=true en sub-secuencias después de EOS (seg_start>0).
-                            let eps = self.progressive_epsilon(epoch, epochs);
-                            let loss = self.train_sequence(train_seg, tgt_seg, seg_start > 0, eps);
+                            let flush = batch_train_buf.len() >= max_batch_tokens
+                                || (eos_token != 0 && seg_start > 0); // flush on document boundary
 
-                            if is_val {
-                                self.eval_mode = false;
-                                println!(
-                                    "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
-                                    num_chunks, loss
-                                );
-                            } else {
-                                epoch_loss += loss;
+                            if flush && !batch_train_buf.is_empty() {
+                                let is_val = num_chunks % 20 == 0;
+                                if is_val {
+                                    self.eval_mode = true;
+                                }
+                                let eps = self.progressive_epsilon(epoch, epochs);
+                                let loss =
+                                    self.train_sequence(&batch_train_buf, &batch_tgt_buf, seg_start > 0, eps);
+                                if is_val {
+                                    self.eval_mode = false;
+                                    println!(
+                                        "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
+                                        num_chunks, loss
+                                    );
+                                } else {
+                                    epoch_loss += loss;
+                                }
+                                num_chunks += 1;
+                                total_tokens += batch_train_buf.len();
+                                batch_train_buf.clear();
+                                batch_tgt_buf.clear();
                             }
-
-                            num_chunks += 1;
-                            total_tokens += train_seg.len();
                         }
                     }
 
@@ -2016,9 +2125,25 @@ impl Trainer {
 
                 // Carry: solapar los últimos min(stride, tokens.len()) tokens para contexto.
                 let overlap_start = tokens.len().saturating_sub(stride.min(tokens.len()));
-                carry = tokens[overlap_start..].to_vec();
+                carry.clear();
+                carry.extend_from_slice(&tokens[overlap_start..]);
+
+                // Early stop for quick benchmarks / debugging.
+                if num_chunks >= self.cfg_max_chunks {
+                    break;
+                }
 
                 if n == 0 {
+                    // EOF: flush any remaining accumulated chunks (< batch_size_file)
+                    if !batch_train_buf.is_empty() {
+                        let eps = self.progressive_epsilon(epoch, epochs);
+                        let loss = self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
+                        epoch_loss += loss;
+                        num_chunks += 1;
+                        total_tokens += batch_train_buf.len();
+                        batch_train_buf.clear();
+                        batch_tgt_buf.clear();
+                    }
                     break; // EOF
                 }
 
@@ -2485,7 +2610,18 @@ impl Trainer {
                         .collect();
                     self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
                 }
-                self.reasoning.w_o = to_mat(wo);
+                {
+                    let d_r = self.config.d_r;
+                    let h_slots = self.config.h_slots;
+                    // w_o is per-slot on GPU — average slots for CPU prototype (checkpoint only)
+                    let avg: Vec<f32> = (0..d_r * d_r)
+                        .map(|i| {
+                            (0..h_slots).map(|s| wo[s * d_r * d_r + i]).sum::<f32>()
+                                / h_slots as f32
+                        })
+                        .collect();
+                    self.reasoning.w_o = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
+                }
                 // win is h_slots*d*d — average slots for CPU representation.
                 let d_r = self.config.d_r;
                 let h_slots = self.config.h_slots;

@@ -43,7 +43,7 @@ impl ComputeState {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Aideen-Block-V8"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: wgpu::Features::SUBGROUP,
                     required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },

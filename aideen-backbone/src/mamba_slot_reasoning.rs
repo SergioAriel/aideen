@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
 pub struct MambaSlotReasoning {
@@ -327,7 +327,6 @@ impl MambaSlotReasoning {
         }
         let seed = hasher.finish();
         let mut out = Vec::with_capacity(h_slots * base.len());
-        let attn_t = 0.10_f32;
         let win_t = 0.30_f32;
         let n_iter = 20;
         // Disable per-slot jitter to remove seed-dependent W_in variance during diagnosis.
@@ -369,6 +368,36 @@ impl MambaSlotReasoning {
                     ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.3_f32).sin() * 0.03_f32;
                 v.push(x + jitter);
             }
+        }
+        v
+    }
+
+    /// GPU flat layout for W_o: [h_slots × d_r×d_r matrices].
+    /// Each slot matrix is the shared w_o plus a deterministic per-slot jitter.
+    /// Shader accesses slot s: W_o[s*d*d + j*d + d_out].
+    pub fn w_o_gpu_flat(&self) -> Vec<f32> {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let attn_t = 0.10_f32;
+        let n_iter = 20;
+        let jitter_scale = std::env::var("AIDEEN_DEQ_WO_JITTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.05);
+        let mut v = Vec::with_capacity(h * d * d);
+        for s in 0..h {
+            let mut mat = self.w_o.clone();
+            for r in 0..d {
+                for c in 0..d {
+                    // Slightly smaller jitter than W_q/W_k to keep output stable.
+                    let i = r * d + c;
+                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin() * jitter_scale;
+                    mat[(r, c)] += jitter;
+                }
+            }
+            spectral_norm::normalize_if_needed(&mut mat, attn_t, n_iter);
+            v.extend_from_slice(mat.as_slice());
         }
         v
     }

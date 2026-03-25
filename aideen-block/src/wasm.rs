@@ -109,7 +109,7 @@ impl AideenEngine {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Aideen Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: wgpu::Features::SUBGROUP,
                     required_limits: adapter.limits(),
                     memory_hints: Default::default(),
                 },

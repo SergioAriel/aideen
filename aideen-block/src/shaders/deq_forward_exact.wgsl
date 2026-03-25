@@ -7,6 +7,10 @@ struct RunUniforms {
     damping: f32,
     seq_len: u32,
     residual_alpha: f32,
+    debug_enable: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
@@ -51,6 +55,7 @@ fn deq_forward_main(
 
     let total_elements = h_slots * d_model;
     let h_base = batch_idx * total_elements;
+    let debug_on = shape.debug_enable > 0u;
 
     // Scratch layout per batch:
     // q [h*d], k [h*d], v [h*d], attn [h*d], mamba [h*d], signal [d]
@@ -269,7 +274,7 @@ fn deq_forward_main(
     }
     workgroupBarrier();
 
-    if (batch_idx == 0u && tid == 0u) {
+    if (debug_on && batch_idx == 0u && tid == 0u) {
         DebugLog[0] = 777.7;
         DebugLog[1] = f32(shape.batch_size);
         DebugLog[2] = f32(shape.d_model);

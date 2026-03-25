@@ -252,13 +252,84 @@ fn picard_gmix_main(@builtin(local_invocation_id) lid: vec3<u32>,
     let h_slots = params.h_slots;
     let n_entries = params.batch_size * params.seq_len * h_slots;
     if (entry >= n_entries) { return; }
+    let slot = entry % h_slots;
+    let wo_base = slot * d * d;
 
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var gmix = 0.0;
         for (var dout = 0u; dout < d; dout = dout + 1u) {
-            gmix = gmix + W_o[dout * d + dim] * gcomb_buf[entry_base(entry, d) + dout];
+            gmix = gmix + W_o[wo_base + dout * d + dim] * gcomb_buf[entry_base(entry, d) + dout];
         }
         gmix_buf[entry_base(entry, d) + dim] = gmix;
+    }
+}
+
+// Fused GMix + GScore: computes gmix_buf and gscore_buf (and qgrad) in one dispatch.
+// Reduces one dispatch per Picard iteration.
+@compute
+@workgroup_size(64, 1, 1)
+fn picard_gmix_gscore_main(@builtin(local_invocation_id) lid: vec3<u32>,
+                           @builtin(workgroup_id) wid: vec3<u32>) {
+    let lane = lid.x;
+    let entry = wid.x;
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
+    if (entry >= n_entries) { return; }
+    let slot = entry % h_slots;
+    let wo_base = slot * d * d;
+
+    // Compute gmix for this entry.
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        var gmix = 0.0;
+        for (var dout = 0u; dout < d; dout = dout + 1u) {
+            gmix = gmix + W_o[wo_base + dout * d + dim] * gcomb_buf[entry_base(entry, d) + dout];
+        }
+        gmix_buf[entry_base(entry, d) + dim] = gmix;
+    }
+    workgroupBarrier();
+
+    // Compute gscore for all ks for this entry.
+    let t = entry / h_slots;
+    let qs = entry % h_slots;
+    let base = t * scratch_stride(d, h_slots);
+    let v_base = base + h_slots * d * 2u;
+    let k_base = base + h_slots * d;
+    let q_base = base;
+    let attn_weight_base = base + d * (h_slots * 7u);
+    let off = entry_base(entry, d);
+    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+        var g_alpha = 0.0;
+        let k_off = ks * d;
+        for (var dim = 0u; dim < d; dim = dim + 1u) {
+            g_alpha = g_alpha + gmix_buf[off + dim] * Scratch[v_base + k_off + dim];
+        }
+
+        var alpha_dot_g = 0.0;
+        for (var js = 0u; js < h_slots; js = js + 1u) {
+            let j_off = js * d;
+            var g_alpha_j = 0.0;
+            for (var dim = 0u; dim < d; dim = dim + 1u) {
+                g_alpha_j = g_alpha_j + gmix_buf[off + dim] * Scratch[v_base + j_off + dim];
+            }
+            let a_j = Scratch[attn_weight_base + qs * h_slots + js];
+            alpha_dot_g = alpha_dot_g + a_j * g_alpha_j;
+        }
+
+        let a = Scratch[attn_weight_base + qs * h_slots + ks];
+        gscore_buf[entry * h_slots + ks] = a * (g_alpha - alpha_dot_g);
+    }
+    workgroupBarrier();
+
+    // qgrad for this entry (per-slot).
+    let scale = inverseSqrt(max(1.0, f32(d)));
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        var gq = 0.0;
+        for (var j = 0u; j < h_slots; j = j + 1u) {
+            gq = gq + scale * gscore_buf[entry * h_slots + j]
+                * Scratch[k_base + j * d + dim];
+        }
+        qgrad_buf[off + dim] = gq;
     }
 }
 
@@ -452,4 +523,149 @@ fn picard_accum_q_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         q_path_acc = q_path_acc + W_q[qd * d + dim] * qgrad_buf[src_off + qd];
     }
     gcomb_buf[entry_base(entry, d) + dim] = q_path_acc;
+}
+
+// ============================================================
+// Anderson Acceleration — @group(1) for Anderson pipelines only
+// (Different BGL from the Picard weight group(1) above)
+// ============================================================
+
+struct AndersonParams {
+    m: u32,   // ring buffer depth; effective Anderson window = m - 1
+    k: u32,   // current Picard iteration index (0-indexed)
+};
+
+@group(1) @binding(0) var<uniform> anderson: AndersonParams;
+@group(1) @binding(1) var<storage, read_write> anderson_hist: array<f32>;
+// anderson_hist layout: [m × n_entries × d_model] flat
+// slot for iteration k: (k % m) * attn_len + entry * d + dim
+
+// Workgroup-scope scratch for anderson_mix_main (one instance per workgroup at runtime)
+var<workgroup> anderson_gram: array<f32, 9>;  // up to 3×3, indexed [ri*3+rj]
+var<workgroup> anderson_beta: array<f32, 3>;  // mixing coefficients
+
+// Store current v_next into ring-buffer slot k%m
+@compute @workgroup_size(256, 1, 1)
+fn anderson_store_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let d = params.d_model;
+    let n_entries = params.batch_size * params.seq_len * params.h_slots;
+    let attn_len = n_entries * d;
+    if (idx >= attn_len) { return; }
+    let slot = anderson.k % anderson.m;
+    anderson_hist[slot * attn_len + idx] = v_next[idx];
+}
+
+// Per-token Anderson mixing.
+// Dispatch: one workgroup per token (batch_size × seq_len), WG_SIZE=64.
+// Computes Gram matrix from pseudo-residuals Δ_i = hist[(k-i)%m] - hist[(k-i-1+m)%m],
+// solves the constrained LS (G β = 1, normalize), overwrites v_next with mixed iterate.
+@compute @workgroup_size(64, 1, 1)
+fn anderson_mix_main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let token = wid.x;
+    let lane  = lid.x;
+    let d       = params.d_model;
+    let h_slots = params.h_slots;
+    let n_tokens = params.batch_size * params.seq_len;
+    if (token >= n_tokens) { return; }
+
+    let n_entries = n_tokens * h_slots;
+    let attn_len  = n_entries * d;
+    let m = anderson.m;
+    let k = anderson.k;
+
+    // n_res = valid consecutive pseudo-residual pairs in the ring buffer.
+    // A depth-m ring buffer supports at most m-1 valid consecutive pairs.
+    let n_res = min(k, m - 1u);
+    // Need ≥2 residuals for a non-trivial 2×2 or 3×3 solve.
+    if (n_res < 2u) { return; }
+
+    if (lane == 0u) {
+        for (var i = 0u; i < 9u; i = i + 1u) { anderson_gram[i] = 0.0; }
+
+        // Gram[ri][rj] = <Δ_ri, Δ_rj>   (Δ_ri = hist[(k-ri)%m] - hist[(k-ri-1+m)%m])
+        for (var ri = 0u; ri < n_res; ri = ri + 1u) {
+            for (var rj = ri; rj < n_res; rj = rj + 1u) {
+                let si  = (k + m - ri      ) % m;
+                let si1 = (k + m - ri - 1u ) % m;
+                let sj  = (k + m - rj      ) % m;
+                let sj1 = (k + m - rj - 1u ) % m;
+                var dot = 0.0;
+                for (var e = 0u; e < h_slots; e = e + 1u) {
+                    let entry = token * h_slots + e;
+                    let base  = entry * d;
+                    for (var dim2 = 0u; dim2 < d; dim2 = dim2 + 1u) {
+                        let da = anderson_hist[si  * attn_len + base + dim2]
+                               - anderson_hist[si1 * attn_len + base + dim2];
+                        let db = anderson_hist[sj  * attn_len + base + dim2]
+                               - anderson_hist[sj1 * attn_len + base + dim2];
+                        dot = dot + da * db;
+                    }
+                }
+                anderson_gram[ri * 3u + rj] = dot;
+                anderson_gram[rj * 3u + ri] = dot;
+            }
+        }
+
+        // Solve G β = 1 via Cramer's rule, then normalize (β sums to 1).
+        if (n_res == 2u) {
+            var g00 = anderson_gram[0]; let g01 = anderson_gram[1];
+            let g10 = anderson_gram[3]; var g11 = anderson_gram[4];
+            // Tikhonov regularization to avoid ill-conditioned Gram (stabilizes coefficients).
+            let reg = max(1e-8, 1e-4 * (abs(g00) + abs(g11)));
+            g00 = g00 + reg;
+            g11 = g11 + reg;
+            let det = g00 * g11 - g01 * g10;
+            let sdet = select(max(det, 1e-10), min(det, -1e-10), det < 0.0);
+            anderson_beta[0] = (g11 - g01) / sdet;
+            anderson_beta[1] = (g00 - g10) / sdet;
+        } else {
+            // n_res == 3
+            var g00 = anderson_gram[0]; let g01 = anderson_gram[1]; let g02 = anderson_gram[2];
+            let g10 = anderson_gram[3]; var g11 = anderson_gram[4]; let g12 = anderson_gram[5];
+            let g20 = anderson_gram[6]; let g21 = anderson_gram[7]; var g22 = anderson_gram[8];
+            // Tikhonov regularization on diagonal to stabilize solve.
+            let reg = max(1e-8, 1e-4 * (abs(g00) + abs(g11) + abs(g22)));
+            g00 = g00 + reg;
+            g11 = g11 + reg;
+            g22 = g22 + reg;
+            let det = g00*(g11*g22 - g12*g21)
+                    - g01*(g10*g22 - g12*g20)
+                    + g02*(g10*g21 - g11*g20);
+            let sdet = select(max(det, 1e-8), min(det, -1e-8), det < 0.0);
+            anderson_beta[0] = (1.0*(g11*g22 - g12*g21) - g01*(g22 - g12) + g02*(g21 - g11)) / sdet;
+            anderson_beta[1] = (g00*(g22 - g12) - 1.0*(g10*g22 - g12*g20) + g02*(g10 - g20)) / sdet;
+            anderson_beta[2] = (g00*(g11 - g21) - g01*(g10 - g20) + 1.0*(g10*g21 - g11*g20)) / sdet;
+        }
+
+        // Clamp extreme values and renormalize
+        var s = 0.0;
+        for (var i = 0u; i < n_res; i = i + 1u) {
+            anderson_beta[i] = clamp(anderson_beta[i], -2.0, 3.0);
+            s = s + anderson_beta[i];
+        }
+        if (abs(s) < 1e-6) {
+            for (var i = 0u; i < n_res; i = i + 1u) { anderson_beta[i] = 0.0; }
+            anderson_beta[0] = 1.0;  // fall back: use most recent iterate
+        } else {
+            for (var i = 0u; i < n_res; i = i + 1u) { anderson_beta[i] = anderson_beta[i] / s; }
+        }
+    }
+    workgroupBarrier();
+
+    // Apply: v_next[entry, dim] = Σ_i β[i] * hist[(k-i+m)%m, entry, dim]
+    for (var e = 0u; e < h_slots; e = e + 1u) {
+        let entry = token * h_slots + e;
+        for (var dim2 = lane; dim2 < d; dim2 = dim2 + 64u) {
+            var mixed = 0.0;
+            for (var i = 0u; i < n_res; i = i + 1u) {
+                let hi = (k + m - i) % m;
+                mixed = mixed + anderson_beta[i] * anderson_hist[hi * attn_len + entry * d + dim2];
+            }
+            v_next[entry * d + dim2] = mixed;
+        }
+    }
 }

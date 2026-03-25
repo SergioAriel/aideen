@@ -20,7 +20,7 @@ async fn test_deq_forward_wgpu_dispatch() {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("Test DEQ Device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::SUBGROUP,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -43,6 +43,10 @@ async fn test_deq_forward_wgpu_dispatch() {
         damping: 0.9,
         seq_len: 1,
         residual_alpha: 0.0,
+        debug_enable: 1,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
 
     let len_sq = d * d;
@@ -86,7 +90,7 @@ async fn test_cg_solver_wgpu_dispatch() {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("Test CG Device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::SUBGROUP,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },

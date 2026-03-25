@@ -12,6 +12,8 @@ struct UpdateUniforms {
     n_accum: u32,          // accumulation count (for apply_grad_update_main)
     n_total_weights: u32,  // total AllWeights elements (for apply_grad_update_main bounds)
     batch_size: u32,       // number of sequences processed in parallel
+    apply_accum: u32,      // 1=apply accumulated gradients (apply_grad_update_main)
+    _pad0: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
@@ -39,7 +41,7 @@ fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h*d*d + h*d; }
 fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d,h) + h*d*d + h*d; }
 fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d,h) + h*d*d; }
-fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d,h) + d*d; }
+fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d,h) + h*d*d; }
 fn aw_wx_base(d: u32, h: u32) -> u32 { return aw_win_base(d,h) + h*d*d; }
 fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d,h) + d*d; }
 fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_wout_base(d,h) + d*d; }
@@ -245,7 +247,9 @@ fn fused_attn_stage1a_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var gmix = 0.0;
         for (var dout = 0u; dout < d; dout = dout + 1u) {
-            gmix = gmix + AllWeights[aw_wo_base(params.d_model, params.h_slots) +dim * d + dout] * v_adjoint[t_off + q_off + dout];
+            gmix = gmix
+                + AllWeights[aw_wo_base(params.d_model, params.h_slots) +qs * d * d + dim * d + dout]
+                * v_adjoint[t_off + q_off + dout];
         }
         gmix_buf[entry_base(entry, d) + dim] = gmix;
     }
@@ -371,7 +375,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wd_factor = 1.0 - lr * params.weight_decay;
     let grad_scale = params.grad_scale;
 
-    var g_wo = 0.0;
+    var g_wo: array<f32, 16>; // per-slot W_o gradient accumulator
     var g_wv: array<f32, 16>;  // per-slot W_v gradient (max 16 slots), zero-initialized
     var g_win: array<f32, 16>;  // per-slot W_in gradient (max 16 slots), zero-initialized
     var g_wq: array<f32, 16>;  // per-slot W_q gradient (max 16 slots), zero-initialized
@@ -387,7 +391,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let base = t_abs * scratch_stride;
         let q_base = base;
         let g_attn_col = v_adjoint[t_abs * h_slots * d + q_off + col];
-        g_wo = g_wo + g_attn_col * mix_buf[off + row];
+        g_wo[qs] = g_wo[qs] + g_attn_col * mix_buf[off + row];
         // Per-slot W_v gradient: dL/dW_v_ks[row,col] += src[ks,row] * a[qs,ks] * gmix[qs,col]
         let gmix_col = gmix_buf[off + col];
         let signal_base_t = base + d * (h_slots * 5u);
@@ -410,10 +414,17 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let seq_scale = 1.0 / max(1.0, f32(n_entries));
-    g_wo = g_wo * seq_scale;
-
     let clip = 0.5;
-    let raw_wo = lr * g_wo * grad_scale;
+    // Per-slot W_o update
+    for (var s = 0u; s < h_slots; s = s + 1u) {
+        let raw_wo = lr * g_wo[s] * seq_scale * grad_scale;
+        let wo_idx = aw_wo_base(params.d_model, params.h_slots) + s * d * d + idx;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[wo_idx] += raw_wo;
+        } else {
+            AllWeights[wo_idx] = AllWeights[wo_idx] * wd_factor - clamp(raw_wo, -clip, clip);
+        }
+    }
 
     // Per-slot W_q / W_k update
     for (var s = 0u; s < h_slots; s = s + 1u) {
@@ -438,11 +449,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             AllWeights[wv_idx] = AllWeights[wv_idx] * wd_factor - clamp(raw_wv, -clip, clip);
         }
     }
-    if (params.grad_accum_mode == 1u) {
-        AllGradients[aw_wo_base(params.d_model, params.h_slots) +idx] += raw_wo;
-    } else {
-        AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] = AllWeights[aw_wo_base(params.d_model, params.h_slots) +idx] * wd_factor - clamp(raw_wo, -clip, clip);
-    }
+    // (W_o handled above per-slot)
     // Per-slot W_in update: each slot's matrix at offset s * d * d
     for (var s = 0u; s < h_slots; s = s + 1u) {
         let g_win_s = g_win[s] * seq_scale;
@@ -488,7 +495,7 @@ fn fused_attn_stage4_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx == 0u) {
         debug_log[8] = 204.0;
         debug_log[40] = g_wq[0];
-        debug_log[41] = g_wo;
+        debug_log[41] = g_wo[0];
         debug_log[42] = g_wv[0];  // slot-0 W_v gradient for diagnostics
         debug_log[43] = g_win[0]; // log slot-0 gradient for diagnostics
         debug_log[44] = g_wk[0];

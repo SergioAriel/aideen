@@ -1,0 +1,4 @@
+interface:
+  display_name: "Continuous Improvement Loop"
+  short_description: "Continuous improvement checklists"
+  default_prompt: "Apply a continuous improvement loop: capture opportunities, triage, and verify impact without derailing current task."
