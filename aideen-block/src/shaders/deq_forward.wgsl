@@ -36,7 +36,7 @@ const MAX_SLOTS: u32 = 8u;
 const MIX_TILE: u32 = 128u;
 
 var<workgroup> shared_vals: array<f32, WG_SIZE>;
-var<workgroup> hit_count: atomic<u32>;
+var<workgroup> unconverged_count: atomic<u32>;
 var<workgroup> max_delta_seen: f32;
 var<workgroup> last_delta: f32;
 var<workgroup> s_delta: array<f32, WG_SIZE>;
@@ -140,7 +140,7 @@ fn deq_forward_main(
     let full_mamba_mode = !deq_only_mode && !no_mamba_mode && !init_mamba_mode && !hist_gated_mode && !fixed_mamba_mode;
 
     if (tid == 0u) {
-        atomicStore(&hit_count, 0u);
+        atomicStore(&unconverged_count, 0u);
         max_delta_seen = 0.0;
         last_delta = 0.0;
         curr_contractivity = 0.0;
@@ -988,7 +988,7 @@ fn deq_forward_main(
             let d = last_delta;
             max_delta_seen = max(max_delta_seen, d);
             if (!converged) {
-                atomicAdd(&hit_count, 1u);
+                atomicAdd(&unconverged_count, 1u);
             }
         }
         workgroupBarrier();
@@ -1135,8 +1135,8 @@ fn deq_forward_main(
         DebugLog[11] = max_h_seen;
         DebugLog[12] = H_curr[h_base];
         DebugLog[13] = f32(total_iters) / max(1.0, f32(shape.seq_len));
-        DebugLog[14] = select(0.0, 1.0, atomicLoad(&hit_count) == 0u);
-        DebugLog[15] = f32(atomicLoad(&hit_count));
+        DebugLog[14] = select(0.0, 1.0, atomicLoad(&unconverged_count) == 0u);
+        DebugLog[15] = f32(atomicLoad(&unconverged_count));
         DebugLog[16] = max_delta_seen;
         DebugLog[17] = last_delta;
         DebugLog[18] = 0.0;
