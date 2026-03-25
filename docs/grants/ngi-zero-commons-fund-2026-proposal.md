@@ -19,7 +19,7 @@ AIDEEN — Open-Source Decentralized AI Engine for Consumer Hardware
 
 AIDEEN is an open-source AI inference and training engine built entirely in Rust, designed to run large language models on consumer-grade hardware without dependence on centralized cloud providers.
 
-Unlike transformer-based models that require expensive GPU clusters, AIDEEN uses a Deep Equilibrium Model (DEQ) architecture combined with Mamba-style selective state memory. DEQ models reuse a single set of parameters across iterative refinement steps, achieving the effective depth of a 16-layer transformer with only one layer's worth of parameters. Based on DEQ theory (Bai et al., 2019), this architecture achieves the effective depth of a deep network with a single layer's worth of parameters, enabling meaningful AI on laptops and commodity desktops. Quantifying the exact parameter efficiency vs. transformers on our specific architecture is a key deliverable of this grant (see benchmark suite in Task Breakdown).
+Unlike transformer-based models that require expensive GPU clusters, AIDEEN uses a Deep Equilibrium Model (DEQ) architecture combined with Mamba-style selective state memory. DEQ models (Bai, Kolter & Koltun, 2019) reuse a single set of parameters across iterative refinement steps, achieving the effective depth of a deep network with only one layer's worth of parameters. This architectural property — rather than quantization or pruning — is what enables meaningful AI on laptops and commodity desktops. **Quantifying the exact parameter efficiency vs. transformers on our specific DEQ+SSM architecture is a key deliverable of this grant** (see benchmark suite in Task Breakdown). We commit to publishing results honestly, including negative findings if the architecture does not outperform equivalent transformers.
 
 The engine is designed for peer-to-peer decentralized deployment via WebGPU/wgpu, allowing nodes to collaboratively run and train models without a central server. All communication uses a zero-trust cryptographic protocol with sealed model states verified by Ed25519 signatures.
 
@@ -91,34 +91,71 @@ We plan to apply for additional grants (CDTI NEOTEC in Spain, Smart&Start Italia
 
 ## Field 7: Task Breakdown with Effort Estimates
 
-| Phase | Task | Effort | Milestone |
-|-------|------|--------|-----------|
-| **Month 1** | GPU training pipeline: port CPU trainer to wgpu shaders | 2 person-months | **COMPLETED** — GPU training runs on consumer AMD GPU (Radeon 780M) with 29 WGSL compute shaders, fused Picard adjoint backward pass, and automatic checkpointing |
-| **Month 1-2** | Train d_r=512 and d_r=1024 models on multilingual corpus (English, Spanish, Italian) | 1 person-month + GPU compute | In progress — d_r=512 model training, scaling to full corpus with cloud GPU |
-| **Month 2** | Benchmark suite: compare AIDEEN DEQ vs. transformer baselines (iso-parameter, iso-compute, inference speed) | 1.5 person-months | Published benchmark report with reproducible scripts |
-| **Month 2-3** | Browser inference demo via WebGPU | 1 person-month | Interactive demo running in-browser, zero installation |
-| **Month 3-4** | Documentation, contributor guide, architecture walkthrough | 1 person-month | Public docs site, README, contribution guide |
-| **Month 4** | Community building, conference presentation, release v0.1.0 | 0.5 person-months | Tagged release, blog post, community channels |
+The grant deliverables are structured in three phases. Phase 1 is the **mandatory milestone** — an eliminatory gate review at 8 weeks. Phases 2 and 3 proceed only after Phase 1 is validated. P2P multi-node deployment is explicitly **out of scope** for this grant and planned as a separate follow-up effort.
 
-Total: ~7 person-months over 4 calendar months (2 developers in parallel).
+### Phase 1 — Core Validation (Months 1-2) — ELIMINATORY MILESTONE
 
-**Note on P2P decentralized inference:** The P2P networking layer (QUIC/WebTransport, zero-trust protocol) is architecturally designed and partially implemented in the `aideen-node` crate. Full integration testing and multi-node deployment are planned as a Phase 2 effort, either self-funded or as a follow-up grant application. This grant focuses on validating the core DEQ+SSM architecture with published benchmarks and a browser demo.
+| Task | Effort | Milestone | Status |
+|------|--------|-----------|--------|
+| GPU training pipeline on consumer hardware | 2 person-months | 29 WGSL shaders, fused Picard adjoint, auto-checkpointing | **COMPLETED** |
+| Train d_r=512 model on multilingual corpus | 1 person-month + GPU | Trained model with published weights | **IN PROGRESS** |
+| Benchmark suite: DEQ vs. transformer baselines | 1.5 person-months | Published report: iso-parameter perplexity, VRAM usage, tokens/sec | Pending |
+| Ablation study: DEQ vs. feedforward, with/without SSM | 0.5 person-months | Quantified contribution of each architectural component | Pending |
+
+**Gate review criteria (week 8):** Published benchmark comparing AIDEEN DEQ+Mamba against a transformer of equivalent parameter count (via Candle), trained on the same corpus, reporting perplexity, VRAM, and throughput. If DEQ+Mamba does not demonstrate a measurable advantage in at least one dimension (parameter efficiency, VRAM, or inference speed), the team will publish an honest analysis of the results and propose a revised plan.
+
+### Phase 2 — Accessibility & Demo (Month 3)
+
+| Task | Effort | Milestone |
+|------|--------|-----------|
+| Browser inference demo via WebGPU | 1 person-month | Interactive demo at aideen.dev, zero installation |
+| Documentation, architecture guide, contributor onboarding | 1 person-month | Public docs site, ARCHITECTURE.md, CONTRIBUTING.md |
+
+### Phase 3 — Community & Release (Month 4)
+
+| Task | Effort | Milestone |
+|------|--------|-----------|
+| Community sprint at FOSDEM or Rust conference | 0.5 person-months | At least 2 external contributors with merged PRs |
+| Release v0.1.0 with tagged benchmarks | 0.5 person-months | Tagged release, blog post, reproducible benchmark scripts |
+
+Total: ~8 person-months over 4 calendar months (2 developers in parallel).
+
+**Explicitly out of scope:** P2P multi-node training and inference. The `aideen-node` and `aideen-coordinator` crates contain architectural foundations (QUIC/WebTransport, Ed25519 governance), but full integration testing is planned as a Phase 2 effort in a follow-up grant application. This grant focuses exclusively on validating the core DEQ+SSM architecture with rigorous benchmarks, a browser demo, and community foundations.
 
 ---
 
-## Field 8: Comparison to Existing Efforts
+## Field 8: Comparison to Existing Efforts and Related Work
 
 *"Describe existing comparable efforts and how this project differs."*
 
-**vs. llama.cpp / GGML:** These projects optimize transformer inference for consumer hardware through quantization. AIDEEN takes a fundamentally different approach — instead of shrinking transformers, we use a different architecture (DEQ) that is inherently parameter-efficient. A DEQ model reuses a single parameter block iteratively, achieving effective depth comparable to multi-layer transformers. Our benchmark suite (aideen-bench) is designed to quantify this efficiency precisely, with iso-parameter and iso-compute comparisons as a grant deliverable.
+### Academic Foundations
 
-**vs. Hugging Face Transformers:** HF provides a broad ecosystem for running and fine-tuning transformer models. AIDEEN is not a framework for existing models — it is a new architecture designed from the ground up for efficiency and decentralization. There is no Python dependency; the entire stack is Rust.
+AIDEEN builds on two lines of research:
 
-**vs. Petals / BitTorrent-style distributed inference:** Petals distributes transformer layers across nodes. AIDEEN's DEQ architecture has only one reusable layer, making distribution simpler — nodes share the same parameters and can independently verify convergence, enabling zero-trust collaboration.
+1. **Deep Equilibrium Models (DEQ):** Bai, Kolter & Koltun (2019) showed that implicit-depth networks — where the output is the fixed point of a single repeated layer — can match the performance of deep explicit networks with O(1) memory for the backward pass via implicit differentiation. Subsequent work on stabilized DEQs (Bai et al., 2021) introduced Jacobian regularization, and Winston & Kolter (2020) proved convergence guarantees for monotone operator DEQs. Grazzi et al. (2020) analyzed iterative differentiation methods for implicit models. AIDEEN uses Picard iteration with spectral norm enforcement (σ ≤ 0.10) to guarantee contractivity, and computes gradients via the Picard adjoint equation — a practical implicit differentiation method that avoids storing intermediate iterates.
 
-**vs. RWKV / Mamba implementations:** These explore efficient alternatives to attention. AIDEEN combines DEQ (fixed-point iteration) with selective state memory (Mamba-style), a combination that has not been explored in open-source. The key innovation is placing the SSM outside the DEQ convergence loop to maintain stability. Recent additions include per-slot value projections, a learnable forget gate on the Mamba state, and dynamic history gating — giving each attention slot its own temporal memory profile.
+2. **Selective State Space Models (SSM):** Gu & Dao (2023) introduced Mamba, a selective SSM that achieves linear-time sequence processing by conditioning the state transition on the input. RWKV (Peng et al., 2023) pursues a similar goal via linear attention with time-dependent decay. More recently, Mamba-2 (Dao & Gu, 2024) and Griffin (De et al., 2024) explored hybrid architectures combining SSM blocks with attention.
 
-**Unique contribution:** No existing open-source project combines DEQ + SSM in a Rust-native, WebGPU-portable, P2P-ready stack. AIDEEN is not an incremental improvement on transformers — it is an architectural alternative designed for a decentralized, hardware-sovereign internet.
+**AIDEEN's specific contribution** is combining these two families: DEQ fixed-point iteration for depth-efficient representation learning, with Mamba-style selective state memory for temporal context. The key architectural decision — placing the SSM **outside** the Picard iteration loop — solves a convergence problem: if recurrent state participates in the fixed-point search, the Lipschitz condition L < 1 required for contraction may be violated. By treating the temporal state as frozen context during iteration and updating it post-convergence, AIDEEN preserves the convergence guarantee while retaining temporal reasoning. To our knowledge, this combination has not been explored in the published literature or in open-source implementations.
+
+### Comparison with Open-Source Projects
+
+| Project | Architecture | Language | GPU Backend | Training | Consumer HW | License |
+|---------|-------------|----------|-------------|----------|-------------|---------|
+| **AIDEEN** | DEQ + SSM | Rust | wgpu (Vulkan/Metal/DX12/WebGPU) | Yes | Yes (2GB iGPU) | MIT |
+| llama.cpp | Transformer (quantized) | C++ | CUDA, Metal | No (inference only) | Yes | MIT |
+| Candle | Transformer | Rust | CUDA, Metal | Yes | Partial | Apache-2.0 |
+| RWKV.cpp | Linear attention (RWKV) | C++ | CUDA | No (inference only) | Yes | Apache-2.0 |
+| HF Transformers | Transformer | Python | CUDA | Yes | No (cloud GPUs) | Apache-2.0 |
+| Petals | Transformer (distributed) | Python | CUDA | Yes (federated) | No | MIT |
+
+**vs. llama.cpp / GGML:** These optimize transformer inference via quantization. AIDEEN uses a fundamentally different architecture (DEQ) that is inherently parameter-efficient — the model reuses a single parameter block iteratively. Our benchmark suite (aideen-bench, using Candle for transformer baselines) will quantify this efficiency precisely.
+
+**vs. Candle (Hugging Face Rust ML):** Candle provides Rust ML primitives and transformer implementations on CUDA/Metal. AIDEEN uses Candle as a baseline in benchmarks but targets a different architecture (DEQ+SSM) and a different GPU backend (wgpu, which includes WebGPU for browsers — not available in Candle).
+
+**vs. RWKV / Mamba implementations:** These explore efficient alternatives to attention but use standard stacked architectures. AIDEEN combines the SSM with implicit depth (DEQ), a unique combination that trades iteration count for parameter count.
+
+**Unique contribution:** No existing open-source project combines DEQ + SSM in a Rust-native, WebGPU-portable stack. AIDEEN is not an incremental improvement on transformers — it is an architectural alternative designed for hardware-sovereign inference.
 
 ---
 
@@ -130,7 +167,7 @@ Total: ~7 person-months over 4 calendar months (2 developers in parallel).
 
 2. **GPU shader correctness:** The wgpu/WGSL backend must exactly match the CPU implementation for reproducibility. Our approach: we have a CPU reference implementation with comprehensive tests, and the GPU backend is validated against it tensor-by-tensor.
 
-3. **SSM-DEQ interaction:** As described above, the selective state memory must operate outside the Picard iteration loop. We have solved this architecturally (temporal_step runs after convergence), but the history gate calibration — how much temporal context enters the DEQ as fixed context — requires careful tuning. This is active research.
+3. **SSM-DEQ interaction and history gate calibration:** The selective state memory operates outside the Picard iteration loop (post-convergence update), which preserves the fixed-point contractivity guarantee. However, the history gating parameters (W_hist, gate bias) currently receive very small effective gradient steps (~1e-11) due to the conservative learning rate scaling (lr=1e-5 × grad_scale=1e-2). This means the history mechanism contributes a stable but essentially frozen context signal (hist_rms ≈ 9.5e-4, hist/inj ratio ≈ 0.25) rather than actively adapting during training. This is a known limitation: the history gate needs either a dedicated higher learning rate or a warm-up schedule to become a fully learnable component. Investigating and resolving this calibration is part of the ablation study deliverable in Phase 1.
 
 4. **WebGPU portability:** wgpu works across Vulkan, Metal, and DX12, but WebGPU in browsers has memory limits and no shared memory between compute shaders. We may need to tile large matrix operations for browser deployment.
 
@@ -146,13 +183,22 @@ Total: ~7 person-months over 4 calendar months (2 developers in parallel).
 - Organizations in regions with limited cloud access or data sovereignty requirements
 - The open-source AI community (contributors to projects like llama.cpp, RWKV, etc.)
 
-**Engagement plan:**
-- All code on GitHub under MIT license from day one
-- Monthly progress blog posts during the grant period
-- Architecture documentation designed for contributors (not just users)
-- Benchmark results published as reproducible scripts
-- Browser demo as a zero-friction entry point (no installation needed)
-- Presentation at 1-2 conferences (e.g., FOSDEM, NixCon, or Rust-focused events)
+**Engagement plan with verifiable milestones:**
+
+| Month | Action | Verifiable Outcome |
+|-------|--------|--------------------|
+| 1 | Publish benchmark results as reproducible scripts | Public repo with `cargo bench` instructions, CI-validated |
+| 1 | Open 10+ "good first issue" tickets with clear scope | GitHub Issues tagged, linked to architecture docs |
+| 2 | Architecture documentation for contributors | ARCHITECTURE.md with buffer layouts, shader guides, onboarding path |
+| 2 | Outreach to Rust ML community (r/rust, Rust Zurich, Rust London) | Post with link to benchmarks and call for contributors |
+| 3 | Browser inference demo live at aideen.dev | URL accessible, zero installation, text generation in-browser |
+| 3 | Contact wgpu/WebGPU working group about AI compute use case | Email thread or issue on wgpu repo documenting feedback |
+| 4 | Community sprint at FOSDEM, EuroRust, or NixCon | At least 2 external contributors with merged PRs |
+| 4 | Release v0.1.0 with blog post and announcement | Tagged release on GitHub, blog post on project site |
+
+**Community channels:** GitHub Discussions (primary), Matrix/Discord channel (real-time), monthly progress blog posts.
+
+**Contributor accessibility:** The modular 11-crate architecture enables isolated contributions — a developer can work on `aideen-bench` (benchmarks) without touching the GPU shaders, or contribute documentation without understanding the Picard adjoint. Each crate has its own tests and can be developed independently.
 
 **European dimension:**
 - The lead founder (Marchetto) is an **Italian citizen** (EU national) committed to relocating to the EU to establish the project's permanent base. Relocation is planned for Q2/Q3 2026, with Italy as the primary destination. The team will incorporate as an EU-based entity (Italy) during the grant period, enabling the project to operate as European infrastructure built by European citizens. Marchetto's Italian citizenship provides full right of establishment under EU law.
