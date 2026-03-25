@@ -7,10 +7,6 @@ struct RunUniforms {
     damping: f32,
     seq_len: u32,
     residual_alpha: f32,
-    debug_enable: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
@@ -23,12 +19,12 @@ struct RunUniforms {
 @group(0) @binding(7) var<storage, read_write> DebugLog: array<f32>;
 
 // AllWeights layout offset functions.
-// Layout: W_q | W_k | W_v | W_o (per-slot) | W_in | W_x | W_out | A_log | NormScale | HistParams
+// Layout: W_q | W_k | W_v | W_o | W_in | W_x | W_out | A_log | NormScale | HistParams
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h*d*d + h*d; }
 fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d,h) + h*d*d + h*d; }
 fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d,h) + h*d*d; }
-fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d,h) + h*d*d; }
+fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d,h) + d*d; }
 fn aw_wx_base(d: u32, h: u32) -> u32 { return aw_win_base(d,h) + h*d*d; }
 fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d,h) + d*d; }
 fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_wout_base(d,h) + d*d; }
@@ -95,79 +91,10 @@ var<workgroup> attn_w: array<f32, 64>;
 // Tiled cache for mix vector during W_o * mix projection.
 var<workgroup> mix_tile: array<f32, MIX_TILE>;
 
-// Workgroup reduction with shared memory (portable fallback).
-// Result is stored in shared_vals[0] AND returned.
-fn wg_sum_reduce(partial: f32, tid: u32, num_sg: u32, sg_id: u32, sg_lane: u32) -> f32 {
-    if (num_sg == 0u) { return 0.0; }
-    let sg_sum = subgroupAdd(partial);
-    if (sg_lane == 0u) {
-        shared_vals[sg_id] = sg_sum;
-    }
-    workgroupBarrier();
-
-    if (tid < num_sg) {
-        shared_vals[tid] = shared_vals[tid];
-    } else {
-        shared_vals[tid] = 0.0;
-    }
-    workgroupBarrier();
-
-    var n = 1u;
-    while (n < num_sg) { n = n << 1u; }
-    var stride = n >> 1u;
-    while (stride > 0u) {
-        if (tid < stride) {
-            var rhs = 0.0;
-            if (tid + stride < num_sg) {
-                rhs = shared_vals[tid + stride];
-            }
-            shared_vals[tid] = shared_vals[tid] + rhs;
-        }
-        workgroupBarrier();
-        stride = stride >> 1u;
-    }
-    return shared_vals[0];
-}
-
-fn wg_max_reduce(partial: f32, tid: u32, num_sg: u32, sg_id: u32, sg_lane: u32) -> f32 {
-    if (num_sg == 0u) { return -1.0e30; }
-    let sg_max = subgroupMax(partial);
-    if (sg_lane == 0u) {
-        shared_vals[sg_id] = sg_max;
-    }
-    workgroupBarrier();
-
-    if (tid < num_sg) {
-        shared_vals[tid] = shared_vals[tid];
-    } else {
-        shared_vals[tid] = -1.0e30;
-    }
-    workgroupBarrier();
-
-    var n = 1u;
-    while (n < num_sg) { n = n << 1u; }
-    var stride = n >> 1u;
-    while (stride > 0u) {
-        if (tid < stride) {
-            var rhs = -1.0e30;
-            if (tid + stride < num_sg) {
-                rhs = shared_vals[tid + stride];
-            }
-            shared_vals[tid] = max(shared_vals[tid], rhs);
-        }
-        workgroupBarrier();
-        stride = stride >> 1u;
-    }
-    return shared_vals[0];
-}
-
 @compute @workgroup_size(256, 1, 1)
 fn deq_forward_main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(num_subgroups) num_sg: u32,
-    @builtin(subgroup_id) sg_id: u32,
-    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(workgroup_id) wid: vec3<u32>
 ) {
     let tid = lid.x;
     let batch_idx = wid.x;
@@ -175,7 +102,6 @@ fn deq_forward_main(
 
     let d_model = shape.d_model;
     let h_slots = shape.h_slots;
-    let debug_on = shape.debug_enable > 0u;
     if (h_slots == 0u || h_slots > MAX_SLOTS) { return; }
     let aw_wq = aw_wq_base(d_model, h_slots);
     let aw_wk = aw_wk_base(d_model, h_slots);
@@ -317,7 +243,14 @@ fn deq_forward_main(
                 local_inj_sumsq = local_inj_sumsq + inj * inj;
             }
         }
-        _ = wg_sum_reduce(local_inj_sumsq, tid, num_sg, sg_id, sg_lane);
+        shared_vals[tid] = local_inj_sumsq;
+        workgroupBarrier();
+        for (var stride_inj = WG_SIZE / 2u; stride_inj > 0u; stride_inj = stride_inj >> 1u) {
+            if (tid < stride_inj) {
+                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_inj];
+            }
+            workgroupBarrier();
+        }
         if (tid == 0u) {
             inj_rms_curr = sqrt(
                 shared_vals[0] / max(1.0, f32(d_model * h_slots)) + 1e-6
@@ -335,7 +268,14 @@ fn deq_forward_main(
                     local_inj_sumsq = local_inj_sumsq + inj * inj;
                 }
             }
-            _ = wg_sum_reduce(local_inj_sumsq, tid, num_sg, sg_id, sg_lane);
+            shared_vals[tid] = local_inj_sumsq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
             let inj_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model) * f32(h_slots)) + 1e-6);
             for (var s = 0u; s < h_slots; s = s + 1u) {
                 let off = s * d_model;
@@ -355,7 +295,14 @@ fn deq_forward_main(
                     local_inj_sumsq = local_inj_sumsq + inj * inj;
                 }
             }
-            _ = wg_sum_reduce(local_inj_sumsq, tid, num_sg, sg_id, sg_lane);
+            shared_vals[tid] = local_inj_sumsq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
             let inj_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model) * f32(h_slots)) + 1e-6);
             for (var s = 0u; s < h_slots; s = s + 1u) {
                 let off = s * d_model;
@@ -373,7 +320,14 @@ fn deq_forward_main(
                     }
                     local_prev_sumsq = local_prev_sumsq + prev_v * prev_v;
                 }
-                _ = wg_sum_reduce(local_prev_sumsq, tid, num_sg, sg_id, sg_lane);
+                shared_vals[tid] = local_prev_sumsq;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
                 let prev_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                 var local_hist_sumsq = 0.0;
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
@@ -404,7 +358,14 @@ fn deq_forward_main(
                     Scratch[m_inner_base + off + d_out] = u;
                     local_hist_sumsq = local_hist_sumsq + u * u;
                 }
-                _ = wg_sum_reduce(local_hist_sumsq, tid, num_sg, sg_id, sg_lane);
+                shared_vals[tid] = local_hist_sumsq;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
                 let hist_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                 let gate_logit = AllWeights[aw_hist +hist_gate_base + s];
                 let warmup = clamp(AllWeights[aw_hist +hist_warmup_base], 0.0, 1.0);
@@ -426,7 +387,12 @@ fn deq_forward_main(
                     local_wgate += AllWeights[aw_hist + hist_gate_query_base + off + dj]
                                    * H_curr[h_base + off + dj];
                 }
-                _ = wg_sum_reduce(local_wgate, tid, num_sg, sg_id, sg_lane);
+                shared_vals[tid] = local_wgate;
+                workgroupBarrier();
+                for (var wg_stride = WG_SIZE / 2u; wg_stride > 0u; wg_stride = wg_stride >> 1u) {
+                    if (tid < wg_stride) { shared_vals[tid] += shared_vals[tid + wg_stride]; }
+                    workgroupBarrier();
+                }
                 let gate_dyn = shared_vals[0] / sqrt(f32(d_model));
                 let hist_mod = 1.0 + tanh(gate_dyn);
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
@@ -439,14 +405,19 @@ fn deq_forward_main(
                     local_wf += AllWeights[aw_hist + w_forget_base + off + dj]
                                 * H_curr[h_base + off + dj];
                 }
-                _ = wg_sum_reduce(local_wf, tid, num_sg, sg_id, sg_lane);
+                shared_vals[tid] = local_wf;
+                workgroupBarrier();
+                for (var wf_stride = WG_SIZE / 2u; wf_stride > 0u; wf_stride = wf_stride >> 1u) {
+                    if (tid < wf_stride) { shared_vals[tid] += shared_vals[tid + wf_stride]; }
+                    workgroupBarrier();
+                }
                 let f_logit = shared_vals[0] / sqrt(f32(d_model));
                 let f_gate = 1.0 / (1.0 + exp(-f_logit));
                 if (tid == 0u) {
                     Scratch[f_gate_scratch_base + s] = f_gate;
                 }
                 workgroupBarrier();
-                if (debug_on && tid == 0u) {
+                if (tid == 0u) {
                     if (s == 0u) {
                         avg_inj_rms_sum = avg_inj_rms_sum + inj_rms;
                     }
@@ -483,11 +454,25 @@ fn deq_forward_main(
                     local_inj_sumsq = local_inj_sumsq + inj * inj;
                 }
             }
-            let _h = wg_sum_reduce(local_hist_sumsq, tid, num_sg, sg_id, sg_lane);
+            shared_vals[tid] = local_hist_sumsq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
             let hist_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-            let _i = wg_sum_reduce(local_inj_sumsq, tid, num_sg, sg_id, sg_lane);
+            shared_vals[tid] = local_inj_sumsq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
             let inj_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model) * f32(h_slots)) + 1e-6);
-            if (debug_on && tid == 0u) {
+            if (tid == 0u) {
                 avg_inj_rms_sum = avg_inj_rms_sum + inj_rms;
                 avg_hist_rms_sum = avg_hist_rms_sum + hist_rms;
                 avg_hist_ratio_sum = avg_hist_ratio_sum + hist_rms / max(inj_rms, 1e-6);
@@ -587,26 +572,12 @@ fn deq_forward_main(
                         var q = 0.0;
                         var k = 0.0;
                         var v = 0.0;
-                        // Tile H_curr into shared_vals to reduce global reads.
-                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
-                            let j = tile + tid;
-                            if (j < d_model) {
-                                shared_vals[tid] = H_curr[h_base + off + j];
-                            } else {
-                                shared_vals[tid] = 0.0;
-                            }
-                            workgroupBarrier();
-                            let tile_limit = min(WG_SIZE, d_model - tile);
-                            for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
-                                let h_val = shared_vals[tj];
-                                let w_idx = s * d_model * d_model + (tile + tj) * d_model + d_out;
-                                q = q + AllWeights[aw_wq +w_idx] * h_val;
-                                k = k + AllWeights[aw_wk +w_idx] * h_val;
-                                if (!v_fixed && !v_lag) {
-                                    v = v + AllWeights[aw_wv + s * d_model * d_model + (tile + tj) * d_model + d_out] * h_val;
-                                }
-                            }
-                            workgroupBarrier();
+                        for (var j = 0u; j < d_model; j = j + 1u) {
+                            let h_val = H_curr[h_base + off + j];
+                            let w_idx = s * d_model * d_model + j * d_model + d_out;
+                            q = q + AllWeights[aw_wq +w_idx] * h_val;
+                            k = k + AllWeights[aw_wk +w_idx] * h_val;
+                            if (!v_fixed && !v_lag) { v = v + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val; }
                         }
                         // Per-slot Q/K bias: appended after h_slots matrices in W_q/W_k buffers.
                         q = q + AllWeights[aw_wq +h_slots * d_model * d_model + s * d_model + d_out];
@@ -622,7 +593,14 @@ fn deq_forward_main(
                         // Workgroup reduction to get the global v_rms (not per-thread partial).
                         // Bug: original code used per-thread v_sum (2 elements / 512) giving
                         // v_rms ≈ v_global / 16 and v_gain ≈ 16× correct → Jacobian ≫ 1.
-                        _ = wg_sum_reduce(v_sum, tid, num_sg, sg_id, sg_lane);
+                        shared_vals[tid] = v_sum;
+                        workgroupBarrier();
+                        for (var stride_vr = WG_SIZE / 2u; stride_vr > 0u; stride_vr = stride_vr >> 1u) {
+                            if (tid < stride_vr) {
+                                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_vr];
+                            }
+                            workgroupBarrier();
+                        }
                         let v_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-12);
                         let v_scale = AllWeights[aw_hist +v_scale_base];
                         let v_norm_scale = AllWeights[aw_hist +v_norm_scale_base];
@@ -688,7 +666,7 @@ fn deq_forward_main(
                 // Entropy y max promediados sobre TODOS los slots (no solo slot 0).
                 // Thread 0 recalcula desde Scratch para evitar race conditions.
                 // attn_ent=log(8)=2.079 → slots uniformes. Debe bajar con entrenamiento real.
-                if (debug_on && tid == 0u && iter == 0u) {
+                if (tid == 0u && iter == 0u) {
                     var total_entropy = 0.0;
                     var total_max_p = 0.0;
                     for (var s = 0u; s < h_slots; s = s + 1u) {
@@ -756,7 +734,7 @@ fn deq_forward_main(
                     workgroupBarrier();
                 }
 
-                // cross-slot attention: attn_slot = W_o[slot] * mix
+                // cross-slot attention: attn_slot = W_o * mix
                 for (var qs = 0u; qs < h_slots; qs = qs + 1u) {
                     let q_off = qs * d_model;
                     for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
@@ -772,7 +750,7 @@ fn deq_forward_main(
                             // Consume tile.
                             for (var l = 0u; l < tile_n; l = l + 1u) {
                                 let j = t0 + l;
-                                out = out + AllWeights[aw_wo +qs * d_model * d_model + j * d_model + d_out] * mix_tile[l];
+                                out = out + AllWeights[aw_wo +j * d_model + d_out] * mix_tile[l];
                             }
                             workgroupBarrier();
                         }
@@ -781,7 +759,7 @@ fn deq_forward_main(
                 }
                 workgroupBarrier();
 
-                if (debug_on && iter == 0u) {
+                if (iter == 0u) {
                     let off0 = 0u;
                     var q_sumsq = 0.0;
                     var k_sumsq = 0.0;
@@ -794,21 +772,42 @@ fn deq_forward_main(
                         k_sumsq = k_sumsq + kv * kv;
                         v_sumsq = v_sumsq + vv * vv;
                     }
-                    _ = wg_sum_reduce(q_sumsq, tid, num_sg, sg_id, sg_lane);
+                    shared_vals[tid] = q_sumsq;
+                    workgroupBarrier();
+                    for (var stride_q = WG_SIZE / 2u; stride_q > 0u; stride_q = stride_q >> 1u) {
+                        if (tid < stride_q) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_q];
+                        }
+                        workgroupBarrier();
+                    }
                     if (tid == 0u) {
                         avg_q_rms_sum = avg_q_rms_sum
                             + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                     }
                     workgroupBarrier();
 
-                    _ = wg_sum_reduce(k_sumsq, tid, num_sg, sg_id, sg_lane);
+                    shared_vals[tid] = k_sumsq;
+                    workgroupBarrier();
+                    for (var stride_k = WG_SIZE / 2u; stride_k > 0u; stride_k = stride_k >> 1u) {
+                        if (tid < stride_k) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_k];
+                        }
+                        workgroupBarrier();
+                    }
                     if (tid == 0u) {
                         avg_k_rms_sum = avg_k_rms_sum
                             + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                     }
                     workgroupBarrier();
 
-                    _ = wg_sum_reduce(v_sumsq, tid, num_sg, sg_id, sg_lane);
+                    shared_vals[tid] = v_sumsq;
+                    workgroupBarrier();
+                    for (var stride_v = WG_SIZE / 2u; stride_v > 0u; stride_v = stride_v >> 1u) {
+                        if (tid < stride_v) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_v];
+                        }
+                        workgroupBarrier();
+                    }
                     if (tid == 0u) {
                         avg_v_rms_sum = avg_v_rms_sum
                             + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
@@ -823,14 +822,28 @@ fn deq_forward_main(
                         mix_sumsq = mix_sumsq + mv * mv;
                         out_sumsq = out_sumsq + ov * ov;
                     }
-                    _ = wg_sum_reduce(mix_sumsq, tid, num_sg, sg_id, sg_lane);
+                    shared_vals[tid] = mix_sumsq;
+                    workgroupBarrier();
+                    for (var stride_m = WG_SIZE / 2u; stride_m > 0u; stride_m = stride_m >> 1u) {
+                        if (tid < stride_m) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_m];
+                        }
+                        workgroupBarrier();
+                    }
                     if (tid == 0u) {
                         avg_mix_rms_sum = avg_mix_rms_sum
                             + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                     }
                     workgroupBarrier();
 
-                    _ = wg_sum_reduce(out_sumsq, tid, num_sg, sg_id, sg_lane);
+                    shared_vals[tid] = out_sumsq;
+                    workgroupBarrier();
+                    for (var stride_o = WG_SIZE / 2u; stride_o > 0u; stride_o = stride_o >> 1u) {
+                        if (tid < stride_o) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride_o];
+                        }
+                        workgroupBarrier();
+                    }
                     if (tid == 0u) {
                         avg_attn_out_rms_sum = avg_attn_out_rms_sum
                             + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
@@ -881,7 +894,14 @@ fn deq_forward_main(
                     H_next[h_base_t + off + d] = final_combined;
                     local_sumsq = local_sumsq + attn_signal * attn_signal;
                 }
-                _ = wg_sum_reduce(local_sumsq, tid, num_sg, sg_id, sg_lane);
+                shared_vals[tid] = local_sumsq;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
                 let rms_floor = AllWeights[aw_hist +hist_rms_floor_base];
                 // Smooth floor inside sqrt to keep the map differentiable and enforce
                 // a minimum RMS magnitude without regime switches.
@@ -893,7 +913,7 @@ fn deq_forward_main(
                 if (s == 0u && tid == 0u) {
                     combined_rms_curr = rms;
                 }
-                if (debug_on && iter == 0u && s == 0u && tid == 0u) {
+                if (iter == 0u && s == 0u && tid == 0u) {
                     avg_combined_rms_sum = avg_combined_rms_sum + rms;
                 }
 
@@ -908,7 +928,14 @@ fn deq_forward_main(
                 workgroupBarrier();
             }
 
-            _ = wg_max_reduce(local_max_delta, tid, num_sg, sg_id, sg_lane);
+            shared_vals[tid] = local_max_delta;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = max(shared_vals[tid], shared_vals[tid + stride]);
+                }
+                workgroupBarrier();
+            }
 
             if (shared_vals[0] < shape.epsilon) {
                 converged = true;
@@ -936,7 +963,14 @@ fn deq_forward_main(
             workgroupBarrier();
 
             // Track state magnitude for debugging/oracle guardrails.
-            _ = wg_max_reduce(local_max_h, tid, num_sg, sg_id, sg_lane);
+            shared_vals[tid] = local_max_h;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = max(shared_vals[tid], shared_vals[tid + stride]);
+                }
+                workgroupBarrier();
+            }
             if (tid == 0u) {
                 max_h_seen = max(max_h_seen, shared_vals[0]);
             }
@@ -972,7 +1006,14 @@ fn deq_forward_main(
                     let h_val = H_curr[h_base + off + d];
                     local_h_sumsq = local_h_sumsq + h_val * h_val;
                 }
-                _ = wg_sum_reduce(local_h_sumsq, tid, num_sg, sg_id, sg_lane);
+                shared_vals[tid] = local_h_sumsq;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
                 let h_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
 
                 let warmup = clamp(AllWeights[aw_hist +hist_warmup_base], 0.0, 1.0);
@@ -1041,8 +1082,15 @@ fn deq_forward_main(
                         H_curr[h_base + off + d_out] = out;
                     }
                 }
-                _ = wg_sum_reduce(local_out_sumsq, tid, num_sg, sg_id, sg_lane);
-                if (debug_on && tid == 0u) {
+                shared_vals[tid] = local_out_sumsq;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
+                if (tid == 0u) {
                     avg_mamba_rms_sum = avg_mamba_rms_sum
                         + sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                 }
@@ -1079,7 +1127,7 @@ fn deq_forward_main(
     // (Removed outdated synced H_next readback. Backprop relies entirely on H_next[t*seq_len] exact preservation)
     workgroupBarrier();
 
-    if (debug_on && batch_idx == 0u && tid == 0u) {
+    if (batch_idx == 0u && tid == 0u) {
         DebugLog[0] = 777.7;
         DebugLog[1] = f32(shape.batch_size);
         DebugLog[2] = f32(shape.d_model);
@@ -1139,7 +1187,7 @@ fn deq_forward_main(
         DebugLog[111] = AllWeights[aw_hist +hist_loop_force_nomamba_base_dbg];
 
         // Per-token debug (slot 0) when seq_len is small: H_rms, V_rms, attn_rms.
-        if (shape.seq_len <= 16u) {
+        if (tid == 0u && shape.seq_len <= 16u) {
             let scratch_stride = d_model * h_slots * 7u + h_slots * h_slots + h_slots;
             let base_out = 200u; // leave room for existing debug slots
             for (var t = 0u; t < shape.seq_len; t = t + 1u) {
