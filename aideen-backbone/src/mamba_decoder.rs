@@ -32,12 +32,12 @@ impl MambaDecoder {
         });
 
         let lm_head = DMatrix::from_fn(vocab_size, d_model, |i, j| {
-            ((i * d_model + j + 1) as f32 * 2.71828 % 1.0 - 0.5) * scale
+            ((i * d_model + j + 1) as f32 * std::f32::consts::E % 1.0 - 0.5) * scale
         });
 
         let make_mat = |rows: usize, cols: usize, seed: usize| -> DMatrix<f32> {
             DMatrix::from_fn(rows, cols, |i, j| {
-                ((i * cols + j + seed) as f32 * 1.41421 % 1.0 - 0.5) * scale
+                ((i * cols + j + seed) as f32 * std::f32::consts::SQRT_2 % 1.0 - 0.5) * scale
             })
         };
 
@@ -199,7 +199,7 @@ impl ClassHead {
         let d_r = config.d_r;
         let scale = (d_r as f32).sqrt().recip() * 0.1;
         let w = DMatrix::from_fn(num_classes, d_r, |i, j| {
-            ((i * d_r + j) as f32 * 1.41421 % 1.0 - 0.5) * scale
+            ((i * d_r + j) as f32 * std::f32::consts::SQRT_2 % 1.0 - 0.5) * scale
         });
         Self { config, w }
     }
