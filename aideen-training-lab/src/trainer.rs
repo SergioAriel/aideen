@@ -1224,8 +1224,8 @@ impl Trainer {
                 } else {
                     "NORMAL"
                 };
-                let conv_ok =
-                    unconverged_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
+                let conv_ok = unconverged_ratio <= 0.05
+                    || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
                 let unc_i = unconverged.round() as i32;
                 println!(
