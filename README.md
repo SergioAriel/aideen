@@ -1,5 +1,10 @@
 # AIDEEN — Decentralized AI Engine for Consumer Hardware
 
+[![CI](https://github.com/SergioAriel/aideen/actions/workflows/ci.yml/badge.svg)](https://github.com/SergioAriel/aideen/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/Rust-35k_LOC-orange)
+![WGSL](https://img.shields.io/badge/WGSL-25_shaders-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+
 Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Mamba-style selective state memory (SSM)** instead of stacked transformer layers — achieving comparable quality with significantly fewer parameters.
 
 Designed to run on consumer GPUs (AMD, Intel, NVIDIA) via [wgpu](https://wgpu.rs/) / WebGPU, without dependence on CUDA or cloud providers.
@@ -27,7 +32,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 - **Model configuration:** d_r=512, h_slots=8, vocab_size=50,257 (BPE tokenizer)
 - **Training results:** Validation loss reduced from 5.97 (random init) to 4.08 over 2,860 gradient steps on a 3.76M token corpus (Rust Book + arXiv ML papers + SmolTalk)
 - **Stability:** 12+ hours continuous GPU training at 11.8 tokens/second with automatic checkpointing
+- **Picard convergence:** 100% of tokens converge within 5-6 iterations (cap 20), contractivity < 0.85
 - **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens, English + Spanish) tokenized and prepared for larger-scale training
+
+For the key architectural insight (why Mamba runs outside the DEQ loop), see [docs/blog/001-why-mamba-outside-deq.md](docs/blog/001-why-mamba-outside-deq.md).
 
 ## Workspace Structure
 
