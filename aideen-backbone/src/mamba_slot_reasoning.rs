@@ -328,7 +328,7 @@ impl MambaSlotReasoning {
         let seed = hasher.finish();
         let mut out = Vec::with_capacity(h_slots * base.len());
         let _attn_t = 0.10_f32;
-        let _win_t = 0.30_f32;
+        let win_t = 0.30_f32;
         let n_iter = 20;
         // Disable per-slot jitter to remove seed-dependent W_in variance during diagnosis.
         let jitter = 0.0_f32;
