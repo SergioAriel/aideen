@@ -1,14 +1,14 @@
 use crate::tensor::Tensor;
 use serde::{Deserialize, Serialize};
 
-/// Capa lineal genérica (Pesos y Biases puros)
+/// Generic linear layer (pure Weights and Biases)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearLayer {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
 }
 
-/// Capa Transformer agnóstica
+/// Framework-agnostic Transformer layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformerLayer {
     pub q_proj: LinearLayer,
@@ -19,11 +19,11 @@ pub struct TransformerLayer {
     pub ffn_down: LinearLayer,
 }
 
-/// Definición de Mixture of Experts (MoE) distribuido
+/// Distributed Mixture of Experts (MoE) definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoE {
     pub num_experts: usize,
-    /// En un entorno P2P, los expertos reales podrían estar en otros nodos.
-    /// Aquí solo definimos la estructura de enrutamiento (ej. capa de gating).
+    /// In a P2P environment, the actual experts could reside on other nodes.
+    /// Here we only define the routing structure (e.g. gating layer).
     pub router: LinearLayer,
 }

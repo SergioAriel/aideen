@@ -1,10 +1,10 @@
 use nalgebra::DVector;
 
-/// Contrato canónico de readout: proyecta h* en un output observable.
+/// Canonical readout contract: projects h* into an observable output.
 ///
-/// El readout es la única salida legítima del loop LOXI.
-/// No existe next_token, no existe sampling.
-/// La respuesta emerge de h* — el punto fijo cognitivo.
+/// The readout is the only legitimate output of the LOXI loop.
+/// There is no next_token, there is no sampling.
+/// The response emerges from h* — the cognitive fixed point.
 pub trait Readout {
     type Output;
     fn readout(&self, h_star: &DVector<f32>) -> Self::Output;

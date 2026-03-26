@@ -22,7 +22,7 @@ fn env_u64(name: &str) -> Option<u64> {
 }
 
 fn main() {
-    println!("\n[STRESS-TEST] Iniciando Auditoría de Integridad v13.2...");
+    println!("\n[STRESS-TEST] Starting Integrity Audit v13.2...");
 
     let force_global = env::var("AIDEEN_STRESS_FORCE_GLOBAL").ok().as_deref() == Some("1");
     let _deq_only = env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1");
@@ -64,7 +64,7 @@ fn main() {
 
     let source_text: String = if let Ok(path) = env::var("AIDEEN_STRESS_FILE") {
         std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!("[STRESS-TEST] ERROR leyendo {}: {}", path, e);
+            eprintln!("[STRESS-TEST] ERROR reading {}: {}", path, e);
             PROMPT.to_string()
         })
     } else {
@@ -113,7 +113,7 @@ fn main() {
         }
     }
 
-    println!("[STRESS-TEST] Ejecutando ráfagas de entrenamiento...");
+    println!("[STRESS-TEST] Running training bursts...");
     let seq_tokens = train_tokens.len();
     let mut total_ms = 0u128;
     for i in 0..stress_iters {
@@ -131,7 +131,7 @@ fn main() {
         );
     }
     println!(
-        "[STRESS-TEST] TPS promedio: {:.1} ({} tokens × {} iters en {:.2}s)",
+        "[STRESS-TEST] Average TPS: {:.1} ({} tokens × {} iters in {:.2}s)",
         (seq_tokens * stress_iters) as f64 / (total_ms as f64 / 1000.0),
         seq_tokens,
         stress_iters,
@@ -168,7 +168,7 @@ fn main() {
         }
     }
 
-    println!("\n[STRESS-TEST] Audit Finalizado. Revisa los logs [GPU-ORACLE] arriba.");
+    println!("\n[STRESS-TEST] Audit Complete. Check the [GPU-ORACLE] logs above.");
     println!("  - Si 'mode' es NORMAL/BOOST y 'conv' es OK -> El Sync de Memoria Global funciona.");
     println!("  - Si 'rs_cg' es bajo -> La escalabilidad del CG Solver funciona.");
     println!("  - Para forzar d_r=1024: AIDEEN_STRESS_FORCE_GLOBAL=1");

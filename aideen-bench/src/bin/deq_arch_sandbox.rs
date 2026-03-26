@@ -334,8 +334,8 @@ fn run_sweep(trainer: &mut Trainer, tokens: &[u32]) {
     }
 }
 
-/// Aplica spectral norm a todas las matrices de atención con un threshold dado.
-/// Crea un trainer fresco (misma semilla) para que cada punto del sweep sea independiente.
+/// Applies spectral norm to all attention matrices with a given threshold.
+/// Creates a fresh trainer (same seed) so each sweep point is independent.
 fn renorm_for_deq(trainer: &mut Trainer, threshold: f32) {
     let n = 20;
     spectral_norm::normalize_if_needed(&mut trainer.reasoning.w_q, threshold, n);
@@ -439,8 +439,8 @@ fn main() {
     print_summary(&pure);
     print_summary(&per_slot);
     println!("{}", "-".repeat(100));
-    println!("Interpretación: menor maxΔ/contr y mayor conv_ok = dinámica DEQ más sana.");
-    println!("per_slot vs broadcast: ver si slots independientes mejoran contractividad.");
+    println!("Interpretation: lower maxΔ/contr and higher conv_ok = healthier DEQ dynamics.");
+    println!("per_slot vs broadcast: see if independent slots improve contractivity.");
 
     run_sweep(&mut trainer, &tokens);
     run_init_sweep(&cfg, &tokens);

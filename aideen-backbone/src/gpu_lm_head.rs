@@ -966,8 +966,8 @@ impl GpuLmHeadTrainer {
         }
     }
 
-    /// Executa el entrenamiento del LM Head sin leer resultados de vuelta a la CPU.
-    /// Ideal para encadenar con el retro-propagación de la DEQ en la GPU.
+    /// Executes LM Head training without reading results back to the CPU.
+    /// Ideal for chaining with DEQ backpropagation on the GPU.
     pub fn train_step_no_readback(
         &mut self,
         device: &wgpu::Device,
@@ -1270,9 +1270,9 @@ impl GpuLmHeadTrainer {
         }
     }
 
-    /// Lee los momentos Adam (m, v) de la GPU para checkpoint.
-    /// Devuelve (m_w, v_w, m_b, v_b, m_g, v_g) — todos como Vec<f32>.
-    /// El formato en GPU es interleaved float2: [m0, v0, m1, v1, ...].
+    /// Reads Adam moments (m, v) from the GPU for checkpoint.
+    /// Returns (m_w, v_w, m_b, v_b, m_g, v_g) -- all as Vec<f32>.
+    /// The GPU format is interleaved float2: [m0, v0, m1, v1, ...].
     pub fn read_moments(
         &self,
         device: &wgpu::Device,
@@ -1343,8 +1343,8 @@ impl GpuLmHeadTrainer {
         Ok((m_w, v_w, m_b, v_b, m_g, v_g))
     }
 
-    /// Sube momentos Adam previamente guardados de vuelta a la GPU.
-    /// Espera los mismos 6 vecs que devuelve `read_moments`.
+    /// Uploads previously saved Adam moments back to the GPU.
+    /// Expects the same 6 vecs returned by `read_moments`.
     pub fn write_moments(
         &self,
         queue: &wgpu::Queue,
@@ -1375,8 +1375,8 @@ impl GpuLmHeadTrainer {
         );
     }
 
-    /// Sube w, b, g a la GPU sin despachar ningún kernel.
-    /// Usar para inicializar pesos la primera vez antes de `train_step_no_readback`.
+    /// Uploads w, b, g to the GPU without dispatching any kernel.
+    /// Use to initialize weights the first time before `train_step_no_readback`.
     pub fn upload_weights_only(
         &self,
         queue: &wgpu::Queue,

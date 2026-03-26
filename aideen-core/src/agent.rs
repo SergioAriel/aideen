@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-/// Eventos canónicos del agente LOXI.
+/// Canonical LOXI agent events.
 ///
-/// Append-only: los backends los almacenan en orden temporal.
-/// Versión 1: cubre ciclo cognitivo (Tick, Update, Delegation, Discovery)
-/// y configuración del agente (PreferenceSet).
+/// Append-only: backends store them in temporal order.
+/// Version 1: covers cognitive cycle (Tick, Update, Delegation, Discovery)
+/// and agent configuration (PreferenceSet).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum AgentEvent {
-    /// El solver alcanzó un atractor de calidad aceptable.
+    /// The solver reached an attractor of acceptable quality.
     TickAttractor {
         q_total: f32,
         iters: u32,
@@ -15,20 +15,20 @@ pub enum AgentEvent {
         h_star_hash: [u8; 32],
         unix_ts: u64,
     },
-    /// Se aplicó un SignedUpdate firmado por el Critic.
+    /// A SignedUpdate signed by the Critic was applied.
     UpdateApplied {
         version: u64,
         target_id: String,
         update_hash: [u8; 32],
         unix_ts: u64,
     },
-    /// Se instaló una KeyDelegation del coordinador.
+    /// A KeyDelegation from the coordinator was installed.
     DelegationInstalled {
         epoch: u64,
         critic_pk_hash: [u8; 32],
         unix_ts: u64,
     },
-    /// El nodo emitió un Discovery.
+    /// The node emitted a Discovery.
     DiscoveryEmitted {
         q_total: f32,
         iters: u32,
@@ -36,7 +36,7 @@ pub enum AgentEvent {
         bundle_version: u64,
         unix_ts: u64,
     },
-    /// El usuario (o sistema) modificó una preferencia del agente.
+    /// The user (or system) modified an agent preference.
     PreferenceSet {
         key: String,
         value: String,
@@ -44,27 +44,27 @@ pub enum AgentEvent {
     },
 }
 
-/// Contrato mínimo para la memoria del agente.
+/// Minimal contract for the agent store.
 ///
 /// Backends: `OpfsAgentStore` (WASM), `FsAgentStore` (native).
-/// No-op de producción: `NullAgentStore`.
+/// Production no-op: `NullAgentStore`.
 pub trait AgentStore {
-    /// Leer preferencia (KV exacto).
+    /// Read preference (exact KV).
     fn get_pref(&self, key: &str) -> Option<String>;
 
-    /// Escribir preferencia.
+    /// Write preference.
     fn set_pref(&mut self, key: &str, value: String) -> Result<(), String>;
 
-    /// Agregar evento al log (append-only).
+    /// Append event to the log (append-only).
     fn append_event(&mut self, event: AgentEvent) -> Result<(), String>;
 
-    /// Recuperar los últimos `limit` eventos (orden cronológico inverso).
+    /// Retrieve the last `limit` events (reverse chronological order).
     fn recent_events(&self, limit: usize) -> Vec<AgentEvent>;
 }
 
-/// Backend de producción "sin memoria de agente".
-/// Todas las operaciones son no-op. Permite arrancar el nodo sin backend
-/// de agente configurado.
+/// Production backend with no agent memory.
+/// All operations are no-op. Allows starting the node without a configured
+/// agent backend.
 pub struct NullAgentStore;
 
 impl AgentStore for NullAgentStore {
@@ -82,8 +82,8 @@ impl AgentStore for NullAgentStore {
     }
 }
 
-/// Backend en memoria (in-process). Útil para nativo sin persistencia
-/// o como base para implementaciones con flush a disco/OPFS.
+/// In-memory backend (in-process). Useful for native without persistence
+/// or as a base for implementations with disk/OPFS flush.
 pub struct InMemoryAgentStore {
     prefs: std::collections::HashMap<String, String>,
     events: Vec<AgentEvent>,

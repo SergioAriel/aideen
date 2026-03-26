@@ -1,7 +1,7 @@
-//! Benchmark comparativo de entrenamiento CPU vs GPU (M1 Metal) en AIDEEN.
+//! Comparative CPU vs GPU (M1 Metal) training benchmark for AIDEEN.
 //!
-//! Entrena secuencias idénticas para medir el throughput real en (tokens/s)
-//! usando diferenciación implícita completa con Conjugate Gradient.
+//! Trains identical sequences to measure real throughput in (tokens/s)
+//! using full implicit differentiation with Conjugate Gradient.
 //!
 //! Uso:
 //!   cargo run --release --features wgpu -p aideen-training --bin benchmark
@@ -33,25 +33,25 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     let tok = Tokenizer::from_text(PROMPT, config);
     let tokens = tok.encode(PROMPT);
     if tokens.len() < 2 {
-        println!("  Dataset demasiado corto para entrenamiento autoregresivo.");
+        println!("  Dataset too short for autoregressive training.");
         return;
     }
     let mut train_tokens = &tokens[..tokens.len() - 1];
     let mut targets = &tokens[1..];
 
-    // Modo profesional: FULL por defecto.
-    // Quick solo si se pide explícitamente: AIDEEN_BENCH_QUICK=1
+    // Professional mode: FULL by default.
+    // Quick only if explicitly requested: AIDEEN_BENCH_QUICK=1
     let quick_bench = std::env::var("AIDEEN_BENCH_QUICK").ok().as_deref() == Some("1");
     if quick_bench {
         let quick_len = train_tokens.len().min(16);
         train_tokens = &train_tokens[..quick_len];
         targets = &targets[..quick_len];
         println!(
-            "  Modo QUICK (diagnóstico): {} tokens (AIDEEN_BENCH_QUICK=1)",
+            "  QUICK mode (diagnostic): {} tokens (AIDEEN_BENCH_QUICK=1)",
             quick_len
         );
     } else {
-        println!("  Modo FULL (default): dataset completo");
+        println!("  FULL mode (default): complete dataset");
     }
 
     let mut trainer = Trainer::from_tokenizer(tok, 0.05); // LR elevado para overfit rápido
@@ -64,7 +64,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     trainer.config.renorm_every_steps = if quick_bench { 8 } else { 16 };
     trainer.config.ctx_len = if quick_bench { 12 } else { 24 };
 
-    println!("  -- Configuración Utilizada --");
+    println!("  -- Configuration Used --");
     println!("  vocab_size: {}", trainer.config.vocab_size);
     println!("  tokens: {}", train_tokens.len());
     println!("  D_R: {}", trainer.config.d_r);
@@ -74,7 +74,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     println!("  train_deq: {}", trainer.config.train_deq);
     println!("  -----------------------------");
 
-    // Configurando el Backend
+    // Configuring the Backend
     if use_gpu {
         #[cfg(feature = "wgpu")]
         {
@@ -89,7 +89,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
         }
         #[cfg(not(feature = "wgpu"))]
         {
-            println!("  Hardware Backend: Error - wgpu feature desactivada ❌");
+            println!("  Hardware Backend: Error - wgpu feature disabled ❌");
             return;
         }
     } else {
@@ -98,7 +98,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
 
     println!("  Training context: {} tokens", train_tokens.len());
 
-    // Entrenamiento cronometrado
+    // Timed training
     let epochs = trainer.training_config.epochs;
     let tokens_per_epoch = train_tokens.len();
 
@@ -106,20 +106,20 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     let warmup_epochs = if quick_bench { 0 } else { 1 };
     if warmup_epochs > 0 {
         println!(
-            "  [Warmup de {} epoch para asentar shaders...]",
+            "  [Warmup of {} epoch to settle shaders...]",
             warmup_epochs
         );
         for w in 0..warmup_epochs {
             let tw = Instant::now();
             trainer.train_sequence(train_tokens, targets, false, 1e-4);
             println!(
-                "    warmup {} listo en {}ms",
+                "    warmup {} done in {}ms",
                 w + 1,
                 tw.elapsed().as_millis()
             );
         }
     } else {
-        println!("  [Warmup desactivado en modo QUICK]");
+        println!("  [Warmup disabled in QUICK mode]");
     }
 
     let t0 = Instant::now();
@@ -164,16 +164,16 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     let total_tokens_processed = epochs * tokens_per_epoch;
     let avg_tok_s = total_tokens_processed as f64 / total_secs;
 
-    println!("\n  ── 📊 RESULTADOS {} ──", title);
-    println!("  Tiempo total:    {:.2}s", total_secs);
-    println!("  Tokens Totales:  {}", total_tokens_processed);
-    println!("  V. Promedio:     {:.2} tokens/s E2E", avg_tok_s);
-    println!("  Loss final:      {:.4}", final_loss);
+    println!("\n  ── 📊 RESULTS {} ──", title);
+    println!("  Total time:      {:.2}s", total_secs);
+    println!("  Total tokens:    {}", total_tokens_processed);
+    println!("  Avg. speed:      {:.2} tokens/s E2E", avg_tok_s);
+    println!("  Final loss:      {:.4}", final_loss);
 
     #[cfg(feature = "wgpu")]
     trainer.sync_inference_weights();
 
-    println!("\n  ── 🧠 VALIDACIÓN DE APRENDIZAJE ──");
+    println!("\n  ── 🧠 LEARNING VALIDATION ──");
     for prompt in &["el equilibrio.", "la red......", "aideen int"] {
         // Sample with temperature: 0.8, top_p: 0.9, top_k: 40, repetition_penalty: 1.1
         let generated = trainer.generate(prompt, 60, 0.8, 0.9, 40, 1.1);
@@ -185,11 +185,11 @@ fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║      AIDEEN MVP: CPU vs GPU Training Benchmark       ║");
     println!("╚══════════════════════════════════════════════════════╝");
-    println!("Este benchmark entrena secuencias de repetición y evalúa");
-    println!("la velocidad del Implicit Gradient Descent en D_R=512.");
+    println!("This benchmark trains repetition sequences and evaluates");
+    println!("the speed of Implicit Gradient Descent at D_R=512.");
 
-    // run_training_benchmark(false, "Entrenamiento en CPU"); // Deshabilitado, consume >10 mins
+    // run_training_benchmark(false, "CPU Training"); // Disabled, takes >10 mins
 
     #[cfg(feature = "wgpu")]
-    run_training_benchmark(true, "Entrenamiento en Metal GPU");
+    run_training_benchmark(true, "Metal GPU Training");
 }

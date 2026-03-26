@@ -1,6 +1,6 @@
 use nalgebra::DVector;
 
-/// Integrador estable del estado global
+/// Stable integrator for the global state
 pub struct Integrator {
     pub alpha: f32,
     pub epsilon: f32,
@@ -11,8 +11,8 @@ impl Integrator {
         Self { alpha, epsilon }
     }
 
-    /// Aplica S ← S + tanh(α · Δ)
-    /// Retorna true si el cambio fue significativo
+    /// Applies S ← S + tanh(α · Δ)
+    /// Returns true if the change was significant
     pub fn apply(&self, s: &mut DVector<f32>, delta: &DVector<f32>) -> bool {
         let mut norm = 0.0;
 

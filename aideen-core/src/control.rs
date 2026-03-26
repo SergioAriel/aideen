@@ -1,36 +1,36 @@
-/// Modos de control
+/// Control modes
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ControlMode {
-    /// V0: Observar y medir sin intervenir (Modo Transparente)
+    /// V0: Observe and measure without intervening (Transparent Mode)
     Observe,
-    /// V1: Regular, penalizar y estabilizar
+    /// V1: Regulate, penalize, and stabilize
     Regulate,
 }
 
-/// Decisión de control por iteración
+/// Per-iteration control decision
 #[derive(Debug, Clone)]
 pub struct ControlDecision {
-    /// ¿Debe frenarse el bucle DEQ?
+    /// Should the DEQ loop be stopped?
     pub stop: bool,
-    /// Coeficiente de intensidad de integración (Atenuación)
+    /// Integration intensity coefficient (Attenuation)
     pub beta: f32,
-    /// ¿Se autoriza la persistencia en memoria local?
+    /// Is local memory persistence authorized?
     pub write_memory: bool,
-    /// ¿Se autoriza el aprendizaje local (ajuste de pesos)?
+    /// Is local learning (weight adjustment) authorized?
     pub allow_learning: bool,
 }
 
-/// Control de convergencia y parada (El orquestador)
+/// Convergence and stopping control (The orchestrator)
 pub trait Control {
-    /// Límite máximo de iteraciones permitidas
+    /// Maximum allowed iterations limit
     fn max_iters(&self) -> usize;
 
-    /// Modo actual de operación
+    /// Current operating mode
     fn mode(&self) -> ControlMode;
 
-    /// Tomar una decisión basada en la trayectoria y entropía actual
+    /// Make a decision based on the current trajectory and entropy
     fn decide(&self, iter: usize, delta_norm: f32, entropy: f32) -> ControlDecision;
 
-    /// Función opcional para registrar métricas de trayectoria (V0)
+    /// Optional function to record trajectory metrics (V0)
     fn observe(&self, _iter: usize, _delta_norm: f32, _entropy: f32) {}
 }

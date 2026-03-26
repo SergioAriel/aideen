@@ -4,15 +4,15 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 
-/// Contenedor unificado para modelos AIDEEN (.aidn).
-/// Empaqueta la configuración de la arquitectura y los pesos binarios en un solo archivo.
+/// Unified container for AIDEEN models (.aidn).
+/// Packages the architecture configuration and binary weights into a single file.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AidenModel {
-    /// Configuración técnica del modelo.
+    /// Technical configuration of the model.
     pub config: ArchitectureConfig,
-    /// Mapa de pesos binarios (nombre -> vector de floats).
+    /// Binary weights map (name -> vector of floats).
     pub weights: HashMap<String, Vec<f32>>,
-    /// Metadatos adicionales (autor, fecha, versión, etc).
+    /// Additional metadata (author, date, version, etc).
     pub metadata: HashMap<String, String>,
 }
 
@@ -25,7 +25,7 @@ impl AidenModel {
         }
     }
 
-    /// Guarda el modelo en disco usando bincode.
+    /// Saves the model to disk using bincode.
     pub fn save(&self, path: &str) -> Result<(), String> {
         let mut file = File::create(path).map_err(|e| format!("Failed to create file: {}", e))?;
         let encoded: Vec<u8> =
@@ -35,7 +35,7 @@ impl AidenModel {
         Ok(())
     }
 
-    /// Carga el modelo desde disco.
+    /// Loads the model from disk.
     pub fn load(path: &str) -> Result<Self, String> {
         let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mut buffer = Vec::new();
@@ -46,12 +46,12 @@ impl AidenModel {
         Ok(decoded)
     }
 
-    /// Inserta un peso en el mapa.
+    /// Inserts a weight into the map.
     pub fn set_weight(&mut self, name: &str, data: Vec<f32>) {
         self.weights.insert(name.to_string(), data);
     }
 
-    /// Obtiene un peso del mapa.
+    /// Gets a weight from the map.
     pub fn get_weight(&self, name: &str) -> Option<&Vec<f32>> {
         self.weights.get(name)
     }

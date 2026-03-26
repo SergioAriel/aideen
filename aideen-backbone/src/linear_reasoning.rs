@@ -2,10 +2,10 @@ use aideen_core::reasoning::Reasoning;
 use aideen_core::state::{ArchitectureConfig, HSlots};
 use nalgebra::{DMatrix, DVector};
 
-/// Backbone mínimo: razonamiento lineal + tanh
+/// Minimal backbone: linear reasoning + tanh
 pub struct LinearReasoning {
     pub config: ArchitectureConfig,
-    /// Pesos W ∈ R^{D_R × D_R}
+    /// Weights W ∈ R^{D_R × D_R}
     weights: DMatrix<f32>,
 }
 

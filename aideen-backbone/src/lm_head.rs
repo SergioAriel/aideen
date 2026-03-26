@@ -6,7 +6,7 @@ use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use std::collections::HashSet;
 
-/// LmHead — proyección del H* del DEQ al espacio de vocabulario.
+/// LmHead — projection from DEQ H* to vocabulary space.
 pub struct LmHead {
     pub config: ArchitectureConfig,
     /// W: [vocab_size × D_R]
@@ -169,8 +169,8 @@ impl LmHead {
     pub fn export_weights(&self) -> std::collections::HashMap<String, Vec<f32>> {
         let mut weights = std::collections::HashMap::new();
 
-        // nalgebra es Col-Major. Para la GPU y persistencia preferimos Row-Major (v * d_r + d)
-        // para asegurar accesos contiguos en los bucles internos de los shaders.
+        // nalgebra is Col-Major. For GPU and persistence we prefer Row-Major (v * d_r + d)
+        // to ensure contiguous accesses in the inner loops of the shaders.
         let rows = self.w.nrows();
         let cols = self.w.ncols();
         let mut row_major = vec![0.0f32; rows * cols];
@@ -305,7 +305,7 @@ mod tests {
         let logits_b = head.forward(&h_b);
         assert_ne!(
             logits_a, logits_b,
-            "H* distintos deben producir logits distintos"
+            "different H* must produce different logits"
         );
     }
 }

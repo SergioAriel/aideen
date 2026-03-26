@@ -1,27 +1,27 @@
-//! Binary de entrenamiento de AIDEEN.
+//! AIDEEN training binary.
 //!
-//! # Notas de arquitectura para futuros LLMs que lean esto
+//! # Architecture notes for future LLMs reading this
 //!
-//! ## Cuantización (1.58b / BitNet)
-//! FASE 1: Entrenar en float32. FASE 2: reentrenar desde cero con `ternary = true` (QAT/STE).
-//! NO hacer post-training quantization — a 1.58b destruye la calidad. El STE ya está
-//! implementado en los shaders GPU (embedding_train.wgsl, lm_train.wgsl, fused_deq_update.wgsl).
+//! ## Quantization (1.58b / BitNet)
+//! PHASE 1: Train in float32. PHASE 2: retrain from scratch with `ternary = true` (QAT/STE).
+//! Do NOT use post-training quantization — at 1.58b it destroys quality. The STE is already
+//! implemented in the GPU shaders (embedding_train.wgsl, lm_train.wgsl, fused_deq_update.wgsl).
 //!
-//! ## Atención uniforme — riesgo crítico a monitorear
-//! En pesos random, `attn_ent = log(8) = 2.079` siempre (entropía máxima, slots idénticos).
-//! Para que el DEQ sea poderoso, los slots DEBEN especializarse durante el entrenamiento
-//! (attn_ent debe bajar de 2.079). Si no ocurre, los 8 slots colapsan a lo mismo y la
-//! capacidad de razonamiento paralelo se desperdicia completamente.
-//! Monitorear `attn_ent` en GPU-DEBUG. Si no baja después de ~1000 pasos reales, investigar.
+//! ## Uniform attention — critical risk to monitor
+//! With random weights, `attn_ent = log(8) = 2.079` always (maximum entropy, identical slots).
+//! For the DEQ to be powerful, the slots MUST specialize during training
+//! (attn_ent must drop below 2.079). If this doesn't happen, all 8 slots collapse to the same
+//! and parallel reasoning capacity is completely wasted.
+//! Monitor `attn_ent` in GPU-DEBUG. If it doesn't drop after ~1000 real steps, investigate.
 //!
-//! ## Modos de uso:
-//!   # Modo rápido — dataset.txt existente (pequeño, para tests)
+//! ## Usage modes:
+//!   # Fast mode — existing dataset.txt (small, for tests)
 //!   cargo run --release --features wgpu -p aideen-training --bin train
 //!
-//!   # Modo archivo grande — cualquier .txt (streaming, sin límite de RAM)
+//!   # Large file mode — any .txt (streaming, no RAM limit)
 //!   cargo run --release --features wgpu -p aideen-training --bin train -- --file path/to/corpus.txt
 //!
-//!   # Modo checkpoint — continuar desde un checkpoint previo
+//!   # Checkpoint mode — resume from a previous checkpoint
 //!   cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --resume model
 
 use aideen_backbone::tokenizer::Tokenizer;
@@ -173,8 +173,8 @@ fn run_small_dataset(
     let lr = 0.0001;
 
     let mut trainer = if let Some(ref base) = resume_path {
-        println!("  Resumiendo desde checkpoint: {base}");
-        Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
+        println!("  Resuming from checkpoint: {base}");
+        Trainer::load_checkpoint(base).expect("Error loading checkpoint")
     } else {
         let mut t = Trainer::from_tokenizer(tok, lr);
         t.training_config.lr_min = 0.0001;
@@ -200,19 +200,19 @@ fn run_small_dataset(
 
     setup_gpu(&mut trainer);
     if trainer.training_config.ternary {
-        println!("  Bit-Dieta (Ternary 1.58-bit) activo 🔥  [STE durante training]");
+        println!("  Bit-Diet (Ternary 1.58-bit) active 🔥  [STE during training]");
     }
 
     let t0 = std::time::Instant::now();
     trainer.train_on_tokens(&tokens, epochs, log_every);
-    println!("\n  Tiempo total: {:.1}s", t0.elapsed().as_secs_f32());
+    println!("\n  Total time: {:.1}s", t0.elapsed().as_secs_f32());
     println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
 
     save_and_generate(&mut trainer, "model");
 }
 
-/// Entrena sobre un .txt grande usando streaming (sin límite de RAM).
-/// Tokeniza el texto, lo escribe a un .bin temporal y llama train_on_file.
+/// Trains on a large .txt file using streaming (no RAM limit).
+/// Tokenizes the text, writes it to a temporary .bin and calls train_on_file.
 fn run_large_file(
     txt_path: &str,
     resume_path: Option<String>,
@@ -224,9 +224,9 @@ fn run_large_file(
     freeze_lm: bool,
     skip_chunks: usize,
 ) {
-    println!("  Modo: archivo grande → {txt_path}");
+    println!("  Mode: large file → {txt_path}");
     if skip_chunks > 0 {
-        println!("  Saltando primeros {skip_chunks} chunks (--skip-chunks)");
+        println!("  Skipping first {skip_chunks} chunks (--skip-chunks)");
     }
 
     // ── Resolver ruta real del dataset ─────────────────────────────────────
@@ -249,7 +249,7 @@ fn run_large_file(
                     break;
                 }
             }
-            found.expect("No se puede encontrar el dataset en ninguna ruta conocida.")
+            found.expect("Cannot find the dataset in any known path.")
         }
     };
     let txt_path = resolved_path;
@@ -262,7 +262,7 @@ fn run_large_file(
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
     } else {
-        println!("  Tokenizer: Char-level — escaneando vocab...");
+        println!("  Tokenizer: Char-level — scanning vocab...");
         Tokenizer::from_text(&corpus, config_default.clone())
     };
 
@@ -277,7 +277,7 @@ fn run_large_file(
 
     // ── Tokenizar y escribir .bin ──────────────────────────────────────────
     let bin_path = format!("{txt_path}.tokens.bin");
-    println!("  Tokenizando {txt_path} → {bin_path} ...");
+    println!("  Tokenizing {txt_path} → {bin_path} ...");
     {
         use std::io::Write;
         let tokens = tok.encode(&corpus);
@@ -290,8 +290,8 @@ fn run_large_file(
             }
         }
 
-        let mut f = fs::File::create(&bin_path).expect("No se puede crear .bin");
-        f.write_all(byte_data).expect("Error escribiendo .bin");
+        let mut f = fs::File::create(&bin_path).expect("Cannot create .bin");
+        f.write_all(byte_data).expect("Error writing .bin");
         println!(
             "  {} chars → {} tokens, vocab={} → {:.2} MB",
             corpus.len(),
@@ -305,8 +305,8 @@ fn run_large_file(
     let checkpoint_base = "model_large";
 
     let mut trainer = if let Some(ref base) = resume_path {
-        println!("  Resumiendo desde checkpoint: {base}");
-        Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
+        println!("  Resuming from checkpoint: {base}");
+        Trainer::load_checkpoint(base).expect("Error loading checkpoint")
     } else {
         let mut t = Trainer::from_tokenizer(tok, lr);
         t.training_config.lr_min = 0.00001;
@@ -328,7 +328,7 @@ fn run_large_file(
 
     setup_gpu(&mut trainer);
     if trainer.training_config.ternary {
-        println!("  Bit-Dieta (Ternary 1.58-bit) activo 🔥  [STE durante training]");
+        println!("  Bit-Diet (Ternary 1.58-bit) active 🔥  [STE during training]");
     }
     println!();
 
@@ -349,9 +349,9 @@ fn run_large_file(
             checkpoint_base,
             skip_chunks,
         )
-        .expect("Error durante train_on_file");
+        .expect("Error during train_on_file");
 
-    println!("\n  Tiempo total: {:.1}s", t0.elapsed().as_secs_f32());
+    println!("\n  Total time: {:.1}s", t0.elapsed().as_secs_f32());
     println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
 
     save_and_generate(&mut trainer, checkpoint_base);
@@ -384,17 +384,17 @@ fn save_and_generate(trainer: &mut Trainer, base: &str) {
                 aidn_size as f64 / 1_048_576.0
             );
         }
-        Err(e) => println!("  Error guardando checkpoint: {e}"),
+        Err(e) => println!("  Error saving checkpoint: {e}"),
     }
 
     println!();
-    println!("── Generación ──────────────────────────────────");
+    println!("── Generation ──────────────────────────────────");
     let prompts = [
-        "la inteligencia artificial",
-        "cada neurona",
-        "aideen es una red",
-        "el equilibrio profundo",
-        "la red neuronal distribuida",
+        "artificial intelligence",
+        "each neuron",
+        "aideen is a network",
+        "deep equilibrium",
+        "the distributed neural network",
     ];
     for prompt in &prompts {
         let generated = trainer.generate(prompt, 40, 0.8, 0.9, 40, 1.1);
@@ -403,5 +403,5 @@ fn save_and_generate(trainer: &mut Trainer, base: &str) {
     }
 
     println!();
-    println!("✅ AIDEEN training completo.");
+    println!("✅ AIDEEN training complete.");
 }

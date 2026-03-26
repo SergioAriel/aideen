@@ -1,10 +1,10 @@
 //! aideen-core
 //! ─────────────────────────────────────────────
-//! Contratos matemáticos y tipos base (MRCE + S).
-//! Este crate NO ejecuta lógica.
-//! Este crate NO entrena.
+//! Mathematical contracts and base types (MRCE + S).
+//! This crate does NOT execute logic.
+//! This crate does NOT train.
 //!
-//! Es auditable, estable y geométricamente sellado.
+//! It is auditable, stable, and geometrically sealed.
 
 pub mod agent;
 pub mod artifacts;

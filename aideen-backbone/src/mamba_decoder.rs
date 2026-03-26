@@ -4,10 +4,10 @@ use aideen_core::{
 };
 use nalgebra::{DMatrix, DVector};
 
-/// MambaDecoder — decodificador autoregresivo ligero condicionado por H*.
+/// MambaDecoder — lightweight autoregressive decoder conditioned on H*.
 pub struct MambaDecoder {
     pub config: ArchitectureConfig,
-    /// d_model del decoder (puede ser distinto de config.d_r del DEQ)
+    /// d_model of the decoder (may differ from config.d_r of the DEQ)
     pub d_model: usize,
     pub n_layers: usize,
     pub embedding: DMatrix<f32>,
@@ -21,7 +21,7 @@ pub struct MambaDecoder {
 }
 
 impl MambaDecoder {
-    /// Construye un decoder con pesos random pequeños.
+    /// Builds a decoder with small random weights.
     pub fn new(n_layers: usize, config: ArchitectureConfig) -> Self {
         let d_model = config.d_r;
         let vocab_size = config.vocab_size;
@@ -73,7 +73,7 @@ impl MambaDecoder {
         }
     }
 
-    // ── Pooling de H* ─────────────────────────────────────────────────────────
+    // ── H* Pooling ─────────────────────────────────────────────────────────
 
     fn pool_h_star(&self, h_star: &HSlots) -> DVector<f32> {
         let slots = h_star.slots;
@@ -84,11 +84,11 @@ impl MambaDecoder {
             / slots as f32
     }
 
-    // ── FiLM conditioning para una capa ──────────────────────────────────────
+    // ── FiLM conditioning for a single layer ──────────────────────────────────────
 
     fn film_params(&self, layer: usize, h_pooled: &DVector<f32>) -> (DVector<f32>, DVector<f32>) {
         let film = &self.film_projs[layer] * h_pooled;
-        let scale = film.rows(0, self.d_model).into_owned().map(|x| 1.0 + x); // centrado en 1
+        let scale = film.rows(0, self.d_model).into_owned().map(|x| 1.0 + x); // centered at 1
         let bias = film.rows(self.d_model, self.d_model).into_owned();
         (scale, bias)
     }
@@ -112,7 +112,7 @@ impl MambaDecoder {
         out.zip_map(scale, |o, s| o * s) + bias
     }
 
-    /// Genera secuencias autoregresivas.
+    /// Generates autoregressive sequences.
     pub fn generate(&self, h_star: &HSlots, prompt_tokens: &[u32], max_tokens: usize) -> Vec<u32> {
         let h_pooled = self.pool_h_star(h_star);
 

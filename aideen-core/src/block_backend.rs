@@ -1,24 +1,24 @@
-/// `BlockBackend` — contrato para un backend de cómputo capaz de ejecutar
-/// un paso completo del SSM de Mamba sobre slices de f32.
+/// `BlockBackend` — contract for a compute backend capable of executing
+/// a complete Mamba SSM step on f32 slices.
 ///
-/// Separado de `ComputeBackend` para no contaminar el contrato genérico
-/// con tipos específicos de Mamba. Implementado por:
-///   - `CpuBlockBackend`   (nalgebra, siempre disponible, fallback)
-///   - `WgpuBlockBackend` (wgpu + WGSL shaders de aideen-block, feature "wgpu")
+/// Separated from `ComputeBackend` to avoid contaminating the generic contract
+/// with Mamba-specific types. Implemented by:
+///   - `CpuBlockBackend`   (nalgebra, always available, fallback)
+///   - `WgpuBlockBackend` (wgpu + WGSL shaders from aideen-block, feature "wgpu")
 ///
-/// ## Convención de buffers para `mamba_batch_step`
+/// ## Buffer conventions for `mamba_batch_step`
 /// ```text
-/// Input :  x   [d_model]          — estado/activación de entrada
-///          dt  [d_model]          — timescale por canal (delta)
-///          a   [d_model]          — decay log-domain por canal
-///          b   [d_model]          — input gate por canal
-///          c   [d_model]          — output gate por canal
-/// Output:  y   [d_model]          — salida del SSM
+/// Input :  x   [d_model]          — input state/activation
+///          dt  [d_model]          — per-channel timescale (delta)
+///          a   [d_model]          — per-channel decay (log-domain)
+///          b   [d_model]          — per-channel input gate
+///          c   [d_model]          — per-channel output gate
+/// Output:  y   [d_model]          — SSM output
 /// ```
-/// El backend es responsable de:
-///   1. Subir los buffers a GPU (o mantenerlos en CPU)
-///   2. Ejecutar el kernel (único paso de secuencia, seq_len=1)
-///   3. Retornar y como Vec<f32>
+/// The backend is responsible for:
+///   1. Uploading buffers to GPU (or keeping them on CPU)
+///   2. Executing the kernel (single sequence step, seq_len=1)
+///   3. Returning y as Vec<f32>
 pub trait BlockBackend: Send {
     fn mamba_batch_step(
         &mut self,

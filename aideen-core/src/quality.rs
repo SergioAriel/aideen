@@ -5,23 +5,23 @@ use crate::state::HSlots;
 pub const Q_MIN_LEARN: f32 = 0.6;
 pub const Q_MIN_WRITE: f32 = 0.5;
 
-/// Umbral por debajo del cual se decide consultar a un experto en vivo (1 hop).
-/// Si Q_semantic < Q_EXPERT_HOP, el sistema declara "necesito ayuda".
+/// Threshold below which the system decides to consult a live expert (1 hop).
+/// If Q_semantic < Q_EXPERT_HOP, the system declares "I need help".
 pub const Q_EXPERT_HOP: f32 = 0.45;
 
-/// Métricas físicas que determinan la calidad de un atractor.
+/// Physical metrics that determine attractor quality.
 /// Q(h*) = 0.4*Stability + 0.3*Energy + 0.2*Oscillation + 0.1*Coherence
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QualityMetrics {
-    /// Estabilidad residual: S = exp(-||h_{t+1} - h_t||)
+    /// Residual stability: S = exp(-||h_{t+1} - h_t||)
     pub stability: f32,
-    /// Energía integrada: E = exp(-||delta_s_r||)
+    /// Integrated energy: E = exp(-||delta_s_r||)
     pub energy: f32,
-    /// Oscilación: O = exp(-Var(||h_t - h_{t-1}||))
+    /// Oscillation: O = exp(-Var(||h_t - h_{t-1}||))
     pub oscillation: f32,
-    /// Coherencia interna: C = cos(delta_h, h*)
+    /// Internal coherence: C = cos(delta_h, h*)
     pub coherence: f32,
-    /// Calidad total Q(h*) en el dominio (0, 1]
+    /// Total quality Q(h*) in the domain (0, 1]
     pub q_total: f32,
 }
 
@@ -37,31 +37,31 @@ impl Default for QualityMetrics {
     }
 }
 
-/// Calcula la calidad física de un atractor h*.
-/// Se evalúa solo cuando el sistema ha alcanzado el equilibrio (o Control ha detenido el loop).
+/// Computes the physical quality of an attractor h*.
+/// Evaluated only when the system has reached equilibrium (or Control has stopped the loop).
 pub fn compute_q(
     h_star: &DVector<f32>,
-    h_prev: &DVector<f32>,    // h en t-1 para estabilidad final
+    h_prev: &DVector<f32>,    // h at t-1 for final stability
     delta_s_r: &DVector<f32>, // h* - s0
-    oscillation_var: f32,     // Varianza de las normas de delta_h durante el loop
+    oscillation_var: f32,     // Variance of delta_h norms during the loop
 ) -> QualityMetrics {
-    // 1. Estabilidad residual (Máximo si dejó de moverse)
+    // 1. Residual stability (Maximum if it stopped moving)
     let stability = (-(h_star - h_prev).norm()).exp();
 
-    // 2. Energía integrada (Favorece convergencia suave)
+    // 2. Integrated energy (Favors smooth convergence)
     let energy = (-delta_s_r.norm()).exp();
 
-    // 3. Oscilación (Favorece caída directa sin vibración)
+    // 3. Oscillation (Favors direct descent without vibration)
     let oscillation = (-oscillation_var).exp();
 
-    // 4. Coherencia interna (Alineación entre cambio y estado final)
+    // 4. Internal coherence (Alignment between change and final state)
     let coherence = {
         let dot = h_star.dot(delta_s_r);
         let norm = h_star.norm() * delta_s_r.norm() + 1e-8;
         (dot / norm).clamp(-1.0, 1.0)
     };
 
-    // Fórmula Final: Dominio (0, 1]
+    // Final Formula: Domain (0, 1]
     let q_total = 0.4 * stability + 0.3 * energy + 0.2 * oscillation + 0.1 * coherence;
 
     QualityMetrics {
@@ -73,33 +73,33 @@ pub fn compute_q(
     }
 }
 
-// ── Q Semántico ──────────────────────────────────────────────────────────────
+// ── Semantic Q ──────────────────────────────────────────────────────────────
 
-/// Señal semántica de calidad: mide si el sistema necesita consultar la red.
+/// Semantic quality signal: measures whether the system needs to consult the network.
 ///
-/// Diferencia clave con `QualityMetrics`:
-/// - `QualityMetrics` mide si el DEQ convergió matemáticamente.
-/// - `SemanticSignal` mide si el resultado va a ser útil para el usuario.
+/// Key difference from `QualityMetrics`:
+/// - `QualityMetrics` measures whether the DEQ converged mathematically.
+/// - `SemanticSignal` measures whether the result will be useful to the user.
 ///
 /// Q_semantic = 0.5 * q_convergence
-///            + 0.3 * slot_diversity   (slots distintos = más riqueza en H*)
-///            + 0.2 * feedback_score   (señal de feedback real, bootstrapped a 0.5)
+///            + 0.3 * slot_diversity   (distinct slots = richer H*)
+///            + 0.2 * feedback_score   (real feedback signal, bootstrapped to 0.5)
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticSignal {
-    /// Q del atractor (viene de QualityMetrics.q_total)
+    /// Attractor Q (from QualityMetrics.q_total)
     pub q_convergence: f32,
-    /// Qué tan distintos son los K slots entre sí.
-    /// Alto = diversidad = H* es rico. Bajo = todos convergieron a lo mismo = H* aplastado.
+    /// How different the K slots are from each other.
+    /// High = diversity = H* is rich. Low = all converged to the same = H* collapsed.
     pub slot_diversity: f32,
-    /// Señal de feedback del usuario: 1.0 = aceptó / usó, 0.0 = rechazó / corrigió.
-    /// Bootstrapped a 0.5 hasta tener señal real.
+    /// User feedback signal: 1.0 = accepted / used, 0.0 = rejected / corrected.
+    /// Bootstrapped to 0.5 until real signal is available.
     pub feedback_score: f32,
-    /// Score combinado final. Si < Q_EXPERT_HOP → consultar experto en vivo.
+    /// Final combined score. If < Q_EXPERT_HOP → consult a live expert.
     pub q_semantic: f32,
 }
 
 impl SemanticSignal {
-    /// Crea una señal con feedback neutro (sin datos de usuario aún).
+    /// Creates a signal with neutral feedback (no user data yet).
     pub fn bootstrapped(q_convergence: f32, slot_diversity: f32) -> Self {
         Self::new(q_convergence, slot_diversity, 0.5)
     }
@@ -114,23 +114,23 @@ impl SemanticSignal {
         }
     }
 
-    /// ¿Debe consultarse a un experto en vivo?
+    /// Should a live expert be consulted?
     pub fn needs_expert(&self) -> bool {
         self.q_semantic < Q_EXPERT_HOP
     }
 
-    /// ¿Es suficientemente bueno para disparar Discovery al Critic?
+    /// Is it good enough to trigger Discovery to the Critic?
     pub fn qualifies_for_learning(&self) -> bool {
         self.q_semantic >= Q_MIN_LEARN
     }
 }
 
-/// Calcula la diversidad entre los K slots de H*.
+/// Computes the diversity among the K slots of H*.
 ///
-/// Idea: si todos los slots son iguales, la diversidad es 0 (H* aplastado).
-/// Si los slots son muy distintos entre sí, la diversidad es alta (H* rico).
+/// Idea: if all slots are equal, diversity is 0 (H* collapsed).
+/// If slots are very different from each other, diversity is high (H* rich).
 ///
-/// Implementación: promedio de las distancias entre pares de slots, normalizado.
+/// Implementation: average of pairwise slot distances, normalized.
 pub fn compute_slot_diversity(h: &HSlots) -> f32 {
     let slots = h.slots;
     if slots < 2 {
@@ -153,12 +153,12 @@ pub fn compute_slot_diversity(h: &HSlots) -> f32 {
     1.0 / (1.0 + (-mean_dist).exp())
 }
 
-/// Calcula la energía media de los K slots (norma L2 promedio).
+/// Computes the mean energy of the K slots (average L2 norm).
 ///
-/// Un slot con energía cercana a 0 es un "slot muerto" que no se diferenció
-/// del estado de broadcast inicial. Útil para detectar colapso de la representación.
+/// A slot with energy close to 0 is a "dead slot" that did not differentiate
+/// from the initial broadcast state. Useful for detecting representation collapse.
 ///
-/// Rango de salida: [0, ∞) — no acotado, la magnitud depende de los pesos del DEQ.
+/// Output range: [0, ∞) — unbounded, the magnitude depends on the DEQ weights.
 pub fn compute_slot_energy(h: &HSlots) -> f32 {
     let slots = h.slots;
     if slots == 0 {
@@ -167,18 +167,18 @@ pub fn compute_slot_energy(h: &HSlots) -> f32 {
     (0..slots).map(|k| h.slot(k).norm()).sum::<f32>() / slots as f32
 }
 
-/// Decisión de routing: qué camino tomar dado el estado semántico.
+/// Routing decision: which path to take given the semantic state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingDecision {
-    /// H* local es suficientemente bueno. Ir directo al decoder.
+    /// Local H* is good enough. Go directly to the decoder.
     LocalOnly,
-    /// H* es incierto. Pedir contribución a un experto en vivo (1 hop).
+    /// H* is uncertain. Request contribution from a live expert (1 hop).
     ExpertHop,
-    /// H* es excelente. Enviar Discovery al Coordinator para que el Critic aprenda.
+    /// H* is excellent. Send Discovery to the Coordinator so the Critic can learn.
     Discovery,
 }
 
-/// Toma la decisión de routing basada en Q_semantic.
+/// Makes the routing decision based on Q_semantic.
 pub fn decide_routing(signal: &SemanticSignal) -> RoutingDecision {
     if signal.needs_expert() {
         RoutingDecision::ExpertHop

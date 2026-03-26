@@ -6,13 +6,13 @@ use zstd::stream::{decode_all, encode_all};
 
 use crate::artifacts::ArtifactMeta;
 
-/// Hash de modelo base (para asegurar que el delta aplica sobre el mismo snapshot global).
+/// Base model hash (to ensure the delta applies to the same global snapshot).
 pub type ModelHash = [u8; 32];
 
-/// Identifica qué parte del modelo se actualiza (ej: un expert específico).
+/// Identifies which part of the model is updated (e.g., a specific expert).
 pub type TargetId = String;
 
-/// Qué parámetro se toca dentro del expert.
+/// Which parameter is touched within the expert.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamId {
     W1,
@@ -25,15 +25,15 @@ pub enum ParamId {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct QuantizedDelta {
     pub param: ParamId,
-    pub scale: f32,    // des-quantización
-    pub idx: Vec<u32>, // indices absolutos, ordenados
-    pub q: Vec<i16>,   // mismos len que idx
+    pub scale: f32,    // de-quantization
+    pub idx: Vec<u32>, // absolute indices, sorted
+    pub q: Vec<i16>,   // same len as idx
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModelBundleManifest {
     pub bundle_version: u64,
-    pub experts: Vec<ExpertEntry>, // ordenado por target_id
+    pub experts: Vec<ExpertEntry>, // sorted by target_id
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -42,37 +42,37 @@ pub struct ExpertEntry {
     pub expert_hash: [u8; 32],
 }
 
-/// Update firmado por el Critic.
-/// IMPORTANTE: el cliente verifica firma + model_hash + anti-replay.
+/// Update signed by the Critic.
+/// IMPORTANT: the client verifies signature + model_hash + anti-replay.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SignedUpdate {
-    /// Versión monotónica por (target_id). Previene replay simple.
+    /// Monotonic version per (target_id). Prevents simple replay.
     pub version: u64,
 
-    /// Identifica el expert / módulo afectado.
+    /// Identifies the affected expert / module.
     pub target_id: TargetId,
 
-    /// Versión del bundle global actual
+    /// Current global bundle version
     pub bundle_version: u64,
 
-    /// Hash del bundle global para alineación de red
+    /// Global bundle hash for network alignment
     pub bundle_hash: [u8; 32],
 
-    /// Hash del modelo base sobre el cual se calculó el delta.
+    /// Hash of the base model on which the delta was computed.
     pub base_model_hash: ModelHash,
 
-    /// Hash del update anterior (cadena). Previene rollbacks/forks.
+    /// Hash of the previous update (chain). Prevents rollbacks/forks.
     pub prev_update_hash: [u8; 32],
 
-    /// Payload binario comprimido con ZSTD conteniendo Vec<QuantizedDelta>.
+    /// Binary payload compressed with ZSTD containing Vec<QuantizedDelta>.
     pub payload: Vec<u8>,
 
-    /// Firma ed25519 de `signing_bytes()`.
+    /// ed25519 signature of `signing_bytes()`.
     pub signature: Vec<u8>,
 }
 
 impl SignedUpdate {
-    /// Bytes canónicos que se firman/verifican.
+    /// Canonical bytes that are signed/verified.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(256 + self.target_id.len() + self.payload.len());
 
@@ -89,7 +89,7 @@ impl SignedUpdate {
         out
     }
 
-    /// Hash del update (para encadenado secuencial criptográfico).
+    /// Hash of the update (for cryptographic sequential chaining).
     pub fn update_hash(&self) -> [u8; 32] {
         let h = Sha256::digest(self.signing_bytes());
         let mut out = [0u8; 32];
@@ -97,7 +97,7 @@ impl SignedUpdate {
         out
     }
 
-    /// Verifica firma ed25519 con la llave pública del Laboratorio.
+    /// Verifies ed25519 signature with the Laboratory's public key.
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<(), String> {
         let vk = VerifyingKey::from_bytes(public_key).map_err(|e| e.to_string())?;
         let sig = Signature::from_slice(&self.signature).map_err(|e| e.to_string())?;
@@ -106,20 +106,20 @@ impl SignedUpdate {
     }
 }
 
-/// Helper: serializar un Vec<QuantizedDelta> a payload bytes comprimido con zstd.
+/// Helper: serialize a Vec<QuantizedDelta> to zstd-compressed payload bytes.
 pub fn encode_payload_zstd<T: serde::Serialize>(obj: &T) -> Result<Vec<u8>, String> {
     let raw = bincode::serialize(obj).map_err(|e| e.to_string())?;
     encode_all(Cursor::new(raw), 3).map_err(|e| e.to_string())
 }
 
-/// Helper: deserializar payload bytes comprimido a Vec<QuantizedDelta>.
+/// Helper: deserialize compressed payload bytes to Vec<QuantizedDelta>.
 pub fn decode_payload_zstd<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let raw = decode_all(Cursor::new(bytes)).map_err(|e| e.to_string())?;
     bincode::deserialize(&raw).map_err(|e| e.to_string())
 }
 
-/// Delegación de llaves para rotación.
-/// El nodo validará esto usando su llave raíz (ROOT_PK) embebida o inyectada al inicio.
+/// Key delegation for rotation.
+/// The node will validate this using its root key (ROOT_PK) embedded or injected at startup.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct KeyDelegation {
     pub epoch: u64,
@@ -148,7 +148,7 @@ impl KeyDelegation {
     }
 }
 
-/// Discriminante de Ack: indica qué mensaje se está confirmando.
+/// Ack discriminant: indicates which message is being acknowledged.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckKind {
     Delegation,
@@ -156,59 +156,59 @@ pub enum AckKind {
     Discovery,
 }
 
-/// Mensajes canónicos de la red de intercambio de LOXI.
+/// Canonical messages of the LOXI exchange network.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetMsg {
-    /// Saludo inicial del cliente identificando su protocolo y estado topológico.
+    /// Initial client greeting identifying its protocol and topological state.
     Hello {
         node_id: [u8; 32],
-        /// Versión del protocolo wire (incrementar en breaking changes).
+        /// Wire protocol version (increment on breaking changes).
         protocol: u32,
-        /// Versión del bundle de modelos instalado en el nodo.
+        /// Version of the model bundle installed on the node.
         bundle_version: u64,
-        /// Hash SHA-256 del bundle (alineación de topología).
+        /// SHA-256 hash of the bundle (topology alignment).
         bundle_hash: [u8; 32],
     },
-    /// Delegación de llave operativa del coordinador
+    /// Operational key delegation from the coordinator
     Delegation(KeyDelegation),
-    /// Envío de actualización de topología
+    /// Topology update delivery
     Update(SignedUpdate),
-    /// Confirmación tipificada de recepción.
+    /// Typed receipt acknowledgement.
     Ack {
         kind: AckKind,
         version: u64,
         ok: bool,
     },
-    /// Tarea de inferencia enviada por el nodo origen a un nodo experto.
-    /// El experto recibe H* (aplanado como s_r), ejecuta su DEQ, y devuelve ExpertResult.
+    /// Inference task sent by the origin node to an expert node.
+    /// The expert receives H* (flattened as s_r), runs its DEQ, and returns ExpertResult.
     ExpertTask {
-        /// Identificador de la tarea (correlaciona Request ↔ Response)
+        /// Task identifier (correlates Request ↔ Response)
         task_id: [u8; 16],
-        /// Expert que debe procesarlo
+        /// Expert that must process it
         target_id: TargetId,
-        /// H* aplanado (K×D_R floats en LE) — el punto de partida para el refinement
+        /// H* flattened (K×D_R floats in LE) — the starting point for refinement
         s_r: Vec<f32>,
         bundle_version: u64,
-        /// Número de ronda: 0=H_rough, 1=refine, 2=verify.
-        /// Permite que el expert calibre su respuesta según el avance del pipeline.
+        /// Round number: 0=H_rough, 1=refine, 2=verify.
+        /// Allows the expert to calibrate its response based on pipeline progress.
         round: u8,
-        /// Máximo tiempo en ms que el expert puede usar para responder.
+        /// Maximum time in ms the expert can use to respond.
         time_budget_ms: u32,
     },
-    /// Resultado del nodo experto: Δ y métricas de calidad.
+    /// Expert node result: Δ and quality metrics.
     ExpertResult {
         task_id: [u8; 16],
         target_id: TargetId,
-        /// Delta Δ = h_next - h, serializado como floats LE (~8KB)
+        /// Delta Δ = h_next - h, serialized as LE floats (~8KB)
         delta: Vec<f32>,
         q_total: f32,
         iters: u32,
         stop: u8,
     },
-    /// Señal de discovery al AiArchitect/Critic cuando Q >= Q_MIN_LEARN.
+    /// Discovery signal to the AiArchitect/Critic when Q >= Q_MIN_LEARN.
     ///
-    /// No contiene h* completo — solo hashes para correlación y anti-spam.
-    /// El Architect decide si pide más info o dispara el Critic.
+    /// Does not contain the full h* — only hashes for correlation and anti-spam.
+    /// The Architect decides whether to request more info or trigger the Critic.
     Discovery {
         node_id: [u8; 32],
         target_id: TargetId,
@@ -216,14 +216,14 @@ pub enum NetMsg {
         iters: u32,
         /// 0 = Q_MIN_WRITE gate, 1 = Epsilon gate (ver StopReason)
         stop: u8,
-        /// SHA-256 de h* serializado en LE bytes (correlación y dedup)
+        /// SHA-256 of h* serialized in LE bytes (correlation and dedup)
         h_star_hash: [u8; 32],
-        /// SHA-256 del s_context serializado (para reproducibilidad en Critic)
+        /// SHA-256 of serialized s_context (for reproducibility in Critic)
         context_hash: [u8; 32],
         bundle_version: u64,
     },
-    /// Métricas ligeras de estabilidad (telemetría, no discovery).
-    /// Para señales de discovery usar NetMsg::Discovery.
+    /// Lightweight stability metrics (telemetry, not discovery).
+    /// For discovery signals use NetMsg::Discovery.
     Metrics {
         q_total: f32,
         iters: u32,
@@ -231,12 +231,12 @@ pub enum NetMsg {
     },
     Ping,
     Pong,
-    /// Error de protocolo (ej: mensaje recibido fuera de secuencia).
+    /// Protocol error (e.g., message received out of sequence).
     Error {
         code: u32,
         msg: String,
     },
-    /// Solicitud de reproducibilidad: el Coordinator pide al nodo re-ejecutar un sample.
+    /// Reproducibility request: the Coordinator asks the node to re-execute a sample.
     ReplayRequest {
         sample_id: u64,
         context_hash: [u8; 32],
@@ -244,15 +244,15 @@ pub enum NetMsg {
         seed: u64,
         iters: u32,
     },
-    /// Respuesta del nodo tras re-ejecutar el sample solicitado.
+    /// Node response after re-executing the requested sample.
     ReplayResponse {
         sample_id: u64,
         reproduced: bool,
         q_recomputed: f32,
         trace_digest: [u8; 32],
     },
-    /// Telemetría de routing emitida por NodeRunner cada N ticks.
-    /// Vec<(target_id, hit_count)> ordenado por target_id — determinista.
+    /// Routing telemetry emitted by NodeRunner every N ticks.
+    /// Vec<(target_id, hit_count)> sorted by target_id — deterministic.
     RouterStats {
         node_id: [u8; 32],
         window_ticks: u32,
@@ -268,13 +268,13 @@ pub enum NetMsg {
         drops_count: u32,
         beta_mean: f32,
     },
-    /// Nodo pide al Coordinator qué artefactos le corresponden.
-    /// caps_encoded: NodeCapabilities serializado con bincode (decodificar en el receptor).
+    /// Node asks the Coordinator which artifacts it should have.
+    /// caps_encoded: NodeCapabilities serialized with bincode (decode at the receiver).
     GetArtifactManifest {
         node_id: [u8; 32],
         caps_encoded: Vec<u8>,
     },
-    /// Coordinator responde con la lista de artefactos disponibles para este nodo.
+    /// Coordinator responds with the list of available artifacts for this node.
     ArtifactManifest {
         artifacts: Vec<ArtifactMeta>,
     },

@@ -1,4 +1,4 @@
-/// Resultado de un tick del sistema
+/// Result of a system tick
 #[derive(Debug, Clone)]
 pub enum TickResult {
     Integrated,

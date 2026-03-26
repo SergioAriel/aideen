@@ -1,27 +1,27 @@
-//! Spectral Normalization para garantizar convergencia del DEQ.
+//! Spectral Normalization to guarantee DEQ convergence.
 //!
-//! ## Fundamento matemático
-//! Para que el DEQ H_{t+1} = f(H_t) converja por el Teorema de Banach,
-//! f debe ser una contracción: ||f(x) - f(y)|| ≤ L ||x - y|| con L < 1.
+//! ## Mathematical foundation
+//! For the DEQ H_{t+1} = f(H_t) to converge by Banach's Theorem,
+//! f must be a contraction: ||f(x) - f(y)|| <= L ||x - y|| with L < 1.
 //!
-//! La norma espectral de una matriz W es su mayor valor singular σ_max(W).
-//! Si σ_max(W) ≤ 1, la multiplicación por W es no-expansiva.
+//! The spectral norm of a matrix W is its largest singular value sigma_max(W).
+//! If sigma_max(W) <= 1, multiplication by W is non-expansive.
 //!
-//! ## Estimación eficiente: Power Iteration
-//! Calcula σ_max(W) sin SVD completo — O(n) iteraciones × O(n²) × O(n).
-//! Converge en 5-20 iteraciones para matrices bien condicionadas.
+//! ## Efficient estimation: Power Iteration
+//! Computes sigma_max(W) without full SVD -- O(n) iterations x O(n^2) x O(n).
+//! Converges in 5-20 iterations for well-conditioned matrices.
 //!
-//! ## Damping (β-relaxation)
-//! Alternativa/complemento a SN: H_{t+1} = β·f(H_t) + (1-β)·H_t
-//! Garantiza convergencia incluso si f no es contractiva, a costa de
-//! necesitar más iteraciones. β=0.5 es conservador, β=0.9 es agresivo.
+//! ## Damping (beta-relaxation)
+//! Alternative/complement to SN: H_{t+1} = beta*f(H_t) + (1-beta)*H_t
+//! Guarantees convergence even if f is not contractive, at the cost of
+//! requiring more iterations. beta=0.5 is conservative, beta=0.9 is aggressive.
 
 use nalgebra::{DMatrix, DVector};
 
-/// Estima σ_max(W) mediante power iteration.
+/// Estimates sigma_max(W) via power iteration.
 ///
-/// `n_iter` = 20 es suficiente para matrices de D_R×D_R.
-/// Retorna 1.0 si la matriz es cero o casi cero.
+/// `n_iter` = 20 is sufficient for D_R x D_R matrices.
+/// Returns 1.0 if the matrix is zero or near-zero.
 pub fn spectral_norm(w: &DMatrix<f32>, n_iter: usize) -> f32 {
     let rows = w.nrows();
     let cols = w.ncols();
@@ -29,7 +29,7 @@ pub fn spectral_norm(w: &DMatrix<f32>, n_iter: usize) -> f32 {
         return 1.0;
     }
 
-    // Inicializar vector u uniforme
+    // Initialize uniform vector u
     let norm_u = (rows as f32).sqrt();
     let mut u: DVector<f32> = DVector::from_element(rows, 1.0 / norm_u);
 
@@ -59,10 +59,10 @@ pub fn spectral_norm(w: &DMatrix<f32>, n_iter: usize) -> f32 {
     sigma.abs().max(1e-12)
 }
 
-/// Normaliza W para que σ_max(W) = target_sigma (default = 1.0).
+/// Normalizes W so that sigma_max(W) = target_sigma (default = 1.0).
 ///
-/// Después de normalizar, multiplicar por W es no-expansivo.
-/// Para ser contractivo estrictamente, usar target_sigma < 1.
+/// After normalizing, multiplication by W is non-expansive.
+/// For strict contractivity, use target_sigma < 1.
 pub fn normalize(w: &DMatrix<f32>, target_sigma: f32, n_iter: usize) -> DMatrix<f32> {
     let sigma = spectral_norm(w, n_iter);
     if sigma < 1e-12 {
@@ -71,8 +71,8 @@ pub fn normalize(w: &DMatrix<f32>, target_sigma: f32, n_iter: usize) -> DMatrix<
     w * (target_sigma / sigma)
 }
 
-/// Normaliza in-place si σ_max > threshold.
-/// Útil para llamar después de cada paso de entrenamiento.
+/// Normalizes in-place if sigma_max > threshold.
+/// Useful to call after each training step.
 pub fn normalize_if_needed(w: &mut DMatrix<f32>, threshold: f32, n_iter: usize) {
     let sigma = spectral_norm(w, n_iter);
     if sigma > threshold {
@@ -80,16 +80,16 @@ pub fn normalize_if_needed(w: &mut DMatrix<f32>, threshold: f32, n_iter: usize) 
     }
 }
 
-/// Mixtura Picard con damping β ∈ (0, 1).
+/// Picard mixture with damping beta in (0, 1).
 ///
-/// h_next = β * f(h) + (1-β) * h
+/// h_next = beta * f(h) + (1-beta) * h
 ///
-/// Garantiza convergencia con cualquier f si β es lo suficientemente pequeño.
-/// Útil como fallback cuando no se puede garantizar contracción vía SN.
+/// Guarantees convergence for any f if beta is sufficiently small.
+/// Useful as a fallback when contraction cannot be guaranteed via SN.
 ///
-/// - β = 1.0 → vanilla DEQ (puede divergir)
-/// - β = 0.5 → conservador, siempre converge si f está acotada
-/// - β = 0.9 → agresivo, converge solo si f es casi contractiva
+/// - beta = 1.0 -> vanilla DEQ (may diverge)
+/// - beta = 0.5 -> conservative, always converges if f is bounded
+/// - beta = 0.9 -> aggressive, converges only if f is nearly contractive
 pub fn damped_update(h_curr: &DVector<f32>, f_h: &DVector<f32>, beta: f32) -> DVector<f32> {
     f_h * beta + h_curr * (1.0 - beta)
 }
@@ -120,7 +120,7 @@ mod tests {
         let sigma = spectral_norm(&w_norm, 20);
         assert!(
             (sigma - 1.0).abs() < 0.05,
-            "σ después de normalize ≈ 1.0, got {sigma}"
+            "sigma after normalize should be approx 1.0, got {sigma}"
         );
     }
 
@@ -132,7 +132,7 @@ mod tests {
         let sigma = spectral_norm(&w, 20);
         assert!(
             (sigma - 0.5).abs() < 0.05,
-            "debería permanecer en 0.5, got {sigma}"
+            "should remain at 0.5, got {sigma}"
         );
     }
 
@@ -144,7 +144,7 @@ mod tests {
         // β=0.5 → resultado = 0.5*1 + 0.5*0 = 0.5
         assert!(
             (result[0] - 0.5).abs() < 1e-6,
-            "damped_update con β=0.5 debe dar 0.5"
+            "damped_update with beta=0.5 should yield 0.5"
         );
     }
 }

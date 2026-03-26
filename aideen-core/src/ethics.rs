@@ -1,13 +1,13 @@
 use nalgebra::DVector;
 
-/// Núcleo ético: Restricciones geométricas no negociables
+/// Ethics core: Non-negotiable geometric constraints
 pub trait Ethics {
-    /// Proyecta el estado S al manifold seguro
+    /// Projects state S onto the safe manifold
     fn project(&self, s: &DVector<f32>) -> DVector<f32>;
 
-    /// Detecta si hay violación directa (booleano duro)
+    /// Detects if there is a direct violation (hard boolean)
     fn violates(&self, s: &DVector<f32>) -> bool;
 
-    /// Huella ontológica del sistema (Ethics Fingerprint)
+    /// Ontological fingerprint of the system (Ethics Fingerprint)
     fn fingerprint(&self) -> [u8; 32];
 }

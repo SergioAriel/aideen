@@ -580,7 +580,7 @@ impl GpuEmbeddingTrainer {
         Ok(())
     }
 
-    /// Actualiza embeddings usando el gradiente dL/dh ya presente en la GPU.
+    /// Updates embeddings using the dL/dh gradient already present on the GPU.
     pub fn apply_embedding_update_from_buffer(
         &self,
         device: &wgpu::Device,
@@ -719,7 +719,7 @@ impl GpuEmbeddingTrainer {
         }
     }
 
-    /// Lee los momentos Adam (m, v) para checkpoint.
+    /// Reads Adam moments (m, v) for checkpoint.
     pub fn read_moments(
         &self,
         device: &wgpu::Device,
@@ -764,7 +764,7 @@ impl GpuEmbeddingTrainer {
         Ok((m, v))
     }
 
-    /// Sube momentos Adam guardados de vuelta a la GPU.
+    /// Uploads saved Adam moments back to the GPU.
     pub fn write_moments(&self, queue: &wgpu::Queue, m: &[f32], v: &[f32]) {
         queue.write_buffer(&self.m_buf, 0, bytemuck::cast_slice(m));
         queue.write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v));

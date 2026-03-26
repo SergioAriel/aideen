@@ -137,7 +137,7 @@ fn test_forward_parity(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult {
         return TestResult {
             name: "forward_parity_cpu_vs_gpu",
             status: "SKIP",
-            detail: "gpu_deq=None (no backend disponible)".to_string(),
+            detail: "gpu_deq=None (no backend available)".to_string(),
         };
     }
 
