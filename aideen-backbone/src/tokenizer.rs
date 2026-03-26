@@ -176,6 +176,9 @@ mod tests {
         let ea = tok.embed(0);
         let eb = tok.embed(1);
         let diff: f32 = (&ea - &eb).norm();
-        assert!(diff > 1e-6, "different tokens should have different embeddings");
+        assert!(
+            diff > 1e-6,
+            "different tokens should have different embeddings"
+        );
     }
 }

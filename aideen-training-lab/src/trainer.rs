@@ -717,10 +717,7 @@ impl Trainer {
                 let g_raw = w_head.get("head.g").unwrap();
 
                 let w_sum: f32 = w_raw.iter().map(|&x| x.abs()).sum();
-                println!(
-                    "[GPU-LM] Syncing LM Head weights... (abs_sum={:.4})",
-                    w_sum
-                );
+                println!("[GPU-LM] Syncing LM Head weights... (abs_sum={:.4})", w_sum);
 
                 gpu_lm.upload_weights_only(&gpu.queue, w_raw, b_raw, g_raw);
                 self.gpu_lm_weights_uploaded = true;
@@ -1945,8 +1942,11 @@ impl Trainer {
                 let skip_bytes = skip_bytes.min(file_size as u64);
                 file.seek(SeekFrom::Start(skip_bytes))?;
                 num_chunks = skip_chunks;
-                println!("    [skip] Skipping {skip_chunks} chunks ({} tokens, {:.2} MB)",
-                    skip_bytes / 4, skip_bytes as f64 / 1_048_576.0);
+                println!(
+                    "    [skip] Skipping {skip_chunks} chunks ({} tokens, {:.2} MB)",
+                    skip_bytes / 4,
+                    skip_bytes as f64 / 1_048_576.0
+                );
             }
 
             loop {
@@ -2114,10 +2114,7 @@ impl Trainer {
 
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {
                 if let Err(e) = self.save_checkpoint(checkpoint_path) {
-                    eprintln!(
-                        "[checkpoint] Error saving to '{}': {}",
-                        checkpoint_path, e
-                    );
+                    eprintln!("[checkpoint] Error saving to '{}': {}", checkpoint_path, e);
                 } else {
                     eprintln!(
                         "[checkpoint] Saved to '{}' (epoch {})",
