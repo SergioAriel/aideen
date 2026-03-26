@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 
 /// MambaSlotReasoning — el bloque `f` real del DEQ.
 pub struct MambaSlotReasoning {
@@ -150,7 +150,6 @@ impl MambaSlotReasoning {
         DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range))
     }
 
-    #[allow(dead_code)]
     fn identity_like_mat_with_rng<R: Rng + ?Sized>(
         rng: &mut R,
         d_r: usize,
@@ -328,7 +327,7 @@ impl MambaSlotReasoning {
         }
         let seed = hasher.finish();
         let mut out = Vec::with_capacity(h_slots * base.len());
-        let _attn_t = 0.10_f32;
+        let attn_t = 0.10_f32;
         let win_t = 0.30_f32;
         let n_iter = 20;
         // Disable per-slot jitter to remove seed-dependent W_in variance during diagnosis.
