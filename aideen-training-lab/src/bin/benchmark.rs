@@ -105,10 +105,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     // Warmup iterativo (Sequence Fusing)
     let warmup_epochs = if quick_bench { 0 } else { 1 };
     if warmup_epochs > 0 {
-        println!(
-            "  [Warmup of {} epoch to settle shaders...]",
-            warmup_epochs
-        );
+        println!("  [Warmup of {} epoch to settle shaders...]", warmup_epochs);
         for w in 0..warmup_epochs {
             let tw = Instant::now();
             trainer.train_sequence(train_tokens, targets, false, 1e-4);
