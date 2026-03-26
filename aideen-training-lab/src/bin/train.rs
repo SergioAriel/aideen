@@ -62,6 +62,7 @@ fn main() {
     let mut freeze_deq = false;
     let mut freeze_emb = false;
     let mut freeze_lm = false;
+    let mut skip_chunks: usize = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -95,6 +96,12 @@ fn main() {
             "--freeze-deq" => freeze_deq = true,
             "--freeze-emb" => freeze_emb = true,
             "--freeze-lm" => freeze_lm = true,
+            "--skip-chunks" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    skip_chunks = v.parse().unwrap_or(0);
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -111,6 +118,7 @@ fn main() {
             freeze_deq,
             freeze_emb,
             freeze_lm,
+            skip_chunks,
         );
         return;
     }
@@ -214,8 +222,12 @@ fn run_large_file(
     freeze_deq: bool,
     freeze_emb: bool,
     freeze_lm: bool,
+    skip_chunks: usize,
 ) {
     println!("  Modo: archivo grande → {txt_path}");
+    if skip_chunks > 0 {
+        println!("  Saltando primeros {skip_chunks} chunks (--skip-chunks)");
+    }
 
     // ── Resolver ruta real del dataset ─────────────────────────────────────
     let (corpus, resolved_path) = match fs::read_to_string(txt_path) {
@@ -335,6 +347,7 @@ fn run_large_file(
             eos_token,
             save_every,
             checkpoint_base,
+            skip_chunks,
         )
         .expect("Error durante train_on_file");
 

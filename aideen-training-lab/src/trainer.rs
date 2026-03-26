@@ -1888,8 +1888,9 @@ impl Trainer {
         eos_token: u32,
         save_every: usize,
         checkpoint_path: &str,
+        skip_chunks: usize,
     ) -> std::io::Result<()> {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
 
         let file_size = std::fs::metadata(path)?.len() as usize;
         let total_file_tokens = file_size / 4;
@@ -1936,6 +1937,17 @@ impl Trainer {
             // Buffer de tokens no consumidos del chunk anterior (para ventana solapada).
             let mut carry: Vec<u32> = Vec::new();
             let mut last_save_time = std::time::Instant::now();
+
+            // Skip chunks: advance file position past already-trained data.
+            // Each chunk advances by `stride` tokens (stride = ctx_len/2).
+            if skip_chunks > 0 && epoch == 0 {
+                let skip_bytes = (skip_chunks * stride * 4) as u64;
+                let skip_bytes = skip_bytes.min(file_size as u64);
+                file.seek(SeekFrom::Start(skip_bytes))?;
+                num_chunks = skip_chunks;
+                println!("    [skip] Saltando {skip_chunks} chunks ({} tokens, {:.2} MB)",
+                    skip_bytes / 4, skip_bytes as f64 / 1_048_576.0);
+            }
 
             loop {
                 // Prepend carry del chunk anterior + leer nuevos bytes
