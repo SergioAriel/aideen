@@ -35,10 +35,10 @@ const WG_SIZE: u32 = 256u;
 var<workgroup> s_rms: f32;
 var<workgroup> s_scratch: array<f32, WG_SIZE>;
 var<workgroup> s_target_e: f32;
-var<workgroup> s_h_rms_local: array<f32, 1024>;
-var<workgroup> s_indices_cache: array<u32, 512>;
+var<workgroup> s_h_rms_local: array<f32, 1024>;  // LIMIT: d_model <= 1024
+var<workgroup> s_indices_cache: array<u32, 512>; // LIMIT: num_samples <= 512
 var<workgroup> s_h_tile: array<f32, WG_SIZE>;
-var<workgroup> s_logits: array<f32, 512>;
+var<workgroup> s_logits: array<f32, 512>;        // LIMIT: num_samples <= 512
 
 // Pipeline 1: softmax + loss per token.
 // Dispatch: (seq_len, 1, 1) workgroups of size (256, 1, 1).
