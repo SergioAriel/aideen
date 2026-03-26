@@ -15,7 +15,7 @@ use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── Framing (idéntico a QuicChannel) ─────────────────────────────────────
 
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[coord] cliente: {}", conn.remote_address());
 
             // Dos uni streams: uno para recibir (client→coord), uno para enviar (coord→client)
-            let (tx, rx) = tokio::join!(conn.open_uni(), conn.accept_uni());
+            let (mut tx, mut rx) = tokio::join!(conn.open_uni(), conn.accept_uni());
             let mut tx = match tx {
                 Ok(s) => s,
                 Err(e) => {
