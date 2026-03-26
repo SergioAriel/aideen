@@ -35,7 +35,10 @@ const WG_SIZE: u32 = 256u;
 var<workgroup> s_rms: f32;
 var<workgroup> s_scratch: array<f32, WG_SIZE>;
 var<workgroup> s_target_e: f32;
-var<workgroup> s_h_rms_local: array<f32, 1024>;
+var<workgroup> s_h_rms_local: array<f32, 1024>;  // LIMIT: d_model <= 1024
+var<workgroup> s_indices_cache: array<u32, 512>; // LIMIT: num_samples <= 512
+var<workgroup> s_h_tile: array<f32, WG_SIZE>;
+var<workgroup> s_logits: array<f32, 512>;        // LIMIT: num_samples <= 512
 
 // Pipeline 1: softmax + loss per token.
 // Dispatch: (seq_len, 1, 1) workgroups of size (256, 1, 1).
@@ -86,13 +89,19 @@ fn lm_probs_main(
     }
     workgroupBarrier();
 
-    // 1. Calculate Logits using local cache
-    var local_max = -3.4e38;
+    // 1. Cache sampled indices to shared (avoid repeated storage reads)
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = sampled_indices[k];
-        let row_base = v * params.d_model;
-        var logit = b_lm[v];
-        if (params.ternary_flag == 1u) {
+        s_indices_cache[k] = sampled_indices[k];
+    }
+    workgroupBarrier();
+
+    // 2. Calculate Logits (GEMM-style for non-ternary; fallback for ternary)
+    var local_max = -3.4e38;
+    if (params.ternary_flag == 1u) {
+        for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+            let v = s_indices_cache[k];
+            let row_base = v * params.d_model;
+            var logit = b_lm[v];
             var abs_sum = 0.0;
             for (var d = 0u; d < params.d_model; d = d + 1u) {
                 abs_sum += abs(w_lm[row_base + d]);
@@ -102,13 +111,42 @@ fn lm_probs_main(
                 let q_w = clamp(round(w_lm[row_base + d] / gamma), -1.0, 1.0);
                 logit += q_w * s_h_rms_local[d];
             }
-        } else {
-            for (var d = 0u; d < params.d_model; d = d + 1u) {
-                logit += w_lm[row_base + d] * s_h_rms_local[d];
-            }
+            probs[t * params.num_samples + k] = logit;
+            local_max = max(local_max, logit);
         }
-        probs[t * params.num_samples + k] = logit;
-        local_max = max(local_max, logit);
+    } else {
+        // Initialize logits with bias.
+        for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+            let v = s_indices_cache[k];
+            s_logits[k] = b_lm[v];
+        }
+        workgroupBarrier();
+        // GEMM-style blocking: load H once per tile, reuse for all sampled rows.
+        for (var tile = 0u; tile < params.d_model; tile = tile + WG_SIZE) {
+            let d_load = tile + tid;
+            if (d_load < params.d_model) {
+                s_h_tile[tid] = s_h_rms_local[d_load];
+            } else {
+                s_h_tile[tid] = 0.0;
+            }
+            workgroupBarrier();
+            let tile_limit = min(WG_SIZE, params.d_model - tile);
+            for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+                let v = s_indices_cache[k];
+                let row_base = v * params.d_model + tile;
+                var acc = 0.0;
+                for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                    acc += w_lm[row_base + tj] * s_h_tile[tj];
+                }
+                s_logits[k] = s_logits[k] + acc;
+            }
+            workgroupBarrier();
+        }
+        for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+            let logit = s_logits[k];
+            probs[t * params.num_samples + k] = logit;
+            local_max = max(local_max, logit);
+        }
     }
 
     // 2. Workgroup reduction for Global Max
@@ -125,7 +163,7 @@ fn lm_probs_main(
     // 3. Compute exp(logit - mx) and sum
     var local_sum = 0.0;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = sampled_indices[k];
+        let v = s_indices_cache[k];
         let e = exp(probs[t * params.num_samples + k] - mx);
         probs[t * params.num_samples + k] = e;
         if (v == target_indices[t]) { s_target_e = e; }
