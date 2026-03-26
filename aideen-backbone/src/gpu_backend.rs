@@ -1,18 +1,18 @@
-//! gpu_backend — WgpuBlockBackend y CpuBlockBackend
+//! gpu_backend — WgpuBlockBackend and CpuBlockBackend
 //!
-//! - `CpuBlockBackend`: implementación nalgebra pura (siempre compilada).
-//!   Funciona sin GPU, útil para tests y fallback.
+//! - `CpuBlockBackend`: pure nalgebra implementation (always compiled).
+//!   Works without GPU, useful for tests and fallback.
 //!
-//! - `WgpuBlockBackend`: implementación wgpu+WGSL (feature "wgpu").
-//!   Usa el shader `mamba.wgsl` de `aideen-block` para correr el SSM
-//!   en GPU (Metal/Vulkan/WebGPU). Sincronización vía pollster::block_on.
+//! - `WgpuBlockBackend`: wgpu+WGSL implementation (feature "wgpu").
+//!   Uses the `mamba.wgsl` shader from `aideen-block` to run the SSM
+//!   on GPU (Metal/Vulkan/WebGPU). Synchronization via pollster::block_on.
 
 use aideen_core::block_backend::BlockBackend;
 
 // ── CPU Fallback ──────────────────────────────────────────────────────────────
 
-/// Backend CPU puro. Implementa el mismo ZOH que MambaSlotReasoning
-/// pero como backend swappable. Útil para tests y despliegue sin GPU.
+/// Pure CPU backend. Implements the same ZOH as MambaSlotReasoning
+/// but as a swappable backend. Useful for tests and deployment without GPU.
 pub struct CpuBlockBackend;
 
 impl BlockBackend for CpuBlockBackend {
@@ -57,10 +57,10 @@ impl BlockBackend for CpuBlockBackend {
 
 // ── GPU Backend (feature = "wgpu") ────────────────────────────────────────────
 
-/// Backend wgpu: ejecuta el kernel `mamba_parallel_scan` de aideen-block
-/// en GPU mediante sincronización bloqueante con `pollster`.
+/// wgpu backend: executes the `mamba_parallel_scan` kernel from aideen-block
+/// on GPU via blocking synchronization with `pollster`.
 ///
-/// ## Uso
+/// ## Usage
 /// ```ignore
 /// let gpu = WgpuBlockBackend::new_blocking();
 /// if let Some(mut backend) = gpu {
@@ -76,8 +76,8 @@ pub struct WgpuBlockBackend {
 
 #[cfg(feature = "wgpu")]
 impl WgpuBlockBackend {
-    /// Inicializa el backend GPU de forma síncrona usando pollster.
-    /// Retorna `None` si no hay GPU disponible.
+    /// Initializes the GPU backend synchronously using pollster.
+    /// Returns `None` if no GPU is available.
     pub fn new_blocking() -> Option<Self> {
         pollster::block_on(Self::new_async())
     }

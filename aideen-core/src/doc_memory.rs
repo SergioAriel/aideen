@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 pub type DocId = u64;
 pub type ChunkId = u32;
 
-/// Metadata canónica de un documento.
+/// Canonical document metadata.
 ///
-/// `locator` es un identificador estable del origen:
-/// - native: path absoluto/relativo
+/// `locator` is a stable identifier of the origin:
+/// - native: absolute/relative path
 /// - web:    URL
-/// - ui:     "chat:<id>" o "note:<id>"
+/// - ui:     "chat:<id>" or "note:<id>"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocMeta {
     pub title: String,
@@ -18,11 +18,11 @@ pub struct DocMeta {
     pub added_unix: u64,
 }
 
-/// Resultado de una búsqueda lexical.
+/// Result of a lexical search.
 ///
-/// `byte_start/byte_end` son offsets en el documento raw (exclusivo en end,
-/// al estilo Rust `[byte_start..byte_end]`).
-/// `preview` es texto best-effort para UI.
+/// `byte_start/byte_end` are offsets in the raw document (exclusive on end,
+/// Rust-style `[byte_start..byte_end]`).
+/// `preview` is best-effort text for UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocHit {
     pub doc_id: DocId,
@@ -33,38 +33,38 @@ pub struct DocHit {
     pub preview: String,
 }
 
-/// Contrato mínimo de memoria documental (búsqueda precisa por texto).
+/// Minimal contract for document memory (precise text search).
 ///
-/// Diseño:
-/// - Búsqueda lexical exacta: token → posting list, ranking por TF.
-/// - `locate()`: offsets byte-exactos de una needle en el documento raw.
-/// - `get_chunk()`: bytes reales del chunk (para construir prompts).
+/// Design:
+/// - Exact lexical search: token → posting list, ranking by TF.
+/// - `locate()`: byte-exact offsets of a needle in the raw document.
+/// - `get_chunk()`: actual bytes of the chunk (for building prompts).
 ///
 /// Backends: `FsDocMemory` (native), `OpfsDocMemory` (WASM).
 pub trait DocMemory {
-    /// Inserta documento completo (bytes raw). Devuelve `DocId` asignado.
-    /// Sobrescribe `meta.len_bytes` con `bytes.len()`.
+    /// Inserts a complete document (raw bytes). Returns the assigned `DocId`.
+    /// Overwrites `meta.len_bytes` with `bytes.len()`.
     fn add_document(&mut self, meta: DocMeta, bytes: Vec<u8>) -> Result<DocId, String>;
 
-    /// Devuelve metadata si el `doc_id` existe.
+    /// Returns metadata if the `doc_id` exists.
     fn get_meta(&self, doc_id: DocId) -> Option<DocMeta>;
 
-    /// Recupera bytes de un chunk específico (contexto real para prompts).
+    /// Retrieves bytes of a specific chunk (real context for prompts).
     fn get_chunk(&self, doc_id: DocId, chunk_id: ChunkId) -> Option<Vec<u8>>;
 
-    /// Búsqueda lexical. Devuelve top-k hits ordenados por score descendente.
+    /// Lexical search. Returns top-k hits sorted by descending score.
     fn search(&self, query: &str, k: usize) -> Vec<DocHit>;
 
-    /// Devuelve offsets `(byte_start, byte_end)` de ocurrencias exactas de
-    /// `needle` en el documento raw. `byte_end` es exclusivo. Sin stemming.
+    /// Returns offsets `(byte_start, byte_end)` of exact occurrences of
+    /// `needle` in the raw document. `byte_end` is exclusive. No stemming.
     fn locate(&self, doc_id: DocId, needle: &[u8], limit: usize) -> Vec<(u64, u64)>;
 
-    /// Lista todos los doc_ids almacenados.
+    /// Lists all stored doc_ids.
     fn list_docs(&self) -> Vec<DocId>;
 }
 
-/// Backend no-op (sin memoria documental).
-/// Permite arrancar el nodo sin DocMemory configurada.
+/// No-op backend (no document memory).
+/// Allows starting the node without a configured DocMemory.
 pub struct NullDocMemory;
 
 impl DocMemory for NullDocMemory {

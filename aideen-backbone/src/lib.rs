@@ -1,7 +1,7 @@
 //! aideen-backbone
 //! ─────────────────────────────────────────────
-//! Arquitectura del Modelo y Pesos base.
-//! Agnóstico de ML frameworks (No Candle, No PyTorch) para P2P streaming.
+//! Model Architecture and base Weights.
+//! ML framework-agnostic (No Candle, No PyTorch) for P2P streaming.
 
 pub mod architecture;
 pub mod ffn_reasoning;

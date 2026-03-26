@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// Backbone: Red Feed-Forward de 2 capas con expansión.
+/// Backbone: 2-layer Feed-Forward Network with expansion.
 pub struct FfnReasoning {
     pub config: ArchitectureConfig,
     w1: DMatrix<f32>,
@@ -146,7 +146,7 @@ impl Reasoning for FfnReasoning {
     }
 }
 
-/// FFN CPU de 2 capas: tanh(W2 · tanh(W1 · h + b1) + b2)
+/// 2-layer CPU FFN: tanh(W2 * tanh(W1 * h + b1) + b2)
 fn cpu_ffn(
     w1: &DMatrix<f32>,
     b1: &DVector<f32>,
@@ -180,7 +180,7 @@ impl Default for ReplayGuard {
 }
 
 impl FfnReasoning {
-    /// Hash del "modelo base" actual (w1, w2, b1, b2).
+    /// Hash of the current "base model" (w1, w2, b1, b2).
     pub fn current_model_hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
 
@@ -195,7 +195,7 @@ impl FfnReasoning {
         mh
     }
 
-    /// ÚNICA entrada pública para mutación: update firmado criptográficamente.
+    /// ONLY public entry point for mutation: cryptographically signed update.
     pub fn apply_signed_update(
         &mut self,
         update: &SignedUpdate,
@@ -297,19 +297,19 @@ impl FfnReasoning {
         Ok(())
     }
 
-    /// Acceso de alta velocidad a los pesos para el backprop. SOLO LABORATORIO PRIVADO.
+    /// High-speed access to weights for backprop. PRIVATE LAB ONLY.
     #[cfg(feature = "lab")]
     pub fn w1_mut(&mut self) -> &mut nalgebra::DMatrix<f32> {
         &mut self.w1
     }
 
-    /// Serializa los pesos hacia un buffer (Snapshot)
+    /// Serializes weights to a buffer (Snapshot)
     #[cfg(feature = "lab")]
     pub fn get_weights_snapshot(&self) -> Vec<f32> {
         self.w1.as_slice().to_vec()
     }
 
-    /// Aplica un buffer de pesos crudo. SOLO LABORATORIO PRIVADO.
+    /// Applies a raw weights buffer. PRIVATE LAB ONLY.
     #[cfg(feature = "lab")]
     pub fn apply_weights_snapshot(&mut self, snapshot: &[f32]) {
         assert_eq!(snapshot.len(), self.w1.len());

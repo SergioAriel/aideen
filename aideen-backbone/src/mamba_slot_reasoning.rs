@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
-/// MambaSlotReasoning — el bloque `f` real del DEQ.
+/// MambaSlotReasoning -- the actual `f` block of the DEQ.
 pub struct MambaSlotReasoning {
     pub config: ArchitectureConfig,
 
@@ -974,7 +974,7 @@ mod tests {
         assert_ne!(
             h_a.to_flat(),
             h_b.to_flat(),
-            "step debe ser sensible al input s"
+            "step must be sensitive to input s"
         );
     }
 
@@ -988,7 +988,7 @@ mod tests {
             h = r.step(&h, &s, None);
         }
         let energy: f32 = h.to_flat().iter().map(|x| x * x).sum();
-        assert!(energy.is_finite(), "Energy no debe explotar: {energy}");
-        assert!(energy < 1e6, "Energy demasiado alta: {energy}");
+        assert!(energy.is_finite(), "Energy must not explode: {energy}");
+        assert!(energy < 1e6, "Energy too high: {energy}");
     }
 }

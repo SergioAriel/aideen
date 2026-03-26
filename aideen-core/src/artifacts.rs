@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::capabilities::QuantLevel;
 
-/// Dominio del experto. String flexible ("math", "code", "reasoning", …).
-/// Normalizar a lowercase en punto de ingesta si se requiere compat cross-lang.
+/// Expert domain. Flexible string ("math", "code", "reasoning", ...).
+/// Normalize to lowercase at ingestion if cross-lang compat is required.
 pub type ExpertDomain = String;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]

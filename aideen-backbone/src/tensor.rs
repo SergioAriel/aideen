@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Definición pura de un Tensor para transporte P2P o carga en Buffer WGSL
+/// Pure Tensor definition for P2P transport or WGSL Buffer loading
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tensor {
     pub shape: Vec<usize>,

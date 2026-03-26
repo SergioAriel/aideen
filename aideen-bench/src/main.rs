@@ -1,16 +1,16 @@
 //! bench_harness — AIDEEN (DEQ+SSM) vs Transformer: benchmark defensible.
 //!
-//! Tres experimentos coordinados:
-//!   EXP 1 · Iso-data  : mismos tokens vistos → compara val_loss y eficiencia
-//!   EXP 2 · Iso-time  : mismo tiempo de pared → compara tokens logrados y val_loss
-//!   EXP 3 · Inference : teacher-forcing NLL + throughput (sobre checkpoints del EXP 1)
+//! Three coordinated experiments:
+//!   EXP 1 · Iso-data  : same tokens seen → compares val_loss and efficiency
+//!   EXP 2 · Iso-time  : same wall time → compares tokens achieved and val_loss
+//!   EXP 3 · Inference : teacher-forcing NLL + throughput (on EXP 1 checkpoints)
 //!
-//! Garantías del protocolo:
-//!   • eval_*() es &self puro — no muta pesos, optimizer ni estados
-//!   • Ambos modelos ven los mismos batches en el mismo orden
-//!   • tokens_seen se cuenta exactamente: tokens_in.len() por paso
-//!   • wall_clock de training se acumula separado del tiempo de eval
-//!   • Limitación declarada: AIDEEN hace T micro-steps Adam por batch
+//! Protocol guarantees:
+//!   • eval_*() is pure &self — does not mutate weights, optimizer, or state
+//!   • Both models see the same batches in the same order
+//!   • tokens_seen counted exactly: tokens_in.len() per step
+//!   • training wall_clock accumulated separately from eval time
+//!   • Declared limitation: AIDEEN does T micro-steps Adam per batch
 //!
 //! Uso:
 //!   cargo run -p aideen-bench --release
@@ -33,7 +33,7 @@ use transformer_candle::{CandleBackend, CandleTransformer, CandleTransformerConf
 // ── Presupuesto del experimento ───────────────────────────────────────────────
 /// Contexto por batch — ambos modelos ven la misma longitud.
 const CTX_LEN: usize = 128;
-/// Dimensión oculta DEQ → ~283 K params con vocab=65.
+/// DEQ hidden dimension → ~283 K params with vocab=65.
 const D_R_AIDEEN: usize = 192;
 /// Learning rate compartido.
 const LR: f32 = 1e-3;
@@ -43,7 +43,7 @@ const TOTAL_TOKENS: usize = 1_000_000;
 const ISO_TIME_SECS: u64 = 600;
 /// Evaluar val_loss cada N tokens de training.
 const EVAL_EVERY: usize = 20_000;
-/// Tokens de validación por checkpoint (teacher-forcing).
+/// Validation tokens per checkpoint (teacher-forcing).
 const VAL_TOKENS: usize = 16_384;
 const PARAM_TOLERANCE_PCT: f32 = 5.0;
 const DEFAULT_SEEDS: [u64; 5] = [42, 1337, 2026, 31415, 27182];
@@ -189,7 +189,7 @@ fn build_aideen(vocab_size: usize, vocab: Vec<char>, seed: u64, backend: Backend
     match backend {
         Backend::Gpu => {
             if trainer.gpu_deq.is_none() {
-                panic!("AIDEEN backend=gpu pero trainer.gpu_deq=None.");
+                panic!("AIDEEN backend=gpu but trainer.gpu_deq=None.");
             }
         }
         Backend::Cpu => {
@@ -225,8 +225,8 @@ fn tf_candle_config(vocab_size: usize) -> CandleTransformerConfig {
 
 // ── Eval puro — &self garantizado, no muta nada ───────────────────────────────
 
-/// Evalúa AIDEEN en VAL_CHUNKS ventanas del conjunto val.
-/// Usa `eval_loss` que es `&self` (forward DEQ sin backprop, sin optimizer.tick()).
+/// Evaluates AIDEEN on VAL_CHUNKS windows of the val set.
+/// Uses `eval_loss` which is `&self` (forward DEQ without backprop, without optimizer.tick()).
 fn eval_aideen(trainer: &Trainer, val: &[u32]) -> f32 {
     let stride = CTX_LEN + 1;
     let n_target = (VAL_TOKENS / CTX_LEN).max(1);
@@ -241,8 +241,8 @@ fn eval_aideen(trainer: &Trainer, val: &[u32]) -> f32 {
     sum / n as f32
 }
 
-/// Evalúa Transformer en VAL_CHUNKS ventanas.
-/// Usa `val_loss` que es `&self` (forward_only, sin optimizer.tick()).
+/// Evaluates Transformer on VAL_CHUNKS windows.
+/// Uses `val_loss` which is `&self` (forward_only, without optimizer.tick()).
 fn eval_tf(tf: &CandleTransformer, val: &[u32]) -> f32 {
     let stride = CTX_LEN + 1;
     let n_target = (VAL_TOKENS / CTX_LEN).max(1);
@@ -545,9 +545,9 @@ fn inference_bench(aideen: &Trainer, tf: &CandleTransformer, val: &[u32]) {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  EXP 3: Inference — teacher-forcing NLL + throughput        ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    println!("  • forward-only (&self): sin sampling, sin backprop, sin tick");
+    println!("  • forward-only (&self): no sampling, no backprop, no tick");
     println!(
-        "  • Mismos chunks del conjunto val (target_tokens={}, stride=CTX_LEN+1)",
+        "  • Same chunks from the val set (target_tokens={}, stride=CTX_LEN+1)",
         VAL_TOKENS
     );
     println!();
@@ -581,19 +581,19 @@ fn inference_bench(aideen: &Trainer, tf: &CandleTransformer, val: &[u32]) {
     let nll_delta = m.tf_nll - m.ai_nll;
     if nll_delta > 0.005 {
         println!(
-            "  NLL: AIDEEN gana por {:.4} nats ({:.1}% mejor)",
+            "  NLL: AIDEEN wins by {:.4} nats ({:.1}% better)",
             nll_delta,
             100.0 * nll_delta / m.tf_nll
         );
     } else if nll_delta < -0.005 {
         println!(
-            "  NLL: Transformer gana por {:.4} nats ({:.1}% mejor)",
+            "  NLL: Transformer wins by {:.4} nats ({:.1}% better)",
             nll_delta.abs(),
             100.0 * nll_delta.abs() / m.ai_nll
         );
     } else {
         println!(
-            "  NLL: estadísticamente similar (|delta|={:.4} nats)",
+            "  NLL: statistically similar (|delta|={:.4} nats)",
             nll_delta.abs()
         );
     }
@@ -663,7 +663,7 @@ fn parse_backend_env(name: &str, default: Backend) -> Backend {
         "gpu" => Backend::Gpu,
         other => {
             eprintln!(
-                "Valor inválido para {}='{}'. Usando '{}'.",
+                "Invalid value for {}='{}'. Using '{}'.",
                 name,
                 other,
                 default.as_str()
@@ -683,7 +683,7 @@ fn parse_iso_data_unit_env(name: &str, default: IsoDataUnit) -> IsoDataUnit {
         "updates" => IsoDataUnit::Updates,
         other => {
             eprintln!(
-                "Valor inválido para {}='{}'. Usando '{}'.",
+                "Invalid value for {}='{}'. Using '{}'.",
                 name,
                 other,
                 default.as_str()
@@ -890,12 +890,12 @@ fn main() {
     println!("║  EXP 1: Iso-Data | EXP 2: Iso-Time | EXP 3: Inference      ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Garantías del protocolo:");
-    println!("  ✓ eval_*() es &self puro — no muta pesos, optimizer ni estado");
-    println!("  ✓ Ambos modelos ven los mismos batches en el mismo orden");
-    println!("  ✓ tokens_seen contado exactamente (tokens_in.len() por paso)");
-    println!("  ✓ wall_clock de training acumulado SIN contar tiempo de eval");
-    println!("  ✓ Mismo tokenizer y split train/val para los dos modelos");
+    println!("  Protocol guarantees:");
+    println!("  ✓ eval_*() is pure &self — does not mutate weights, optimizer, or state");
+    println!("  ✓ Both models see the same batches in the same order");
+    println!("  ✓ tokens_seen counted exactly (tokens_in.len() per step)");
+    println!("  ✓ training wall_clock accumulated WITHOUT counting eval time");
+    println!("  ✓ Same tokenizer and train/val split for both models");
     println!();
     println!(
         "  Config: iso_data_budget={} {} | iso_time={}s eval_every={} val_tokens={} seeds={:?} | backends: aideen={} transformer={}",
@@ -911,14 +911,14 @@ fn main() {
     let allow_mixed = parse_bool_env("AIDEEN_BENCH_ALLOW_MIXED", false);
     if ai_backend != tf_backend && !allow_mixed {
         panic!(
-            "Benchmark abortado: backend mixto ({} vs {}). Usa ambos en cpu/gpu o exporta AIDEEN_BENCH_ALLOW_MIXED=1.",
+            "Benchmark aborted: mixed backend ({} vs {}). Use both on cpu/gpu or export AIDEEN_BENCH_ALLOW_MIXED=1.",
             ai_backend.as_str(),
             tf_backend.as_str()
         );
     }
     if ai_backend != tf_backend && allow_mixed {
         println!(
-            "  [WARN] Comparación de backend mixto ({} vs {}). Para benchmark simétrico usa CPUvsCPU.",
+            "  [WARN] Mixed backend comparison ({} vs {}). For symmetric benchmark use CPUvsCPU.",
             ai_backend.as_str(),
             tf_backend.as_str()
         );
@@ -926,7 +926,7 @@ fn main() {
     println!();
 
     // ── Dataset
-    println!("① Cargando dataset...");
+    println!("① Loading dataset...");
     let ds = Dataset::load();
     let vocab_size = ds.vocab_size();
     println!();
@@ -950,12 +950,12 @@ fn main() {
     );
     let param_diff_pct = 100.0 * (ai_p as f32 - tf_p as f32).abs() / tf_p as f32;
     println!(
-        "  Diferencia : {:.1}%  (objetivo iso-params <{:.1}%)",
+        "  Difference : {:.1}%  (target iso-params <{:.1}%)",
         param_diff_pct, PARAM_TOLERANCE_PCT
     );
     if param_diff_pct > PARAM_TOLERANCE_PCT {
         eprintln!(
-            "❌ Abortado: iso-params fuera de tolerancia ({:.2}% > {:.2}%). Ajusta D_R_AIDEEN o tf_config().",
+            "❌ Aborted: iso-params out of tolerance ({:.2}% > {:.2}%). Adjust D_R_AIDEEN or tf_config().",
             param_diff_pct, PARAM_TOLERANCE_PCT
         );
         std::process::exit(2);
@@ -1002,7 +1002,7 @@ fn main() {
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  Resumen agregado (mean ± std, multi-seed)                  ║");
+    println!("║  Aggregated summary (mean ± std, multi-seed)                 ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!(
         "EXP1 Iso-Data best_val:   AIDEEN {:.4} ± {:.4} | TF {:.4} ± {:.4}",
@@ -1030,7 +1030,7 @@ fn main() {
             t, p, dz
         );
     } else {
-        println!("EXP1 paired t-test: n insuficiente o varianza nula.");
+        println!("EXP1 paired t-test: insufficient n or zero variance.");
     }
     if let Some((t, p, dz)) = paired_t_test_and_effect(&exp2_ai, &exp2_tf) {
         println!(
@@ -1038,7 +1038,7 @@ fn main() {
             t, p, dz
         );
     } else {
-        println!("EXP2 paired t-test: n insuficiente o varianza nula.");
+        println!("EXP2 paired t-test: insufficient n or zero variance.");
     }
     if let Some((t, p, dz)) = paired_t_test_and_effect(&inf_ai, &inf_tf) {
         println!(
@@ -1046,11 +1046,11 @@ fn main() {
             t, p, dz
         );
     } else {
-        println!("EXP3 paired t-test: n insuficiente o varianza nula.");
+        println!("EXP3 paired t-test: insufficient n or zero variance.");
     }
 
     match write_seed_csv(&results, ai_backend, tf_backend, bench_cfg) {
-        Ok(path) => println!("CSV de seeds: {}", path),
-        Err(e) => eprintln!("No se pudo escribir CSV: {}", e),
+        Ok(path) => println!("Seeds CSV: {}", path),
+        Err(e) => eprintln!("Could not write CSV: {}", e),
     }
 }

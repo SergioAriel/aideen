@@ -1,6 +1,6 @@
-//! Binary de chat interactivo con AIDEEN.
+//! Interactive chat binary for AIDEEN.
 //!
-//! Carga un checkpoint y permite conversar en modo texto.
+//! Loads a checkpoint and allows text-mode conversation.
 //!
 //! Uso:
 //!   cargo run --release --features wgpu -p aideen-training --bin chat
@@ -19,7 +19,7 @@ const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.9;
 const DEFAULT_TOP_K: usize = 40;
 const DEFAULT_REP_PENALTY: f32 = 1.1;
-const CTX_WINDOW: usize = 512; // caracteres máximos del historial de conversación
+const CTX_WINDOW: usize = 512; // maximum characters in conversation history
 
 fn main() {
     // ── Parse args ──────────────────────────────────────────────────────────
@@ -78,19 +78,19 @@ fn main() {
     // ── Banner ───────────────────────────────────────────────────────────────
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  AIDEEN — Chat interactivo                                  ║");
+    println!("║  AIDEEN — Interactive Chat                                   ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Modelo : {model_base}");
+    println!("  Model  : {model_base}");
     println!("  Tokens : {max_tokens}  temp={temperature}  top_p={top_p}  top_k={top_k}  rep={rep_penalty}");
     println!();
-    println!("  Escribe tu mensaje y pulsa Enter. Escribe 'exit' o Ctrl+D para salir.");
-    println!("  Escribe '/reset' para limpiar el contexto de conversación.");
-    println!("  Escribe '/info' para ver el contexto activo.");
+    println!("  Type your message and press Enter. Type 'exit' or Ctrl+D to quit.");
+    println!("  Type '/reset' to clear the conversation context.");
+    println!("  Type '/info' to see the active context.");
     println!();
 
     // ── Cargar checkpoint ────────────────────────────────────────────────────
-    print!("  Cargando checkpoint '{model_base}'... ");
+    print!("  Loading checkpoint '{model_base}'... ");
     io::stdout().flush().ok();
 
     let mut trainer = match Trainer::load_checkpoint(&model_base) {
@@ -100,7 +100,7 @@ fn main() {
         }
         Err(e) => {
             eprintln!("❌\n  Error: {e}");
-            eprintln!("  Asegúrate de haber entrenado primero con:");
+            eprintln!("  Make sure you have trained first with:");
             eprintln!("    cargo run --release --features wgpu -p aideen-training --bin train -- --file <dataset>");
             std::process::exit(1);
         }
@@ -108,8 +108,8 @@ fn main() {
 
     println!();
 
-    // ── Bucle de conversación ────────────────────────────────────────────────
-    // Mantenemos un contexto de texto acumulado (ventana deslizante).
+    // ── Conversation loop ────────────────────────────────────────────────
+    // We maintain an accumulated text context (sliding window).
     let mut context = String::new();
     let stdin = io::stdin();
 
@@ -122,7 +122,7 @@ fn main() {
             Ok(0) => break, // Ctrl+D / EOF
             Ok(_) => {}
             Err(e) => {
-                eprintln!("Error leyendo stdin: {e}");
+                eprintln!("Error reading stdin: {e}");
                 break;
             }
         }
@@ -132,20 +132,20 @@ fn main() {
             continue;
         }
 
-        // Comandos especiales
+        // Special commands
         match input {
             "exit" | "quit" | "q" => break,
             "/reset" => {
                 context.clear();
-                println!("  [contexto reiniciado]\n");
+                println!("  [context reset]\n");
                 continue;
             }
             "/info" => {
-                println!("  [contexto actual ({} chars)]:", context.len());
+                println!("  [current context ({} chars)]:", context.len());
                 if context.is_empty() {
-                    println!("  (vacío)");
+                    println!("  (empty)");
                 } else {
-                    // Mostrar últimas líneas del contexto
+                    // Show last lines of context
                     let preview: String = context
                         .chars()
                         .rev()
@@ -162,12 +162,12 @@ fn main() {
             _ => {}
         }
 
-        // Construir el prompt: historial + turno actual
+        // Build the prompt: history + current turn
         context.push_str("Human: ");
         context.push_str(input);
         context.push_str("\nAIDEEN:");
 
-        // Ventana deslizante: si el contexto es muy largo, recortamos por el principio
+        // Sliding window: if context is too long, trim from the beginning
         let prompt = if context.len() > CTX_WINDOW {
             &context[context.len() - CTX_WINDOW..]
         } else {
@@ -193,12 +193,12 @@ fn main() {
         println!();
         println!();
 
-        // Añadir respuesta al contexto
+        // Add response to context
         context.push(' ');
         context.push_str(response.trim());
         context.push('\n');
     }
 
     println!();
-    println!("  Hasta luego.");
+    println!("  Goodbye.");
 }

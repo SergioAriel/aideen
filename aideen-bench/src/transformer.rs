@@ -1,7 +1,7 @@
-/// Transformer GPT-style simple con backprop manual en nalgebra.
+/// Simple GPT-style Transformer with manual backprop in nalgebra.
 ///
-/// Arquitectura: Token+Pos embeddings → N × (CausalSelfAttention + FFN) → LM head
-/// Sin dependencias de autograd — todos los gradientes son analíticos.
+/// Architecture: Token+Pos embeddings → N × (CausalSelfAttention + FFN) → LM head
+/// No autograd dependencies — all gradients are analytical.
 
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -20,7 +20,7 @@ pub struct TransformerConfig {
 }
 
 impl TransformerConfig {
-    /// Config por defecto: ~288K parámetros con vocab=65.
+    /// Default config: ~288K parameters with vocab=65.
     pub fn default_small(vocab_size: usize) -> Self {
         Self {
             vocab_size,

@@ -1,21 +1,21 @@
 use crate::state::HSlots;
 
-/// `ModelHead` — contrato para cualquier head sobre H*.
+/// `ModelHead` — contract for any head on H*.
 ///
-/// Un head toma el atractor H* del DEQ y produce una salida observable.
-/// Es la única puerta de salida legítima del loop Loxi.
+/// A head takes the DEQ attractor H* and produces an observable output.
+/// It is the only legitimate output gate of the Loxi loop.
 ///
-/// ## Heads disponibles en aideen-backbone
-/// - `LmHead`    → tokens de texto (generación autoregresiva)
-/// - `EmbedHead` → vector de embedding (D_R dims)
-/// - `ClassHead` → clase predicha (usize)
+/// ## Available heads in aideen-backbone
+/// - `LmHead`    → text tokens (autoregressive generation)
+/// - `EmbedHead` → embedding vector (D_R dims)
+/// - `ClassHead` → predicted class (usize)
 ///
-/// ## Diseño
-/// El contrato es genérico sobre `Output` para que cada head pueda
-/// retornar el tipo apropiado sin boxing ni dyn overhead.
+/// ## Design
+/// The contract is generic over `Output` so that each head can
+/// return the appropriate type without boxing or dyn overhead.
 pub trait ModelHead {
     type Output;
 
-    /// Proyectar H* al espacio de salida.
+    /// Project H* to the output space.
     fn forward(&self, h_star: &HSlots) -> Self::Output;
 }

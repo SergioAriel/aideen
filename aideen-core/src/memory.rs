@@ -1,9 +1,9 @@
 use nalgebra::DVector;
 
-/// Contrato mínimo de memoria del agente
+/// Minimal contract for the agent memory
 pub trait Memory {
     fn write(&mut self, invariant: DVector<f32>);
 
-    /// Búsqueda geométrica en el manifold
+    /// Geometric search on the manifold
     fn query(&self, query: &DVector<f32>, k: usize) -> Vec<DVector<f32>>;
 }

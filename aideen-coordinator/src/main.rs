@@ -1,13 +1,13 @@
 /// AIDEEN Coordinator — router + logger MVP.
 ///
-/// Estado por conexión:
+/// Per-connection state:
 ///   Waiting → HelloReceived → Delegated → (puede recibir Discovery / recibir Update)
 ///
 /// Zero-Trust:
 ///   - Discovery recibido antes de Delegated → responde Error { code: 403 }
 ///   - Todos los mensajes fuera de secuencia → Error { code: 400 }
 ///
-/// Framing idéntico a QuicChannel: u32 LE (longitud) + bincode(NetMsg).
+/// Framing identical to QuicChannel: u32 LE (length) + bincode(NetMsg).
 use aideen_core::protocol::{AckKind, KeyDelegation, NetMsg, ParamId, QuantizedDelta};
 use aideen_training::signer::{generate_master_keys, sign_key_delegation, sign_update};
 use quinn::{Endpoint, RecvStream, SendStream, ServerConfig};
@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-// ── Framing (idéntico a QuicChannel) ─────────────────────────────────────
+// ── Framing (identical to QuicChannel) ─────────────────────────────────────
 
 async fn send_msg(stream: &mut SendStream, msg: &NetMsg) -> Result<(), String> {
     let payload = msg.encode()?;
@@ -41,7 +41,7 @@ async fn recv_msg(stream: &mut RecvStream) -> Result<NetMsg, String> {
     NetMsg::decode(&buf)
 }
 
-// ── Estado de sesión ──────────────────────────────────────────────────────
+// ── Session state ──────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
 enum SessionState {
@@ -74,11 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (root_sk, _root_pk) = generate_master_keys();
     let (critic_sk, critic_pk) = generate_master_keys();
 
-    // Delegation prefirmada (epoch 1, válida indefinidamente)
+    // Pre-signed delegation (epoch 1, valid indefinitely)
     let delegation: KeyDelegation =
         sign_key_delegation(&root_sk, 1, critic_pk, 0, u64::MAX).expect("sign delegation");
 
-    // Update dummy (en producción esto viene del Critic real)
+    // Dummy update (in production this comes from the real Critic)
     let dummy_delta = QuantizedDelta {
         param: ParamId::W1,
         scale: 0.1,
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = "127.0.0.1:4433".parse()?;
     let (server_config, _cert) = configure_server();
     let endpoint = Endpoint::server(server_config, addr)?;
-    println!("Coordinator escuchando en {}", addr);
+    println!("Coordinator listening on {}", addr);
 
     while let Some(incoming) = endpoint.accept().await {
         let delegation = Arc::clone(&delegation);
@@ -113,11 +113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[coord] conexión fallida: {e}");
+                    eprintln!("[coord] connection failed: {e}");
                     return;
                 }
             };
-            println!("[coord] cliente: {}", conn.remote_address());
+            println!("[coord] client: {}", conn.remote_address());
 
             // Dos uni streams: uno para recibir (client→coord), uno para enviar (coord→client)
             let (tx, rx) = tokio::join!(conn.open_uni(), conn.accept_uni());
@@ -137,14 +137,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if let Err(e) = handle_session(&mut tx, &mut rx, &delegation, &update).await {
-                eprintln!("[coord] sesión terminada con error: {e}");
+                eprintln!("[coord] session ended with error: {e}");
             }
         });
     }
     Ok(())
 }
 
-// ── Máquina de estados por sesión ─────────────────────────────────────────
+// ── Per-session state machine ─────────────────────────────────────────
 
 async fn handle_session(
     tx: &mut SendStream,
@@ -205,7 +205,7 @@ async fn handle_session(
                 },
             ) => {
                 println!("[coord] Ack Update v={} ok={}", version, ok);
-                // Sesión completa para este ciclo demo
+                // Session complete for this demo cycle
                 return Ok(());
             }
 
@@ -226,7 +226,7 @@ async fn handle_session(
                     q_total,
                     bundle_version
                 );
-                // Router: ACK y log. No evalúa aún (Critic pendiente).
+                // Router: ACK and log. Does not evaluate yet (Critic pending).
                 send_msg(
                     tx,
                     &NetMsg::Ack {
@@ -238,9 +238,9 @@ async fn handle_session(
                 .await?;
             }
 
-            // ── Discovery sin delegación = Zero-Trust reject ─────────────
+            // ── Discovery without delegation = Zero-Trust reject ─────────────
             (_, NetMsg::Discovery { .. }) => {
-                eprintln!("[coord] Discovery rechazado: nodo no delegado");
+                eprintln!("[coord] Discovery rejected: node not delegated");
                 send_msg(
                     tx,
                     &NetMsg::Error {
@@ -257,10 +257,10 @@ async fn handle_session(
                 send_msg(tx, &NetMsg::Pong).await?;
             }
 
-            // ── Mensaje fuera de secuencia ────────────────────────────────
+            // ── Out-of-sequence message ────────────────────────────────
             (_, unexpected) => {
                 eprintln!(
-                    "[coord] mensaje inesperado en estado {:?}: {:?}",
+                    "[coord] unexpected message in state {:?}: {:?}",
                     state, unexpected
                 );
                 send_msg(

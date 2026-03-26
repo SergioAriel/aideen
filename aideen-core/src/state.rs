@@ -1,8 +1,8 @@
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
-/// Configuración de la arquitectura y ejecución de una instancia de AIDEEN.
-/// Permite que el motor sea dinámico y se adapte al archivo cargado.
+/// Architecture and execution configuration for an AIDEEN instance.
+/// Allows the engine to be dynamic and adapt to the loaded file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArchitectureConfig {
     pub d_m: usize,
@@ -13,41 +13,41 @@ pub struct ArchitectureConfig {
     pub h_slots: usize,
     pub vocab_size: usize,
 
-    // -- Parámetros de Ejecución / Diseño --
-    /// Ventana de contexto máxima.
+    // -- Execution / Design Parameters --
+    /// Maximum context window.
     pub ctx_len: usize,
-    /// Máximo de iteraciones DEQ.
+    /// Maximum DEQ iterations.
     pub max_deq_iters: usize,
-    /// Epsilon de convergencia DEQ.
+    /// DEQ convergence epsilon.
     pub deq_epsilon: f32,
-    /// Iteraciones del adjoint Picard (Retropropagación Implícita).
+    /// Adjoint Picard iterations (Implicit Backpropagation).
     pub adj_iters: usize,
-    /// ¿Entrenar el núcleo DEQ?
+    /// Train the DEQ core?
     pub train_deq: bool,
-    /// Escala del gradiente DEQ.
+    /// DEQ gradient scale.
     pub deq_grad_scale: f32,
-    /// Renormalización espectral cada N steps.
+    /// Spectral renormalization every N steps.
     pub renorm_every_steps: usize,
-    /// Número de muestras para Sampled Softmax.
+    /// Number of samples for Sampled Softmax.
     pub num_samples: usize,
-    /// Factor de penalización para evitar crecimiento de pesos en DEQ.
+    /// Penalty factor to prevent weight growth in DEQ.
     pub weight_decay: f32,
 }
 
 impl Default for ArchitectureConfig {
     fn default() -> Self {
         Self {
-            d_m: 1024, // Cerebro robusto
-            d_r: 512,  // Espacio de equilibrio (estable en GPU actual)
+            d_m: 1024, // Robust brain
+            d_r: 512,  // Equilibrium space (stable on current GPU)
             d_c: 256,
             d_e: 256,
             d_sim: 1024,
-            h_slots: 8,        // 8 Slots — especialización temporal multi-escala
-            vocab_size: 50257, // DEBE coincidir con tu tokenizer.json
-            ctx_len: 256,      // Ventana de memoria para chat
-            max_deq_iters: 16, // v14 (Optimizado tras sweep: garantiza 100% conv con alpha=0)
+            h_slots: 8,        // 8 Slots — multi-scale temporal specialization
+            vocab_size: 50257, // MUST match your tokenizer.json
+            ctx_len: 256,      // Memory window for chat
+            max_deq_iters: 16, // v14 (Optimized after sweep: guarantees 100% conv with alpha=0)
             deq_epsilon: 1e-4,
-            adj_iters: 6, // contr≈0.20 → error residual 0.20^6≈6e-5, prácticamente exacto
+            adj_iters: 6, // contr≈0.20 → residual error 0.20^6≈6e-5, practically exact
             train_deq: true,
             deq_grad_scale: 0.01,
             renorm_every_steps: 4, // Cada 4 steps: ~0.25x overhead vs inline, σ controlada en ventana corta
@@ -79,8 +79,8 @@ impl ArchitectureConfig {
     }
 }
 
-/// Estado de razonamiento iterativo: K slots × D_R floats.
-/// H*[k] es el vector de razonamiento del k-ésimo slot.
+/// Iterative reasoning state: K slots × D_R floats.
+/// H*[k] is the reasoning vector of the k-th slot.
 #[derive(Clone, Debug)]
 pub struct HSlots {
     pub data: DMatrix<f32>,
@@ -89,7 +89,7 @@ pub struct HSlots {
 }
 
 impl HSlots {
-    /// Inicializa todos los slots a cero usando la configuración.
+    /// Initializes all slots to zero using the configuration.
     pub fn zeros(config: &ArchitectureConfig) -> Self {
         HSlots {
             data: DMatrix::zeros(config.h_slots, config.d_r),
@@ -98,7 +98,7 @@ impl HSlots {
         }
     }
 
-    /// Construye HSlots copiando el mismo vector s en los K slots.
+    /// Builds HSlots by copying the same vector s into the K slots.
     pub fn from_broadcast(s: &DVector<f32>, config: &ArchitectureConfig) -> Self {
         assert_eq!(s.len(), config.d_r, "broadcast requires s.len() == d_r");
         let mut m = DMatrix::zeros(config.h_slots, config.d_r);
@@ -112,17 +112,17 @@ impl HSlots {
         }
     }
 
-    /// Extrae un slot como DVector.
+    /// Extracts a slot as a DVector.
     pub fn slot(&self, k: usize) -> DVector<f32> {
         self.data.row(k).transpose()
     }
 
-    /// Escribe un DVector en el slot k.
+    /// Writes a DVector into slot k.
     pub fn set_slot(&mut self, k: usize, v: &DVector<f32>) {
         self.data.row_mut(k).copy_from(&v.transpose());
     }
 
-    /// Aplana para envío por red.
+    /// Flattens for network transmission.
     pub fn to_flat(&self) -> Vec<f32> {
         // Export in row-major ([slot][d]) to match `from_flat` and GPU buffers.
         let mut out = Vec::with_capacity(self.slots * self.d_r);
@@ -134,7 +134,7 @@ impl HSlots {
         out
     }
 
-    /// Reconstruye desde bytes aplanados.
+    /// Reconstructs from flattened bytes.
     pub fn from_flat(flat: &[f32], config: &ArchitectureConfig) -> Self {
         assert_eq!(flat.len(), config.h_slots * config.d_r);
         HSlots {
@@ -145,7 +145,7 @@ impl HSlots {
     }
 }
 
-/// Estado cognitivo global
+/// Global cognitive state
 #[derive(Clone, Debug)]
 pub struct State {
     pub s: DVector<f32>,
@@ -193,7 +193,7 @@ impl State {
 
     // ── escritura controlada ────────────────────────────
 
-    /// Inyecta delta SOLO en S_R
+    /// Injects delta ONLY into S_R
     pub fn inject_delta_r(&mut self, delta_r: &[f32]) {
         assert_eq!(delta_r.len(), self.config.d_r);
         let start = self.config.d_m;
@@ -203,7 +203,7 @@ impl State {
         }
     }
 
-    /// Escribe estado simulado
+    /// Writes simulated state
     pub fn write_sim(&mut self, sim: &[f32]) {
         assert_eq!(sim.len(), self.config.d_sim);
         let start = self.config.d_m + self.config.d_r + self.config.d_c + self.config.d_e;
@@ -211,7 +211,7 @@ impl State {
         sim_slice.copy_from_slice(sim);
     }
 
-    /// Limpia la simulación
+    /// Clears the simulation
     pub fn clear_sim(&mut self) {
         let start = self.config.d_m + self.config.d_r + self.config.d_c + self.config.d_e;
         let sim_slice = &mut self.s.as_mut_slice()[start..start + self.config.d_sim];
@@ -220,7 +220,7 @@ impl State {
         }
     }
 
-    /// Extrae S_R como DVector.
+    /// Extracts S_R as a DVector.
     pub fn r_vec(&self) -> DVector<f32> {
         DVector::from_row_slice(self.r())
     }

@@ -3,7 +3,7 @@ use nalgebra::{DMatrix, DVector};
 
 // ── LmHead gradientes ────────────────────────────────────────────────────────
 
-/// Resultados del backprop de LmHead.
+/// LmHead backprop results.
 pub struct LmHeadGrads {
     pub dw: DMatrix<f32>,
     pub db: DVector<f32>,

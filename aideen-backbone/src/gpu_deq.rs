@@ -31,7 +31,7 @@ pub struct AdjointBuffers {
     pub b_v_out: wgpu::Buffer, // adjoint state v output       (size: ctx_len × h_slots × d_model)
 }
 
-/// Abstracción del DEQ vía GPU (WGPU).
+/// DEQ abstraction via GPU (WGPU).
 pub struct GpuDeqBackend {
     pub config: ArchitectureConfig,
     pub instance: wgpu::Instance,
@@ -353,7 +353,7 @@ impl GpuDeqBackend {
         alpha
     }
 
-    /// Inicializa la conexión con Apple Metal / Vulkan y compila los Shaders WGSL del DEQ
+    /// Initializes the connection with Apple Metal / Vulkan and compiles the DEQ WGSL Shaders
     pub async fn new_async(config: ArchitectureConfig) -> Option<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -379,7 +379,7 @@ impl GpuDeqBackend {
         let mut limits = adapter.limits();
         limits.max_storage_buffers_per_shader_stage = 16;
 
-        // 3. Crear Device
+        // 3. Create Device
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -1664,12 +1664,12 @@ impl GpuDeqBackend {
         })
     }
 
-    /// Método sincrónico por si necesitamos llamarlo desde el main hilo (pollster) V1.
+    /// Synchronous method in case we need to call it from the main thread (pollster) V1.
     pub fn new_blocking(config: ArchitectureConfig) -> Option<Self> {
         pollster::block_on(Self::new_async(config))
     }
 
-    /// Reinicia los estados ocultos (slots) en la GPU a cero.
+    /// Resets the hidden states (slots) on the GPU to zero.
     pub fn reset_state(&self) {
         let mut encoder = self
             .device

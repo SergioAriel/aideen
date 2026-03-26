@@ -1,21 +1,21 @@
-//! Dataset de texto char-level para training.
+//! Char-level text dataset for training.
 //!
-//! Convierte texto arbitrario en pares (contexto, target) para
-//! entrenar el pipeline AIDEEN: query → DEQ → H* → LmHead → token.
+//! Converts arbitrary text into (context, target) pairs for
+//! training the AIDEEN pipeline: query → DEQ → H* → LmHead → token.
 
 use nalgebra::DVector;
 
-/// Dataset char-level: cada carácter único es un token.
+/// Char-level dataset: each unique character is a token.
 pub struct TextDataset {
-    /// Vocabulario: cada char es un token.
+    /// Vocabulary: each char is a token.
     pub vocab: Vec<char>,
-    /// Texto tokenizado como indices [0, vocab_size).
+    /// Tokenized text as indices [0, vocab_size).
     pub data: Vec<u32>,
 }
 
 impl TextDataset {
-    /// Construye un dataset a partir de texto plano.
-    /// Filtra caracteres repetidos para construir el vocabulario.
+    /// Builds a dataset from plain text.
+    /// Filters repeated characters to build the vocabulary.
     pub fn from_str(text: &str) -> Self {
         let mut vocab: Vec<char> = Vec::new();
         for c in text.chars() {
@@ -33,7 +33,7 @@ impl TextDataset {
         Self { vocab, data }
     }
 
-    /// Dataset de ejemplo embebido para verificar que el sistema aprende.
+    /// Embedded example dataset to verify the system can learn.
     pub fn demo() -> Self {
         Self::from_str(
             "la inteligencia artificial distribuida razona en equilibrio \
@@ -47,10 +47,10 @@ impl TextDataset {
         self.vocab.len()
     }
 
-    /// Genera un par (query_vec, target_token) para training.
-    /// `idx`: posición en el texto (0..data.len()-1)
-    /// `d_r`: dimensión del vector de query.
-    /// Retorna: (query como DVector, token target)
+    /// Generates a (query_vec, target_token) pair for training.
+    /// `idx`: position in the text (0..data.len()-1)
+    /// `d_r`: dimension of the query vector.
+    /// Returns: (query as DVector, target token)
     pub fn sample(&self, idx: usize, d_r: usize) -> (DVector<f32>, u32) {
         let ctx_start = idx.saturating_sub(8);
         let ctx_end = idx.min(self.data.len() - 1);
@@ -70,7 +70,7 @@ impl TextDataset {
         (query, target)
     }
 
-    /// Número de samples disponibles.
+    /// Number of available samples.
     pub fn len(&self) -> usize {
         self.data.len().saturating_sub(1)
     }
@@ -83,8 +83,8 @@ mod tests {
     #[test]
     fn demo_dataset_has_content() {
         let ds = TextDataset::demo();
-        assert!(ds.vocab_size() > 10, "vocab demasiado pequeño");
-        assert!(ds.len() > 50, "dataset demasiado corto");
+        assert!(ds.vocab_size() > 10, "vocab too small");
+        assert!(ds.len() > 50, "dataset too short");
     }
 
     #[test]
@@ -101,6 +101,6 @@ mod tests {
         let (q1, _) = ds.sample(0, 512);
         let (q2, _) = ds.sample(10, 512);
         let diff: f32 = q1.iter().zip(q2.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 0.01, "queries distintas deben diferir");
+        assert!(diff > 0.01, "different queries must differ");
     }
 }

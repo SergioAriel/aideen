@@ -1,7 +1,7 @@
-/// Dataset: TinyShakespeare con tokenizer char-level.
+/// Dataset: TinyShakespeare with char-level tokenizer.
 ///
-/// Descarga ~1MB desde GitHub, construye vocab de 65 chars,
-/// y devuelve splits train/val como Vec<u32>.
+/// Downloads ~1MB from GitHub, builds 65-char vocab,
+/// and returns train/val splits as Vec<u32>.
 
 const URL: &str =
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
@@ -38,29 +38,29 @@ impl Dataset {
 }
 
 fn load_text() -> String {
-    // 1. Intentar leer desde cache local
+    // 1. Try to read from local cache
     if let Ok(text) = std::fs::read_to_string(CACHE) {
         if text.len() > 100_000 {
-            println!("  Dataset: cache local ({} chars)", text.len());
+            println!("  Dataset: local cache ({} chars)", text.len());
             return text;
         }
     }
 
-    // 2. Descargar con curl (disponible en macOS por defecto)
-    println!("  Dataset: descargando TinyShakespeare...");
+    // 2. Download with curl (available by default on macOS)
+    println!("  Dataset: downloading TinyShakespeare...");
     let output = std::process::Command::new("curl")
         .args(["-sL", "--max-time", "30", URL])
         .output()
-        .expect("curl no disponible");
+        .expect("curl not available");
 
     if !output.status.success() || output.stdout.len() < 100_000 {
-        panic!("Error descargando TinyShakespeare. Verifica conexión a internet.");
+        panic!("Error downloading TinyShakespeare. Check internet connection.");
     }
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
-    println!("  Dataset: {} chars descargados", text.len());
+    println!("  Dataset: {} chars downloaded", text.len());
 
-    // Guardar cache
+    // Save cache
     if let Some(parent) = std::path::Path::new(CACHE).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -70,7 +70,7 @@ fn load_text() -> String {
 }
 
 fn build(text: String) -> Dataset {
-    // Construir vocab char-level ordenado
+    // Build sorted char-level vocab
     let mut vocab: Vec<char> = text
         .chars()
         .collect::<std::collections::BTreeSet<_>>()

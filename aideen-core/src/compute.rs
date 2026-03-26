@@ -1,19 +1,19 @@
-//! Contratos constitucionales de cómputo.
+//! Constitutional compute contracts.
 
 use nalgebra::DVector;
 
-/// Identificador de un tensor cargado en el backend.
+/// Identifier for a tensor loaded in the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorId(pub usize);
 
-/// Trait constitucional para backend de cómputo.
-/// Debe implementarse por infraestructura no compartida pero responsable de operaciones aceleradas.
+/// Constitutional trait for compute backend.
+/// Must be implemented by non-shared infrastructure responsible for accelerated operations.
 pub trait ComputeBackend {
-    /// Inicializa o registra un tensor y devuelve su ID en el dispositivo.
+    /// Initializes or registers a tensor and returns its device ID.
     fn load_tensor(&mut self, data: &[f32]) -> Result<TensorId, String>;
 
-    /// Ejecuta el forward pass de FFN (multiplicación matriz-vector) puro.
-    /// `weights` y `input` son IDs de tensores previamente cargados.
+    /// Executes a pure FFN forward pass (matrix-vector multiplication).
+    /// `weights` and `input` are IDs of previously loaded tensors.
     fn ffn_forward(
         &mut self,
         weights: &TensorId,

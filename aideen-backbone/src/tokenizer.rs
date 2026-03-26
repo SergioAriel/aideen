@@ -1,10 +1,10 @@
-//! Tokenizer char-level con embedding matrix trainable.
+//! Char-level tokenizer with trainable embedding matrix.
 //!
-//! Fase actual: char-level (cada carácter único es un token).
-//! La clave no es BPE — es la **embedding matrix** que mapea tokens a D_R.
-//! Sin embeddings, el DEQ recibe hashes sin estructura semántica.
+//! Current phase: char-level (each unique character is a token).
+//! The key is not BPE -- it is the **embedding matrix** that maps tokens to D_R.
+//! Without embeddings, the DEQ receives hashes with no semantic structure.
 //!
-//! Fase futura: reemplazar char-level por BPE (crate `tokenizers`).
+//! Future phase: replace char-level with BPE (crate `tokenizers`).
 //!
 
 use aideen_core::state::ArchitectureConfig;
@@ -12,12 +12,12 @@ use nalgebra::{DMatrix, DVector};
 use std::path::Path;
 use tokenizers::Tokenizer as HFTokenizer;
 
-/// Tokenizer con vocabulario y embedding matrix trainable.
+/// Tokenizer with vocabulary and trainable embedding matrix.
 pub struct Tokenizer {
     pub config: ArchitectureConfig,
-    /// Vocabulario: char → token ID (solo para modo char-level).
+    /// Vocabulary: char -> token ID (char-level mode only).
     pub vocab: Vec<char>,
-    /// Tokenizer profesional opcional.
+    /// Optional professional tokenizer.
     pub hf_tokenizer: Option<HFTokenizer>,
     /// Embedding matrix [vocab_size × D_R].
     pub embeddings: DMatrix<f32>,
@@ -176,6 +176,6 @@ mod tests {
         let ea = tok.embed(0);
         let eb = tok.embed(1);
         let diff: f32 = (&ea - &eb).norm();
-        assert!(diff > 1e-6, "embeddings distintos para tokens distintos");
+        assert!(diff > 1e-6, "different tokens should have different embeddings");
     }
 }

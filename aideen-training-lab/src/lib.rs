@@ -1,7 +1,7 @@
 //! aideen-training
 //! ─────────────────────────────────────────────
-//! Infraestructura de entrenamiento para AIDEEN.
-//! Separado del backbone para que backbone pueda compilarse a WASM.
+//! Training infrastructure for AIDEEN.
+//! Separated from the backbone so backbone can compile to WASM.
 
 pub mod checkpoint;
 pub mod dataset;

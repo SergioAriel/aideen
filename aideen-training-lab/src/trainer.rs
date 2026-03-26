@@ -1,11 +1,11 @@
-//! Training loop principal de AIDEEN.
+//! Main training loop for AIDEEN.
 //!
-//! Pipeline por step:
+//! Pipeline per step:
 //!   ① tokenizer.embed_context(tokens) → query D_R
 //!   ② query → DEQ forward → H*
 //!   ③ H* → LmHead → logits
 //!   ④ loss = cross_entropy(logits, target)
-//!   ⑤ backward LmHead + backward embedding (analítico)
+//!   ⑤ backward LmHead + backward embedding (analytical)
 //!   ⑥ backward DEQ (implicit diff via CG)
 //!   ⑦ Adam update (embeddings + LmHead + DEQ)
 //!   ⑧ renormalize_weights() (spectral norm)
@@ -27,16 +27,16 @@ use aideen_backbone::gpu_embedding::GpuEmbeddingTrainer;
 #[cfg(feature = "wgpu")]
 use aideen_backbone::gpu_lm_head::GpuLmHeadTrainer;
 
-/// Configuración del training (hiperparámetros).
+/// Training configuration (hyperparameters).
 pub struct TrainingConfig {
     pub lr: f32,
-    /// LR mínimo al final del cosine schedule (default: lr/10).
+    /// Minimum LR at the end of the cosine schedule (default: lr/10).
     pub lr_min: f32,
     pub epochs: usize,
     pub log_every: usize,
-    /// Warmup epochs: LR sube linealmente de lr_min a lr.
+    /// Warmup epochs: LR increases linearly from lr_min to lr.
     pub warmup_epochs: usize,
-    /// Experimento "Bit-Dieta": Proyecta pesos a valores ternarios (-1, 0, 1).
+    /// "Bit-Diet" experiment: Projects weights to ternary values (-1, 0, 1).
     pub ternary: bool,
     pub emb_lr_mult: f32,
     pub lm_lr_mult: f32,
@@ -205,7 +205,7 @@ impl Trainer {
         }
     }
 
-    /// Crea un Trainer con un tokenizer pre-construido.
+    /// Creates a Trainer with a pre-built tokenizer.
     pub fn from_tokenizer(tokenizer: Tokenizer, lr: f32) -> Self {
         let config = tokenizer.config.clone();
 
@@ -266,8 +266,8 @@ impl Trainer {
         trainer
     }
 
-    /// Igual que `from_tokenizer`, pero forzando inicialización determinística
-    /// de los pesos de reasoning (DEQ core) para reproducibilidad por seed.
+    /// Same as `from_tokenizer`, but forcing deterministic initialization
+    /// of reasoning weights (DEQ core) for reproducibility via seed.
     pub fn from_tokenizer_seeded(tokenizer: Tokenizer, lr: f32, seed: u64) -> Self {
         let config = tokenizer.config.clone();
 
@@ -369,7 +369,7 @@ impl Trainer {
         }
     }
 
-    /// Reinicia los estados cognitivos (slots) tanto en CPU como en GPU.
+    /// Resets cognitive states (slots) on both CPU and GPU.
     pub fn reset_state(&mut self) {
         // MambaSlotReasoning es stateless entre llamadas: el DEQ recomputa h* desde cero
         // en cada forward pass, por lo que no hay estado oculto persistente que limpiar.
@@ -381,10 +381,10 @@ impl Trainer {
         }
     }
 
-    /// Ejecuta un paso de entrenamiento dado un slice de tokens.
-    /// `context`: tokens de contexto (input)
-    /// `target`: token a predecir
-    /// `reset_state`: si es true, limpia el estado oculto antes de procesar.
+    /// Executes a training step given a slice of tokens.
+    /// `context`: context tokens (input)
+    /// `target`: token to predict
+    /// `reset_state`: if true, clears the hidden state before processing.
     pub fn train_step(&mut self, context: &[u32], target: u32, reset_state: bool) -> f32 {
         if reset_state {
             self.reset_state();
@@ -438,9 +438,9 @@ impl Trainer {
         0.0
     }
 
-    /// Paso de entrenamiento para una secuencia completa (Sequence Fusing).
-    /// Procesa 1..N tokens en una única ráfaga GPU.
-    /// `reset_state`: si es true, limpia el estado oculto antes de empezar la secuencia.
+    /// Training step for a full sequence (Sequence Fusing).
+    /// Processes 1..N tokens in a single GPU burst.
+    /// `reset_state`: if true, clears the hidden state before starting the sequence.
     pub fn train_sequence(
         &mut self,
         tokens: &[u32],
@@ -718,7 +718,7 @@ impl Trainer {
 
                 let w_sum: f32 = w_raw.iter().map(|&x| x.abs()).sum();
                 println!(
-                    "[GPU-LM] Sincronizando pesos del LM Head... (abs_sum={:.4})",
+                    "[GPU-LM] Syncing LM Head weights... (abs_sum={:.4})",
                     w_sum
                 );
 
@@ -1371,7 +1371,7 @@ impl Trainer {
         0.0
     }
 
-    /// Cosine LR schedule con warmup.
+    /// Cosine LR schedule with warmup.
     fn cosine_lr(&self, epoch: usize, total_epochs: usize) -> f32 {
         let lr_max = self.training_config.lr;
         let lr_min = self.training_config.lr_min;
@@ -1385,7 +1385,7 @@ impl Trainer {
         }
     }
 
-    /// Schedule de Epsilon progresivo para el solver DEQ.
+    /// Progressive epsilon schedule for the DEQ solver.
     fn progressive_epsilon(&self, epoch: usize, total_epochs: usize) -> f32 {
         let progress = epoch as f32 / total_epochs.max(1) as f32;
         if progress < 0.20 {
@@ -1399,7 +1399,7 @@ impl Trainer {
         }
     }
 
-    /// Ejecuta el training loop sobre un corpus tokenizado.
+    /// Runs the training loop over a tokenized corpus.
     pub fn train_on_tokens(&mut self, tokens: &[u32], epochs: usize, log_every: usize) {
         if tokens.len() < 2 {
             return;
@@ -1548,7 +1548,7 @@ impl Trainer {
         }
     }
 
-    /// Genera texto a partir de un prompt.
+    /// Generates text from a prompt.
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -1672,8 +1672,8 @@ impl Trainer {
         self.tokenizer.decode(&tokens[prompt_len..])
     }
 
-    /// Versión streaming de generate: llama a `on_token` con cada fragmento de texto
-    /// generado en tiempo real, sin esperar a que termine la generación completa.
+    /// Streaming version of generate: calls `on_token` with each text fragment
+    /// generated in real time, without waiting for the full generation to finish.
     pub fn generate_stream<F: FnMut(&str)>(
         &mut self,
         prompt: &str,
@@ -1817,8 +1817,8 @@ impl Trainer {
         self.tokenizer.decode(tokens)
     }
 
-    /// Calcula la cross-entropy loss sobre una secuencia sin actualizar pesos.
-    /// Útil para validación limpia (forward-only, sin backprop).
+    /// Computes the cross-entropy loss over a sequence without updating weights.
+    /// Useful for clean validation (forward-only, no backprop).
     pub fn eval_loss(&self, tokens: &[u32]) -> f32 {
         if tokens.len() < 2 {
             return f32::NAN;
@@ -1860,8 +1860,8 @@ impl Trainer {
     // Gradient clipping global (L2 norm)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Escala `grad` in-place si su norma L2 supera `max_norm`.
-    /// Equivalente a `clip_grad_norm_` de PyTorch para un único tensor.
+    /// Scales `grad` in-place if its L2 norm exceeds `max_norm`.
+    /// Equivalent to PyTorch's `clip_grad_norm_` for a single tensor.
     fn clip_grad_norm(grad: &mut nalgebra::DVector<f32>, max_norm: f32) {
         let norm = grad.norm();
         if norm > max_norm {
@@ -1873,13 +1873,13 @@ impl Trainer {
     // Streaming dataloader — entrenamiento desde archivo binario de tokens
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Entrena sobre un archivo binario de tokens u32 (little-endian).
+    /// Trains on a binary file of u32 tokens (little-endian).
     ///
-    /// El archivo puede tener cualquier tamaño: se lee en chunks de `ctx_len + 1`
-    /// tokens con una ventana solapada de `overlap` tokens para preservar contexto
-    /// entre chunks. Cuando aparece el token `eos_token` se reinicia el contexto.
+    /// The file can be any size: it is read in chunks of `ctx_len + 1`
+    /// tokens with an overlapping window of `overlap` tokens to preserve context
+    /// between chunks. When the `eos_token` appears, the context is reset.
     ///
-    /// `save_every`: guarda checkpoint cada N epochs (0 = nunca).
+    /// `save_every`: saves a checkpoint every N epochs (0 = never).
     pub fn train_on_file(
         &mut self,
         path: &str,
@@ -1897,7 +1897,7 @@ impl Trainer {
         if total_file_tokens < 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "El archivo tiene menos de 2 tokens",
+                "File has fewer than 2 tokens",
             ));
         }
 
@@ -1945,7 +1945,7 @@ impl Trainer {
                 let skip_bytes = skip_bytes.min(file_size as u64);
                 file.seek(SeekFrom::Start(skip_bytes))?;
                 num_chunks = skip_chunks;
-                println!("    [skip] Saltando {skip_chunks} chunks ({} tokens, {:.2} MB)",
+                println!("    [skip] Skipping {skip_chunks} chunks ({} tokens, {:.2} MB)",
                     skip_bytes / 4, skip_bytes as f64 / 1_048_576.0);
             }
 
@@ -2052,14 +2052,14 @@ impl Trainer {
                     let time_save = last_save_time.elapsed().as_secs() > 1800;
                     if time_save && !checkpoint_path.is_empty() {
                         println!(
-                            "    \x1b[93m[auto-save]\x1b[0m Guardando progreso (chunk {})...",
+                            "    \x1b[93m[auto-save]\x1b[0m Saving progress (chunk {})...",
                             num_chunks
                         );
                         if let Err(e) = self.save_checkpoint(checkpoint_path) {
-                            eprintln!("    \x1b[31m[error]\x1b[0m No se pudo guardar: {}", e);
+                            eprintln!("    \x1b[31m[error]\x1b[0m Failed to save: {}", e);
                         } else {
                             println!(
-                                "    \x1b[32m[success]\x1b[0m Checkpoint '{}' actualizado.",
+                                "    \x1b[32m[success]\x1b[0m Checkpoint '{}' updated.",
                                 checkpoint_path
                             );
                             last_save_time = std::time::Instant::now();
@@ -2115,12 +2115,12 @@ impl Trainer {
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {
                 if let Err(e) = self.save_checkpoint(checkpoint_path) {
                     eprintln!(
-                        "[checkpoint] Error guardando en '{}': {}",
+                        "[checkpoint] Error saving to '{}': {}",
                         checkpoint_path, e
                     );
                 } else {
                     eprintln!(
-                        "[checkpoint] Guardado en '{}' (epoch {})",
+                        "[checkpoint] Saved to '{}' (epoch {})",
                         checkpoint_path,
                         epoch + 1
                     );
@@ -2134,8 +2134,8 @@ impl Trainer {
     // Checkpointing: pesos + estado del optimizador
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Guarda el modelo completo más el estado del optimizador.
-    /// Formato: <path>.aidn (pesos) + <path>.opt (momentos Adam).
+    /// Saves the full model plus the optimizer state.
+    /// Format: <path>.aidn (weights) + <path>.opt (Adam moments).
     pub fn save_checkpoint(&mut self, base_path: &str) -> std::io::Result<()> {
         // Pesos del modelo
         self.save_full(&format!("{base_path}.aidn"))?;
@@ -2150,7 +2150,7 @@ impl Trainer {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    /// Carga un checkpoint completo (pesos + estado del optimizador).
+    /// Loads a full checkpoint (weights + optimizer state).
     pub fn load_checkpoint(base_path: &str) -> std::io::Result<Self> {
         let mut trainer = Self::load_full(&format!("{base_path}.aidn"))?;
         let opt_path = format!("{base_path}.opt");
@@ -2166,7 +2166,7 @@ impl Trainer {
         Ok(trainer)
     }
 
-    /// Descarga los momentos Adam desde GPU → CPU Adam struct para poder guardarlos.
+    /// Downloads Adam moments from GPU to CPU Adam struct so they can be saved.
     #[cfg(feature = "wgpu")]
     fn sync_gpu_moments_to_cpu(&mut self) {
         use nalgebra::{DMatrix, DVector};
@@ -2175,7 +2175,7 @@ impl Trainer {
             None => return,
         };
 
-        println!("[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...");
+        println!("[GPU-CHECK] Starting VRAM checksum before saving...");
         gpu.device.poll(wgpu::Maintain::Wait);
 
         // LM Head moments
@@ -2187,7 +2187,7 @@ impl Trainer {
 
                 // VRAM Checksum: Si los momentos son exactamente cero, algo falló en el mapeo
                 if sum_mw == 0.0 && sum_vw == 0.0 && self.optimizer.step_count() > 10 {
-                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Checksum de VRAM falló (Momentos LM=0). Abortando para proteger checkpoint.");
+                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (LM Moments=0). Aborting to protect checkpoint.");
                 }
 
                 println!(
@@ -2213,7 +2213,7 @@ impl Trainer {
             if let Ok((m_emb, v_emb)) = gpu_emb.read_moments(&gpu.device, &gpu.queue) {
                 let sum_me: f32 = m_emb.iter().map(|x| x.abs()).sum();
                 if sum_me == 0.0 && self.optimizer.step_count() > 10 {
-                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Checksum de VRAM falló (Momentos EMB=0). Abortando.");
+                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (EMB Moments=0). Aborting.");
                 }
                 println!("    Embedding Moments Checksum: m={:.4}", sum_me);
 
@@ -2227,7 +2227,7 @@ impl Trainer {
         }
     }
 
-    /// Sube los momentos Adam CPU → GPU después de cargar un checkpoint.
+    /// Uploads Adam moments from CPU to GPU after loading a checkpoint.
     #[cfg(feature = "wgpu")]
     pub fn sync_cpu_moments_to_gpu(&mut self) {
         let gpu = match self.gpu_deq.as_ref() {
@@ -2266,7 +2266,7 @@ impl Trainer {
         }
     }
 
-    /// Guarda el modelo completo (Config + Reasoning + LmHead + Tokenizer) en un solo .aidn
+    /// Saves the full model (Config + Reasoning + LmHead + Tokenizer) in a single .aidn
     pub fn save_full(&mut self, path: &str) -> std::io::Result<()> {
         use aideen_core::model::AidenModel;
 
@@ -2332,7 +2332,7 @@ impl Trainer {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    /// Carga el modelo completo (Config + Reasoning + LmHead + Tokenizer) desde un .aidn
+    /// Loads the full model (Config + Reasoning + LmHead + Tokenizer) from a .aidn
     pub fn load_full(path: &str) -> std::io::Result<Self> {
         use aideen_core::model::AidenModel;
 
@@ -2570,9 +2570,9 @@ impl Trainer {
         }
     }
 
-    /// Configura explícitamente el backend de inferencia.
-    /// - `prefer_gpu=true`: intenta activar GPU; si no hay, queda en CPU.
-    /// - `prefer_gpu=false`: fuerza CPU.
+    /// Explicitly configures the inference backend.
+    /// - `prefer_gpu=true`: tries to activate GPU; falls back to CPU if unavailable.
+    /// - `prefer_gpu=false`: forces CPU.
     #[cfg(feature = "wgpu")]
     pub fn configure_inference_backend(&mut self, prefer_gpu: bool) -> bool {
         if !prefer_gpu {
@@ -2589,7 +2589,7 @@ impl Trainer {
         }
     }
 
-    /// En builds sin `wgpu`, siempre usa CPU.
+    /// In builds without `wgpu`, always uses CPU.
     #[cfg(not(feature = "wgpu"))]
     pub fn configure_inference_backend(&mut self, _prefer_gpu: bool) -> bool {
         self.reasoning.clear_backend();

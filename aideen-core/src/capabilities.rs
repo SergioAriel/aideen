@@ -8,8 +8,8 @@ pub enum DeviceClass {
     Unknown,
 }
 
-/// Siempre Unknown en detect() sync.
-/// Sprint 5K añadirá probe async para detectar GPU real via wgpu.
+/// Always Unknown in sync detect().
+/// Sprint 5K will add async probe to detect real GPU via wgpu.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Accel {
     Gpu { vendor: String },
@@ -29,9 +29,9 @@ pub enum QuantLevel {
 pub struct NodeCapabilities {
     pub device_class: DeviceClass,
     pub cpu_threads: u32,
-    /// RAM en MB. 0 si desconocido (WASM sin DeviceMemory API).
+    /// RAM in MB. 0 if unknown (WASM without DeviceMemory API).
     pub ram_mb: u64,
-    /// Siempre Unknown en la detección sync de 5I.
+    /// Always Unknown in the 5I sync detection.
     pub accel: Accel,
     pub quant_support: Vec<QuantLevel>,
 }
