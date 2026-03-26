@@ -729,14 +729,18 @@ fn deq_forward_main(
                 // Build mixed V vector per query slot once:
                 // mix[qs, j] = Σ_ks attn_w[qs,ks] * V[ks,j]
                 // Reuse mamba_base as temporary buffer during the DEQ loop.
-                for (var qs = 0u; qs < h_slots; qs = qs + 1u) {
-                    let q_off = qs * d_model;
-                    for (var j = tid; j < d_model; j = j + WG_SIZE) {
+                // Optimization: load V[:, j] once per j and reuse across all qs.
+                for (var j = tid; j < d_model; j = j + WG_SIZE) {
+                    var vks: array<f32, MAX_SLOTS>;
+                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                        vks[ks] = Scratch[v_base + ks * d_model + j];
+                    }
+                    for (var qs = 0u; qs < h_slots; qs = qs + 1u) {
                         var mix = 0.0;
                         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                            mix = mix + attn_w[qs * h_slots + ks] * Scratch[v_base + ks * d_model + j];
+                            mix = mix + attn_w[qs * h_slots + ks] * vks[ks];
                         }
-                        Scratch[mamba_base + q_off + j] = mix;
+                        Scratch[mamba_base + qs * d_model + j] = mix;
                     }
                 }
                 workgroupBarrier();
@@ -763,11 +767,25 @@ fn deq_forward_main(
                 if (v_lag && !v_fixed) {
                     for (var s = 0u; s < h_slots; s = s + 1u) {
                         let off = s * d_model;
+                        let w_base = s * d_model * d_model;
                         for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                             var v_next = 0.0;
-                            for (var j = 0u; j < d_model; j = j + 1u) {
-                                let h_val = H_curr[h_base + off + j];
-                                v_next = v_next + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val;
+                            // Tiled matmul to reuse H_curr tile from shared memory.
+                            for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                                let j_load = tile + tid;
+                                if (j_load < d_model) {
+                                    h_tile[tid] = H_curr[h_base + off + j_load];
+                                } else {
+                                    h_tile[tid] = 0.0;
+                                }
+                                workgroupBarrier();
+                                let tile_limit = min(WG_SIZE, d_model - tile);
+                                for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                                    let j = tile + tj;
+                                    let h_val = h_tile[tj];
+                                    v_next = v_next + AllWeights[aw_wv + w_base + j * d_model + d_out] * h_val;
+                                }
+                                workgroupBarrier();
                             }
                             let v_scale = AllWeights[aw_hist +v_scale_base];
                             Scratch[v_base + off + d_out] = v_next * v_scale;

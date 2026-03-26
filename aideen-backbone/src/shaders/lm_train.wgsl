@@ -60,6 +60,9 @@ fn s_h_rms_idx(t: u32, d: u32) -> u32 { return t * params.d_model + d; }
 var<workgroup> s_scratch:    array<f32, WG_SIZE>;
 var<workgroup> s_rms:        f32;
 var<workgroup> s_target_exp: f32;
+var<workgroup> s_h_tile:     array<f32, WG_SIZE>;
+var<workgroup> s_indices_cache: array<u32, 512>;
+var<workgroup> s_logits: array<f32, 512>;
 
 // =============================================================================
 // Pipeline 1: lm_probs_main
@@ -108,15 +111,42 @@ fn lm_probs_main(
     workgroupBarrier();
 
     // --- 3. Sampled logits ---
+    // Cache sampled_indices into workgroup memory (avoid repeated storage reads).
+    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+        s_indices_cache[k] = sampled_indices[k];
+    }
+    workgroupBarrier();
     if (tid == 0u) { s_target_exp = 0.0; }
+    // Initialize logits with bias.
+    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+        let v = s_indices_cache[k];
+        s_logits[k] = b_lm[v];
+    }
+    workgroupBarrier();
+    // GEMM-style blocking: load H once per tile, reuse for all sampled rows.
+    for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+        let d_load = tile + tid;
+        if (d_load < d_model) {
+            s_h_tile[tid] = s_h_rms[s_h_rms_idx(t, d_load)];
+        } else {
+            s_h_tile[tid] = 0.0;
+        }
+        workgroupBarrier();
+        let tile_limit = min(WG_SIZE, d_model - tile);
+        for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+            let v        = s_indices_cache[k];
+            let row_base = v * d_model + tile;
+            var acc = 0.0;
+            for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                acc += w_lm[row_base + tj] * s_h_tile[tj];
+            }
+            s_logits[k] = s_logits[k] + acc;
+        }
+        workgroupBarrier();
+    }
     var local_max = -3.4e38;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v        = sampled_indices[k];
-        let row_base = v * d_model;
-        var logit    = b_lm[v];
-        for (var d = 0u; d < d_model; d++) {
-            logit += w_lm[row_base + d] * s_h_rms[s_h_rms_idx(t, d)];
-        }
+        let logit = s_logits[k];
         probs[probs_idx(t, k)] = logit;
         local_max = max(local_max, logit);
     }
@@ -132,7 +162,7 @@ fn lm_probs_main(
 
     var local_sum = 0.0;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = sampled_indices[k];
+        let v = s_indices_cache[k];
         let e = exp(probs[probs_idx(t, k)] - mx);
         probs[probs_idx(t, k)] = e;
         if (v == target_v) { s_target_exp = e; }
@@ -277,12 +307,18 @@ fn lm_backprop_h_t_main(
     }
     workgroupBarrier();
 
+    // Cache sampled indices (avoid repeated storage reads in the inner loop).
+    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
+        s_indices_cache[k] = sampled_indices[k];
+    }
+    workgroupBarrier();
+
     // --- dL/dy_d = sum_k (p_k - 1_{v==target}) * W_k[d] ---
     var local_rms_dot = 0.0;
     for (var d = tid; d < d_model; d += WG_SIZE) {
         var dldy = 0.0;
         for (var k = 0u; k < params.num_samples; k++) {
-            let v       = sampled_indices[k];
+            let v       = s_indices_cache[k];
             let p       = s_probs_cache[k];
             let one_hot = select(0.0, 1.0, v == target_v);
             dldy += (p - one_hot) * w_lm[v * d_model + d];

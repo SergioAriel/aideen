@@ -50,6 +50,7 @@ pub struct GpuLmHeadTrainer {
     backprop_pipeline: wgpu::ComputePipeline,
     lm_scratch_buf: wgpu::Buffer,
     fused_b19: bool,
+    cfg_lm_debug: bool,
     last_sampled_indices: Vec<u32>,
     last_num_samples: u32,
     sampled_indices_reuse: Vec<u32>, // pre-alloc to avoid heap alloc per training step
@@ -548,8 +549,18 @@ impl GpuLmHeadTrainer {
             lm_scratch_buf,
             fused_b19: std::env::var("AIDEEN_LM_FUSED_B19")
                 .ok()
-                .map(|v| v.to_lowercase() == "1" || v.to_lowercase() == "true" || v.to_lowercase() == "yes")
-                .unwrap_or(true),
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(false),
+            cfg_lm_debug: std::env::var("AIDEEN_LM_DEBUG")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(false),
             last_sampled_indices: Vec::new(),
             last_num_samples: 0,
             sampled_indices_reuse: Vec::new(),
@@ -601,14 +612,7 @@ impl GpuLmHeadTrainer {
         self.sampled_indices_reuse.dedup();
         self.sampled_indices_reuse.truncate(max_samples);
         let actual_num_samples = self.sampled_indices_reuse.len() as u32;
-        let lm_debug = std::env::var("AIDEEN_LM_DEBUG")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        if lm_debug {
+        if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
                 "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
@@ -680,23 +684,14 @@ impl GpuLmHeadTrainer {
         let t_parts = seq_len as u32;
         let d_parts = (d_r as u32 + 15) / 16;
         if self.fused_b19 {
+            // Fused path: use the same update kernel as non-fused to guarantee
+            // numerical equivalence (avoids drift seen with lm_dw_accum_main).
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("LM dW Accum Pass"),
+                    label: Some("LM Update Pass (fused)"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.dw_accum_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
-                let v_parts = (actual_num_samples + 15) / 16;
-                let d_parts = (d_r as u32 + 15) / 16;
-                pass.dispatch_workgroups(d_parts, v_parts, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("LM Apply AdamW Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.apply_adamw_pipeline);
+                pass.set_pipeline(&self.update_pipeline);
                 pass.set_bind_group(0, &self.probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (d_r as u32 + 15) / 16;
@@ -758,7 +753,7 @@ impl GpuLmHeadTrainer {
             let dl = bytemuck::cast_slice(&dl_slice.get_mapped_range()).to_vec();
             let loss_int = bytemuck::cast_slice::<u8, i32>(&loss_slice.get_mapped_range())[0];
             let loss = loss_int as f32 / 10000.0;
-            if lm_debug {
+            if self.cfg_lm_debug {
                 eprintln!("    [LM-DEBUG] loss_int={}", loss_int);
             }
             self.dl_staging_buf.unmap();
@@ -804,14 +799,7 @@ impl GpuLmHeadTrainer {
         // Truncar a max_samples para no desbordar sampled_indices_buf.
         self.sampled_indices_reuse.truncate(max_samples);
         let actual_num_samples = self.sampled_indices_reuse.len() as u32;
-        let lm_debug = std::env::var("AIDEEN_LM_DEBUG")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        if lm_debug {
+        if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
                 "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
@@ -878,23 +866,14 @@ impl GpuLmHeadTrainer {
         let t_parts = seq_len as u32;
         let d_parts = (self.config.d_r as u32 + 15) / 16;
         if self.fused_b19 {
+            // Fused path: use the same update kernel as non-fused to guarantee
+            // numerical equivalence (avoids drift seen with lm_dw_accum_main).
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("LM dW Accum Pass"),
+                    label: Some("LM Update Pass (fused, buffer input)"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.dw_accum_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
-                let v_parts = (actual_num_samples + 15) / 16;
-                let d_parts = (self.config.d_r as u32 + 15) / 16;
-                pass.dispatch_workgroups(d_parts, v_parts, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("LM Apply AdamW Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.apply_adamw_pipeline);
+                pass.set_pipeline(&self.update_pipeline);
                 pass.set_bind_group(0, &self.probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (self.config.d_r as u32 + 15) / 16;
@@ -995,14 +974,7 @@ impl GpuLmHeadTrainer {
         self.sampled_indices_reuse.dedup();
         self.sampled_indices_reuse.truncate(max_samples);
         let actual_num_samples = self.sampled_indices_reuse.len() as u32;
-        let lm_debug = std::env::var("AIDEEN_LM_DEBUG")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        if lm_debug {
+        if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
                 "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
@@ -1058,23 +1030,14 @@ impl GpuLmHeadTrainer {
         let t_parts = seq_len as u32;
         let d_parts = (self.config.d_r as u32 + 15) / 16;
         if self.fused_b19 {
+            // Fused path: use the same update kernel as non-fused to guarantee
+            // numerical equivalence (avoids drift seen with lm_dw_accum_main).
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("LM dW Accum Pass"),
+                    label: Some("LM Update Pass (fused, no readback)"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.dw_accum_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
-                let v_parts = (actual_num_samples + 15) / 16;
-                let d_parts = (self.config.d_r as u32 + 15) / 16;
-                pass.dispatch_workgroups(d_parts, v_parts, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("LM Apply AdamW Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.apply_adamw_pipeline);
+                pass.set_pipeline(&self.update_pipeline);
                 pass.set_bind_group(0, &self.probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (self.config.d_r as u32 + 15) / 16;
@@ -1083,8 +1046,8 @@ impl GpuLmHeadTrainer {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("LM Backprop T Pass (NO READBACK)"),
-                    timestamp_writes: None,
-                });
+                        timestamp_writes: None,
+                    });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &self.probs_bg, &[]);
                 pass.dispatch_workgroups(t_parts, 1, 1);

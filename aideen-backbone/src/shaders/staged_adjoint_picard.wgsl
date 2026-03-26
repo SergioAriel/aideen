@@ -533,12 +533,47 @@ fn picard_accum_q_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct AndersonParams {
     m: u32,   // ring buffer depth; effective Anderson window = m - 1
     k: u32,   // current Picard iteration index (0-indexed)
+    slots_per_segment: u32,
+    _pad0: u32,
 };
 
 @group(1) @binding(0) var<uniform> anderson: AndersonParams;
-@group(1) @binding(1) var<storage, read_write> anderson_hist: array<f32>;
+@group(1) @binding(1) var<storage, read_write> anderson_hist0: array<f32>;
+@group(1) @binding(2) var<storage, read_write> anderson_hist1: array<f32>;
+@group(1) @binding(3) var<storage, read_write> anderson_hist2: array<f32>;
+@group(1) @binding(4) var<storage, read_write> anderson_hist3: array<f32>;
 // anderson_hist layout: [m × n_entries × d_model] flat
 // slot for iteration k: (k % m) * attn_len + entry * d + dim
+
+fn anderson_seg(slot: u32) -> u32 {
+    let sps = max(1u, anderson.slots_per_segment);
+    return slot / sps;
+}
+
+fn anderson_local_slot(slot: u32) -> u32 {
+    let sps = max(1u, anderson.slots_per_segment);
+    return slot - (slot / sps) * sps;
+}
+
+fn anderson_read(slot: u32, attn_len: u32, idx: u32) -> f32 {
+    let seg = anderson_seg(slot);
+    let local = anderson_local_slot(slot);
+    let off = local * attn_len + idx;
+    if (seg == 0u) { return anderson_hist0[off]; }
+    if (seg == 1u) { return anderson_hist1[off]; }
+    if (seg == 2u) { return anderson_hist2[off]; }
+    return anderson_hist3[off];
+}
+
+fn anderson_write(slot: u32, attn_len: u32, idx: u32, v: f32) {
+    let seg = anderson_seg(slot);
+    let local = anderson_local_slot(slot);
+    let off = local * attn_len + idx;
+    if (seg == 0u) { anderson_hist0[off] = v; return; }
+    if (seg == 1u) { anderson_hist1[off] = v; return; }
+    if (seg == 2u) { anderson_hist2[off] = v; return; }
+    anderson_hist3[off] = v;
+}
 
 // Workgroup-scope scratch for anderson_mix_main (one instance per workgroup at runtime)
 var<workgroup> anderson_gram: array<f32, 9>;  // up to 3×3, indexed [ri*3+rj]
@@ -553,7 +588,7 @@ fn anderson_store_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let attn_len = n_entries * d;
     if (idx >= attn_len) { return; }
     let slot = anderson.k % anderson.m;
-    anderson_hist[slot * attn_len + idx] = v_next[idx];
+    anderson_write(slot, attn_len, idx, v_next[idx]);
 }
 
 // Per-token Anderson mixing.
@@ -598,10 +633,10 @@ fn anderson_mix_main(
                     let entry = token * h_slots + e;
                     let base  = entry * d;
                     for (var dim2 = 0u; dim2 < d; dim2 = dim2 + 1u) {
-                        let da = anderson_hist[si  * attn_len + base + dim2]
-                               - anderson_hist[si1 * attn_len + base + dim2];
-                        let db = anderson_hist[sj  * attn_len + base + dim2]
-                               - anderson_hist[sj1 * attn_len + base + dim2];
+                        let da = anderson_read(si, attn_len, base + dim2)
+                               - anderson_read(si1, attn_len, base + dim2);
+                        let db = anderson_read(sj, attn_len, base + dim2)
+                               - anderson_read(sj1, attn_len, base + dim2);
                         dot = dot + da * db;
                     }
                 }
@@ -663,7 +698,7 @@ fn anderson_mix_main(
             var mixed = 0.0;
             for (var i = 0u; i < n_res; i = i + 1u) {
                 let hi = (k + m - i) % m;
-                mixed = mixed + anderson_beta[i] * anderson_hist[hi * attn_len + entry * d + dim2];
+                mixed = mixed + anderson_beta[i] * anderson_read(hi, attn_len, entry * d + dim2);
             }
             v_next[entry * d + dim2] = mixed;
         }

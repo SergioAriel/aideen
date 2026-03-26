@@ -32,8 +32,8 @@ struct UpdateUniforms {
 struct AndersonParams {
     m: u32,
     k: u32,
+    slots_per_segment: u32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 /// Minimal buffers needed by the Picard adjoint path (replaces the old RustCgBridge).
@@ -51,6 +51,11 @@ pub struct GpuDeqBackend {
     pub queue: Arc<wgpu::Queue>,
     pub bridge: RustDeqBridge,
     pub adj_bufs: AdjointBuffers,
+    tps_timestamp_enabled: bool,
+    tps_timestamp_period: f32,
+    tps_timestamp_query: Option<wgpu::QuerySet>,
+    tps_timestamp_resolve_buf: Option<wgpu::Buffer>,
+    tps_timestamp_readback_buf: Option<wgpu::Buffer>,
 
     // Fused update pipeline
     fused_adjoint_picard_pipeline: wgpu::ComputePipeline,
@@ -109,7 +114,8 @@ pub struct GpuDeqBackend {
 
     // Anderson acceleration for adjoint Picard
     anderson_m: u32,                           // ring buffer depth (effective window = m-1)
-    anderson_hist_buf: wgpu::Buffer,           // m × ctx_len × h_slots × d floats
+    anderson_hist_bufs: Vec<wgpu::Buffer>,     // segmented ring buffer slots
+    anderson_slots_per_segment: u32,
     anderson_params_bufs: Vec<wgpu::Buffer>,   // one 16-byte uniform per iteration slot
     anderson_bgs: Vec<wgpu::BindGroup>,        // one bind group per iteration slot
     anderson_store_pipeline: wgpu::ComputePipeline,
@@ -120,6 +126,26 @@ pub struct GpuDeqBackend {
     pub cached_residual_alpha: f32,
     cfg_hist_gated: bool,
     cfg_hist_selective: bool,
+    cfg_slot_anchor_zero: bool,
+    cfg_rms_floor: f32,
+    cfg_contr_floor: f32,
+    cfg_hist_zero: bool,
+    cfg_hist_minner_zero: bool,
+    cfg_hist_force_nomamba: bool,
+    cfg_hist_prelude_skip: bool,
+    cfg_hist_loop_force_nomamba: bool,
+    cfg_signal_zero: bool,
+    cfg_attn_out_mode: f32,
+    cfg_attn_uniform: bool,
+    cfg_attn_freeze: bool,
+    cfg_v_fixed: bool,
+    cfg_v_lag: bool,
+    cfg_v_scale: f32,
+    cfg_signal_scale: f32,
+    cfg_v_gate_scale: f32,
+    cfg_v_gate_bias: f32,
+    cfg_v_norm: bool,
+    cfg_v_norm_scale: f32,
     cfg_hist_train_carrier: bool,
     cfg_hist_train_wx: bool,
     cfg_hist_train_wout: bool,
@@ -127,6 +153,11 @@ pub struct GpuDeqBackend {
     cfg_hist_train_delta: bool,
     cfg_hist_internal_probe: bool,
     cfg_fused_profile: bool,
+    cfg_picard_profile: bool,
+    cfg_picard_stage_profile: bool,
+    cfg_picard_accum_split: bool,
+    cfg_picard_internal_probe: bool,
+    cfg_picard_gscore_fused: bool,
 }
 
 impl GpuDeqBackend {
@@ -192,121 +223,35 @@ impl GpuDeqBackend {
         out.extend_from_slice(hist_slot_scale);
         out.extend_from_slice(hist_slot_bias);
         out.extend_from_slice(hist_gate_logit);
-        if Self::env_flag("AIDEEN_DEQ_SLOT_ANCHOR_ZERO") {
+        if self.cfg_slot_anchor_zero {
             out.extend(std::iter::repeat(0.0).take(h * d));
         } else {
             out.extend_from_slice(slot_anchor);
         }
         out.extend_from_slice(w_delta);
         out.extend_from_slice(b_delta);
-        out.push(if Self::hist_selective_from_env() {
-            1.0
-        } else {
-            0.0
-        });
+        out.push(if self.cfg_hist_selective { 1.0 } else { 0.0 });
         // Warmup factor for alpha_min (0..1). Default to 1.0 so inference is unaffected.
         out.push(1.0);
-        let rms_floor = Self::env_f32("AIDEEN_DEQ_RMS_FLOOR")
-            .unwrap_or(0.0)
-            .max(0.0);
-        let contr_floor = Self::env_f32("AIDEEN_DEQ_CONTR_RMS_FLOOR")
-            .unwrap_or(0.0)
-            .max(0.0);
-        out.push(rms_floor);
-        out.push(contr_floor);
-        let hist_inject = if Self::env_flag("AIDEEN_DEQ_HIST_ZERO") {
-            0.0
-        } else {
-            1.0
-        };
-        out.push(hist_inject);
-        let hist_minner_zero = if Self::env_flag("AIDEEN_DEQ_HIST_MINNER_ZERO") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_minner_zero);
-        let hist_force_nomamba = if Self::env_flag("AIDEEN_DEQ_HIST_FORCE_NOMAMBA") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_force_nomamba);
-        let hist_prelude_skip = if Self::env_flag("AIDEEN_DEQ_HIST_PRELUDE_SKIP") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_prelude_skip);
-        let hist_loop_force_nomamba = if Self::env_flag("AIDEEN_DEQ_HIST_LOOP_FORCE_NOMAMBA") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_loop_force_nomamba);
-        let signal_zero = if Self::env_flag("AIDEEN_DEQ_SIGNAL_ZERO") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(signal_zero);
-        let attn_out_mode = Self::env_f32("AIDEEN_DEQ_ATTN_OUT_MODE")
-            .unwrap_or(0.0)
-            .clamp(0.0, 2.0);
-        out.push(attn_out_mode);
-        let attn_uniform = if Self::env_flag("AIDEEN_DEQ_ATTN_UNIFORM") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(attn_uniform);
-        let attn_freeze = if Self::env_flag("AIDEEN_DEQ_ATTN_FREEZE") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(attn_freeze);
-        let v_fixed = if std::env::var("AIDEEN_DEQ_V_FIXED")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false)
-        {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(v_fixed);
-        let v_lag = if Self::env_flag("AIDEEN_DEQ_V_LAG") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(v_lag);
-        let v_scale = Self::env_f32("AIDEEN_DEQ_V_SCALE")
-            .unwrap_or(1.0)
-            .clamp(0.01, 10.0);
-        out.push(v_scale);
-        let signal_scale = Self::env_f32("AIDEEN_DEQ_SIGNAL_SCALE")
-            .unwrap_or(1.0)
-            .clamp(0.01, 10.0);
-        out.push(signal_scale);
-        // V gating (scalar per slot) — disabled by default.
-        let v_gate_scale = Self::env_f32("AIDEEN_DEQ_V_GATE_SCALE").unwrap_or(0.0);
-        let v_gate_bias = Self::env_f32("AIDEEN_DEQ_V_GATE_BIAS").unwrap_or(0.0);
-        out.push(v_gate_scale);
-        out.push(v_gate_bias);
-        // V normalization (per-slot RMS) with optional learned scale.
-        let v_norm = if Self::env_flag("AIDEEN_DEQ_V_NORM") {
-            1.0
-        } else {
-            0.0
-        };
-        let v_norm_scale = Self::env_f32("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
-        out.push(v_norm);
-        out.push(v_norm_scale);
+        out.push(self.cfg_rms_floor);
+        out.push(self.cfg_contr_floor);
+        out.push(if self.cfg_hist_zero { 0.0 } else { 1.0 });
+        out.push(if self.cfg_hist_minner_zero { 1.0 } else { 0.0 });
+        out.push(if self.cfg_hist_force_nomamba { 1.0 } else { 0.0 });
+        out.push(if self.cfg_hist_prelude_skip { 1.0 } else { 0.0 });
+        out.push(if self.cfg_hist_loop_force_nomamba { 1.0 } else { 0.0 });
+        out.push(if self.cfg_signal_zero { 1.0 } else { 0.0 });
+        out.push(self.cfg_attn_out_mode);
+        out.push(if self.cfg_attn_uniform { 1.0 } else { 0.0 });
+        out.push(if self.cfg_attn_freeze { 1.0 } else { 0.0 });
+        out.push(if self.cfg_v_fixed { 1.0 } else { 0.0 });
+        out.push(if self.cfg_v_lag { 1.0 } else { 0.0 });
+        out.push(self.cfg_v_scale);
+        out.push(self.cfg_signal_scale);
+        out.push(self.cfg_v_gate_scale);
+        out.push(self.cfg_v_gate_bias);
+        out.push(if self.cfg_v_norm { 1.0 } else { 0.0 });
+        out.push(self.cfg_v_norm_scale);
         // W_gate_hist: h_slots × d_model dynamic gate query matrix (after 21 scalars)
         out.extend_from_slice(w_gate_hist);
         // Forget gate parameters: W_forget (h×d) and b_forget (h)
@@ -417,6 +362,26 @@ impl GpuDeqBackend {
         };
 
         println!("[GpuDeqBackend] Adapter: {}", adapter.get_info().name);
+        let wants_timestamps = std::env::var("AIDEEN_TPS_GPU_TIMESTAMPS")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let adapter_features = adapter.features();
+        let timestamps_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+            && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let tps_timestamp_enabled = wants_timestamps && timestamps_supported;
+        let mut required_features = wgpu::Features::SUBGROUP;
+        if tps_timestamp_enabled {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+            required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        } else if wants_timestamps {
+            eprintln!(
+                "[GpuDeqBackend] TIMESTAMP_QUERY not supported or missing TIMESTAMP_QUERY_INSIDE_ENCODERS."
+            );
+        }
         let mut limits = adapter.limits();
         limits.max_storage_buffers_per_shader_stage = 16;
 
@@ -425,7 +390,7 @@ impl GpuDeqBackend {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("AIDEEN DEQ GPU"),
-                    required_features: wgpu::Features::SUBGROUP,
+                    required_features,
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -439,6 +404,43 @@ impl GpuDeqBackend {
                 return None;
             }
         };
+
+        let (
+            tps_timestamp_enabled,
+            tps_timestamp_period,
+            tps_timestamp_query,
+            tps_timestamp_resolve_buf,
+            tps_timestamp_readback_buf,
+        ) =
+            if tps_timestamp_enabled {
+                let query = device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("AIDEEN TPS Timestamp QuerySet"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                });
+                let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("AIDEEN TPS Timestamp Resolve"),
+                    size: 2 * std::mem::size_of::<u64>() as u64,
+                    usage: wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::QUERY_RESOLVE,
+                    mapped_at_creation: false,
+                });
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("AIDEEN TPS Timestamp Readback"),
+                    size: 2 * std::mem::size_of::<u64>() as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                (
+                    true,
+                    queue.get_timestamp_period(),
+                    Some(query),
+                    Some(resolve),
+                    Some(readback),
+                )
+            } else {
+                (false, 0.0, None, None, None)
+            };
 
         // Read batch_size from env — scales all forward+backward buffers.
         let forward_batch_cap = std::env::var("AIDEEN_BATCH_SIZE")
@@ -1239,6 +1241,36 @@ impl GpuDeqBackend {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let anderson_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1246,17 +1278,31 @@ impl GpuDeqBackend {
             bind_group_layouts: &[&bg0_layout, &anderson_bg1_layout],
             push_constant_ranges: &[],
         });
-        // Ring buffer: m × max_attn_len floats (allocate at least 1 slot to satisfy wgpu)
+        // Ring buffer: m × max_attn_len floats (segment into <=4 buffers to stay under buffer limits)
         let anderson_attn_len_max =
             (forward_batch_cap as usize).max(1) * config.ctx_len.max(1) * config.h_slots * config.d_r;
         let anderson_m_alloc = anderson_m_val.max(1);
-        let anderson_hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Anderson Hist Buffer"),
-            size: (anderson_m_alloc as usize * anderson_attn_len_max * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let max_storage_bytes = device.limits().max_storage_buffer_binding_size as usize;
+        let slot_bytes = anderson_attn_len_max * 4;
+        if slot_bytes > max_storage_bytes {
+            return None;
+        }
+        let slots_per_segment = (max_storage_bytes / slot_bytes).max(1);
+        let segment_count = (anderson_m_alloc as usize + slots_per_segment - 1) / slots_per_segment;
+        if segment_count > 4 {
+            return None;
+        }
+        let mut anderson_hist_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(4);
+        for seg in 0..4 {
+            let slots_in_seg = if seg < segment_count { slots_per_segment } else { 1 };
+            let size = (slots_in_seg * slot_bytes) as u64;
+            anderson_hist_bufs.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Anderson Hist Buffer seg {}", seg)),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
         const ANDERSON_MAX_ITERS: usize = 16;
         let mut anderson_params_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(ANDERSON_MAX_ITERS);
         let mut anderson_bgs: Vec<wgpu::BindGroup> = Vec::with_capacity(ANDERSON_MAX_ITERS);
@@ -1272,7 +1318,10 @@ impl GpuDeqBackend {
                 layout: &anderson_bg1_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: pbuf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: anderson_hist_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: anderson_hist_bufs[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: anderson_hist_bufs[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: anderson_hist_bufs[2].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: anderson_hist_bufs[3].as_entire_binding() },
                 ],
             });
             anderson_params_bufs.push(pbuf);
@@ -1737,8 +1786,12 @@ impl GpuDeqBackend {
         let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let cfg_hist_selective = Self::hist_selective_from_env();
         let bool_flag = |s: &str| -> Option<bool> {
-            std::env::var(s).ok().map(|v| { let vl = v.trim().to_ascii_lowercase(); vl == "1" || vl == "true" || vl == "yes" })
+            std::env::var(s).ok().map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
         };
+        let f32_flag = |s: &str| -> Option<f32> { std::env::var(s).ok().and_then(|v| v.parse::<f32>().ok()) };
         let cfg_hist_train_carrier = bool_flag("AIDEEN_HIST_TRAIN_CARRIER").unwrap_or(false);
         let cfg_hist_train_wx      = bool_flag("AIDEEN_HIST_TRAIN_WX").unwrap_or(cfg_hist_train_carrier);
         let cfg_hist_train_wout    = bool_flag("AIDEEN_HIST_TRAIN_WOUT").unwrap_or(false);
@@ -1746,6 +1799,31 @@ impl GpuDeqBackend {
         let cfg_hist_train_delta   = bool_flag("AIDEEN_HIST_TRAIN_DELTA").unwrap_or(cfg_hist_selective);
         let cfg_hist_internal_probe = bool_flag("AIDEEN_HIST_INTERNAL_PROBE").unwrap_or(false);
         let cfg_fused_profile       = bool_flag("AIDEEN_FUSED_PROFILE").unwrap_or(false);
+        let cfg_slot_anchor_zero = bool_flag("AIDEEN_DEQ_SLOT_ANCHOR_ZERO").unwrap_or(false);
+        let cfg_rms_floor = f32_flag("AIDEEN_DEQ_RMS_FLOOR").unwrap_or(0.0).max(0.0);
+        let cfg_contr_floor = f32_flag("AIDEEN_DEQ_CONTR_RMS_FLOOR").unwrap_or(0.0).max(0.0);
+        let cfg_hist_zero = bool_flag("AIDEEN_DEQ_HIST_ZERO").unwrap_or(false);
+        let cfg_hist_minner_zero = bool_flag("AIDEEN_DEQ_HIST_MINNER_ZERO").unwrap_or(false);
+        let cfg_hist_force_nomamba = bool_flag("AIDEEN_DEQ_HIST_FORCE_NOMAMBA").unwrap_or(false);
+        let cfg_hist_prelude_skip = bool_flag("AIDEEN_DEQ_HIST_PRELUDE_SKIP").unwrap_or(false);
+        let cfg_hist_loop_force_nomamba = bool_flag("AIDEEN_DEQ_HIST_LOOP_FORCE_NOMAMBA").unwrap_or(false);
+        let cfg_signal_zero = bool_flag("AIDEEN_DEQ_SIGNAL_ZERO").unwrap_or(false);
+        let cfg_attn_out_mode = f32_flag("AIDEEN_DEQ_ATTN_OUT_MODE").unwrap_or(0.0).clamp(0.0, 2.0);
+        let cfg_attn_uniform = bool_flag("AIDEEN_DEQ_ATTN_UNIFORM").unwrap_or(false);
+        let cfg_attn_freeze = bool_flag("AIDEEN_DEQ_ATTN_FREEZE").unwrap_or(false);
+        let cfg_v_fixed = bool_flag("AIDEEN_DEQ_V_FIXED").unwrap_or(false);
+        let cfg_v_lag = bool_flag("AIDEEN_DEQ_V_LAG").unwrap_or(false);
+        let cfg_v_scale = f32_flag("AIDEEN_DEQ_V_SCALE").unwrap_or(1.0).clamp(0.01, 10.0);
+        let cfg_signal_scale = f32_flag("AIDEEN_DEQ_SIGNAL_SCALE").unwrap_or(1.0).clamp(0.01, 10.0);
+        let cfg_v_gate_scale = f32_flag("AIDEEN_DEQ_V_GATE_SCALE").unwrap_or(0.0);
+        let cfg_v_gate_bias = f32_flag("AIDEEN_DEQ_V_GATE_BIAS").unwrap_or(0.0);
+        let cfg_v_norm = bool_flag("AIDEEN_DEQ_V_NORM").unwrap_or(false);
+        let cfg_v_norm_scale = f32_flag("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
+        let cfg_picard_profile = bool_flag("AIDEEN_PICARD_PROFILE").unwrap_or(false);
+        let cfg_picard_stage_profile = bool_flag("AIDEEN_PICARD_STAGE_PROFILE").unwrap_or(false);
+        let cfg_picard_accum_split = bool_flag("AIDEEN_PICARD_ACCUM_SPLIT_PROFILE").unwrap_or(false);
+        let cfg_picard_internal_probe = bool_flag("AIDEEN_PICARD_INTERNAL_PROBE").unwrap_or(false);
+        let cfg_picard_gscore_fused = bool_flag("AIDEEN_PICARD_GSCORE_FUSED").unwrap_or(false);
 
         Some(Self {
             config,
@@ -1758,6 +1836,11 @@ impl GpuDeqBackend {
                 b_dl: adj_dl_buf,
                 b_v_out: adj_v_out_buf,
             },
+            tps_timestamp_enabled,
+            tps_timestamp_period,
+            tps_timestamp_query,
+            tps_timestamp_resolve_buf,
+            tps_timestamp_readback_buf,
             fused_adjoint_picard_pipeline,
             staged_picard_init_pipeline,
             staged_picard_gcomb_pipeline,
@@ -1812,7 +1895,8 @@ impl GpuDeqBackend {
             tbptt_carry_buf,
             all_gradients_buf,
             anderson_m: anderson_m_val,
-            anderson_hist_buf,
+            anderson_hist_bufs,
+            anderson_slots_per_segment: slots_per_segment as u32,
             anderson_params_bufs,
             anderson_bgs,
             anderson_store_pipeline,
@@ -1820,6 +1904,26 @@ impl GpuDeqBackend {
             cached_residual_alpha,
             cfg_hist_gated,
             cfg_hist_selective,
+            cfg_slot_anchor_zero,
+            cfg_rms_floor,
+            cfg_contr_floor,
+            cfg_hist_zero,
+            cfg_hist_minner_zero,
+            cfg_hist_force_nomamba,
+            cfg_hist_prelude_skip,
+            cfg_hist_loop_force_nomamba,
+            cfg_signal_zero,
+            cfg_attn_out_mode,
+            cfg_attn_uniform,
+            cfg_attn_freeze,
+            cfg_v_fixed,
+            cfg_v_lag,
+            cfg_v_scale,
+            cfg_signal_scale,
+            cfg_v_gate_scale,
+            cfg_v_gate_bias,
+            cfg_v_norm,
+            cfg_v_norm_scale,
             cfg_hist_train_carrier,
             cfg_hist_train_wx,
             cfg_hist_train_wout,
@@ -1827,6 +1931,11 @@ impl GpuDeqBackend {
             cfg_hist_train_delta,
             cfg_hist_internal_probe,
             cfg_fused_profile,
+            cfg_picard_profile,
+            cfg_picard_stage_profile,
+            cfg_picard_accum_split,
+            cfg_picard_internal_probe,
+            cfg_picard_gscore_fused,
         })
     }
 
@@ -2363,42 +2472,12 @@ impl GpuDeqBackend {
         clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
-        let profile_picard = std::env::var("AIDEEN_PICARD_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let profile_picard_stages = std::env::var("AIDEEN_PICARD_STAGE_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let profile_picard_accum_split = std::env::var("AIDEEN_PICARD_ACCUM_SPLIT_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let picard_internal_probe = std::env::var("AIDEEN_PICARD_INTERNAL_PROBE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
+        let profile_picard = self.cfg_picard_profile;
+        let profile_picard_stages = self.cfg_picard_stage_profile;
+        let profile_picard_accum_split = self.cfg_picard_accum_split;
+        let picard_internal_probe = self.cfg_picard_internal_probe;
         let total_t0 = std::time::Instant::now();
-        let fused_gscore = std::env::var("AIDEEN_PICARD_GSCORE_FUSED")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
+        let fused_gscore = self.cfg_picard_gscore_fused;
         let params = UpdateUniforms {
             d_model: self.config.d_r as u32,
             h_slots: self.config.h_slots as u32,
@@ -2441,8 +2520,8 @@ impl GpuDeqBackend {
                     let ap = AndersonParams {
                         m: anderson_m,
                         k: k as u32,
+                        slots_per_segment: self.anderson_slots_per_segment,
                         _pad0: 0,
-                        _pad1: 0,
                     };
                     self.queue.write_buffer(
                         &self.anderson_params_bufs[k],
@@ -2474,7 +2553,9 @@ impl GpuDeqBackend {
             enc.clear_buffer(&self.fused_gscore_buf, 0, None);
             // Clear Anderson history ring buffer
             if anderson_m > 0 {
-                enc.clear_buffer(&self.anderson_hist_buf, 0, None);
+                for buf in &self.anderson_hist_bufs {
+                    enc.clear_buffer(buf, 0, None);
+                }
             }
             // Init pass (replaces separate init_encoder submit).
             {
@@ -3354,6 +3435,77 @@ impl GpuDeqBackend {
 
     pub fn read_debug_buffer(&self) -> Vec<f32> {
         self.bridge.read_debug_buffer(&self.device, &self.queue)
+    }
+
+    pub fn tps_epoch_begin(&self) {
+        if !self.tps_timestamp_enabled {
+            return;
+        }
+        let Some(qs) = self.tps_timestamp_query.as_ref() else { return; };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("AIDEEN TPS Timestamp Begin"),
+        });
+        encoder.write_timestamp(qs, 0);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn tps_epoch_end(&self) {
+        if !self.tps_timestamp_enabled {
+            return;
+        }
+        let (Some(qs), Some(resolve), Some(readback)) = (
+            self.tps_timestamp_query.as_ref(),
+            self.tps_timestamp_resolve_buf.as_ref(),
+            self.tps_timestamp_readback_buf.as_ref(),
+        ) else {
+            return;
+        };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("AIDEEN TPS Timestamp End"),
+        });
+        encoder.write_timestamp(qs, 1);
+        encoder.resolve_query_set(qs, 0..2, resolve, 0);
+        encoder.copy_buffer_to_buffer(
+            resolve,
+            0,
+            readback,
+            0,
+            2 * std::mem::size_of::<u64>() as u64,
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn read_tps_epoch_ns(&self) -> Option<f64> {
+        if !self.tps_timestamp_enabled {
+            return None;
+        }
+        let buf = self.tps_timestamp_readback_buf.as_ref()?;
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            buf.unmap();
+            return None;
+        }
+        let data = slice.get_mapped_range();
+        let ts: &[u64] = bytemuck::cast_slice(&data);
+        if ts.len() < 2 {
+            drop(data);
+            buf.unmap();
+            return None;
+        }
+        let start = ts[0];
+        let end = ts[1];
+        drop(data);
+        buf.unmap();
+        if end <= start {
+            return None;
+        }
+        let period = self.tps_timestamp_period as f64;
+        Some((end - start) as f64 * period)
     }
 
     pub fn read_scratch_buffer(&self) -> Vec<f32> {
