@@ -259,12 +259,15 @@ fn run_large_file(
     let bin_path = format!("{txt_path}.tokens.bin");
     let txt_meta = fs::metadata(&txt_path).ok();
     let bin_meta = fs::metadata(&bin_path).ok();
-    let use_cache = bin_meta
-        .as_ref()
-        .and_then(|b| b.modified().ok())
-        .zip(txt_meta.as_ref().and_then(|t| t.modified().ok()))
+    let bin_mtime = bin_meta.as_ref().and_then(|b| b.modified().ok());
+    let txt_mtime = txt_meta.as_ref().and_then(|t| t.modified().ok());
+    let tok_mtime = tok_path.as_ref().and_then(|p| fs::metadata(p).ok()).and_then(|m| m.modified().ok());
+    let use_cache = bin_mtime
+        .zip(txt_mtime)
         .map(|(b, t)| b >= t)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && tok_mtime.map(|tm| bin_mtime.unwrap() >= tm).unwrap_or(true)
+        && bin_meta.as_ref().map(|m| m.len() % 4 == 0 && m.len() > 0).unwrap_or(false);
 
     if use_cache && tok_path.is_some() {
         let bin_bytes = bin_meta.unwrap().len() as usize;

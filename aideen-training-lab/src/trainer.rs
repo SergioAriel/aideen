@@ -678,10 +678,10 @@ impl Trainer {
             let fw = gpu.read_debug_buffer();
             let heartbeat = if fw.len() > 10 { fw[10] } else { 1.0 };
             let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
-            let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
+            let unconverged_count = if fw.len() > 15 { fw[15] } else { 0.0 };
             let contractivity = if fw.len() > 21 { fw[21] } else { 0.0 };
             let seq = heartbeat.max(1.0);
-            let hit_ratio = hit_count.max(0.0) / seq;
+            let unconverged_ratio = unconverged_count.max(0.0) / seq;
             // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
             // also being non-contractive. Non-monotone convergence (contr transiently > 1
             // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
@@ -695,10 +695,10 @@ impl Trainer {
             }
             if self.invalid_hi_streak >= 3 {
                 eprintln!(
-                    "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
+                    "    [DEQ-INVALID] step={} contr={:.3} unconverged={:.3} maxΔ={:.3e} seq={:.0}",
                     self.optimizer.step_count(),
                     contractivity,
-                    hit_ratio,
+                    unconverged_ratio,
                     max_delta,
                     seq
                 );
@@ -1027,7 +1027,7 @@ impl Trainer {
                 let heartbeat = if fw.len() > 10 { fw[10] } else { 0.0 }; // seq
                 let max_h = if fw.len() > 11 { fw[11] } else { 0.0 };
                 let avg_iters = if fw.len() > 13 { fw[13] } else { 0.0 };
-                let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
+                let unconverged_count = if fw.len() > 15 { fw[15] } else { 0.0 };
                 let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
                 let _last_delta = if fw.len() > 17 { fw[17] } else { 0.0 };
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
@@ -1094,8 +1094,8 @@ impl Trainer {
                 }
 
                 let seq = heartbeat.max(1.0);
-                let hit = hit_count.max(0.0);
-                let hit_ratio = hit / seq;
+                let unconverged = unconverged_count.max(0.0);
+                let unconverged_ratio = unconverged / seq;
 
                 // ---------- v13.2 Stability Oracle Logic ----------
 
@@ -1125,13 +1125,13 @@ impl Trainer {
                 }
 
                 // 3. Forward Iters Hysteresis (v13.3)
-                // For very short sequences (e.g. seq=1), hit_ratio is not informative
+                // For very short sequences (e.g. seq=1), unconverged_ratio is not informative
                 // and tends to force unnecessary iteration growth.
                 if seq >= 8.0 {
-                    if hit_ratio > 0.08 {
+                    if unconverged_ratio > 0.08 {
                         self.hit_hi_streak += 1;
                         self.hit_lo_streak = 0;
-                    } else if hit_ratio < 0.03 {
+                    } else if unconverged_ratio < 0.03 {
                         self.hit_lo_streak += 1;
                         self.hit_hi_streak = 0;
                     } else {
@@ -1165,8 +1165,8 @@ impl Trainer {
                     self.hit_lo_streak = 0;
                 }
 
-                // BOOST de Damping por inestabilidad puntual o hit ratio alto
-                if hit_ratio > 0.20 || max_delta > 1e-3 {
+                // BOOST de Damping por inestabilidad puntual o unconverged ratio alto
+                if unconverged_ratio > 0.20 || max_delta > 1e-3 {
                     self.damping_boost_left = 2; // 2 windows de debug (~20 steps)
                 }
 
@@ -1225,16 +1225,16 @@ impl Trainer {
                 } else {
                     "NORMAL"
                 };
-                let conv_ok =
-                    hit_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
+                let conv_ok = unconverged_ratio <= 0.05
+                    || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
-                let hit_i = hit.round() as i32;
+                let unc_i = unconverged.round() as i32;
                 println!(
-                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
+                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: unconverged={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
-                    hit_i,
+                    unc_i,
                     seq,
-                    100.0 * hit_ratio,
+                    100.0 * unconverged_ratio,
                     contractivity,
                     max_delta,
                     rs_cg,
