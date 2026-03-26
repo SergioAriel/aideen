@@ -100,17 +100,25 @@ fn main() {
         i += 1;
     }
 
-    // Require explicit --file to avoid silent fallback to the tiny dataset.
-    let Some(ref txt_path) = large_file else {
-        eprintln!("ERROR: falta --file <corpus.txt>. El modo fallback fue deshabilitado.");
-        std::process::exit(2);
-    };
-    run_large_file(
-        txt_path,
+    // Pass freeze flags to run functions or use them directly
+    if let Some(ref txt_path) = large_file {
+        run_large_file(
+            txt_path,
+            resume_path,
+            epochs,
+            log_every,
+            save_every,
+            freeze_deq,
+            freeze_emb,
+            freeze_lm,
+        );
+        return;
+    }
+
+    run_small_dataset(
         resume_path,
         epochs,
         log_every,
-        save_every,
         freeze_deq,
         freeze_emb,
         freeze_lm,
@@ -210,8 +218,8 @@ fn run_large_file(
     println!("  Modo: archivo grande → {txt_path}");
 
     // ── Resolver ruta real del dataset ─────────────────────────────────────
-    let (resolved_path, corpus) = match fs::read_to_string(txt_path) {
-        Ok(c) => (txt_path.to_string(), Some(c)),
+    let (corpus, resolved_path) = match fs::read_to_string(txt_path) {
+        Ok(c) => (c, txt_path.to_string()),
         Err(_) => {
             let filename = std::path::Path::new(txt_path)
                 .file_name()
@@ -225,7 +233,7 @@ fn run_large_file(
             let mut found = None;
             for p in alt_paths {
                 if let Ok(c) = fs::read_to_string(&p) {
-                    found = Some((p, Some(c)));
+                    found = Some((c, p));
                     break;
                 }
             }
@@ -237,13 +245,13 @@ fn run_large_file(
     // ── Construir tokenizer ────────────────────────────────────────────────
     let config_default = ArchitectureConfig::default();
     let tok_path = find_tokenizer_path();
+
     let mut tok = if let Some(ref path) = tok_path {
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
     } else {
-        let corpus = corpus.as_ref().expect("Tokenizer char-level requiere corpus en memoria.");
         println!("  Tokenizer: Char-level — escaneando vocab...");
-        Tokenizer::from_text(corpus, config_default.clone())
+        Tokenizer::from_text(&corpus, config_default.clone())
     };
 
     tok.config.vocab_size = tok.vocab_size();
@@ -255,52 +263,30 @@ fn run_large_file(
 
     let vocab_size = tok.vocab_size();
 
-    // ── Tokenizar y escribir .bin (o reutilizar cache) ─────────────────────
+    // ── Tokenizar y escribir .bin ──────────────────────────────────────────
     let bin_path = format!("{txt_path}.tokens.bin");
-    let txt_meta = fs::metadata(&txt_path).ok();
-    let bin_meta = fs::metadata(&bin_path).ok();
-    let bin_mtime = bin_meta.as_ref().and_then(|b| b.modified().ok());
-    let txt_mtime = txt_meta.as_ref().and_then(|t| t.modified().ok());
-    let tok_mtime = tok_path.as_ref().and_then(|p| fs::metadata(p).ok()).and_then(|m| m.modified().ok());
-    let use_cache = bin_mtime
-        .zip(txt_mtime)
-        .map(|(b, t)| b >= t)
-        .unwrap_or(false)
-        && tok_mtime.map(|tm| bin_mtime.unwrap() >= tm).unwrap_or(true)
-        && bin_meta.as_ref().map(|m| m.len() % 4 == 0 && m.len() > 0).unwrap_or(false);
+    println!("  Tokenizando {txt_path} → {bin_path} ...");
+    {
+        use std::io::Write;
+        let tokens = tok.encode(&corpus);
+        let byte_data: &[u8] = bytemuck::cast_slice(&tokens);
 
-    if use_cache && tok_path.is_some() {
-        let bin_bytes = bin_meta.unwrap().len() as usize;
-        let tokens_len = bin_bytes / 4;
-        println!(
-            "  Cache OK: reutilizando {bin_path} ({} tokens, vocab={})",
-            tokens_len, vocab_size
-        );
-    } else {
-        let corpus = corpus.as_ref().expect("Corpus en memoria requerido para tokenizar.");
-        println!("  Tokenizando {txt_path} → {bin_path} ...");
-        {
-            use std::io::Write;
-            let tokens = tok.encode(corpus);
-            let byte_data: &[u8] = bytemuck::cast_slice(&tokens);
-
-            // Asegurar que el directorio padre existe
-            if let Some(parent) = std::path::Path::new(&bin_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    let _ = fs::create_dir_all(parent);
-                }
+        // Asegurar que el directorio padre existe
+        if let Some(parent) = std::path::Path::new(&bin_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
             }
-
-            let mut f = fs::File::create(&bin_path).expect("No se puede crear .bin");
-            f.write_all(byte_data).expect("Error escribiendo .bin");
-            println!(
-                "  {} chars → {} tokens, vocab={} → {:.2} MB",
-                corpus.len(),
-                tokens.len(),
-                vocab_size,
-                byte_data.len() as f64 / 1_048_576.0
-            );
         }
+
+        let mut f = fs::File::create(&bin_path).expect("No se puede crear .bin");
+        f.write_all(byte_data).expect("Error escribiendo .bin");
+        println!(
+            "  {} chars → {} tokens, vocab={} → {:.2} MB",
+            corpus.len(),
+            tokens.len(),
+            vocab_size,
+            byte_data.len() as f64 / 1_048_576.0
+        );
     }
 
     let lr = 0.0001;
@@ -355,10 +341,6 @@ fn run_large_file(
     println!("\n  Tiempo total: {:.1}s", t0.elapsed().as_secs_f32());
     println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
 
-    if save_every == 0 {
-        println!("  [Skip] save/generate desactivado (save_every=0)");
-        return;
-    }
     save_and_generate(&mut trainer, checkpoint_base);
 }
 
