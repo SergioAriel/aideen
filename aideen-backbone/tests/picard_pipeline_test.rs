@@ -415,7 +415,7 @@ fn run_cg_vs_picard_case(w_q_scale: f32, w_k_scale: f32, w_v_scale: f32, w_o_sca
         });
 
     let cg_shape = gpu.build_cg_shape(seq_len, config.adj_iters as u32);
-    gpu.bridge
+    gpu.cg_bridge
         .run_backward_no_readback(
             &gpu.device,
             &gpu.queue,
