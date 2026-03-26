@@ -333,7 +333,7 @@ fn run_picard_vs_numeric_case(
 
     let dl = vec![0.05f32; d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
     gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
         .expect("Picard adjoint dispatch failed");
     let v_picard = gpu.read_cg_v_out(seq_len);
@@ -405,7 +405,7 @@ fn run_cg_vs_picard_case(w_q_scale: f32, w_k_scale: f32, w_v_scale: f32, w_o_sca
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
     let dl_src = gpu
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -485,7 +485,7 @@ fn test_picard_adjoint_wgpu_dispatch() {
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     gpu.run_fused_adjoint_picard_no_readback(seq_len, 0.9)
         .expect("Picard adjoint dispatch failed");
@@ -841,7 +841,7 @@ fn test_picard_adjoint_deq_only_matches_closed_form() {
 
     let dl = vec![grad; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
         .expect("Picard adjoint dispatch failed");
@@ -932,7 +932,7 @@ fn test_picard_matches_numeric_reference_no_mamba_small() {
 
     let dl = vec![0.05f32; d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
     gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
         .expect("Picard adjoint dispatch failed");
     let v_picard = gpu.read_cg_v_out(seq_len);
@@ -1010,7 +1010,7 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
 
     let dl = vec![0.05f32; d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
     gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
         .expect("Staged Picard adjoint dispatch failed");
     let v_picard = gpu.read_cg_v_out(seq_len);
@@ -1087,7 +1087,7 @@ fn test_staged_picard_perf_smoke_no_mamba() {
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
     gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
@@ -1158,7 +1158,7 @@ fn test_staged_picard_only_perf_smoke_no_mamba() {
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
     gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
@@ -1220,7 +1220,7 @@ fn run_staged_picard_perf_case(seq_len: u32, d: usize, h_slots: usize, iters: u3
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.bridge.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
     gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, iters, None, true, 1)
