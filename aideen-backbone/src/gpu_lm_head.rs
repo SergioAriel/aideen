@@ -831,6 +831,7 @@ impl GpuLmHeadTrainer {
         // Truncar a max_samples para no desbordar sampled_indices_buf.
         sampled_indices.truncate(max_samples);
         let actual_num_samples = sampled_indices.len() as u32;
+        assert!(actual_num_samples <= 512, "num_samples ({actual_num_samples}) exceeds lm_train.wgsl shared memory limit of 512");
         self.last_sampled_indices = sampled_indices.clone();
         self.last_num_samples = actual_num_samples;
 
@@ -995,6 +996,7 @@ impl GpuLmHeadTrainer {
         // Truncar a max_samples para no desbordar sampled_indices_buf
         sampled_indices.truncate(max_samples);
         let actual_num_samples = sampled_indices.len() as u32;
+        assert!(actual_num_samples <= 512, "num_samples ({actual_num_samples}) exceeds lm_train.wgsl shared memory limit of 512");
         self.last_sampled_indices = sampled_indices.clone();
         self.last_num_samples = actual_num_samples;
 
