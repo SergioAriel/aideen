@@ -8,6 +8,108 @@
 
 ---
 
+### 2026-03-26 — Baseline provisional (TPS real, batch=4, no model changes)
+**Contexto**: throughput real en M1 Pro, entrenamiento completo GPU, sin tocar la matemática.
+**Objetivo**: establecer baseline fijo para medir mejoras.
+
+**Configuración exacta**
+- Cmd:
+  `AIDEEN_BATCH_SIZE=4 AIDEEN_DEBUG_SAMPLE=0 AIDEEN_LM_FUSED_B19=0 AIDEEN_LOSS_READBACK_EVERY=10 AIDEEN_TPS_SYNC_EVERY=10 AIDEEN_VAL_EVERY=20 AIDEEN_MAX_CHUNKS=40 cargo run --release --features wgpu -p aideen-training --bin train -- --file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt --epochs 1 --log-every 1 --save-every 0`
+- Dataset: `tinyshakespeare.txt` (token cache reutilizado)
+- Perfil: training real (LM + DEQ + adjoint)
+- Código: `e88dcb5`
+
+**Resultados**
+- chunk 10: loss=5.1464, tps=81.3
+- chunk 20: loss=5.6460, tps=83.3
+- VAL chunk 0: 5.7344
+
+**Criterios de invalidez**
+- Si la misma config en otro commit produce TPS < 70 o loss divergente, revalidar.
+- Si se modifica `aideen-training-lab/src/trainer.rs` o `aideen-backbone/src/shaders/lm_train.wgsl`, repetir este baseline.
+
+**Alcance**
+- Válido para Apple M1 Pro, batch=4, ctx=256, h_slots=8, d=512.
+
+---
+
+## Benchmark Profiles (fixed usage)
+
+No usar una sola configuración para todo. En AIDEEN hay tres preguntas distintas:
+- si un cambio rompe o altera la estabilidad,
+- si mejora el throughput del hot path,
+- o si baja el overhead total del sistema.
+
+Cada una requiere un perfil distinto. No comparar números entre perfiles.
+
+### Perfil A — Validación
+**Objetivo**: validar corrección/estabilidad cuando un cambio toca backward, historia, adjoint, DEQ o numerics.
+
+**Mirar**
+- `loss`
+- `val_loss`
+- `DEQ-INVALID`
+- `contr`
+- `maxΔ`
+- `iters`
+- NaNs / crash / divergencia
+
+**Configuración**
+- Cmd:
+  `AIDEEN_BATCH_SIZE=1 AIDEEN_DEBUG_SAMPLE=10 AIDEEN_LM_FUSED_B19=0 AIDEEN_LOSS_READBACK_EVERY=10 AIDEEN_TPS_SYNC_EVERY=10 AIDEEN_VAL_EVERY=20 AIDEEN_MAX_CHUNKS=10 cargo run --release --features wgpu -p aideen-training --bin train -- --file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt --epochs 1 --log-every 1 --save-every 0`
+
+**Uso**
+- fusiones de kernels en solver/backward
+- cambios en staged adjoint
+- cambios en historia
+- rutas nuevas matemáticamente equivalentes que todavía no fueron validadas
+
+### Perfil B — Régimen
+**Objetivo**: medir throughput real del hot path repetitivo. Esta es la métrica principal para performance estructural.
+
+**Mirar**
+- `progress chunk 10`
+- `progress chunk 20`
+- `tps` de régimen
+
+**Configuración**
+- Cmd:
+  `AIDEEN_BATCH_SIZE=4 AIDEEN_DEBUG_SAMPLE=0 AIDEEN_LM_FUSED_B19=0 AIDEEN_LOSS_READBACK_EVERY=10 AIDEEN_TPS_SYNC_EVERY=10 AIDEEN_VAL_EVERY=20 AIDEEN_MAX_CHUNKS=40 cargo run --release --features wgpu -p aideen-training --bin train -- --file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt --epochs 1 --log-every 1 --save-every 0`
+
+**Uso**
+- solo después de pasar Perfil A si el cambio toca matemática
+- optimizaciones de shader/dispatch/lifecycle de buffers que apunten a subir TPS de régimen
+
+**Referencia provisional**
+- chunk 10: loss=5.1464, tps=81.3
+- chunk 20: loss=5.6460, tps=83.3
+
+### Perfil C — Sistema Total
+**Objetivo**: medir overhead total del run corto. Útil para startup, readbacks, bind groups, observabilidad y costos fuera del hot path.
+
+**Mirar**
+- `tps` final del run
+- tiempo total
+- tokens procesados
+
+**Configuración**
+- Cmd:
+  `AIDEEN_BATCH_SIZE=4 AIDEEN_DEBUG_SAMPLE=0 AIDEEN_LM_FUSED_B19=0 AIDEEN_LOSS_READBACK_EVERY=10 AIDEEN_TPS_SYNC_EVERY=10 AIDEEN_VAL_EVERY=20 AIDEEN_MAX_CHUNKS=10 cargo run --release --features wgpu -p aideen-training --bin train -- --file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt --epochs 1 --log-every 1 --save-every 0`
+
+**Uso**
+- costos de driver/setup
+- pérdida de tiempo por readbacks
+- churn de bind groups
+- mejoras que no necesariamente mueven el régimen pero sí el tiempo total del sistema
+
+### Regla de uso
+- Si un cambio toca matemática o solver: `Perfil A` -> `Perfil B`
+- Si un cambio toca solo overhead: `Perfil C`, y luego `Perfil B` si parece promisor
+- No decidir por TPS de un perfil usando números de otro perfil
+- No promover defaults por “compila y no crashea”; deben pasar el perfil correspondiente
+
+---
+
 ## Status Legend
 - ✅ FIXED — already implemented
 - 🔥 HIGH — significant gain, actionable now

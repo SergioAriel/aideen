@@ -98,7 +98,10 @@ pub struct GpuDeqBackend {
     fused_update_bg0: wgpu::BindGroup,
     fused_update_bg1: wgpu::BindGroup,
     pub fused_update_params_buf: wgpu::Buffer,
-    fused_v_next_buf: wgpu::Buffer, // State for Picard Adjoint
+    // Legacy fused-adjoint-only state buffer.
+    // Training real no longer uses run_fused_adjoint_picard_no_readback(); the active
+    // staged adjoint path ping-pongs between adj_bufs.b_v_out and fused_weighted_h_buf.
+    fused_v_next_buf: wgpu::Buffer,
     fused_mix_buf: wgpu::Buffer,
     fused_weighted_h_buf: wgpu::Buffer,
     fused_gmix_buf: wgpu::Buffer,
@@ -2521,6 +2524,10 @@ impl GpuDeqBackend {
         Ok(())
     }
 
+    // Legacy fused Picard adjoint path.
+    // Kept for debugging/experiments, but current training real does not call this entrypoint.
+    // Active training path:
+    //   trainer -> run_staged_adjoint_picard_no_readback -> apply_fused_deq_update
     pub fn run_fused_adjoint_picard_no_readback(
         &self,
         seq_len: u32,
@@ -2622,6 +2629,11 @@ impl GpuDeqBackend {
         let dl_bytes = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
         let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
 
+        // Active training adjoint path:
+        // - v_state / v_next ping-pong between adj_bufs.b_v_out and fused_weighted_h_buf
+        // - fused_v_next_buf does not participate here
+        // - fused_hist_delta_buf is not read by staged_adjoint_picard.wgsl
+        //
         // T1-B: Batch dl_copy + zero + init + all Picard iterations into a single encoder
         // in the normal path, eliminating iters+3 queue.submit() calls per adjoint call.
         if !profile_picard_stages && !picard_internal_probe {
@@ -2657,13 +2669,11 @@ impl GpuDeqBackend {
             }
             // Zero buffers (replaces separate zero_encoder submit).
             enc.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
-            enc.clear_buffer(&self.fused_v_next_buf, 0, None);
             enc.clear_buffer(&self.fused_weighted_h_buf, 0, None);
             enc.clear_buffer(&self.fused_gmix_buf, 0, None);
             if clear_slot_rhs {
                 enc.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
             }
-            enc.clear_buffer(&self.fused_hist_delta_buf, 0, None);
             enc.clear_buffer(&self.fused_qgrad_buf, 0, None);
             enc.clear_buffer(&self.fused_gscore_buf, 0, None);
             // Clear Anderson history ring buffer
@@ -2783,13 +2793,11 @@ impl GpuDeqBackend {
         // Picard adjoint must start from v_state = 0 each call to solve (I - J^T)v = b.
         // Leaving b_v_out stale carries state across steps and breaks the linear solve.
         zero_encoder.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
-        zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_weighted_h_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_gmix_buf, 0, None);
         if clear_slot_rhs {
             zero_encoder.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
         }
-        zero_encoder.clear_buffer(&self.fused_hist_delta_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_gscore_buf, 0, None);
         self.queue.submit(Some(zero_encoder.finish()));
