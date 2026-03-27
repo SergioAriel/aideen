@@ -41,6 +41,7 @@ pub struct GpuLmHeadTrainer {
     loss_staging_buf: wgpu::Buffer,
 
     probs_pipeline: wgpu::ComputePipeline,
+    probs_bgl: wgpu::BindGroupLayout,
     probs_bg: wgpu::BindGroup,
 
     update_pipeline: wgpu::ComputePipeline,
@@ -57,6 +58,79 @@ pub struct GpuLmHeadTrainer {
 }
 
 impl GpuLmHeadTrainer {
+    fn make_probs_bg_for_h(&self, device: &wgpu::Device, h_buf: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("LM Unified BG (external h)"),
+            layout: &self.probs_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: h_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.dl_dh_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.loss_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.moments_w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.moments_b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.target_indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.lm_scratch_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.g_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.moments_g_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.rms_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.dl_dh_temp_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.sampled_indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.s_h_rms_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
     pub fn new(device: &wgpu::Device, vocab_size: usize, config: ArchitectureConfig) -> Self {
         let d_r = config.d_r;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -276,20 +350,21 @@ impl GpuLmHeadTrainer {
             compilation_options: Default::default(),
             cache: None,
         });
-        let apply_adamw_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("LM Apply AdamW Pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("LM Apply AdamW PL"),
-                    bind_group_layouts: &[&bgl_probs],
-                    push_constant_ranges: &[],
-                }),
-            ),
-            module: &shader,
-            entry_point: Some("lm_apply_adamw_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let apply_adamw_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("LM Apply AdamW Pipeline"),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("LM Apply AdamW PL"),
+                        bind_group_layouts: &[&bgl_probs],
+                        push_constant_ranges: &[],
+                    }),
+                ),
+                module: &shader,
+                entry_point: Some("lm_apply_adamw_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // --- PIPELINE 3: Backprop (dl_dh_t) ---
         let backprop_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -541,6 +616,7 @@ impl GpuLmHeadTrainer {
             dl_staging_buf,
             loss_staging_buf,
             probs_pipeline,
+            probs_bgl: bgl_probs,
             probs_bg,
             update_pipeline,
             dw_accum_pipeline,
@@ -600,13 +676,15 @@ impl GpuLmHeadTrainer {
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse.reserve(max_samples + targets.len());
+        self.sampled_indices_reuse
+            .reserve(max_samples + targets.len());
         self.sampled_indices_reuse.extend_from_slice(targets);
         self.sampled_indices_reuse.truncate(max_samples);
         let needed = max_samples.saturating_sub(self.sampled_indices_reuse.len());
         for _ in 0..needed {
             use rand::Rng;
-            self.sampled_indices_reuse.push(rng.gen_range(0..self.vocab_size as u32));
+            self.sampled_indices_reuse
+                .push(rng.gen_range(0..self.vocab_size as u32));
         }
         self.sampled_indices_reuse.sort_unstable();
         self.sampled_indices_reuse.dedup();
@@ -616,20 +694,20 @@ impl GpuLmHeadTrainer {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
                 "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
-                seq_len,
-                actual_num_samples,
-                tgt0
+                seq_len, actual_num_samples, tgt0
             );
         }
-        std::mem::swap(&mut self.sampled_indices_reuse, &mut self.last_sampled_indices);
+        std::mem::swap(
+            &mut self.sampled_indices_reuse,
+            &mut self.last_sampled_indices,
+        );
         self.last_num_samples = actual_num_samples;
         let sampled_indices = &self.last_sampled_indices;
 
         if seq_len > self.config.ctx_len {
             return Err(format!(
                 "seq_len {} exceeds architectural limit of {}",
-                seq_len,
-                self.config.ctx_len
+                seq_len, self.config.ctx_len
             ));
         }
 
@@ -786,7 +864,8 @@ impl GpuLmHeadTrainer {
         let mut rng = rand::thread_rng();
         // Reuse pre-allocated buffer to avoid heap allocation per training step.
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse.reserve(max_samples + targets.len());
+        self.sampled_indices_reuse
+            .reserve(max_samples + targets.len());
         self.sampled_indices_reuse.extend_from_slice(targets);
         let needed = max_samples.saturating_sub(targets.len());
         for _ in 0..needed {
@@ -803,13 +882,14 @@ impl GpuLmHeadTrainer {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
                 "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
-                seq_len,
-                actual_num_samples,
-                tgt0
+                seq_len, actual_num_samples, tgt0
             );
         }
         // Swap buffers: sampled_indices_reuse ↔ last_sampled_indices (no copy, just pointer swap).
-        std::mem::swap(&mut self.sampled_indices_reuse, &mut self.last_sampled_indices);
+        std::mem::swap(
+            &mut self.sampled_indices_reuse,
+            &mut self.last_sampled_indices,
+        );
         self.last_num_samples = actual_num_samples;
         // Use last_sampled_indices for the rest of this call.
         let sampled_indices = &self.last_sampled_indices;
@@ -852,15 +932,20 @@ impl GpuLmHeadTrainer {
             label: Some("LM Train Encoder (buffer input)"),
         });
 
-        let copy_size = (self.config.d_r * seq_len * 4) as u64;
-        encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+        let probs_bg = if h_offset == 0 {
+            self.make_probs_bg_for_h(device, h_src)
+        } else {
+            let copy_size = (self.config.d_r * seq_len * 4) as u64;
+            encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+            self.make_probs_bg_for_h(device, &self.h_buf)
+        };
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Probs Pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.probs_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.set_bind_group(0, &probs_bg, &[]);
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
         let t_parts = seq_len as u32;
@@ -874,7 +959,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.update_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (self.config.d_r as u32 + 15) / 16;
                 pass.dispatch_workgroups(d_parts, v_parts, 1);
@@ -885,7 +970,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 pass.dispatch_workgroups(t_parts, 1, 1);
             }
         } else {
@@ -895,7 +980,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.update_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (self.config.d_r as u32 + 15) / 16;
                 pass.dispatch_workgroups(d_parts, v_parts, 1);
@@ -906,7 +991,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 pass.dispatch_workgroups(t_parts, 1, 1);
             }
         }
@@ -963,12 +1048,14 @@ impl GpuLmHeadTrainer {
         let mut rng = rand::thread_rng();
         // Reuse pre-allocated buffer to avoid heap allocation per training step.
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse.reserve(max_samples + targets.len());
+        self.sampled_indices_reuse
+            .reserve(max_samples + targets.len());
         self.sampled_indices_reuse.extend_from_slice(targets);
         let needed = max_samples.saturating_sub(targets.len());
         for _ in 0..needed {
             use rand::Rng;
-            self.sampled_indices_reuse.push(rng.gen_range(0..self.vocab_size as u32));
+            self.sampled_indices_reuse
+                .push(rng.gen_range(0..self.vocab_size as u32));
         }
         self.sampled_indices_reuse.sort_unstable();
         self.sampled_indices_reuse.dedup();
@@ -978,13 +1065,14 @@ impl GpuLmHeadTrainer {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
                 "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
-                seq_len,
-                actual_num_samples,
-                tgt0
+                seq_len, actual_num_samples, tgt0
             );
         }
         // Swap buffers: sampled_indices_reuse ↔ last_sampled_indices (no copy, just pointer swap).
-        std::mem::swap(&mut self.sampled_indices_reuse, &mut self.last_sampled_indices);
+        std::mem::swap(
+            &mut self.sampled_indices_reuse,
+            &mut self.last_sampled_indices,
+        );
         self.last_num_samples = actual_num_samples;
         // Use last_sampled_indices for the rest of this call.
         let sampled_indices = &self.last_sampled_indices;
@@ -1015,8 +1103,13 @@ impl GpuLmHeadTrainer {
             label: Some("LM Train Encoder (NO READBACK)"),
         });
 
-        let copy_size = (self.config.d_r * seq_len * 4) as u64;
-        encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+        let probs_bg = if h_offset == 0 {
+            self.make_probs_bg_for_h(device, h_src)
+        } else {
+            let copy_size = (self.config.d_r * seq_len * 4) as u64;
+            encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+            self.make_probs_bg_for_h(device, &self.h_buf)
+        };
         encoder.clear_buffer(&self.loss_buf, 0, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1024,7 +1117,7 @@ impl GpuLmHeadTrainer {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.probs_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.set_bind_group(0, &probs_bg, &[]);
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
         let t_parts = seq_len as u32;
@@ -1038,7 +1131,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.update_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (self.config.d_r as u32 + 15) / 16;
                 pass.dispatch_workgroups(d_parts, v_parts, 1);
@@ -1046,10 +1139,10 @@ impl GpuLmHeadTrainer {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("LM Backprop T Pass (NO READBACK)"),
-                        timestamp_writes: None,
-                    });
+                    timestamp_writes: None,
+                });
                 pass.set_pipeline(&self.backprop_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 pass.dispatch_workgroups(t_parts, 1, 1);
             }
         } else {
@@ -1059,7 +1152,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.update_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 let v_parts = (actual_num_samples + 15) / 16;
                 let d_parts = (self.config.d_r as u32 + 15) / 16;
                 pass.dispatch_workgroups(d_parts, v_parts, 1);
@@ -1070,7 +1163,7 @@ impl GpuLmHeadTrainer {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
-                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.set_bind_group(0, &probs_bg, &[]);
                 pass.dispatch_workgroups(t_parts, 1, 1);
             }
         }
