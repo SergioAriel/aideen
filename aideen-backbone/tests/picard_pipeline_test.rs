@@ -3,7 +3,6 @@
 use aideen_backbone::{gpu_deq::GpuDeqBackend, MambaSlotReasoning};
 use aideen_core::state::ArchitectureConfig;
 use std::sync::{Mutex, OnceLock};
-use wgpu::util::DeviceExt;
 
 fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -276,230 +275,6 @@ fn numeric_jt_v_no_mamba(
         out[idx] = (phi_plus - phi_minus) / (2.0 * eps);
     }
     out
-}
-
-fn run_picard_vs_numeric_case(
-    w_q_scale: f32,
-    w_k_scale: f32,
-    w_v_scale: f32,
-    w_o_scale: f32,
-) -> f32 {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
-
-    let mut config = ArchitectureConfig::default();
-    config.d_r = 16;
-    config.h_slots = 2;
-    config.ctx_len = 1;
-    config.max_deq_iters = 4;
-
-    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
-
-    let seq_len = 1u32;
-    let d = config.d_r;
-    let h = config.h_slots;
-    let len_sq = d * d;
-    let damping = 0.9f32;
-
-    let s_in = vec![0.1f32; d];
-    let w_q = vec![w_q_scale; len_sq];
-    let w_k = vec![w_k_scale; len_sq];
-    let w_v = vec![w_v_scale; len_sq];
-    let w_o = vec![w_o_scale; len_sq];
-    let w_in = vec![0.01f32; len_sq];
-    let w_x = vec![0.0f32; len_sq];
-    let w_out = vec![0.0f32; len_sq];
-    let a_log = vec![-0.5f32; d];
-    let norm = vec![1.0f32; d];
-
-    gpu.run_forward_deq_no_readback(
-        1,
-        seq_len,
-        config.max_deq_iters as u32,
-        config.deq_epsilon,
-        damping,
-        &s_in,
-        &w_q,
-        &w_k,
-        &w_v,
-        &w_o,
-        &w_in,
-        &w_x,
-        &w_out,
-        &a_log,
-        &norm,
-        true,
-    )
-    .expect("GPU DEQ forward failed");
-
-    let dl = vec![0.05f32; d];
-    gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-    gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
-        .expect("Picard adjoint dispatch failed");
-    let v_picard = gpu.read_cg_v_out(seq_len);
-    let h_star = gpu.read_hnext();
-
-    let mut v_ref = vec![0.05f32 / h as f32; h * d];
-    let b_rep = v_ref.clone();
-    for _ in 0..8 {
-        let jt_v = numeric_jt_v_no_mamba(
-            &h_star, &v_ref, &s_in, &w_q, &w_k, &w_v, &w_o, &w_in, &norm, damping, h, d,
-        );
-        for i in 0..v_ref.len() {
-            v_ref[i] = b_rep[i] + jt_v[i];
-        }
-    }
-
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
-    cosine(&v_picard, &v_ref)
-}
-
-fn run_cg_vs_picard_case(w_q_scale: f32, w_k_scale: f32, w_v_scale: f32, w_o_scale: f32) -> f32 {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
-
-    let mut config = ArchitectureConfig::default();
-    config.d_r = 128;
-    config.h_slots = 4;
-    config.ctx_len = 2;
-    config.max_deq_iters = 4;
-    config.adj_iters = 4;
-
-    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
-
-    let seq_len = 2u32;
-    let d = config.d_r;
-    let _h = config.h_slots;
-    let len_sq = d * d;
-    let damping = 0.9f32;
-
-    let s_in = vec![0.1f32; seq_len as usize * d];
-    let w_q = vec![w_q_scale; len_sq];
-    let w_k = vec![w_k_scale; len_sq];
-    let w_v = vec![w_v_scale; len_sq];
-    let w_o = vec![w_o_scale; len_sq];
-    let w_in = vec![0.01f32; len_sq];
-    let w_x = vec![0.0f32; len_sq];
-    let w_out = vec![0.0f32; len_sq];
-    let a_log = vec![-0.5f32; d];
-    let norm = vec![1.0f32; d];
-
-    gpu.run_forward_deq_no_readback(
-        1,
-        seq_len,
-        config.max_deq_iters as u32,
-        config.deq_epsilon,
-        damping,
-        &s_in,
-        &w_q,
-        &w_k,
-        &w_v,
-        &w_o,
-        &w_in,
-        &w_x,
-        &w_out,
-        &a_log,
-        &norm,
-        true,
-    )
-    .expect("GPU DEQ forward failed");
-
-    let dl = vec![0.05f32; seq_len as usize * d];
-    gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-    let dl_src = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Picard/CG dl_src"),
-            contents: bytemuck::cast_slice(&dl),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-
-    let cg_shape = gpu.build_cg_shape(seq_len, config.adj_iters as u32);
-    gpu.cg_bridge
-        .run_backward_no_readback(
-            &gpu.device,
-            &gpu.queue,
-            &cg_shape,
-            &gpu.bridge.hnext_buf,
-            0,
-            &dl_src,
-        )
-        .expect("CG no-readback failed");
-    gpu.device.poll(wgpu::Maintain::Wait);
-    let v_cg = gpu.read_cg_v_out(seq_len);
-
-    gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
-        .expect("Picard adjoint dispatch failed");
-    let v_picard = gpu.read_cg_v_out(seq_len);
-
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
-    cosine(&v_cg, &v_picard)
-}
-
-#[test]
-fn test_picard_adjoint_wgpu_dispatch() {
-    let _guard = env_test_lock();
-    let mut config = ArchitectureConfig::default();
-    config.d_r = 512;
-    config.h_slots = 8;
-    config.ctx_len = 2;
-    config.max_deq_iters = 4;
-
-    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
-
-    let seq_len = 2u32;
-    let d = config.d_r;
-    let h = config.h_slots;
-    let len_sq = d * d;
-
-    let s_in = vec![0.1f32; seq_len as usize * d];
-    let w_q = vec![0.02f32; len_sq];
-    let w_k = vec![0.02f32; len_sq];
-    let w_v = vec![0.02f32; len_sq];
-    let w_o = vec![0.02f32; len_sq];
-    let w_in = vec![0.01f32; len_sq];
-    let w_x = vec![0.0f32; len_sq];
-    let w_out = vec![0.0f32; len_sq];
-    let a_log = vec![-0.5f32; d];
-    let norm = vec![1.0f32; d];
-
-    gpu.run_forward_deq_no_readback(
-        1,
-        seq_len,
-        config.max_deq_iters as u32,
-        config.deq_epsilon,
-        0.9,
-        &s_in,
-        &w_q,
-        &w_k,
-        &w_v,
-        &w_o,
-        &w_in,
-        &w_x,
-        &w_out,
-        &a_log,
-        &norm,
-        true,
-    )
-    .expect("GPU DEQ forward failed");
-
-    let dl = vec![0.05f32; seq_len as usize * d];
-    gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-
-    gpu.run_fused_adjoint_picard_no_readback(seq_len, 0.9)
-        .expect("Picard adjoint dispatch failed");
-
-    let v = gpu.read_cg_v_out(seq_len);
-    assert_eq!(v.len(), seq_len as usize * h * d);
-    assert!(
-        v.iter().all(|x| x.is_finite()),
-        "Picard adjoint produced non-finite values"
-    );
-    assert!(
-        v.iter().any(|x| x.abs() > 0.0),
-        "Picard adjoint left V_out fully zero"
-    );
 }
 
 #[test]
@@ -789,176 +564,6 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
 }
 
 #[test]
-fn test_picard_adjoint_deq_only_matches_closed_form() {
-    let _guard = env_test_lock();
-    std::env::set_var("AIDEEN_DEQ_ONLY", "1");
-
-    let mut config = ArchitectureConfig::default();
-    config.d_r = 512;
-    config.h_slots = 8;
-    config.ctx_len = 1;
-    config.max_deq_iters = 2;
-
-    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
-
-    let seq_len = 1u32;
-    let d = config.d_r;
-    let h = config.h_slots;
-    let len_sq = d * d;
-    let damping = 0.9f32;
-    let grad = 0.05f32;
-
-    let s_in = vec![0.1f32; seq_len as usize * d];
-    let w_q = vec![0.0f32; len_sq];
-    let w_k = vec![0.0f32; len_sq];
-    let w_v = vec![0.0f32; len_sq];
-    let w_o = vec![0.0f32; len_sq];
-    let w_in = vec![0.01f32; len_sq];
-    let w_x = vec![0.0f32; len_sq];
-    let w_out = vec![0.0f32; len_sq];
-    let a_log = vec![-0.5f32; d];
-    let norm = vec![1.0f32; d];
-
-    gpu.run_forward_deq_no_readback(
-        1,
-        seq_len,
-        config.max_deq_iters as u32,
-        config.deq_epsilon,
-        damping,
-        &s_in,
-        &w_q,
-        &w_k,
-        &w_v,
-        &w_o,
-        &w_in,
-        &w_x,
-        &w_out,
-        &a_log,
-        &norm,
-        true,
-    )
-    .expect("GPU DEQ forward failed");
-
-    let dl = vec![grad; seq_len as usize * d];
-    gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-
-    gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
-        .expect("Picard adjoint dispatch failed");
-
-    let v = gpu.read_cg_v_out(seq_len);
-    let b = grad / h as f32;
-    let r = 1.0f32 - damping;
-    let expected = b * (1.0 - r.powi(9)) / damping;
-    let probe = v[0];
-    assert!(
-        (probe - expected).abs() < 1e-4,
-        "DEQ-only Picard mismatch: got {probe}, expected {expected}"
-    );
-
-    std::env::remove_var("AIDEEN_DEQ_ONLY");
-}
-
-#[test]
-#[ignore = "Known root-cause gap: Picard attention adjoint still diverges from CG in no-mamba path; keep as progress meter until VJP parity is closed."]
-fn test_picard_matches_cg_reasonably_no_mamba() {
-    let cos = run_cg_vs_picard_case(0.02, 0.015, 0.01, 0.012);
-    assert!(
-        cos > 0.60,
-        "Picard/CG cosine too low for no-mamba attention path: {cos}"
-    );
-}
-
-#[test]
-#[ignore = "Diagnostic decomposition of Picard/CG gap."]
-fn test_picard_cg_gap_breakdown() {
-    let cos_vo_only = run_cg_vs_picard_case(0.0, 0.0, 0.01, 0.012);
-    let cos_with_qk = run_cg_vs_picard_case(0.02, 0.015, 0.01, 0.012);
-    eprintln!(
-        "[PICARD-GAP] cos_vo_only={:.6} cos_with_qk={:.6}",
-        cos_vo_only, cos_with_qk
-    );
-}
-
-#[test]
-#[ignore = "Numeric reference for no-mamba attention adjoint; expensive but authoritative."]
-fn test_picard_matches_numeric_reference_no_mamba_small() {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
-
-    let mut config = ArchitectureConfig::default();
-    config.d_r = 16;
-    config.h_slots = 2;
-    config.ctx_len = 1;
-    config.max_deq_iters = 4;
-
-    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
-
-    let seq_len = 1u32;
-    let d = config.d_r;
-    let h = config.h_slots;
-    let len_sq = d * d;
-    let damping = 0.9f32;
-
-    let s_in = vec![0.1f32; d];
-    let w_q = vec![0.02f32; len_sq];
-    let w_k = vec![0.015f32; len_sq];
-    let w_v = vec![0.01f32; len_sq];
-    let w_o = vec![0.012f32; len_sq];
-    let w_in = vec![0.01f32; len_sq];
-    let w_x = vec![0.0f32; len_sq];
-    let w_out = vec![0.0f32; len_sq];
-    let a_log = vec![-0.5f32; d];
-    let norm = vec![1.0f32; d];
-
-    gpu.run_forward_deq_no_readback(
-        1,
-        seq_len,
-        config.max_deq_iters as u32,
-        config.deq_epsilon,
-        damping,
-        &s_in,
-        &w_q,
-        &w_k,
-        &w_v,
-        &w_o,
-        &w_in,
-        &w_x,
-        &w_out,
-        &a_log,
-        &norm,
-        true,
-    )
-    .expect("GPU DEQ forward failed");
-
-    let dl = vec![0.05f32; d];
-    gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-    gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
-        .expect("Picard adjoint dispatch failed");
-    let v_picard = gpu.read_cg_v_out(seq_len);
-    let h_star = gpu.read_hnext();
-
-    let mut v_ref = vec![0.05f32 / h as f32; h * d];
-    let b_rep = v_ref.clone();
-    for _ in 0..8 {
-        let jt_v = numeric_jt_v_no_mamba(
-            &h_star, &v_ref, &s_in, &w_q, &w_k, &w_v, &w_o, &w_in, &norm, damping, h, d,
-        );
-        for i in 0..v_ref.len() {
-            v_ref[i] = b_rep[i] + jt_v[i];
-        }
-    }
-
-    let cos = cosine(&v_picard, &v_ref);
-    assert!(
-        cos > 0.80,
-        "Picard/numeric cosine too low for no-mamba small case: {cos}"
-    );
-
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
-}
-
-#[test]
 #[ignore = "Numeric reference for staged Picard no-mamba attention adjoint."]
 fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
     std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
@@ -1010,10 +615,10 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
 
     let dl = vec![0.05f32; d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.adj_bufs.b_dl, 0, bytemuck::cast_slice(&dl));
     gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
         .expect("Staged Picard adjoint dispatch failed");
-    let v_picard = gpu.read_cg_v_out(seq_len);
+    let v_picard = gpu.read_adj_v_out(seq_len);
     let h_star = gpu.read_hnext();
 
     let mut v_ref = vec![0.05f32 / h as f32; h * d];
@@ -1031,77 +636,6 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
     assert!(
         cos > 0.80,
         "Staged Picard/numeric cosine too low for no-mamba small case: {cos}"
-    );
-
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
-}
-
-#[test]
-#[ignore = "Performance smoke for staged vs monolithic Picard."]
-fn test_staged_picard_perf_smoke_no_mamba() {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
-
-    let mut config = ArchitectureConfig::default();
-    config.d_r = 512;
-    config.h_slots = 8;
-    config.ctx_len = 8;
-    config.max_deq_iters = 4;
-
-    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
-
-    let seq_len = 8u32;
-    let d = config.d_r;
-    let len_sq = d * d;
-    let damping = 0.9f32;
-
-    let s_in = vec![0.1f32; seq_len as usize * d];
-    let w_q = vec![0.02f32; len_sq];
-    let w_k = vec![0.015f32; len_sq];
-    let w_v = vec![0.01f32; len_sq];
-    let w_o = vec![0.012f32; len_sq];
-    let w_in = vec![0.01f32; len_sq];
-    let w_x = vec![0.0f32; len_sq];
-    let w_out = vec![0.0f32; len_sq];
-    let a_log = vec![-0.5f32; d];
-    let norm = vec![1.0f32; d];
-
-    gpu.run_forward_deq_no_readback(
-        1,
-        seq_len,
-        config.max_deq_iters as u32,
-        config.deq_epsilon,
-        damping,
-        &s_in,
-        &w_q,
-        &w_k,
-        &w_v,
-        &w_o,
-        &w_in,
-        &w_x,
-        &w_out,
-        &a_log,
-        &norm,
-        true,
-    )
-    .expect("GPU DEQ forward failed");
-
-    let dl = vec![0.05f32; seq_len as usize * d];
-    gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
-
-    let t0 = std::time::Instant::now();
-    gpu.run_fused_adjoint_picard_no_readback(seq_len, damping)
-        .expect("Monolithic Picard failed");
-    let mono_ms = t0.elapsed().as_millis();
-
-    let t1 = std::time::Instant::now();
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
-        .expect("Staged Picard failed");
-    let staged_ms = t1.elapsed().as_millis();
-
-    eprintln!(
-        "[PICARD-PERF] seq_len={} d={} h_slots={} mono_ms={} staged_ms={}",
-        seq_len, d, config.h_slots, mono_ms, staged_ms
     );
 
     std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
@@ -1158,7 +692,7 @@ fn test_staged_picard_only_perf_smoke_no_mamba() {
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.adj_bufs.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
     gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
@@ -1220,7 +754,7 @@ fn run_staged_picard_perf_case(seq_len: u32, d: usize, h_slots: usize, iters: u3
 
     let dl = vec![0.05f32; seq_len as usize * d];
     gpu.queue
-        .write_buffer(&gpu.cg_bridge.b_dl, 0, bytemuck::cast_slice(&dl));
+        .write_buffer(&gpu.adj_bufs.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
     gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, iters, None, true, 1)
@@ -1264,21 +798,5 @@ fn test_staged_picard_exact_trainer_case_one_iter_no_mamba() {
     eprintln!(
         "[PICARD-TRAINER-CASE-1] seq_len=98 d=512 h_slots=8 iters=1 staged_ms={}",
         ms
-    );
-}
-
-#[test]
-#[ignore = "Diagnostic decomposition of Picard/numeric gap."]
-fn test_picard_numeric_gap_breakdown() {
-    let cos_vo_only = run_picard_vs_numeric_case(0.0, 0.0, 0.01, 0.012);
-    let cos_with_qk = run_picard_vs_numeric_case(0.02, 0.015, 0.01, 0.012);
-    eprintln!(
-        "[PICARD-NUMERIC] cos_vo_only={:.6} cos_with_qk={:.6}",
-        cos_vo_only, cos_with_qk
-    );
-    assert!(cos_vo_only > 0.80, "V/O only cosine too low: {cos_vo_only}");
-    assert!(
-        cos_with_qk > 0.80,
-        "Full Q/K/V/O cosine too low: {cos_with_qk}"
     );
 }

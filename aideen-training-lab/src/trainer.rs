@@ -198,10 +198,6 @@ impl Trainer {
         dx - h_pooled.map(|v| v * sum_dx_h / (d * rms * rms))
     }
 
-    fn env_u32(name: &str) -> Option<u32> {
-        std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
-    }
-
     fn apply_experimental_profile_from_env(&mut self) {
         let exp = Self::env_flag("AIDEEN_DEQ_EXPERIMENTAL");
         let alpha_env = Self::env_f32("AIDEEN_DEQ_RESIDUAL_ALPHA").map(|v| v.clamp(0.0, 1.0));
@@ -1568,6 +1564,8 @@ impl Trainer {
                 if self.cfg_tps_sync_every != 0
                     && num_chunks % self.cfg_tps_sync_every == 0 {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
+                        // Progress/TPS sync point only. This is outside the per-step GPU hot path
+                        // and exists so reported throughput reflects completed GPU work.
                         gpu.device.poll(wgpu::Maintain::Wait);
                     }
                 }
@@ -1621,6 +1619,7 @@ impl Trainer {
             #[cfg(feature = "wgpu")]
             {
                 if let Some(gpu) = self.gpu_deq.as_ref() {
+                    // Epoch boundary: make end-of-epoch metrics/checkpoints observe completed GPU work.
                     gpu.device.poll(wgpu::Maintain::Wait);
                 }
             }
@@ -2221,6 +2220,7 @@ impl Trainer {
                                 if self.cfg_tps_sync_every != 0
                                     && num_chunks % self.cfg_tps_sync_every == 0 {
                                     if let Some(gpu) = self.gpu_deq.as_ref() {
+                                        // Validation/debug path: CPU reads results immediately after.
                                         gpu.device.poll(wgpu::Maintain::Wait);
                                     }
                                 }
@@ -2260,6 +2260,7 @@ impl Trainer {
                         if self.cfg_tps_sync_every != 0
                             && num_chunks % self.cfg_tps_sync_every == 0 {
                             if let Some(gpu) = self.gpu_deq.as_ref() {
+                                // Validation/debug path: CPU reads results immediately after.
                                 gpu.device.poll(wgpu::Maintain::Wait);
                             }
                         }
@@ -2307,6 +2308,7 @@ impl Trainer {
             // Vaciar cola GPU al final de cada epoch.
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
+                // Validation/end-of-run boundary. We intentionally synchronize before final metrics.
                 gpu.device.poll(wgpu::Maintain::Wait);
             }
 
@@ -2421,6 +2423,7 @@ impl Trainer {
         };
 
         println!("[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...");
+        // Checkpoint checksum path: CPU is about to read GPU moments synchronously.
         gpu.device.poll(wgpu::Maintain::Wait);
 
         // LM Head moments

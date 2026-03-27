@@ -150,15 +150,6 @@ impl MambaSlotReasoning {
         DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range))
     }
 
-    fn identity_like_mat_with_rng<R: Rng + ?Sized>(
-        rng: &mut R,
-        d_r: usize,
-        noise: f32,
-    ) -> DMatrix<f32> {
-        let jitter = DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-noise..noise));
-        DMatrix::identity(d_r, d_r) + jitter
-    }
-
     fn scaled_identity_like_mat_with_rng<R: Rng + ?Sized>(
         rng: &mut R,
         d_r: usize,

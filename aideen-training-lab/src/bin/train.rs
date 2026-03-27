@@ -30,18 +30,6 @@ use aideen_training::trainer::Trainer;
 
 use std::{env, fs};
 
-fn print_banner(config: &ArchitectureConfig) {
-    println!();
-    println!("╔═══════════════════════════════════════════════╗");
-    println!("║     AIDEEN — Semba Engine v3                 ║");
-    println!(
-        "║     Slot-Equilibrium Mamba (D_R={})         ║",
-        config.d_r
-    );
-    println!("╚═══════════════════════════════════════════════╝");
-    println!();
-}
-
 fn setup_gpu(_trainer: &mut Trainer) {
     #[cfg(feature = "wgpu")]
     {
@@ -115,87 +103,6 @@ fn main() {
         freeze_emb,
         freeze_lm,
     );
-}
-
-fn run_small_dataset(
-    resume_path: Option<String>,
-    epochs: usize,
-    log_every: usize,
-    freeze_deq: bool,
-    freeze_emb: bool,
-    freeze_lm: bool,
-) {
-    let corpus = fs::read_to_string("aideen-backbone/dataset.txt")
-        .or_else(|_| fs::read_to_string("dataset.txt"))
-        .unwrap_or_else(|_| "AIDEEN engine running basic logic.".to_string());
-
-    let config_default = ArchitectureConfig::default();
-
-    let tok_path = find_tokenizer_path();
-    let mut tok = if let Some(ref path) = tok_path {
-        println!("  Tokenizer: BPE ({path}) ✅");
-        Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
-    } else {
-        println!("  Tokenizer: Char-level (fallback) ⚠️");
-        Tokenizer::from_text(&corpus, config_default.clone())
-    };
-
-    let mut config = ArchitectureConfig::default();
-    config.vocab_size = tok.vocab_size();
-    config.max_deq_iters = 15;
-    tok.config = config.clone();
-
-    print_banner(&config);
-    let tokens = tok.encode(&corpus);
-    println!(
-        "  Corpus: {} chars → {} tokens, vocab={}",
-        corpus.len(),
-        tokens.len(),
-        tok.vocab_size()
-    );
-
-    let lr = std::env::var("AIDEEN_LR")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.0001);
-
-    let mut trainer = if let Some(ref base) = resume_path {
-        println!("  Resumiendo desde checkpoint: {base}");
-        Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
-    } else {
-        let mut t = Trainer::from_tokenizer(tok, lr);
-        t.training_config.lr_min = lr / 10.0;
-        t.training_config.warmup_epochs = 3;
-        t.training_config.epochs = epochs;
-        // FASE 1: Entrenar en float32 hasta que los resultados sean buenos.
-        // FASE 2: Cuando el modelo float32 funcione bien, cambiar a `true` para
-        //         reentrenar desde cero con QAT (Quantization-Aware Training, STE).
-        //         NO hacer post-training quantization — 1.58b requiere QAT desde el inicio.
-        t.training_config.ternary = false;
-        t
-    };
-
-    trainer.frozen_deq = freeze_deq;
-    trainer.frozen_emb = freeze_emb;
-    trainer.frozen_lm = freeze_lm;
-    if freeze_deq {
-        println!("  [Ablation] DEQ Frozen ❄️");
-    }
-    if freeze_emb {
-        println!("  [Ablation] Embeddings Frozen ❄️");
-    }
-
-    setup_gpu(&mut trainer);
-    if trainer.training_config.ternary {
-        println!("  Bit-Dieta (Ternary 1.58-bit) activo 🔥  [STE durante training]");
-    }
-
-    let t0 = std::time::Instant::now();
-    trainer.train_on_tokens(&tokens, epochs, log_every);
-    println!("\n  Tiempo total: {:.1}s", t0.elapsed().as_secs_f32());
-    println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
-
-    save_and_generate(&mut trainer, "model");
 }
 
 /// Entrena sobre un .txt grande usando streaming (sin límite de RAM).

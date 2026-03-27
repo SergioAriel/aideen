@@ -45,9 +45,6 @@ pub struct GpuLmHeadTrainer {
     probs_bg: wgpu::BindGroup,
 
     update_pipeline: wgpu::ComputePipeline,
-    dw_accum_pipeline: wgpu::ComputePipeline,
-    apply_adamw_pipeline: wgpu::ComputePipeline,
-
     backprop_pipeline: wgpu::ComputePipeline,
     lm_scratch_buf: wgpu::Buffer,
     fused_b19: bool,
@@ -336,36 +333,6 @@ impl GpuLmHeadTrainer {
             cache: None,
         });
 
-        let dw_accum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("LM dW Accum Pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("LM dW Accum PL"),
-                    bind_group_layouts: &[&bgl_probs],
-                    push_constant_ranges: &[],
-                }),
-            ),
-            module: &shader,
-            entry_point: Some("lm_dw_accum_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let apply_adamw_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("LM Apply AdamW Pipeline"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("LM Apply AdamW PL"),
-                        bind_group_layouts: &[&bgl_probs],
-                        push_constant_ranges: &[],
-                    }),
-                ),
-                module: &shader,
-                entry_point: Some("lm_apply_adamw_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
         // --- PIPELINE 3: Backprop (dl_dh_t) ---
         let backprop_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("LM Backprop T Pipeline"),
@@ -619,8 +586,6 @@ impl GpuLmHeadTrainer {
             probs_bgl: bgl_probs,
             probs_bg,
             update_pipeline,
-            dw_accum_pipeline,
-            apply_adamw_pipeline,
             backprop_pipeline,
             lm_scratch_buf,
             fused_b19: std::env::var("AIDEEN_LM_FUSED_B19")
@@ -760,7 +725,6 @@ impl GpuLmHeadTrainer {
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
         let t_parts = seq_len as u32;
-        let d_parts = (d_r as u32 + 15) / 16;
         if self.fused_b19 {
             // Fused path: use the same update kernel as non-fused to guarantee
             // numerical equivalence (avoids drift seen with lm_dw_accum_main).
@@ -825,6 +789,7 @@ impl GpuLmHeadTrainer {
         loss_slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback path: block until mapped dl/loss are ready.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -949,7 +914,6 @@ impl GpuLmHeadTrainer {
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
         let t_parts = seq_len as u32;
-        let d_parts = (self.config.d_r as u32 + 15) / 16;
         if self.fused_b19 {
             // Fused path: use the same update kernel as non-fused to guarantee
             // numerical equivalence (avoids drift seen with lm_dw_accum_main).
@@ -1014,6 +978,7 @@ impl GpuLmHeadTrainer {
         loss_slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback path: block until mapped dl/loss are ready.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1121,7 +1086,6 @@ impl GpuLmHeadTrainer {
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
         let t_parts = seq_len as u32;
-        let d_parts = (self.config.d_r as u32 + 15) / 16;
         if self.fused_b19 {
             // Fused path: use the same update kernel as non-fused to guarantee
             // numerical equivalence (avoids drift seen with lm_dw_accum_main).
@@ -1183,6 +1147,7 @@ impl GpuLmHeadTrainer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        // Immediate CPU readback path: caller consumes the mapped loss now.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1205,6 +1170,7 @@ impl GpuLmHeadTrainer {
             let _ = tx.send(res);
         });
         // Use Wait to ensure we can unmap before the next submission.
+        // Immediate CPU readback path: caller consumes the mapped loss now.
         device.poll(wgpu::Maintain::Wait);
         if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
@@ -1243,6 +1209,7 @@ impl GpuLmHeadTrainer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1280,6 +1247,7 @@ impl GpuLmHeadTrainer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1337,6 +1305,7 @@ impl GpuLmHeadTrainer {
         g_slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
         if let Ok(Ok(())) = rx.recv() {
             let w = bytemuck::cast_slice(&w_slice.get_mapped_range()).to_vec();
@@ -1399,6 +1368,7 @@ impl GpuLmHeadTrainer {
         mg_sl.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
 
         if rx.recv().ok().and_then(|r| r.ok()).is_none() {
