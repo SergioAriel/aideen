@@ -405,8 +405,8 @@ impl RustDeqBridge {
         });
         // Stride por (batch, token):
         //   q [h*d] + k [h*d] + v [h*d] + attn_out [h*d] + mamba [h*d] + signal [h*d]
-        //   + m_inner [h*d] + attn_weights [h*h]
-        //   = d*(7h) + h²
+        //   + m_inner [h*d] + hist_ctx [h*d] + attn_weights [h*h] + f_gate [h]
+        //   = d*(8h) + h² + h
         // deq_forward.wgsl indexa Scratch como:
         //   (batch_idx * seq_len + t) * scratch_stride
         // por lo que el buffer debe reservar batch * seq_len * stride.
@@ -414,7 +414,7 @@ impl RustDeqBridge {
         // BUG (viejo): scratch_stride = d_model * (h_slots * 6 + 1) + h_slots * h_slots;
         // Faltaba la región m_inner [h*d] y "signal [d]" era incorrecto (es [h*d] con W_in per-slot).
         // Para d=512, h=8: viejo=25152 floats/token, correcto=28736. Escrituras de attn_weights OOB.
-        let scratch_stride = d_model * h_slots * 7 + h_slots * h_slots + h_slots;
+        let scratch_stride = d_model * h_slots * 8 + h_slots * h_slots + h_slots;
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
             size: (max_batch_size as u64) * (max_seq_len as u64) * (scratch_stride as u64) * 4u64,

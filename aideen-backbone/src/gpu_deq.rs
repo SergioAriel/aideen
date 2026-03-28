@@ -63,6 +63,8 @@ pub struct GpuDeqBackend {
     staged_picard_gmix_pipeline: wgpu::ComputePipeline,
     staged_picard_gmix_gscore_pipeline: wgpu::ComputePipeline,
     staged_picard_gscore_pipeline: wgpu::ComputePipeline,
+    staged_picard_accum_base_pipeline: wgpu::ComputePipeline,
+    staged_picard_accum_opt_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_v_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_k_pipeline: wgpu::ComputePipeline,
@@ -1010,6 +1012,24 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let staged_picard_accum_base_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Accum Base Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("picard_accum_base_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let staged_picard_accum_opt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Accum Opt Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("picard_accum_opt_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let staged_picard_accum_v_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Staged Picard Accum V Pipeline"),
@@ -1657,8 +1677,9 @@ impl GpuDeqBackend {
         let cfg_v_norm_scale = f32_flag("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
         let cfg_picard_profile = bool_flag("AIDEEN_PICARD_PROFILE").unwrap_or(false);
         let cfg_picard_stage_profile = bool_flag("AIDEEN_PICARD_STAGE_PROFILE").unwrap_or(false);
-        let cfg_picard_accum_split =
-            bool_flag("AIDEEN_PICARD_ACCUM_SPLIT_PROFILE").unwrap_or(false);
+        let cfg_picard_accum_split = bool_flag("AIDEEN_PICARD_ACCUM_SPLIT")
+            .or_else(|| bool_flag("AIDEEN_PICARD_ACCUM_SPLIT_PROFILE"))
+            .unwrap_or(false);
         let cfg_picard_internal_probe = bool_flag("AIDEEN_PICARD_INTERNAL_PROBE").unwrap_or(false);
         let cfg_picard_gscore_fused = bool_flag("AIDEEN_PICARD_GSCORE_FUSED").unwrap_or(false);
 
@@ -1683,6 +1704,8 @@ impl GpuDeqBackend {
             staged_picard_gmix_pipeline,
             staged_picard_gmix_gscore_pipeline,
             staged_picard_gscore_pipeline,
+            staged_picard_accum_base_pipeline,
+            staged_picard_accum_opt_pipeline,
             staged_picard_accum_pipeline,
             staged_picard_accum_v_pipeline,
             staged_picard_accum_k_pipeline,
@@ -2374,8 +2397,24 @@ impl GpuDeqBackend {
                             1,
                         );
                     }
-                    pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                    pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    if self.cfg_picard_accum_split {
+                        pass.set_pipeline(&self.staged_picard_accum_base_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_v_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_k_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_q_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    } else {
+                        if self.config.d_r <= 512 {
+                            pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
+                            pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        } else {
+                            pass.set_pipeline(&self.staged_picard_accum_pipeline);
+                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        }
+                    }
                     // Anderson: store current v_next into ring buffer, then mix.
                     if anderson_m > 0 {
                         pass.set_bind_group(1, &self.anderson_bgs[k], &[]);
@@ -2594,20 +2633,41 @@ impl GpuDeqBackend {
                     },
                     &self.staged_picard_bg1,
                 );
-                stage_accum_ms += run_stage(
-                    "Staged Picard Accum",
-                    &self.staged_picard_accum_pipeline,
-                    d.div_ceil(16),
-                    n_entries.div_ceil(16).max(1),
-                    &self.device,
-                    &self.queue,
-                    if (iter & 1) == 0 {
-                        &self.staged_picard_bg
-                    } else {
-                        &self.staged_picard_bg_alt
-                    },
-                    &self.staged_picard_bg1,
-                );
+                if profile_picard_accum_split {
+                    stage_accum_ms += run_stage(
+                        "Staged Picard Accum Base",
+                        &self.staged_picard_accum_base_pipeline,
+                        d.div_ceil(16),
+                        n_entries.div_ceil(16).max(1),
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                } else {
+                    stage_accum_ms += run_stage(
+                        if self.config.d_r <= 512 { "Staged Picard Accum Opt" } else { "Staged Picard Accum" },
+                        if self.config.d_r <= 512 {
+                            &self.staged_picard_accum_opt_pipeline
+                        } else {
+                            &self.staged_picard_accum_pipeline
+                        },
+                        if self.config.d_r <= 512 { n_entries.max(1) } else { d.div_ceil(16) },
+                        if self.config.d_r <= 512 { 1 } else { n_entries.div_ceil(16).max(1) },
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                }
                 if profile_picard_accum_split {
                     stage_accum_v_ms += run_stage(
                         "Staged Picard Accum V",
@@ -2681,8 +2741,24 @@ impl GpuDeqBackend {
                         n_entries.div_ceil(16).max(1),
                         1,
                     );
-                    pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                    pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    if self.cfg_picard_accum_split {
+                        pass.set_pipeline(&self.staged_picard_accum_base_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_v_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_k_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_q_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    } else {
+                        if self.config.d_r <= 512 {
+                            pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
+                            pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        } else {
+                            pass.set_pipeline(&self.staged_picard_accum_pipeline);
+                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        }
+                    }
                 }
                 self.queue.submit(Some(encoder.finish()));
                 submit_ms += iter_t0.elapsed().as_millis();
@@ -3274,17 +3350,17 @@ impl GpuDeqBackend {
                 n.div_ceil(16),
                 profile_fused,
             );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage4",
-                &self.fused_update_stage4_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                profile_fused,
-            );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage4",
+                    &self.fused_update_stage4_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    profile_fused,
+                );
             if grad_accum_mode == 1 && apply_accum {
                 run_stage(
                     &self.device,
@@ -3692,72 +3768,22 @@ impl GpuDeqBackend {
         )
     }
 
-    /// Reconstructs the forward historical context `c_{t,k}` used by the
-    /// hist-gated DEQ branch from persisted scratch state and history params.
-    /// This is the semantically correct debug signal for hist_gated; the
-    /// fused_hist_ctx_buf storage is reused by backward and cannot be trusted
-    /// as a forward-context probe after training steps.
+    /// Reads the exact forward historical context `c_{t,k}` retained in Scratch.
+    /// This matches the constant term injected into the DEQ loop, including the
+    /// dynamic `hist_mod` scaling applied in the forward prelude.
     pub fn read_hist_gated_ctx_forward(&self, seq_len: u32) -> Vec<f32> {
         let d = self.config.d_r;
         let h_slots = self.config.h_slots;
         let scratch = self.read_scratch_buffer();
-        let hist_off = aw_hist_byte_off(d as u64, h_slots as u64);
-        let hist_params = self.read_storage_buffer_at(
-            &self.bridge.all_weights_buf,
-            hist_off,
-            Self::history_params_len(d, h_slots),
-            "Hist Gated Params Readback Staging",
-        );
-        let scratch_stride = d * (h_slots * 6 + 1) + h_slots * h_slots;
-        let mamba_base = h_slots * 4 * d;
-        let signal_base = mamba_base + h_slots * d;
-        let hist_mat_len = d * d;
-        let hist_scale_base = hist_mat_len;
-        let hist_bias_base = hist_scale_base + h_slots * d;
-        let hist_gate_base = hist_bias_base + h_slots * d;
+        let scratch_stride = d * h_slots * 8 + h_slots * h_slots + h_slots;
+        let hist_ctx_base = h_slots * d * 7;
 
         let mut out = vec![0.0f32; seq_len as usize * h_slots * d];
         for t in 0..seq_len as usize {
             let token_base = t * scratch_stride;
-            let mut inj_sumsq = 0.0f32;
-            for i in 0..d {
-                let inj = scratch[token_base + signal_base + i];
-                inj_sumsq += inj * inj;
-            }
-            let inj_rms = (inj_sumsq / d.max(1) as f32 + 1e-6).sqrt();
-            for s in 0..h_slots {
-                let gate_logit = hist_params[hist_gate_base + s];
-                let alpha = 0.08 + 0.20 * (1.0 / (1.0 + (-gate_logit).exp()));
-                let out_base = (t * h_slots + s) * d;
-                if t == 0 {
-                    continue;
-                }
-                let prev_base = (t - 1) * scratch_stride + mamba_base + s * d;
-                let scale_base = hist_scale_base + s * d;
-                let mut prev_sumsq = 0.0f32;
-                for j in 0..d {
-                    let prev = scratch[prev_base + j];
-                    prev_sumsq += prev * prev;
-                }
-                let prev_rms = (prev_sumsq / d.max(1) as f32 + 1e-6).sqrt();
-                let mut hist_sumsq = 0.0f32;
-                for dim_out in 0..d {
-                    let mut u = hist_params[scale_base + dim_out]
-                        * (scratch[prev_base + dim_out] / prev_rms);
-                    let row_base = dim_out * d;
-                    for j in 0..d {
-                        u += hist_params[row_base + j] * (scratch[prev_base + j] / prev_rms);
-                    }
-                    out[out_base + dim_out] = u;
-                    hist_sumsq += u * u;
-                }
-                let hist_rms = (hist_sumsq / d.max(1) as f32 + 1e-6).sqrt();
-                let tau = inj_rms;
-                let hist_scale = (tau / hist_rms.max(1e-6)).min(1.0);
-                for dim_out in 0..d {
-                    out[out_base + dim_out] *= alpha * hist_scale;
-                }
-            }
+            let src = token_base + hist_ctx_base;
+            let dst = t * h_slots * d;
+            out[dst..dst + h_slots * d].copy_from_slice(&scratch[src..src + h_slots * d]);
         }
         out
     }
@@ -3966,7 +3992,7 @@ impl GpuDeqBackend {
         let d = self.config.d_r;
         let h_slots = self.config.h_slots;
         let scratch = self.read_scratch_buffer();
-        let scratch_stride = d * (h_slots * 6 + 1) + h_slots * h_slots;
+        let scratch_stride = d * h_slots * 8 + h_slots * h_slots + h_slots;
         let mamba_base = h_slots * 4 * d;
         let mut rms = vec![0.0f32; seq_len as usize];
         for t in 0..seq_len as usize {

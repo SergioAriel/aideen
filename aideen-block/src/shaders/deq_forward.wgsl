@@ -171,7 +171,7 @@ fn deq_forward_main(
 
     for (var t = 0u; t < shape.seq_len; t = t + 1u) {
         // --- Per-token Memory Striding for BPTT ---
-        let scratch_stride = d_model * (h_slots * 7u) + h_slots * h_slots + h_slots;
+        let scratch_stride = d_model * (h_slots * 8u) + h_slots * h_slots + h_slots;
         let batch_scratch_t = (batch_idx * shape.seq_len + t) * scratch_stride;
         let q_base = batch_scratch_t;
         let k_base = q_base + h_slots * d_model;
@@ -180,7 +180,8 @@ fn deq_forward_main(
         let mamba_base = attn_base + h_slots * d_model;
         let signal_base = mamba_base + h_slots * d_model;
         let m_inner_base = signal_base + h_slots * d_model;
-        let attn_weight_base = m_inner_base + h_slots * d_model;
+        let hist_ctx_base = m_inner_base + h_slots * d_model;
+        let attn_weight_base = hist_ctx_base + h_slots * d_model;
         let f_gate_scratch_base = attn_weight_base + h_slots * h_slots;
         let hist_mat_len = d_model * d_model;
         let hist_scale_base = hist_mat_len;
@@ -218,6 +219,17 @@ fn deq_forward_main(
         let b_forget_base = w_forget_base + h_slots * d_model;
 
         let h_base_t = (batch_idx * shape.seq_len + t) * total_elements;
+
+        // Keep a dedicated copy of the forward historical context used by the DEQ loop.
+        // Backward treats this branch as stop-gradient, so retaining the exact forward
+        // value restores forward/backward consistency and avoids recomputing W_hist.
+        for (var s = 0u; s < h_slots; s = s + 1u) {
+            let off = s * d_model;
+            for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+                Scratch[hist_ctx_base + off + d_out] = 0.0;
+            }
+        }
+        workgroupBarrier();
 
         // input_signal_s = W_in_s * s_t  (per-slot: each slot has its own W_in matrix)
         let s_in_base = batch_idx * (shape.seq_len * d_model) + t * d_model;
@@ -419,6 +431,7 @@ fn deq_forward_main(
                 let hist_mod = 1.0 + tanh(gate_dyn);
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                     Scratch[m_inner_base + off + d_out] *= hist_mod;
+                    Scratch[hist_ctx_base + off + d_out] = Scratch[m_inner_base + off + d_out];
                 }
                 // Forget gate: f[s] = σ(b_f[s] + dot(W_f[s,:], H_curr[t-1,s,:]) / sqrt(d))
                 // Uses H_curr (h*_{t-1}), ∂/∂h=0. Applied in post-convergence SSM recurrence.
@@ -937,7 +950,7 @@ fn deq_forward_main(
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     var hist_ctx = 0.0;
                     if (hist_gated_mode && hist_inject > 0.5 && hist_minner_zero < 0.5) {
-                        hist_ctx = Scratch[m_inner_base + off + d];
+                        hist_ctx = Scratch[hist_ctx_base + off + d];
                     }
                     let slot_bias = AllWeights[aw_hist +slot_anchor_base + off + d];
                     // attn_signal is the only h-dependent term (∂slot_bias/∂h = 0,
@@ -1248,7 +1261,7 @@ fn deq_forward_main(
 
         // Per-token debug (slot 0) when seq_len is small: H_rms, V_rms, attn_rms.
         if (tid == 0u && shape.seq_len <= 16u) {
-            let scratch_stride = d_model * h_slots * 7u + h_slots * h_slots + h_slots;
+            let scratch_stride = d_model * h_slots * 8u + h_slots * h_slots + h_slots;
             let base_out = 200u; // leave room for existing debug slots
             for (var t = 0u; t < shape.seq_len; t = t + 1u) {
                 let h_base_t = (t * h_slots) * d_model;

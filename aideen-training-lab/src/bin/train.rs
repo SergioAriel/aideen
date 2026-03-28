@@ -30,6 +30,12 @@ use aideen_training::trainer::Trainer;
 
 use std::{env, fs};
 
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 fn setup_gpu(_trainer: &mut Trainer) {
     #[cfg(feature = "wgpu")]
     {
@@ -216,11 +222,19 @@ fn run_large_file(
         .unwrap_or(0.0001);
     let checkpoint_base = "model_large";
 
+    let train_seed = env_u64("AIDEEN_TRAIN_SEED");
     let mut trainer = if let Some(ref base) = resume_path {
         println!("  Resumiendo desde checkpoint: {base}");
         Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
     } else {
-        let mut t = Trainer::from_tokenizer(tok, lr);
+        if let Some(seed) = train_seed {
+            println!("  Init seed: {seed}");
+        }
+        let mut t = if let Some(seed) = train_seed {
+            Trainer::from_tokenizer_seeded(tok, lr, seed)
+        } else {
+            Trainer::from_tokenizer(tok, lr)
+        };
         t.training_config.lr_min = lr / 10.0;
         t.training_config.warmup_epochs = 0;
         t.training_config.epochs = epochs;
