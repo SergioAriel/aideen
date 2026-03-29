@@ -38,6 +38,7 @@ struct UpdateUniforms {
 const ACCUM_SHARED_D: u32 = 512u;
 var<workgroup> accum_vsum: array<f32, 512>;
 var<workgroup> accum_ksum: array<f32, 512>;
+var<workgroup> accum_qgrad: array<f32, 512>;
 
 fn entry_base(entry: u32, d: u32) -> u32 {
     return entry * d;
@@ -156,10 +157,10 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
     let base = t * scratch_stride(d, h_slots);
     let attn_base = base + h_slots * d * 3u;
     let signal_base = attn_base + 2u * h_slots * d;
+    var sumsq = 0.0;
     let hist_ctx_base = signal_base + 2u * h_slots * d;
     let slot_anchor = slot_anchor_base(d, h_slots);
 
-    var sumsq = 0.0;
     var coeff = 0.0;
     for (var dim = 0u; dim < d; dim = dim + 1u) {
         let hist_ctx = Scratch[hist_ctx_base + q_off + dim];
@@ -347,6 +348,8 @@ fn picard_accum_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let attn_weight_base = base + d * (h_slots * 8u);
     let scale = inverseSqrt(max(1.0, f32(d)));
     let deq_only_mode = params.residual_alpha <= -1.5;
+    let q_src_entry = t * h_slots + target_slot;
+    let q_src_off = entry_base(q_src_entry, d);
 
     var jt_v = (1.0 - params.damping) * v_state[t_off + target_off + dim];
 
@@ -406,6 +409,8 @@ fn picard_accum_opt_main(@builtin(local_invocation_id) lid: vec3<u32>,
     let attn_weight_base = base + d * (h_slots * 8u);
     let scale = inverseSqrt(max(1.0, f32(d)));
     let deq_only_mode = params.residual_alpha <= -1.5;
+    let q_src_entry = t * h_slots + target_slot;
+    let q_src_off = entry_base(q_src_entry, d);
 
     for (var idx = lane; idx < d; idx = idx + 64u) {
         var vs = 0.0;
@@ -422,11 +427,10 @@ fn picard_accum_opt_main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
         accum_vsum[idx] = vs;
         accum_ksum[idx] = ks;
+        accum_qgrad[idx] = qgrad_buf[q_src_off + idx];
     }
     workgroupBarrier();
 
-    let q_src_entry = t * h_slots + target_slot;
-    let q_src_off = entry_base(q_src_entry, d);
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var jt_v = (1.0 - params.damping) * v_state[t_off + target_off + dim];
         if (!deq_only_mode) {
@@ -439,7 +443,7 @@ fn picard_accum_opt_main(@builtin(local_invocation_id) lid: vec3<u32>,
             for (var j = 0u; j < d; j = j + 1u) {
                 v_path_acc = v_path_acc + W_v[wv_base + j] * accum_vsum[j];
                 k_path_acc = k_path_acc + W_k[wk_base + j] * accum_ksum[j];
-                q_path_acc = q_path_acc + W_q[wq_base + j] * qgrad_buf[q_src_off + j];
+                q_path_acc = q_path_acc + W_q[wq_base + j] * accum_qgrad[j];
             }
             jt_v = jt_v + v_path_acc + k_path_acc + q_path_acc;
         }
@@ -553,9 +557,9 @@ fn picard_accum_q_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t_off = t * h_slots * d;
     let target_off = target_slot * d;
 
-    var q_path_acc = 0.0;
     let src_entry = t * h_slots + target_slot;
     let src_off = entry_base(src_entry, d);
+    var q_path_acc = 0.0;
     for (var qd = 0u; qd < d; qd = qd + 1u) {
         q_path_acc = q_path_acc + W_q[dim * d + qd] * qgrad_buf[src_off + qd];
     }
