@@ -55,7 +55,6 @@ docs/ChatGPT-*
 build_val_set.py
 download_corpus.py
 prepare_training_corpus.py
-plot_training.py
 check_training.sh
 resume_training.sh
 scaling_experiment.sh
