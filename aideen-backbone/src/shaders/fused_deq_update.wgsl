@@ -229,32 +229,50 @@ var<workgroup> stage4_mat_a_tile: array<f32, 256>;
 var<workgroup> stage4_mat_b_tile: array<f32, 256>;
 
 @compute
-@workgroup_size(64, 1, 1)
+@workgroup_size(16, 16, 1)
 fn fused_attn_stage1a_main(
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
 ) {
     let d = params.d_model;
     let h_slots = params.h_slots;
-    let n_entries = params.batch_size * params.seq_len * h_slots;
-    let n_tokens = max(1u, params.seq_len - 1u);
-    let lane = lid.x;
-    let entry = wid.x;
-    if (entry >= n_entries) { return; }
-    let t_abs = entry / h_slots;
-    let t = t_abs % params.seq_len;
-    let qs = entry % h_slots;
-    let q_off = qs * d;
-    let t_off = t_abs * h_slots * d;
-    for (var dim = lane; dim < d; dim = dim + 64u) {
-        var gmix = 0.0;
-        for (var dout = 0u; dout < d; dout = dout + 1u) {
-            gmix = gmix
-                + AllWeights[aw_wo_base(params.d_model, params.h_slots) +qs * d * d + dim * d + dout]
-                * v_adjoint[t_off + q_off + dout];
+    let row = gid.x;
+    let token = gid.y;
+    let slot = gid.z;
+    let local_col = lid.x;
+    let local_row = lid.y;
+    let n_tokens = params.batch_size * params.seq_len;
+    if (row >= d || token >= n_tokens || slot >= h_slots) { return; }
+
+    var gmix = 0.0;
+    for (var tile = 0u; tile < d; tile = tile + 16u) {
+        let k_a = tile + local_col;
+        if (k_a < d) {
+            stage4_mat_a_tile[local_row * 16u + local_col] =
+                v_adjoint[token * h_slots * d + slot * d + k_a];
+        } else {
+            stage4_mat_a_tile[local_row * 16u + local_col] = 0.0;
         }
-        gmix_buf[entry_base(entry, d) + dim] = gmix;
+
+        let k_b = tile + local_row;
+        if (k_b < d) {
+            stage4_mat_b_tile[local_row * 16u + local_col] =
+                AllWeights[aw_wo_base(params.d_model, params.h_slots) + slot * d * d + row * d + k_b];
+        } else {
+            stage4_mat_b_tile[local_row * 16u + local_col] = 0.0;
+        }
+        workgroupBarrier();
+
+        let tile_limit = min(16u, d - tile);
+        for (var k = 0u; k < tile_limit; k = k + 1u) {
+            gmix = gmix
+                + stage4_mat_a_tile[local_row * 16u + k]
+                * stage4_mat_b_tile[k * 16u + local_col];
+        }
+        workgroupBarrier();
     }
+    let entry = token * h_slots + slot;
+    gmix_buf[entry_base(entry, d) + row] = gmix;
 }
 
 @compute
@@ -750,28 +768,37 @@ fn fused_hist_stage_prep_main(
     let hist_out = entry_base(entry, d);
     let sample_t = select(0u, max(1u, params.seq_len / 2u), params.seq_len > 1u);
     let sample_entry = sample_t * h_slots;
+    let selective = hist_selective_enabled(d, h_slots);
 
     var local_prev_sumsq = 0.0;
+    var local_prev_h_sumsq = 0.0;
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
             prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         local_prev_sumsq = local_prev_sumsq + prev_m * prev_m;
+        var prev_h = 0.0;
+        if (t > 0u) {
+            prev_h = h_star[(t_abs - 1u) * h_slots * d + off + dim];
+        }
+        local_prev_h_sumsq = local_prev_h_sumsq + prev_h * prev_h;
     }
     hist_reduce_aux[lane] = local_prev_sumsq;
+    hist_reduce_u[lane] = local_prev_h_sumsq;
     workgroupBarrier();
     for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
         if (lane < stride) {
             hist_reduce_aux[lane] = hist_reduce_aux[lane] + hist_reduce_aux[lane + stride];
+            hist_reduce_u[lane] = hist_reduce_u[lane] + hist_reduce_u[lane + stride];
         }
         workgroupBarrier();
     }
     let prev_rms = sqrt(hist_reduce_aux[0] / max(1.0, f32(d)) + 1e-6);
+    let prev_h_rms = sqrt(hist_reduce_u[0] / max(1.0, f32(d)) + 1e-6);
+    let inv_prev_rms = 1.0 / max(prev_rms, 1e-6);
     if (lane == 0u) {
-        // Reuse hist_delta_buf as temporary per-entry scalar scratch before selective-delta stages.
-        // hist_mat / hist_scale only need inv_prev_rms(entry), not the full prev vector.
-        hist_delta_buf[entry] = 1.0 / max(prev_rms, 1e-6);
+        gscore_buf[entry] = inv_prev_rms;
     }
 
     var local_u_sumsq = 0.0;
@@ -792,10 +819,15 @@ fn fused_hist_stage_prep_main(
             }
             u = u + AllWeights[aw_hist_base(params.d_model, params.h_slots) +dim * d + j] * prev_j;
         }
-        qgrad_buf[hist_out + dim] = u;
+        gmix_buf[hist_out + dim] = u;
         local_u_sumsq = local_u_sumsq + u * u;
         let inj = Scratch[signal_base + off + dim];
         local_inj_sumsq = local_inj_sumsq + inj * inj;
+        var prev_h = 0.0;
+        if (t > 0u) {
+            prev_h = h_star[(t_abs - 1u) * h_slots * d + off + dim];
+        }
+        qgrad_buf[hist_out + dim] = prev_h / prev_h_rms;
     }
     hist_reduce_u[lane] = local_u_sumsq;
     hist_reduce_aux[lane] = local_inj_sumsq;
@@ -821,10 +853,9 @@ fn fused_hist_stage_prep_main(
     var local_dot = 0.0;
     for (var dim = lane; dim < d; dim = dim + 64u) {
         let g_c = mix_buf[hist_out + dim];
-        let u = qgrad_buf[hist_out + dim];
+        let u = gmix_buf[hist_out + dim];
         let u_tilde = scale * u;
         gmix_buf[hist_out + dim] = u_tilde;
-        hist_ctx_buf[hist_out + dim] = alpha * u_tilde;
         local_dot = local_dot + g_c * u_tilde;
     }
     hist_reduce_u[lane] = local_dot;
@@ -840,29 +871,121 @@ fn fused_hist_stage_prep_main(
     let clip_active = r_u > tau + 1e-6;
     for (var dim = lane; dim < d; dim = dim + 64u) {
         let g_c = mix_buf[hist_out + dim];
-        let u = qgrad_buf[hist_out + dim];
+        let u = gmix_buf[hist_out + dim] / max(scale, 1.0e-6);
         let g_utilde = alpha * g_c;
         var g_u = g_utilde;
         if (clip_active) {
             g_u = scale * g_utilde - (scale / denom) * u * hist_reduce_u[0];
         }
         weighted_h_buf[hist_out + dim] = g_u;
+
+        let a_base = 1.0 / (1.0 + exp(AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim]));
+        var a_t = a_base;
+        var delta_coeff = 0.0;
+        if (selective) {
+            var delta_pre = AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_delta_bias_base(d, h_slots) + dim];
+            for (var j = 0u; j < d; j = j + 1u) {
+                delta_pre = delta_pre
+                    + AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_delta_base(d, h_slots) + slot * d * d + j * d + dim]
+                    * qgrad_buf[hist_out + j];
+            }
+            let delta_factor = 1.0 + 0.5 * tanh(delta_pre);
+            let a_core = pow(max(a_base, 1.0e-6), delta_factor);
+            let a_floor = hist_alpha_min(d, h_slots);
+            if (a_core < a_floor) {
+                a_t = a_floor;
+                delta_coeff = 0.0;
+            } else {
+                a_t = a_core;
+                let log_a = log(max(a_base, 1.0e-6));
+                let x_unit = qgrad_buf[hist_out + dim];
+                let wx = hist_wx_max() * tanh(AllWeights[aw_wx_base(params.d_model, params.h_slots) +dim * d + dim]);
+                let x_proj = x_unit + wx * x_unit;
+                let prev_m_raw = select(
+                    0.0,
+                    Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim],
+                    t > 0u
+                );
+                let gpre_factor = a_core * log_a * 0.5 * (1.0 - tanh(delta_pre) * tanh(delta_pre));
+                delta_coeff = (prev_m_raw - x_proj) * gpre_factor;
+            }
+        }
+        hist_ctx_buf[hist_out + dim] = a_t;
+        hist_delta_buf[hist_out + dim] = delta_coeff;
+    }
+    workgroupBarrier();
+
+    if (entry == params.seq_len * h_slots - 1u && lane == 0u) {
+        debug_log[53] = 0.0;
+        debug_log[54] = 0.0;
+    }
+    var local_prev_dot = 0.0;
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        var g_m_unit = AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_scale + off + dim]
+            * weighted_h_buf[hist_out + dim];
+        for (var row = 0u; row < d; row = row + 1u) {
+            g_m_unit = g_m_unit
+                + AllWeights[aw_hist_base(params.d_model, params.h_slots) +row * d + dim]
+                * weighted_h_buf[hist_out + row];
+        }
+        gmix_buf[hist_out + dim] = g_m_unit;
+    }
+    workgroupBarrier();
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        var prev_m = 0.0;
+        if (t > 0u) {
+            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+        }
+        local_prev_dot = local_prev_dot + prev_m * gmix_buf[hist_out + dim];
+    }
+    hist_reduce_aux[lane] = local_prev_dot;
+    workgroupBarrier();
+    for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
+        if (lane < stride) {
+            hist_reduce_aux[lane] = hist_reduce_aux[lane] + hist_reduce_aux[lane + stride];
+        }
+        workgroupBarrier();
+    }
+    let prev_denom = max(1e-6, f32(d) * prev_rms * prev_rms * prev_rms);
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        var prev_m = 0.0;
+        if (t > 0u) {
+            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+        }
+        let g_m_unit = gmix_buf[hist_out + dim];
+        gmix_buf[hist_out + dim] = (g_m_unit / prev_rms)
+            - (prev_m * hist_reduce_aux[0] / prev_denom);
     }
     workgroupBarrier();
     if (entry == sample_entry && lane == 0u) {
         var sum_gc = 0.0;
         var sum_gu = 0.0;
+        var sum_gm = 0.0;
         for (var dim = 0u; dim < d; dim = dim + 1u) {
             sum_gc = sum_gc + abs(mix_buf[hist_out + dim]);
             sum_gu = sum_gu + abs(weighted_h_buf[hist_out + dim]);
+            sum_gm = sum_gm + abs(gmix_buf[hist_out + dim]);
         }
         let inv_d = 1.0 / max(1.0, f32(d));
         debug_log[55] = sum_gc * inv_d;
         debug_log[56] = sum_gu * inv_d;
+        debug_log[57] = sum_gm * inv_d;
         if (t == sample_t) {
             debug_log[60] = sum_gc * inv_d;
             debug_log[61] = sum_gu * inv_d;
+            debug_log[62] = sum_gm * inv_d;
         }
+    }
+    if (entry == params.seq_len * h_slots - 1u && lane == 0u) {
+        var sum_gu = 0.0;
+        var sum_gm = 0.0;
+        for (var dim = 0u; dim < d; dim = dim + 1u) {
+            sum_gu = sum_gu + abs(weighted_h_buf[hist_out + dim]);
+            sum_gm = sum_gm + abs(gmix_buf[hist_out + dim]);
+        }
+        let inv_d = 1.0 / max(1.0, f32(d));
+        debug_log[53] = sum_gu * inv_d;
+        debug_log[54] = sum_gm * inv_d;
     }
 }
 
@@ -884,7 +1007,7 @@ fn fused_hist_stage_mat_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (t == 0u) { continue; }
         let slot = entry % h_slots;
         let off = slot * d;
-        let inv_prev_rms = hist_delta_buf[entry];
+        let inv_prev_rms = gscore_buf[entry];
         let prev_val = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + col] * inv_prev_rms;
         grad = grad + weighted_h_buf[entry_base(entry, d) + row] * prev_val;
     }
@@ -929,7 +1052,7 @@ fn fused_hist_stage_scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let t_abs = b * params.seq_len + t;
             let entry = t_abs * h_slots + slot;
             let off = slot * d;
-            let inv_prev_rms = hist_delta_buf[entry];
+            let inv_prev_rms = gscore_buf[entry];
             let prev_val = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim] * inv_prev_rms;
             grad = grad + weighted_h_buf[entry_base(entry, d) + dim] * prev_val;
         }
@@ -1195,50 +1318,15 @@ fn fused_hist_stage_tbptt_main(
             workgroupBarrier();
         }
         let h_rms = sqrt(hist_reduce_u[0] / max(1.0, f32(d)) + 1e-6);
-        for (var dim = lane; dim < d; dim = dim + 64u) {
-            qgrad_buf[hist_out + dim] = h_star[prev_h_base + dim] / h_rms;
-        }
-        workgroupBarrier();
 
         for (var dim = lane; dim < d; dim = dim + 64u) {
-            let a_base = 1.0 / (1.0 + exp(AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim]));
-            var a_t = a_base;
-            var x_proj = qgrad_buf[hist_out + dim];
-            let wx = hist_wx_max() * tanh(AllWeights[aw_wx_base(params.d_model, params.h_slots) +dim * d + dim]);
-            x_proj = x_proj + wx * qgrad_buf[hist_out + dim];
-            var g_pre = 0.0;
-            if (selective) {
-                var delta_pre = AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_delta_bias_base(d, h_slots) + dim];
-                for (var j = 0u; j < d; j = j + 1u) {
-                    delta_pre = delta_pre
-                        + AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_delta_base(d, h_slots) + slot * d * d + j * d + dim]
-                        * qgrad_buf[hist_out + j];
-                }
-                // delta_factor in [0.5, 1.5], a_core = a_base^{delta_factor}, default a_core=a_base.
-                let delta_factor = 1.0 + 0.5 * tanh(delta_pre);
-                let a_core = pow(max(a_base, 1.0e-6), delta_factor);
-                let prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
-                let g_a = (prev_m - x_proj) * hist_ginner_vec[dim];
-                let log_a = log(max(a_base, 1.0e-6));
-                let a_floor = hist_alpha_min(d, h_slots);
-                if (a_core < a_floor) {
-                    a_t = a_floor;
-                    g_pre = 0.0;
-                } else {
-                    a_t = a_core;
-                    let g_delta_factor = g_a * a_core * log_a;
-                    // d delta_factor / d delta_pre = 0.5 * (1 - tanh^2(delta_pre))
-                    g_pre =
-                        g_delta_factor * 0.5 * (1.0 - tanh(delta_pre) * tanh(delta_pre));
-                }
-            }
+            let a_t = hist_ctx_buf[hist_out + dim];
+            let g_pre = hist_ginner_vec[dim] * hist_delta_buf[hist_out + dim];
             hist_delta_buf[hist_out + dim] = g_pre;
-            // Reuse the exact selective/nonselective carry coefficient later in this same
-            // temporal step instead of rebuilding delta_pre -> a_t a second time.
-            hist_ctx_buf[hist_out + dim] = a_t;
             hist_gx_vec[dim] = (1.0 - a_t) * hist_ginner_vec[dim];
             weighted_h_buf[hist_out + dim] = hist_gx_vec[dim];
             var g_h_unit = hist_gx_vec[dim];
+            let wx = hist_wx_max() * tanh(AllWeights[aw_wx_base(params.d_model, params.h_slots) +dim * d + dim]);
             g_h_unit = g_h_unit + wx * hist_gx_vec[dim];
             if (selective) {
                 for (var out = 0u; out < d; out = out + 1u) {
@@ -1267,10 +1355,7 @@ fn fused_hist_stage_tbptt_main(
         let denom = max(1e-6, f32(d) * h_rms * h_rms * h_rms);
         let dot_gh_h = hist_reduce_u[0];
         for (var dim = lane; dim < d; dim = dim + 64u) {
-            let h_val = h_star[prev_h_base + dim];
             let g_h_unit = hist_total_vec[dim];
-            hist_ctx_buf[dst_off + dim] = (g_h_unit / h_rms)
-                - (h_val * dot_gh_h / denom);
             let a_t = hist_ctx_buf[hist_out + dim];
             hist_carry_vec[dim] = a_t * hist_ginner_vec[dim];
         }

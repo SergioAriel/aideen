@@ -85,7 +85,6 @@ pub struct GpuDeqBackend {
     fused_update_hist_mat_pipeline: wgpu::ComputePipeline,
     fused_update_hist_scale_pipeline: wgpu::ComputePipeline,
     fused_update_hist_gate_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_mprev_pipeline: wgpu::ComputePipeline,
     fused_update_hist_tbptt_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wout_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wx_pipeline: wgpu::ComputePipeline,
@@ -921,15 +920,6 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_hist_stage_gate_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_mprev_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist MPrev Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_mprev_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1796,7 +1786,6 @@ impl GpuDeqBackend {
             fused_update_hist_mat_pipeline,
             fused_update_hist_scale_pipeline,
             fused_update_hist_gate_pipeline,
-            fused_update_hist_mprev_pipeline,
             fused_update_hist_tbptt_pipeline,
             fused_update_hist_wout_pipeline,
             fused_update_hist_wx_pipeline,
@@ -3055,7 +3044,6 @@ impl GpuDeqBackend {
                     hs.div_ceil(16)
                 );
                 if train_hist_temporal {
-                    add_pass!(&self.fused_update_hist_mprev_pipeline, n, 1);
                     add_pass!(&self.fused_update_hist_tbptt_pipeline, batch_size * hs, 1);
                     add_pass!(
                         &self.fused_update_hist_forget_pipeline,
@@ -3089,7 +3077,12 @@ impl GpuDeqBackend {
                     }
                 }
             }
-            add_pass!(&self.fused_update_stage1a_pipeline, n, 1);
+            add_pass_3d!(
+                &self.fused_update_stage1a_pipeline,
+                d.div_ceil(16),
+                (batch_size * seq_len).div_ceil(16),
+                hs
+            );
             add_pass!(&self.fused_update_stage1b_pipeline, n, 1);
             add_pass!(
                 &self.fused_update_stage2_pipeline,
@@ -3288,17 +3281,6 @@ impl GpuDeqBackend {
                     run_stage(
                         &self.device,
                         &self.queue,
-                        "hist_mprev_final",
-                        &self.fused_update_hist_mprev_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        n,
-                        1,
-                        profile_fused,
-                    );
-                    run_stage(
-                        &self.device,
-                        &self.queue,
                         "hist_tbptt_final",
                         &self.fused_update_hist_tbptt_pipeline,
                         &self.fused_update_bg0,
@@ -3383,15 +3365,16 @@ impl GpuDeqBackend {
                     }
                 }
             }
-            run_stage(
+            run_stage_3d(
                 &self.device,
                 &self.queue,
                 "stage1a",
                 &self.fused_update_stage1a_pipeline,
                 &self.fused_update_bg0,
                 &self.fused_update_bg1,
-                n,
-                1,
+                d.div_ceil(16),
+                (batch_size * seq_len).div_ceil(16),
+                hs,
                 profile_fused,
             );
             run_stage(
