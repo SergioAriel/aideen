@@ -74,7 +74,11 @@ pub struct GpuDeqBackend {
     fused_update_stage2_pipeline: wgpu::ComputePipeline,
     fused_update_stage3_pipeline: wgpu::ComputePipeline,
     fused_update_stage4_wo_win_pipeline: wgpu::ComputePipeline,
-    fused_update_stage4_qkv_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_wq_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_prep_wk_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_prep_wv_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_wk_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_wv_pipeline: wgpu::ComputePipeline,
     fused_update_stage4_bias_pipeline: wgpu::ComputePipeline,
     fused_update_hist_prep_pipeline: wgpu::ComputePipeline,
     fused_update_hist_mat_pipeline: wgpu::ComputePipeline,
@@ -829,12 +833,48 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let fused_update_stage4_qkv_pipeline =
+        let fused_update_stage4_wq_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Stage4 QKV Pipeline"),
+                label: Some("Fused DEQ Update Stage4 WQ Pipeline"),
                 layout: Some(&pl),
                 module: &update_shader,
-                entry_point: Some("fused_attn_stage4_qkv_main"),
+                entry_point: Some("fused_attn_stage4_wq_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_stage4_prep_wk_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Stage4 Prep WK Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_attn_stage4_prep_wk_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_stage4_prep_wv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Stage4 Prep WV Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_attn_stage4_prep_wv_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_stage4_wk_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Stage4 WK Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_attn_stage4_wk_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_stage4_wv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Stage4 WV Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_attn_stage4_wv_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1735,7 +1775,11 @@ impl GpuDeqBackend {
             fused_update_stage2_pipeline,
             fused_update_stage3_pipeline,
             fused_update_stage4_wo_win_pipeline,
-            fused_update_stage4_qkv_pipeline,
+            fused_update_stage4_wq_pipeline,
+            fused_update_stage4_prep_wk_pipeline,
+            fused_update_stage4_prep_wv_pipeline,
+            fused_update_stage4_wk_pipeline,
+            fused_update_stage4_wv_pipeline,
             fused_update_stage4_bias_pipeline,
             fused_update_hist_prep_pipeline,
             fused_update_hist_mat_pipeline,
@@ -2952,6 +2996,18 @@ impl GpuDeqBackend {
                     pass.dispatch_workgroups($x, $y, 1);
                 }};
             }
+            macro_rules! add_pass_3d {
+                ($pipeline:expr, $x:expr, $y:expr, $z:expr) => {{
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline($pipeline);
+                    pass.set_bind_group(0, &self.fused_update_bg0, &[]);
+                    pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                    pass.dispatch_workgroups($x, $y, $z);
+                }};
+            }
             if hist_gated {
                 let train_hist_carrier = self.cfg_hist_train_carrier;
                 let train_hist_wx = self.cfg_hist_train_wx;
@@ -3028,10 +3084,33 @@ impl GpuDeqBackend {
                 d.div_ceil(16),
                 d.div_ceil(16)
             );
-            add_pass!(
-                &self.fused_update_stage4_qkv_pipeline,
+            add_pass_3d!(
+                &self.fused_update_stage4_wq_pipeline,
                 d.div_ceil(16),
-                d.div_ceil(16)
+                d.div_ceil(16),
+                hs
+            );
+            add_pass!(
+                &self.fused_update_stage4_prep_wk_pipeline,
+                d.div_ceil(16),
+                (batch_size * seq_len * hs).div_ceil(16)
+            );
+            add_pass!(
+                &self.fused_update_stage4_prep_wv_pipeline,
+                d.div_ceil(16),
+                (batch_size * seq_len * hs).div_ceil(16)
+            );
+            add_pass_3d!(
+                &self.fused_update_stage4_wk_pipeline,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                hs
+            );
+            add_pass_3d!(
+                &self.fused_update_stage4_wv_pipeline,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                hs
             );
             add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
             if grad_accum_mode == 1 && apply_accum {
@@ -3085,6 +3164,35 @@ impl GpuDeqBackend {
                     pass.set_bind_group(0, bg0, &[]);
                     pass.set_bind_group(1, bg1, &[]);
                     pass.dispatch_workgroups(x, y, 1);
+                }
+                queue.submit(Some(encoder.finish()));
+                if profile {
+                    device.poll(wgpu::Maintain::Wait);
+                    eprintln!("[FUSED-PROFILE] {label}: {} ms", t0.elapsed().as_millis());
+                }
+            };
+            let run_stage_3d = |device: &wgpu::Device,
+                                queue: &wgpu::Queue,
+                                label: &str,
+                                pipeline: &wgpu::ComputePipeline,
+                                bg0: &wgpu::BindGroup,
+                                bg1: &wgpu::BindGroup,
+                                x: u32,
+                                y: u32,
+                                z: u32,
+                                profile: bool| {
+                let t0 = std::time::Instant::now();
+                let mut encoder = device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg0, &[]);
+                    pass.set_bind_group(1, bg1, &[]);
+                    pass.dispatch_workgroups(x, y, z);
                 }
                 queue.submit(Some(encoder.finish()));
                 if profile {
@@ -3308,15 +3416,62 @@ impl GpuDeqBackend {
                 d.div_ceil(16),
                 profile_fused,
             );
-            run_stage(
+            run_stage_3d(
                 &self.device,
                 &self.queue,
-                "stage4_qkv",
-                &self.fused_update_stage4_qkv_pipeline,
+                "stage4_wq",
+                &self.fused_update_stage4_wq_pipeline,
                 &self.fused_update_bg0,
                 &self.fused_update_bg1,
                 d.div_ceil(16),
                 d.div_ceil(16),
+                hs,
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage4_prep_wk",
+                &self.fused_update_stage4_prep_wk_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                (batch_size * seq_len * hs).div_ceil(16),
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage4_prep_wv",
+                &self.fused_update_stage4_prep_wv_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                (batch_size * seq_len * hs).div_ceil(16),
+                profile_fused,
+            );
+            run_stage_3d(
+                &self.device,
+                &self.queue,
+                "stage4_wk",
+                &self.fused_update_stage4_wk_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                hs,
+                profile_fused,
+            );
+            run_stage_3d(
+                &self.device,
+                &self.queue,
+                "stage4_wv",
+                &self.fused_update_stage4_wv_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                hs,
                 profile_fused,
             );
             run_stage(
