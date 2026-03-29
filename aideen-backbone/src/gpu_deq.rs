@@ -73,7 +73,9 @@ pub struct GpuDeqBackend {
     fused_update_stage1b_pipeline: wgpu::ComputePipeline,
     fused_update_stage2_pipeline: wgpu::ComputePipeline,
     fused_update_stage3_pipeline: wgpu::ComputePipeline,
-    fused_update_stage4_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_wo_win_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_qkv_pipeline: wgpu::ComputePipeline,
+    fused_update_stage4_bias_pipeline: wgpu::ComputePipeline,
     fused_update_hist_prep_pipeline: wgpu::ComputePipeline,
     fused_update_hist_mat_pipeline: wgpu::ComputePipeline,
     fused_update_hist_scale_pipeline: wgpu::ComputePipeline,
@@ -818,12 +820,30 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let fused_update_stage4_pipeline =
+        let fused_update_stage4_wo_win_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Stage4 Pipeline"),
+                label: Some("Fused DEQ Update Stage4 WO/WIN Pipeline"),
                 layout: Some(&pl),
                 module: &update_shader,
-                entry_point: Some("fused_attn_stage4_main"),
+                entry_point: Some("fused_attn_stage4_wo_win_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_stage4_qkv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Stage4 QKV Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_attn_stage4_qkv_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fused_update_stage4_bias_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fused DEQ Update Stage4 Bias Pipeline"),
+                layout: Some(&pl),
+                module: &update_shader,
+                entry_point: Some("fused_attn_stage4_bias_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1714,7 +1734,9 @@ impl GpuDeqBackend {
             fused_update_stage1b_pipeline,
             fused_update_stage2_pipeline,
             fused_update_stage3_pipeline,
-            fused_update_stage4_pipeline,
+            fused_update_stage4_wo_win_pipeline,
+            fused_update_stage4_qkv_pipeline,
+            fused_update_stage4_bias_pipeline,
             fused_update_hist_prep_pipeline,
             fused_update_hist_mat_pipeline,
             fused_update_hist_scale_pipeline,
@@ -3002,10 +3024,16 @@ impl GpuDeqBackend {
                 n.div_ceil(16)
             );
             add_pass!(
-                &self.fused_update_stage4_pipeline,
+                &self.fused_update_stage4_wo_win_pipeline,
                 d.div_ceil(16),
                 d.div_ceil(16)
             );
+            add_pass!(
+                &self.fused_update_stage4_qkv_pipeline,
+                d.div_ceil(16),
+                d.div_ceil(16)
+            );
+            add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
             if grad_accum_mode == 1 && apply_accum {
                 add_pass!(
                     &self.fused_update_apply_grad_pipeline,
@@ -3269,17 +3297,39 @@ impl GpuDeqBackend {
                 n.div_ceil(16),
                 profile_fused,
             );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "stage4",
-                    &self.fused_update_stage4_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    d.div_ceil(16),
-                    d.div_ceil(16),
-                    profile_fused,
-                );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage4_wo_win",
+                &self.fused_update_stage4_wo_win_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage4_qkv",
+                &self.fused_update_stage4_qkv_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage4_bias",
+                &self.fused_update_stage4_bias_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(64),
+                1,
+                profile_fused,
+            );
             if grad_accum_mode == 1 && apply_accum {
                 run_stage(
                     &self.device,
