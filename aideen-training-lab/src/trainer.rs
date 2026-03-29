@@ -2048,8 +2048,11 @@ impl Trainer {
                 12
             };
             self.adaptive_max_iters = self.adaptive_max_iters.max(sched_floor);
+            // Early large-file training was over-solving the adjoint: short and chunk-10
+            // validations preserve loss with 2 Picard adjoint iterations while materially
+            // improving throughput. Keep later phases conservative until we validate them too.
             self.config.adj_iters = if deq_progress < 0.25 {
-                4
+                2
             } else if deq_progress < 0.60 {
                 6
             } else {
