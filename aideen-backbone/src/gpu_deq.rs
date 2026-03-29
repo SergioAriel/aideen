@@ -65,6 +65,7 @@ pub struct GpuDeqBackend {
     staged_picard_gscore_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_base_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_opt_pipeline: wgpu::ComputePipeline,
+    staged_picard_accum_opt_token8_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_v_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_k_pipeline: wgpu::ComputePipeline,
@@ -1090,6 +1091,15 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let staged_picard_accum_opt_token8_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Accum Opt Token8 Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("picard_accum_opt_token8_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let staged_picard_accum_v_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Staged Picard Accum V Pipeline"),
@@ -1766,6 +1776,7 @@ impl GpuDeqBackend {
             staged_picard_gscore_pipeline,
             staged_picard_accum_base_pipeline,
             staged_picard_accum_opt_pipeline,
+            staged_picard_accum_opt_token8_pipeline,
             staged_picard_accum_pipeline,
             staged_picard_accum_v_pipeline,
             staged_picard_accum_k_pipeline,
@@ -2717,12 +2728,20 @@ impl GpuDeqBackend {
                 } else {
                     stage_accum_ms += run_stage(
                         if self.config.d_r <= 512 { "Staged Picard Accum Opt" } else { "Staged Picard Accum" },
-                        if self.config.d_r <= 512 {
+                        if self.config.d_r <= 512 && self.config.h_slots == 8 {
+                            &self.staged_picard_accum_opt_token8_pipeline
+                        } else if self.config.d_r <= 512 {
                             &self.staged_picard_accum_opt_pipeline
                         } else {
                             &self.staged_picard_accum_pipeline
                         },
-                        if self.config.d_r <= 512 { n_entries.max(1) } else { d.div_ceil(16) },
+                        if self.config.d_r <= 512 && self.config.h_slots == 8 {
+                            batch_size.saturating_mul(seq_len).max(1)
+                        } else if self.config.d_r <= 512 {
+                            n_entries.max(1)
+                        } else {
+                            d.div_ceil(16)
+                        },
                         if self.config.d_r <= 512 { 1 } else { n_entries.div_ceil(16).max(1) },
                         &self.device,
                         &self.queue,
@@ -2817,7 +2836,10 @@ impl GpuDeqBackend {
                         pass.set_pipeline(&self.staged_picard_accum_q_pipeline);
                         pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
                     } else {
-                        if self.config.d_r <= 512 {
+                        if self.config.d_r <= 512 && self.config.h_slots == 8 {
+                            pass.set_pipeline(&self.staged_picard_accum_opt_token8_pipeline);
+                            pass.dispatch_workgroups(batch_size.saturating_mul(seq_len).max(1), 1, 1);
+                        } else if self.config.d_r <= 512 {
                             pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
                             pass.dispatch_workgroups(n_entries.max(1), 1, 1);
                         } else {

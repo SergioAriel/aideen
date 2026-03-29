@@ -36,9 +36,12 @@ struct UpdateUniforms {
 @group(1) @binding(9) var<storage, read_write> HistParams: array<f32>;
 
 const ACCUM_SHARED_D: u32 = 512u;
+const ACCUM_TOKEN_H8: u32 = 8u;
 var<workgroup> accum_vsum: array<f32, 512>;
 var<workgroup> accum_ksum: array<f32, 512>;
 var<workgroup> accum_qgrad: array<f32, 512>;
+var<workgroup> accum_vsum_h8: array<f32, 4096>;
+var<workgroup> accum_ksum_h8: array<f32, 4096>;
 
 fn entry_base(entry: u32, d: u32) -> u32 {
     return entry * d;
@@ -450,6 +453,75 @@ fn picard_accum_opt_main(@builtin(local_invocation_id) lid: vec3<u32>,
         let b = b_in[t * d + dim] / max(1.0, f32(h_slots))
             + rhs_slot_buf[entry_base(entry, d) + dim];
         v_next[t_off + target_off + dim] = jt_v + b;
+    }
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn picard_accum_opt_token8_main(@builtin(local_invocation_id) lid: vec3<u32>,
+                                @builtin(workgroup_id) wid: vec3<u32>) {
+    let lane = lid.x;
+    let token = wid.x;
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    let n_tokens = params.batch_size * params.seq_len;
+    if (token >= n_tokens || d > ACCUM_SHARED_D || h_slots != ACCUM_TOKEN_H8) { return; }
+
+    let t_off = token * h_slots * d;
+    let base = token * scratch_stride(d, h_slots);
+    let q_base = base;
+    let attn_weight_base = base + d * (h_slots * 8u);
+    let scale = inverseSqrt(max(1.0, f32(d)));
+    let deq_only_mode = params.residual_alpha <= -1.5;
+
+    for (var idx = lane; idx < d; idx = idx + 64u) {
+        var vs: array<f32, 8>;
+        var ks: array<f32, 8>;
+        for (var qs = 0u; qs < ACCUM_TOKEN_H8; qs = qs + 1u) {
+            let src_entry = token * h_slots + qs;
+            let src_off = entry_base(src_entry, d);
+            let qs_off = qs * d;
+            let gmix_val = gmix_buf[src_off + idx];
+            for (var ts = 0u; ts < ACCUM_TOKEN_H8; ts = ts + 1u) {
+                let alpha_qt = Scratch[attn_weight_base + qs * h_slots + ts];
+                vs[ts] = vs[ts] + alpha_qt * gmix_val;
+                let g_score_t = gscore_buf[src_entry * h_slots + ts];
+                ks[ts] = ks[ts] + (scale * g_score_t * Scratch[q_base + qs_off + idx]);
+            }
+        }
+        for (var ts = 0u; ts < ACCUM_TOKEN_H8; ts = ts + 1u) {
+            let off = ts * d + idx;
+            accum_vsum_h8[off] = vs[ts];
+            accum_ksum_h8[off] = ks[ts];
+        }
+    }
+    workgroupBarrier();
+
+    for (var dim = lane; dim < d; dim = dim + 64u) {
+        let wk_base = dim * d;
+        let wq_base = dim * d;
+        for (var target_slot = 0u; target_slot < ACCUM_TOKEN_H8; target_slot = target_slot + 1u) {
+            var jt_v = (1.0 - params.damping) * v_state[t_off + target_slot * d + dim];
+            if (!deq_only_mode) {
+                var v_path_acc = 0.0;
+                var k_path_acc = 0.0;
+                var q_path_acc = 0.0;
+                let wv_base = target_slot * d * d + dim * d;
+                let q_src_entry = token * h_slots + target_slot;
+                let q_src_off = entry_base(q_src_entry, d);
+                let slot_off = target_slot * d;
+                for (var j = 0u; j < d; j = j + 1u) {
+                    v_path_acc = v_path_acc + W_v[wv_base + j] * accum_vsum_h8[slot_off + j];
+                    k_path_acc = k_path_acc + W_k[wk_base + j] * accum_ksum_h8[slot_off + j];
+                    q_path_acc = q_path_acc + W_q[wq_base + j] * qgrad_buf[q_src_off + j];
+                }
+                jt_v = jt_v + v_path_acc + k_path_acc + q_path_acc;
+            }
+            let rhs_entry = token * h_slots + target_slot;
+            let b = b_in[token * d + dim] / max(1.0, f32(h_slots))
+                + rhs_slot_buf[entry_base(rhs_entry, d) + dim];
+            v_next[t_off + target_slot * d + dim] = jt_v + b;
+        }
     }
 }
 
