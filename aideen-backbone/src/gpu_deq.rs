@@ -2938,11 +2938,6 @@ impl GpuDeqBackend {
                 let train_hist_delta = self.cfg_hist_train_delta;
                 let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
                 add_pass!(&self.fused_update_hist_prep_pipeline, n, 1);
-                if train_hist_temporal {
-                    add_pass!(&self.fused_update_hist_mprev_pipeline, n, 1);
-                    add_pass!(&self.fused_update_hist_tbptt_pipeline, batch_size * hs, 1);
-                    add_pass!(&self.fused_update_hist_prep_pipeline, n, 1);
-                }
                 add_pass!(&self.fused_update_hist_gate_pipeline, hs.div_ceil(64), 1);
                 add_pass!(
                     &self.fused_update_hist_mat_pipeline,
@@ -3087,82 +3082,6 @@ impl GpuDeqBackend {
                     profile_fused,
                 );
                 let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
-                if train_hist_temporal {
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_mprev",
-                        &self.fused_update_hist_mprev_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        n,
-                        1,
-                        profile_fused,
-                    );
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_tbptt",
-                        &self.fused_update_hist_tbptt_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        batch_size * hs,
-                        1,
-                        profile_fused,
-                    );
-                    if hist_internal_probe {
-                        let sample_t = (seq_len as usize / 2)
-                            .max(1)
-                            .min(seq_len.saturating_sub(1) as usize);
-                        let n_entries = seq_len as usize * self.config.h_slots;
-                        let n_floats = n_entries * self.config.d_r;
-                        let hist_rhs = self.read_storage_buffer(
-                            &self.fused_hist_ctx_buf,
-                            n_floats,
-                            "Hist Probe RHS Readback",
-                        );
-                        let hist_delta = self.read_storage_buffer(
-                            &self.fused_hist_delta_buf,
-                            n_floats,
-                            "Hist Probe Delta Readback",
-                        );
-                        let (rhs_mean, rhs_max, rhs_nz) = Self::summarize_token_block(
-                            &hist_rhs,
-                            sample_t,
-                            self.config.h_slots,
-                            self.config.d_r,
-                        );
-                        let (delta_mean, delta_max, delta_nz) = Self::summarize_token_block(
-                            &hist_delta,
-                            sample_t,
-                            self.config.h_slots,
-                            self.config.d_r,
-                        );
-                        eprintln!(
-                            "[HIST-INTERNAL] pre-rerun sample_t={} rhs(mean/max/nz)={:.6e}/{:.6e}/{}/{} delta(mean/max/nz)={:.6e}/{:.6e}/{}/{}",
-                            sample_t,
-                            rhs_mean,
-                            rhs_max,
-                            rhs_nz,
-                            self.config.h_slots * self.config.d_r,
-                            delta_mean,
-                            delta_max,
-                            delta_nz,
-                            self.config.h_slots * self.config.d_r,
-                        );
-                    }
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_prep_final",
-                        &self.fused_update_hist_prep_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        n,
-                        1,
-                        profile_fused,
-                    );
-                }
                 run_stage(
                     &self.device,
                     &self.queue,
