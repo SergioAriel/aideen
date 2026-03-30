@@ -30,16 +30,10 @@ use aideen_training::trainer::Trainer;
 
 use std::{env, fs};
 
-fn print_banner(config: &ArchitectureConfig) {
-    println!();
-    println!("╔═══════════════════════════════════════════════╗");
-    println!("║     AIDEEN — Semba Engine v3                 ║");
-    println!(
-        "║     Slot-Equilibrium Mamba (D_R={})         ║",
-        config.d_r
-    );
-    println!("╚═══════════════════════════════════════════════╝");
-    println!();
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
 fn setup_gpu(_trainer: &mut Trainer) {
@@ -107,108 +101,22 @@ fn main() {
         i += 1;
     }
 
-    // Pass freeze flags to run functions or use them directly
-    if let Some(ref txt_path) = large_file {
-        run_large_file(
-            txt_path,
-            resume_path,
-            epochs,
-            log_every,
-            save_every,
-            freeze_deq,
-            freeze_emb,
-            freeze_lm,
-            skip_chunks,
-        );
-        return;
-    }
-
-    run_small_dataset(
+    // Require explicit --file to avoid silent fallback to the tiny dataset.
+    let Some(ref txt_path) = large_file else {
+        eprintln!("ERROR: missing --file <corpus.txt>. Fallback mode has been disabled.");
+        std::process::exit(2);
+    };
+    run_large_file(
+        txt_path,
         resume_path,
         epochs,
         log_every,
+        save_every,
         freeze_deq,
         freeze_emb,
         freeze_lm,
+        skip_chunks,
     );
-}
-
-fn run_small_dataset(
-    resume_path: Option<String>,
-    epochs: usize,
-    log_every: usize,
-    freeze_deq: bool,
-    freeze_emb: bool,
-    freeze_lm: bool,
-) {
-    let corpus = fs::read_to_string("aideen-backbone/dataset.txt")
-        .or_else(|_| fs::read_to_string("dataset.txt"))
-        .unwrap_or_else(|_| "AIDEEN engine running basic logic.".to_string());
-
-    let config_default = ArchitectureConfig::default();
-
-    let tok_path = find_tokenizer_path();
-    let mut tok = if let Some(ref path) = tok_path {
-        println!("  Tokenizer: BPE ({path}) ✅");
-        Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
-    } else {
-        println!("  Tokenizer: Char-level (fallback) ⚠️");
-        Tokenizer::from_text(&corpus, config_default.clone())
-    };
-
-    let mut config = ArchitectureConfig::default();
-    config.vocab_size = tok.vocab_size();
-    config.max_deq_iters = 15;
-    tok.config = config.clone();
-
-    print_banner(&config);
-    let tokens = tok.encode(&corpus);
-    println!(
-        "  Corpus: {} chars → {} tokens, vocab={}",
-        corpus.len(),
-        tokens.len(),
-        tok.vocab_size()
-    );
-
-    let lr = 0.0001;
-
-    let mut trainer = if let Some(ref base) = resume_path {
-        println!("  Resuming from checkpoint: {base}");
-        Trainer::load_checkpoint(base).expect("Error loading checkpoint")
-    } else {
-        let mut t = Trainer::from_tokenizer(tok, lr);
-        t.training_config.lr_min = 0.0001;
-        t.training_config.warmup_epochs = 3;
-        t.training_config.epochs = epochs;
-        // FASE 1: Entrenar en float32 hasta que los resultados sean buenos.
-        // FASE 2: Cuando el modelo float32 funcione bien, cambiar a `true` para
-        //         reentrenar desde cero con QAT (Quantization-Aware Training, STE).
-        //         NO hacer post-training quantization — 1.58b requiere QAT desde el inicio.
-        t.training_config.ternary = false;
-        t
-    };
-
-    trainer.frozen_deq = freeze_deq;
-    trainer.frozen_emb = freeze_emb;
-    trainer.frozen_lm = freeze_lm;
-    if freeze_deq {
-        println!("  [Ablation] DEQ Frozen ❄️");
-    }
-    if freeze_emb {
-        println!("  [Ablation] Embeddings Frozen ❄️");
-    }
-
-    setup_gpu(&mut trainer);
-    if trainer.training_config.ternary {
-        println!("  Bit-Diet (Ternary 1.58-bit) active 🔥  [STE during training]");
-    }
-
-    let t0 = std::time::Instant::now();
-    trainer.train_on_tokens(&tokens, epochs, log_every);
-    println!("\n  Total time: {:.1}s", t0.elapsed().as_secs_f32());
-    println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
-
-    save_and_generate(&mut trainer, "model");
 }
 
 /// Trains on a large .txt file using streaming (no RAM limit).
@@ -229,9 +137,9 @@ fn run_large_file(
         println!("  Skipping first {skip_chunks} chunks (--skip-chunks)");
     }
 
-    // ── Resolver ruta real del dataset ─────────────────────────────────────
-    let (corpus, resolved_path) = match fs::read_to_string(txt_path) {
-        Ok(c) => (c, txt_path.to_string()),
+    // ── Resolve real dataset path ────────────────────────────────────────
+    let (resolved_path, corpus) = match fs::read_to_string(txt_path) {
+        Ok(c) => (txt_path.to_string(), Some(c)),
         Err(_) => {
             let filename = std::path::Path::new(txt_path)
                 .file_name()
@@ -245,7 +153,7 @@ fn run_large_file(
             let mut found = None;
             for p in alt_paths {
                 if let Ok(c) = fs::read_to_string(&p) {
-                    found = Some((c, p));
+                    found = Some((p, Some(c)));
                     break;
                 }
             }
@@ -254,62 +162,96 @@ fn run_large_file(
     };
     let txt_path = resolved_path;
 
-    // ── Construir tokenizer ────────────────────────────────────────────────
+    // ── Build tokenizer ─────────────────────────────────────────────────
     let config_default = ArchitectureConfig::default();
     let tok_path = find_tokenizer_path();
-
     let mut tok = if let Some(ref path) = tok_path {
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
     } else {
+        let corpus = corpus
+            .as_ref()
+            .expect("Char-level tokenizer requires corpus in memory.");
         println!("  Tokenizer: Char-level — scanning vocab...");
-        Tokenizer::from_text(&corpus, config_default.clone())
+        Tokenizer::from_text(corpus, config_default.clone())
     };
 
     tok.config.vocab_size = tok.vocab_size();
-    tok.config.ctx_len = env::var("AIDEEN_CTX_LEN")
+    tok.config.ctx_len = std::env::var("AIDEEN_CTX_LEN")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
     tok.config.train_deq = true;
 
     let vocab_size = tok.vocab_size();
 
-    // ── Tokenizar y escribir .bin ──────────────────────────────────────────
+    // ── Tokenize and write .bin (or reuse cache) ──────────────────────────
     let bin_path = format!("{txt_path}.tokens.bin");
-    println!("  Tokenizing {txt_path} → {bin_path} ...");
-    {
-        use std::io::Write;
-        let tokens = tok.encode(&corpus);
-        let byte_data: &[u8] = bytemuck::cast_slice(&tokens);
+    let txt_meta = fs::metadata(&txt_path).ok();
+    let bin_meta = fs::metadata(&bin_path).ok();
+    let use_cache = bin_meta
+        .as_ref()
+        .and_then(|b| b.modified().ok())
+        .zip(txt_meta.as_ref().and_then(|t| t.modified().ok()))
+        .map(|(b, t)| b >= t)
+        .unwrap_or(false);
 
-        // Asegurar que el directorio padre existe
-        if let Some(parent) = std::path::Path::new(&bin_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
-
-        let mut f = fs::File::create(&bin_path).expect("Cannot create .bin");
-        f.write_all(byte_data).expect("Error writing .bin");
+    if use_cache && tok_path.is_some() {
+        let bin_bytes = bin_meta.unwrap().len() as usize;
+        let tokens_len = bin_bytes / 4;
         println!(
-            "  {} chars → {} tokens, vocab={} → {:.2} MB",
-            corpus.len(),
-            tokens.len(),
-            vocab_size,
-            byte_data.len() as f64 / 1_048_576.0
+            "  Cache OK: reusing {bin_path} ({} tokens, vocab={})",
+            tokens_len, vocab_size
         );
+    } else {
+        let corpus = corpus
+            .as_ref()
+            .expect("Corpus in memory required for tokenization.");
+        println!("  Tokenizing {txt_path} → {bin_path} ...");
+        {
+            use std::io::Write;
+            let tokens = tok.encode(corpus);
+            let byte_data: &[u8] = bytemuck::cast_slice(&tokens);
+
+            // Ensure the parent directory exists
+            if let Some(parent) = std::path::Path::new(&bin_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+
+            let mut f = fs::File::create(&bin_path).expect("Cannot create .bin");
+            f.write_all(byte_data).expect("Error writing .bin");
+            println!(
+                "  {} chars → {} tokens, vocab={} → {:.2} MB",
+                corpus.len(),
+                tokens.len(),
+                vocab_size,
+                byte_data.len() as f64 / 1_048_576.0
+            );
+        }
     }
 
-    let lr = 0.0001;
+    let lr = std::env::var("AIDEEN_LR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.0001);
     let checkpoint_base = "model_large";
 
+    let train_seed = env_u64("AIDEEN_TRAIN_SEED");
     let mut trainer = if let Some(ref base) = resume_path {
         println!("  Resuming from checkpoint: {base}");
         Trainer::load_checkpoint(base).expect("Error loading checkpoint")
     } else {
-        let mut t = Trainer::from_tokenizer(tok, lr);
-        t.training_config.lr_min = 0.00001;
+        if let Some(seed) = train_seed {
+            println!("  Init seed: {seed}");
+        }
+        let mut t = if let Some(seed) = train_seed {
+            Trainer::from_tokenizer_seeded(tok, lr, seed)
+        } else {
+            Trainer::from_tokenizer(tok, lr)
+        };
+        t.training_config.lr_min = lr / 10.0;
         t.training_config.warmup_epochs = 0;
         t.training_config.epochs = epochs;
         t.training_config.ternary = false;
@@ -333,9 +275,9 @@ fn run_large_file(
     println!();
 
     // EOS token:
-    // En este pipeline no inyectamos un token EOS explícito en el stream de training.
-    // Usar 2 para BPE fragmentaba por un token común (p.ej. '#') y anulaba la pérdida.
-    // 0 desactiva el split por EOS en train_on_file.
+    // In this pipeline we do not inject an explicit EOS token into the training stream.
+    // Using 2 for BPE was splitting on a common token (e.g. '#') and canceling the loss.
+    // 0 disables the EOS split in train_on_file.
     let eos_token: u32 = 0;
 
     let t0 = std::time::Instant::now();
@@ -354,6 +296,10 @@ fn run_large_file(
     println!("\n  Total time: {:.1}s", t0.elapsed().as_secs_f32());
     println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
 
+    if save_every == 0 {
+        println!("  [Skip] save/generate disabled (save_every=0)");
+        return;
+    }
     save_and_generate(&mut trainer, checkpoint_base);
 }
 

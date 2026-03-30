@@ -34,7 +34,7 @@ pub struct TrainingConfig {
     pub lr_min: f32,
     pub epochs: usize,
     pub log_every: usize,
-    /// Warmup epochs: LR increases linearly from lr_min to lr.
+    /// Warmup epochs: LR ramps linearly from lr_min to lr.
     pub warmup_epochs: usize,
     /// "Bit-Diet" experiment: Projects weights to ternary values (-1, 0, 1).
     pub ternary: bool,
@@ -82,7 +82,7 @@ pub struct Trainer {
     pub lm_head: LmHead,
     pub tokenizer: Tokenizer,
     pub optimizer: Adam,
-    // Flags de ablatación y validación
+    // Ablation and validation flags
     pub frozen_deq: bool,
     pub frozen_emb: bool,
     pub frozen_lm: bool,
@@ -112,6 +112,26 @@ pub struct Trainer {
     // --- TPS tracking for GPU-DEBUG log ---
     debug_last_time: Option<std::time::Instant>,
     debug_tokens_accum: u32, // tokens processed since last GPU-DEBUG print
+
+    // --- Debug buffer cache (avoid blocking GPU readback every step) ---
+    // read_debug_buffer() calls device.poll(Maintain::Wait) — blocks CPU until GPU finishes.
+    // Now deferred to end-of-step (after apply_gradient_update) so GPU is already idle.
+    cached_debug_buf: Vec<f32>,
+    // --- Cached GPU loss (avoid sync readback every step) ---
+    last_gpu_loss: f32,
+
+    // --- Cached hot-path env vars (parsed once at construction) ---
+    // Avoids ~26 env::var syscalls per training step.
+    cfg_fwd_batch_size: u32,       // AIDEEN_BATCH_SIZE (for forward dispatch)
+    cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
+    cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
+    cfg_tps_sync_every: usize,     // AIDEEN_TPS_SYNC_EVERY
+    cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
+    cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
+    cfg_wv_debug: bool,            // AIDEEN_DEQ_WV_DEBUG
+    cfg_ssm_debug: bool,           // AIDEEN_SSM_DEBUG
+    cfg_max_chunks: usize,         // AIDEEN_MAX_CHUNKS
+    cfg_adj_iters_override: Option<u32>, // AIDEEN_ADJ_ITERS_OVERRIDE
 }
 
 impl Trainer {
@@ -127,11 +147,6 @@ impl Trainer {
 
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
-    }
-
-    #[allow(dead_code)]
-    fn env_f32_default(name: &str, default: f32) -> f32 {
-        Self::env_f32(name).unwrap_or(default)
     }
 
     fn lmhead_backward_sampled(
@@ -183,14 +198,10 @@ impl Trainer {
         dx - h_pooled.map(|v| v * sum_dx_h / (d * rms * rms))
     }
 
-    fn env_u32(name: &str) -> Option<u32> {
-        std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
-    }
-
     fn apply_experimental_profile_from_env(&mut self) {
         let exp = Self::env_flag("AIDEEN_DEQ_EXPERIMENTAL");
         let alpha_env = Self::env_f32("AIDEEN_DEQ_RESIDUAL_ALPHA").map(|v| v.clamp(0.0, 1.0));
-        let alpha = alpha_env.unwrap_or(0.0); // v14: Matemáticamente probado que requiere 0.0
+        let alpha = alpha_env.unwrap_or(0.0); // v14: Mathematically proven to require 0.0
         self.reasoning.residual_alpha = alpha;
 
         if exp {
@@ -261,13 +272,51 @@ impl Trainer {
             grad_accum_counter: 0,
             debug_last_time: None,
             debug_tokens_accum: 0,
+            cached_debug_buf: Vec::new(),
+            last_gpu_loss: 0.0,
+            cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
+            cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
+            cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(20)
+                .max(1),
+            cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
+            cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
+            cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(usize::MAX),
+            cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
     }
 
     /// Same as `from_tokenizer`, but forcing deterministic initialization
-    /// of reasoning weights (DEQ core) for reproducibility via seed.
+    /// of the reasoning weights (DEQ core) for seed-based reproducibility.
     pub fn from_tokenizer_seeded(tokenizer: Tokenizer, lr: f32, seed: u64) -> Self {
         let config = tokenizer.config.clone();
 
@@ -322,6 +371,44 @@ impl Trainer {
             grad_accum_counter: 0,
             debug_last_time: None,
             debug_tokens_accum: 0,
+            cached_debug_buf: Vec::new(),
+            last_gpu_loss: 0.0,
+            cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
+            cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
+            cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(20)
+                .max(1),
+            cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
+            cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
+            cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(usize::MAX),
+            cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -358,7 +445,7 @@ impl Trainer {
         }
 
         if self.gpu_emb.is_none() {
-            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
             let safe_ctx = self.config.ctx_len.max(1024) * batch_size;
             self.gpu_emb = Some(GpuEmbeddingTrainer::new(
                 &gpu.device,
@@ -371,9 +458,9 @@ impl Trainer {
 
     /// Resets cognitive states (slots) on both CPU and GPU.
     pub fn reset_state(&mut self) {
-        // MambaSlotReasoning es stateless entre llamadas: el DEQ recomputa h* desde cero
-        // en cada forward pass, por lo que no hay estado oculto persistente que limpiar.
-        // reset_state sirve para forzar que la próxima secuencia no comparta contexto.
+        // MambaSlotReasoning is stateless between calls: the DEQ recomputes h* from scratch
+        // on each forward pass, so there is no persistent hidden state to clear.
+        // reset_state forces the next sequence to not share context.
         self.m_prev = None;
         #[cfg(feature = "wgpu")]
         if let Some(gpu) = self.gpu_deq.as_ref() {
@@ -384,7 +471,7 @@ impl Trainer {
     /// Executes a training step given a slice of tokens.
     /// `context`: context tokens (input)
     /// `target`: token to predict
-    /// `reset_state`: if true, clears the hidden state before processing.
+    /// `reset_state`: if true, clears hidden state before processing.
     pub fn train_step(&mut self, context: &[u32], target: u32, reset_state: bool) -> f32 {
         if reset_state {
             self.reset_state();
@@ -440,7 +527,7 @@ impl Trainer {
 
     /// Training step for a full sequence (Sequence Fusing).
     /// Processes 1..N tokens in a single GPU burst.
-    /// `reset_state`: if true, clears the hidden state before starting the sequence.
+    /// `reset_state`: if true, clears hidden state before starting the sequence.
     pub fn train_sequence(
         &mut self,
         tokens: &[u32],
@@ -454,7 +541,7 @@ impl Trainer {
 
         // hist_gated is default — always enforce min_iters for stable history injection.
         {
-            let min_iters = Self::env_u32("AIDEEN_HIST_MIN_ITERS").unwrap_or(20);
+            let min_iters = self.cfg_hist_min_iters;
             if self.adaptive_max_iters < min_iters {
                 self.adaptive_max_iters = min_iters;
             }
@@ -467,13 +554,9 @@ impl Trainer {
             let out = (|| {
                 self.ensure_gpu_trainers(&gpu);
 
-                // Arreglo defensivo para evitar underflow si seq_len < ctx_len.
-                // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
-                let fwd_batch_size_ts: usize = std::env::var("AIDEEN_BATCH_SIZE")
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(1)
-                    .max(1);
+                // Defensive fix to avoid underflow if seq_len < ctx_len.
+                // For batch > 1, the training loop passes B*ctx_len tokens — do not truncate.
+                let fwd_batch_size_ts: usize = self.cfg_fwd_batch_size.max(1) as usize;
                 let seq_len = tokens.len().min(targets.len());
                 let actual_ctx_len = if fwd_batch_size_ts > 1 {
                     seq_len
@@ -506,7 +589,7 @@ impl Trainer {
                         &self.reasoning.w_q_gpu_flat(),
                         &self.reasoning.w_k_gpu_flat(),
                         &self.reasoning.w_v_gpu_flat(),
-                        self.reasoning.w_o.as_slice(),
+                        &self.reasoning.w_o_gpu_flat(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
@@ -546,7 +629,7 @@ impl Trainer {
             self.put_gpu(gpu);
             return out;
         }
-        // CPU fallback: recorre la secuencia por pasos autoregresivos.
+        // CPU fallback: iterate through the sequence with autoregressive steps.
         let seq_len = tokens.len().min(targets.len());
         if seq_len == 0 {
             return 0.0;
@@ -612,11 +695,7 @@ impl Trainer {
             let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
             // 1. Prepare DEQ input on GPU
-            let fwd_batch_size = std::env::var("AIDEEN_BATCH_SIZE")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1);
+            let fwd_batch_size = self.cfg_fwd_batch_size;
             // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
             let per_seq_len = (num_tokens as u32) / fwd_batch_size;
             let single_query_mode = query.len() == self.config.d_r && num_tokens == 1;
@@ -640,42 +719,33 @@ impl Trainer {
             } else {
                 // train_sequence path: use token sequence embeddings.
                 let emb_needs_upload = !self.gpu_emb_weights_uploaded;
-                let _ = gpu_emb.gather_only(
+                let _ = gpu_emb.gather_only_to_sbuf(
                     &gpu.queue,
                     &gpu.device,
                     context,
                     self.tokenizer.embeddings.as_slice(),
                     emb_needs_upload,
+                    &gpu.bridge.s_buf,
                 );
                 if emb_needs_upload {
                     self.gpu_emb_weights_uploaded = true;
                 }
-                // Copy all B sequences' embeddings (already flat in seq_buf) to s_buf in one copy.
-                let mut conn_enc =
-                    gpu.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Connect Embedding -> DEQ Encoder"),
-                        });
-                let total_emb_bytes = (num_tokens as u64) * (self.config.d_r as u64) * 4;
-                conn_enc.copy_buffer_to_buffer(
-                    &gpu_emb.seq_buf,
-                    0,
-                    &gpu.bridge.s_buf,
-                    0,
-                    total_emb_bytes,
-                );
-                gpu.queue.submit(Some(conn_enc.finish()));
             }
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
+            let debug_every = self.cfg_debug_sample_every;
+            let debug_enable = debug_every != 0 && (self.optimizer.step_count() % debug_every == 0);
             let _ = gpu.run_forward(
                 fwd_batch_size,
                 per_seq_len,
                 self.adaptive_max_iters,
                 damping_eff,
                 epsilon,
+                debug_enable,
             );
-            let fw = gpu.read_debug_buffer();
+            // Use cached debug buffer — refresh deferred to end of step (after GPU is idle).
+            // The DEQ-INVALID streak check needs 3 consecutive failures, so 1-step lag is safe.
+            let fw = self.cached_debug_buf.clone();
             let heartbeat = if fw.len() > 10 { fw[10] } else { 1.0 };
             let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
             let unconverged_count = if fw.len() > 15 { fw[15] } else { 0.0 };
@@ -695,7 +765,7 @@ impl Trainer {
             }
             if self.invalid_hi_streak >= 3 {
                 eprintln!(
-                    "    [DEQ-INVALID] step={} contr={:.3} unconverged={:.3} maxΔ={:.3e} seq={:.0}",
+                    "    [DEQ-INVALID] step={} contr={:.3} unconverged_ratio={:.3} maxΔ={:.3e} seq={:.0}",
                     self.optimizer.step_count(),
                     contractivity,
                     unconverged_ratio,
@@ -723,21 +793,27 @@ impl Trainer {
                 self.gpu_lm_weights_uploaded = true;
             }
 
-            // targets_u32 already covers all B*seq_len positions (training loop provides B chunks).
-            let batch_targets_u32 = targets_u32.clone();
-            let current_loss = gpu_lm
+            // Submit LM forward+backward without blocking for loss readback.
+            // For eval_mode (validation) we still read synchronously since there's no adjoint.
+            // For train mode, loss is read after apply_gradient_update when GPU is already idle.
+            let read_loss_now = self.eval_mode;
+            let current_loss_sync = gpu_lm
                 .train_step_no_readback(
                     &gpu.device,
                     &gpu.queue,
                     &gpu.bridge.hpooled_buf,
                     0,
-                    &batch_targets_u32,
+                    &targets_u32,
                     lm_lr,
                     self.optimizer.step_count() as u32,
                     self.training_config.ternary,
-                    true, // read_loss = true: pérdida síncrona del paso actual
+                    read_loss_now,
                 )
                 .unwrap_or(0.0);
+            if self.eval_mode {
+                self.last_gpu_loss = current_loss_sync;
+            }
+            let mut current_loss = self.last_gpu_loss; // will be updated after GPU idle for train path
             if lm_lr > 0.0 {
                 self.lm_head_cpu_stale = true;
             }
@@ -750,11 +826,11 @@ impl Trainer {
             }
 
             if !self.frozen_deq && !invalid_fixed_point {
-                // ⑥ Backward DEQ — Picard Adjoint (GPU, siempre).
+                // ⑥ Backward DEQ — Picard Adjoint (GPU, always).
                 // Skip when DEQ diverged (invalid_fixed_point): gradients from a non-converged
                 // forward pass are unreliable (∂L/∂θ via implicit diff requires h* to exist).
-                // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
-                // aplica el weight update completo en GPU. Un solo path, siempre correcto.
+                // Staged Picard fills fused_mix_buf with g_comb, then apply_fused_deq_update
+                // applies the full weight update on GPU. Single path, always correct.
                 let batch_size = fwd_batch_size;
                 let _ = gpu.run_staged_adjoint_picard_no_readback(
                     per_seq_len,
@@ -764,15 +840,12 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
-                let grad_accum = std::env::var("AIDEEN_GRAD_ACCUM")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .unwrap_or(1)
-                    .max(1);
+                let grad_accum = self.cfg_grad_accum;
                 // Cross-step gradient accumulation:
                 // Each train_step() call accumulates gradients from a different sequence.
                 // Weight update is applied only every grad_accum steps.
                 let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
+                let apply_accum = grad_accum == 1 || self.grad_accum_counter + 1 >= grad_accum;
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
                     self.config.deq_grad_scale,
@@ -783,29 +856,56 @@ impl Trainer {
                     mode,
                     grad_accum,
                     batch_size,
+                    apply_accum,
                 );
                 self.grad_accum_counter += 1;
                 if self.grad_accum_counter >= grad_accum {
-                    let _ =
-                        gpu.apply_gradient_update(base_lr, self.config.weight_decay, grad_accum);
                     self.grad_accum_counter = 0;
+                    // GPU is now idle after fused apply_grad pass (if apply_accum=true).
+                    // Read deferred results — both calls are near-instant since GPU is idle.
+                    if !self.eval_mode {
+                        let every = self.cfg_loss_readback_every;
+                        let should_read = every != 0
+                            && (every == 1 || (self.optimizer.step_count() % every == 0));
+                        if should_read {
+                            self.last_gpu_loss = gpu_lm.read_cached_loss(&gpu.device);
+                        }
+                        current_loss = self.last_gpu_loss;
+                    }
+                    // Refresh debug buffer cache if this is a sample step.
+                    let debug_every = self.cfg_debug_sample_every;
+                    if debug_every != 0 && (self.optimizer.step_count() % debug_every == 0) {
+                        self.cached_debug_buf = gpu.read_debug_buffer();
+                    }
+                } else {
+                    // Intermediate grad_accum step: no weight update poll yet.
+                    // Read loss now (will cause one poll but GPU is nearly done with fused_update).
+                    if !self.eval_mode {
+                        let every = self.cfg_loss_readback_every;
+                        let should_read = every != 0
+                            && (every == 1 || (self.optimizer.step_count() % every == 0));
+                        if should_read {
+                            self.last_gpu_loss = gpu_lm.read_cached_loss(&gpu.device);
+                        }
+                        current_loss = self.last_gpu_loss;
+                    }
                 }
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
                 // =============================================================================
-                // [LEGACY — NO UTILIZADO] CPU fallback path (CG en CPU con h* leído del GPU).
+                // [LEGACY — NOT USED] CPU fallback path (CG on CPU with h* read from GPU).
                 //
-                // Reemplazado por: run_staged_adjoint_picard_no_readback() + apply_fused_deq_update()
-                // (path GPU completo, líneas arriba de este bloque).
+                // Replaced by: run_staged_adjoint_picard_no_readback() + apply_fused_deq_update()
+                // (full GPU path, lines above this block).
                 //
-                // Este bloque nunca ejecuta (if false). Lo que hace:
-                //   1. Lee h* del GPU, recalcula en CPU via reasoning.step()
-                //   2. Corre deq_implicit_grad (CG numérico con finite differences)
-                //   3. Aplica weight update en CPU y re-sube todo a GPU
+                // This block never executes (if false). What it does:
+                //   1. Reads h* from GPU, recomputes on CPU via reasoning.step()
+                //   2. Runs deq_implicit_grad (numerical CG with finite differences)
+                //   3. Applies weight update on CPU and re-uploads everything to GPU
                 //
-                // Problemas: latencia de readback, CG escalar (O(N²) por iter),
-                // no soporta W_hist ni hist_gate (solo W_q/W_k/W_v/W_o/W_in/NormScale).
+                // Issues: readback latency, scalar CG (O(N^2) per iter),
+                // does not support W_hist or hist_gate (only W_q/W_k/W_v/W_o/W_in/NormScale).
                 // =============================================================================
                 if false {
                     // Strict path: CPU CG with GPU's h_star.
@@ -966,7 +1066,7 @@ impl Trainer {
                         &self.reasoning.w_q_gpu_flat(),
                         &self.reasoning.w_k_gpu_flat(),
                         &self.reasoning.w_v_gpu_flat(),
-                        self.reasoning.w_o.as_slice(),
+                        &self.reasoning.w_o_gpu_flat(),
                         &self.reasoning.w_in_gpu_flat(),
                         self.reasoning.w_x.as_slice(),
                         self.reasoning.w_out.as_slice(),
@@ -1016,8 +1116,13 @@ impl Trainer {
             self.debug_tokens_accum += num_tokens as u32;
 
             // --- DIAGNÓSTICOS GPU (v13.1 Auto-Healing) ---
-            if self.optimizer.step_count() % 10 == 0 {
-                let fw = gpu.read_debug_buffer();
+            // Reuse cached debug buffer to avoid blocking GPU every diagnostic step.
+            let debug_every = self.cfg_debug_sample_every;
+            if debug_every != 0 && (self.optimizer.step_count() % debug_every == 0) {
+                self.cached_debug_buf = gpu.read_debug_buffer();
+            }
+            if !self.cached_debug_buf.is_empty() {
+                let fw = &self.cached_debug_buf;
 
                 let rs_cg = 0.0f32;
 
@@ -1071,7 +1176,7 @@ impl Trainer {
                 self.debug_last_time = Some(now);
                 self.debug_tokens_accum = 0;
 
-                if std::env::var("AIDEEN_DEQ_WV_DEBUG").ok().as_deref() == Some("1") {
+                if self.cfg_wv_debug {
                     if let Ok((_, _, wv, _, _, _, _, _, _)) = gpu.read_weights() {
                         let mut max_abs = 0.0f32;
                         let mut sum_abs = 0.0f32;
@@ -1117,7 +1222,7 @@ impl Trainer {
                     let _ = gpu.renormalize_spectral();
                     self.contractivity_hi_streak = 0;
                     if contractivity > 1.20 {
-                        self.emergency_left = 2; // 2 windows de debug (~20 steps)
+                        self.emergency_left = 2; // 2 debug windows (~20 steps)
                     }
                 }
 
@@ -1150,24 +1255,24 @@ impl Trainer {
                     }
                 }
 
-                // Subir iters si se está pegando al techo sostenidamente
+                // Increase iters if consistently hitting the ceiling
                 if self.hit_hi_streak >= 2 {
                     self.adaptive_max_iters = (self.adaptive_max_iters + 1).min(12);
                     self.hit_hi_streak = 0;
                 }
 
-                // Bajar iters si está sobrado por un buen rato
+                // Decrease iters if consistently overprovisioned
                 if self.hit_lo_streak >= 10 {
                     self.adaptive_max_iters = self.adaptive_max_iters.saturating_sub(1).max(4);
                     self.hit_lo_streak = 0;
                 }
 
-                // BOOST de Damping por inestabilidad puntual o unconverged ratio alto
+                // Damping BOOST on transient instability or high unconverged ratio
                 if unconverged_ratio > 0.20 || max_delta > 1e-3 {
-                    self.damping_boost_left = 2; // 2 windows de debug (~20 steps)
+                    self.damping_boost_left = 2; // 2 debug windows (~20 steps)
                 }
 
-                // Detector de crecimiento explosivo o inestabilidad pura (Stability Guardrail)
+                // Explosive growth or pure instability detector (Stability Guardrail)
                 let growth = if self.last_max_h > 0.0 {
                     max_h / self.last_max_h
                 } else {
@@ -1175,7 +1280,7 @@ impl Trainer {
                 };
                 self.last_max_h = max_h;
 
-                // Evita falsos positivos cuando las activaciones aún son diminutas.
+                // Avoid false positives when activations are still tiny.
                 if self.last_max_h > 1e-2 && max_h > 1e-2 && growth > 1.20 {
                     self.max_h_growth_streak += 1;
                 } else {
@@ -1188,15 +1293,15 @@ impl Trainer {
                     self.max_delta_hi_streak = 0;
                 }
 
-                // EMERGENCY Triggers: crecimiento rápido, NaNs, residuo inaceptable sostenido
-                // o Divergencia (>1.20).
+                // EMERGENCY Triggers: rapid growth, NaNs, sustained unacceptable residual
+                // or divergence (>1.20).
                 if self.max_h_growth_streak >= 3
                     || self.max_delta_hi_streak >= 3
                     || max_h.is_nan()
                     || max_delta.is_nan()
                     || contractivity > 1.20
                 {
-                    self.emergency_left = 3; // 3 windows de debug (~30 steps)
+                    self.emergency_left = 3; // 3 debug windows (~30 steps)
                     self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
                     self.max_h_growth_streak = 0;
                     self.max_delta_hi_streak = 0;
@@ -1213,7 +1318,7 @@ impl Trainer {
                     self.emergency_left -= 1;
                 }
 
-                // Determinar modo y damping efectivo
+                // Determine mode and effective damping
                 let damping_eff = self.damping_eff();
                 let mode_str = if self.emergency_left > 0 {
                     "EMERG"
@@ -1225,11 +1330,11 @@ impl Trainer {
                 let conv_ok = unconverged_ratio <= 0.05
                     || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
-                let unc_i = unconverged.round() as i32;
+                let unconverged_i = unconverged.round() as i32;
                 println!(
                     "    \x1b[90m[GPU-DEBUG] Step {:>2}: unconverged={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
-                    unc_i,
+                    unconverged_i,
                     seq,
                     100.0 * unconverged_ratio,
                     contractivity,
@@ -1295,8 +1400,8 @@ impl Trainer {
                     hist_wd
                 );
 
-                // GPU-SSM per-slot decay diagnostics (activar con AIDEEN_SSM_DEBUG=1).
-                if std::env::var("AIDEEN_SSM_DEBUG").as_deref() == Ok("1") {
+                // GPU-SSM per-slot decay diagnostics (enable with AIDEEN_SSM_DEBUG=1).
+                if self.cfg_ssm_debug {
                     let carrier = gpu.read_hist_carrier_params_full();
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
@@ -1396,7 +1501,7 @@ impl Trainer {
         }
     }
 
-    /// Runs the training loop over a tokenized corpus.
+    /// Executes the training loop over a tokenized corpus.
     pub fn train_on_tokens(&mut self, tokens: &[u32], epochs: usize, log_every: usize) {
         if tokens.len() < 2 {
             return;
@@ -1407,6 +1512,10 @@ impl Trainer {
         for epoch in 0..epochs {
             let t_start = std::time::Instant::now();
             let current_lr = self.cosine_lr(epoch, epochs);
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = self.gpu_deq.as_ref() {
+                gpu.tps_epoch_begin();
+            }
 
             self.optimizer.lr = current_lr;
 
@@ -1434,7 +1543,7 @@ impl Trainer {
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
             let ctx_len = self.config.ctx_len.max(1);
-            let batch_size = Self::env_u32("AIDEEN_BATCH_SIZE").unwrap_or(1).max(1) as usize;
+            let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
             let step = ctx_len * batch_size;
 
             for i in (0..train_tokens.len()).step_by(step) {
@@ -1452,11 +1561,11 @@ impl Trainer {
                     );
                 }
 
-                // Detectar si el primer token es un separador/EOS (ej: 0)
-                // En muchos datasets tokenizados, el 0 se usa para marcar inicio/fin de doc.
+                // Detect if the first token is a separator/EOS (e.g. 0)
+                // In many tokenized datasets, 0 is used to mark document start/end.
                 let mut reset_requested = false;
                 if i == 0 {
-                    reset_requested = true; // Siempre reset al inicio del epoch
+                    reset_requested = true; // Always reset at epoch start
                 } else if !batch_ctx.is_empty() && (batch_ctx[0] == 0 || batch_ctx[0] == 2) {
                     reset_requested = true;
                 }
@@ -1475,6 +1584,14 @@ impl Trainer {
                 }
                 num_chunks += 1;
                 interval_tokens += batch_ctx.len();
+                #[cfg(feature = "wgpu")]
+                if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0 {
+                    if let Some(gpu) = self.gpu_deq.as_ref() {
+                        // Progress/TPS sync point only. This is outside the per-step GPU hot path
+                        // and exists so reported throughput reflects completed GPU work.
+                        gpu.device.poll(wgpu::Maintain::Wait);
+                    }
+                }
 
                 if num_chunks % 10 == 0 {
                     let interval_elapsed = interval_start.elapsed().as_secs_f32();
@@ -1483,7 +1600,13 @@ impl Trainer {
                     #[cfg(feature = "wgpu")]
                     let current_loss_disp = if let Some(gpu_lm) = self.gpu_lm.as_ref() {
                         if let Some(gpu) = self.gpu_deq.as_ref() {
-                            gpu_lm.read_cached_loss(&gpu.device)
+                            let every = self.cfg_loss_readback_every;
+                            let should_read = every != 0
+                                && (every == 1 || (self.optimizer.step_count() % every == 0));
+                            if should_read {
+                                self.last_gpu_loss = gpu_lm.read_cached_loss(&gpu.device);
+                            }
+                            self.last_gpu_loss
                         } else {
                             epoch_loss / num_chunks as f32
                         }
@@ -1510,16 +1633,21 @@ impl Trainer {
                 0.0
             };
 
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = self.gpu_deq.as_ref() {
+                gpu.tps_epoch_end();
+            }
             // Drain GPU queue every epoch — prevents Metal command queue overflow and
             // makes elapsed/TPS measurements reflect actual GPU execution time.
             #[cfg(feature = "wgpu")]
             {
                 if let Some(gpu) = self.gpu_deq.as_ref() {
+                    // Epoch boundary: make end-of-epoch metrics/checkpoints observe completed GPU work.
                     gpu.device.poll(wgpu::Maintain::Wait);
                 }
             }
             let elapsed = t_start.elapsed().as_secs_f32();
-            // Usar tokens reales procesados, no num_chunks * ctx_len (que sobre-cuenta el último chunk).
+            // Use actual processed tokens, not num_chunks * ctx_len (which over-counts the last chunk).
             let tokens_processed = train_tokens.len();
             let tps = tokens_processed as f32 / elapsed.max(1e-9);
 
@@ -1528,7 +1656,13 @@ impl Trainer {
                 #[cfg(feature = "wgpu")]
                 let display_loss = if let Some(gpu_lm) = self.gpu_lm.as_ref() {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
-                        gpu_lm.read_cached_loss(&gpu.device)
+                        let every = self.cfg_loss_readback_every;
+                        let should_read = every != 0
+                            && (every == 1 || (self.optimizer.step_count() % every == 0));
+                        if should_read {
+                            self.last_gpu_loss = gpu_lm.read_cached_loss(&gpu.device);
+                        }
+                        self.last_gpu_loss
                     } else {
                         total_loss
                     }
@@ -1537,9 +1671,17 @@ impl Trainer {
                 };
                 #[cfg(not(feature = "wgpu"))]
                 let display_loss = total_loss;
+                let mut gpu_suffix = String::new();
+                #[cfg(feature = "wgpu")]
+                if let Some(gpu) = self.gpu_deq.as_ref() {
+                    if let Some(ns) = gpu.read_tps_epoch_ns() {
+                        let tps_gpu = (tokens_processed as f64) / (ns / 1e9);
+                        gpu_suffix = format!("  tps_gpu={:>8.1}", tps_gpu);
+                    }
+                }
                 println!(
-                    "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps={:>8.1}  time={:.2}s",
-                    display_loss, current_lr, tps, elapsed
+                    "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps={:>8.1}  time={:.2}s{}",
+                    display_loss, current_lr, tps, elapsed, gpu_suffix
                 );
             }
         }
@@ -1557,7 +1699,7 @@ impl Trainer {
     ) -> String {
         #[cfg(feature = "wgpu")]
         {
-            // Política de inferencia: priorizar GPU; fallback a CPU si no hay dispositivo.
+            // Inference policy: prefer GPU; fall back to CPU if no device available.
             if !self.reasoning.has_backend() {
                 let _ = self.configure_inference_backend(true);
             }
@@ -1618,10 +1760,10 @@ impl Trainer {
                     self.config.deq_epsilon,
                     self.reasoning.damping,
                     &s_sequence,
-                    self.reasoning.w_q.as_slice(),
-                    self.reasoning.w_k.as_slice(),
+                    &self.reasoning.w_q_gpu_flat(),
+                    &self.reasoning.w_k_gpu_flat(),
                     &self.reasoning.w_v_gpu_flat(),
-                    self.reasoning.w_o.as_slice(),
+                    &self.reasoning.w_o_gpu_flat(),
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
@@ -1670,7 +1812,7 @@ impl Trainer {
     }
 
     /// Streaming version of generate: calls `on_token` with each text fragment
-    /// generated in real time, without waiting for the full generation to finish.
+    /// generated in real-time, without waiting for the full generation to finish.
     pub fn generate_stream<F: FnMut(&str)>(
         &mut self,
         prompt: &str,
@@ -1744,10 +1886,10 @@ impl Trainer {
                     self.config.deq_epsilon,
                     self.reasoning.damping,
                     &s_sequence,
-                    self.reasoning.w_q.as_slice(),
-                    self.reasoning.w_k.as_slice(),
+                    &self.reasoning.w_q_gpu_flat(),
+                    &self.reasoning.w_k_gpu_flat(),
                     &self.reasoning.w_v_gpu_flat(),
-                    self.reasoning.w_o.as_slice(),
+                    &self.reasoning.w_o_gpu_flat(),
                     &self.reasoning.w_in_gpu_flat(),
                     self.reasoning.w_x.as_slice(),
                     self.reasoning.w_out.as_slice(),
@@ -1814,7 +1956,7 @@ impl Trainer {
         self.tokenizer.decode(tokens)
     }
 
-    /// Computes the cross-entropy loss over a sequence without updating weights.
+    /// Computes cross-entropy loss over a sequence without updating weights.
     /// Useful for clean validation (forward-only, no backprop).
     pub fn eval_loss(&self, tokens: &[u32]) -> f32 {
         if tokens.len() < 2 {
@@ -1867,16 +2009,17 @@ impl Trainer {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Streaming dataloader — entrenamiento desde archivo binario de tokens
+    // Streaming dataloader — training from binary token file
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Trains on a binary file of u32 tokens (little-endian).
     ///
-    /// The file can be any size: it is read in chunks of `ctx_len + 1`
-    /// tokens with an overlapping window of `overlap` tokens to preserve context
-    /// between chunks. When the `eos_token` appears, the context is reset.
+    /// The file can be any size: it is read in chunks of `ctx_len + 1` tokens
+    /// with an overlapping window of `overlap` tokens to preserve context
+    /// between chunks. When the `eos_token` appears, context is reset.
     ///
-    /// `save_every`: saves a checkpoint every N epochs (0 = never).
+    /// `save_every`: saves checkpoint every N epochs (0 = never).
+    /// `skip_chunks`: number of chunks to skip at start of first epoch (for resuming).
     pub fn train_on_file(
         &mut self,
         path: &str,
@@ -1899,17 +2042,28 @@ impl Trainer {
         }
 
         let ctx_len = self.config.ctx_len.max(1);
-        // Ventana solapada: leemos ctx_len + 1 tokens, avanzamos ctx_len/2 para contexto continuo.
+        // Overlapping window: read ctx_len + 1 tokens, advance ctx_len/2 for continuous context.
         let stride = (ctx_len / 2).max(1);
         let chunk_tokens = ctx_len + 1;
         let chunk_bytes = chunk_tokens * 4;
+        // Batch accumulation: collect batch_size chunks before training.
+        // Without this, AIDEEN_BATCH_SIZE=N with 256-token chunks would give per_seq_len=256/N=32,
+        // training on 32-token windows instead of 256. Fix: accumulate N chunks → N×256 tokens →
+        // per_seq_len = (N×256)/N = 256 (correct).
+        let batch_size_file = self.cfg_fwd_batch_size.max(1) as usize;
+        let mut batch_train_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
+        let mut batch_tgt_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
 
         for epoch in 0..epochs {
             let t_start = std::time::Instant::now();
             let current_lr = self.cosine_lr(epoch, epochs);
             self.optimizer.lr = current_lr;
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = self.gpu_deq.as_ref() {
+                gpu.tps_epoch_begin();
+            }
 
-            // v13.1 Adaptive Epoch Schedule (Piso de iteraciones)
+            // v13.1 Adaptive Epoch Schedule (iteration floor)
             let deq_progress = epoch as f32 / epochs.max(1) as f32;
             let sched_floor = if deq_progress < 0.25 {
                 8
@@ -1926,61 +2080,104 @@ impl Trainer {
             } else {
                 8
             };
+            if let Some(adj) = self.cfg_adj_iters_override {
+                let adj_usize = (adj.max(1)) as usize;
+                self.config.adj_iters = adj_usize;
+                self.adaptive_adj_iters = adj_usize as u32;
+            }
 
-            let mut file = std::fs::File::open(path)?;
-            let mut epoch_loss = 0.0f32;
-            let mut num_chunks = 0usize;
-            let mut total_tokens = 0usize;
-            // Buffer de tokens no consumidos del chunk anterior (para ventana solapada).
-            let mut carry: Vec<u32> = Vec::new();
-            let mut last_save_time = std::time::Instant::now();
-
-            // Skip chunks: advance file position past already-trained data.
+            // Skip chunks: advance file position past already-trained data (first epoch only).
             // Each chunk advances by `stride` tokens (stride = ctx_len/2).
-            if skip_chunks > 0 && epoch == 0 {
-                let skip_bytes = (skip_chunks * stride * 4) as u64;
-                let skip_bytes = skip_bytes.min(file_size as u64);
-                file.seek(SeekFrom::Start(skip_bytes))?;
-                num_chunks = skip_chunks;
+            let skip_offset = if skip_chunks > 0 && epoch == 0 {
+                let skip_bytes = ((skip_chunks * stride * 4) as u64).min(file_size as u64);
                 println!(
                     "    [skip] Skipping {skip_chunks} chunks ({} tokens, {:.2} MB)",
                     skip_bytes / 4,
                     skip_bytes as f64 / 1_048_576.0
                 );
-            }
+                skip_bytes
+            } else {
+                0u64
+            };
+
+            // Prefetch next chunk on a background thread to overlap disk I/O with GPU work.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
+            let path_owned = path.to_string();
+            std::thread::spawn(move || {
+                let mut f = match std::fs::File::open(&path_owned) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        let _ = tx.send((Vec::new(), 0));
+                        return;
+                    }
+                };
+                if skip_offset > 0 {
+                    if f.seek(SeekFrom::Start(skip_offset)).is_err() {
+                        let _ = tx.send((Vec::new(), 0));
+                        return;
+                    }
+                }
+                loop {
+                    let mut buf = vec![0u8; chunk_bytes];
+                    let n = match f.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(_) => 0,
+                    };
+                    if n == 0 {
+                        let _ = tx.send((Vec::new(), 0));
+                        break;
+                    }
+                    buf.truncate(n);
+                    if tx.send((buf, n)).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut epoch_loss = 0.0f32;
+            let mut num_chunks = if skip_chunks > 0 && epoch == 0 {
+                skip_chunks
+            } else {
+                0
+            };
+            let mut total_tokens = 0usize;
+            // Buffer of unconsumed tokens from the previous chunk (for overlapping window).
+            let mut carry: Vec<u32> = Vec::with_capacity(stride);
+            // Pre-allocate token window to avoid per-chunk heap allocations.
+            let mut tokens: Vec<u32> = Vec::with_capacity(chunk_tokens + stride);
+            let mut last_save_time = std::time::Instant::now();
 
             loop {
-                // Prepend carry del chunk anterior + leer nuevos bytes
-                let carry_bytes = carry.len() * 4;
-                let need_bytes = chunk_bytes.saturating_sub(carry_bytes);
-                let mut buf = vec![0u8; need_bytes];
-                let n = file.read(&mut buf)?;
+                // Prepend carry from previous chunk + read new bytes (prefetch thread).
+                let (read_buf, n) = match rx.recv() {
+                    Ok(v) => v,
+                    Err(_) => (Vec::new(), 0),
+                };
                 if n == 0 && carry.is_empty() {
                     break;
                 }
 
-                // Reset de estado estricto en límites de documento (opcional según eos_token)
-                if eos_token != 0 && carry.len() > 0 && carry[0] == eos_token {
+                // Strict state reset at document boundaries (optional depending on eos_token)
+                if eos_token != 0 && !carry.is_empty() && carry[0] == eos_token {
                     self.reset_state();
                 }
 
-                let new_tokens: Vec<u32> = if n > 0 {
-                    bytemuck::cast_slice(&buf[..n & !3]).to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                let mut tokens: Vec<u32> = carry.drain(..).collect();
-                tokens.extend_from_slice(&new_tokens);
+                // Reuse pre-allocated tokens buffer to avoid per-chunk allocation.
+                tokens.clear();
+                tokens.extend_from_slice(&carry);
+                carry.clear();
+                if n > 0 {
+                    let aligned = n & !3;
+                    tokens.extend_from_slice(bytemuck::cast_slice(&read_buf[..aligned]));
+                }
 
                 if tokens.len() < 2 {
                     break;
                 }
 
-                // Detectar EOS: dividir el chunk en sub-secuencias de documento.
+                // Detect EOS: split the chunk into document sub-sequences.
                 let mut seg_start = 0;
                 while seg_start < tokens.len().saturating_sub(1) {
-                    // Encontrar el siguiente EOS dentro de este chunk.
+                    // Find the next EOS within this chunk.
                     let seg_end = tokens[seg_start..]
                         .iter()
                         .position(|&t| t == eos_token)
@@ -1994,32 +2191,101 @@ impl Trainer {
                         let tgt_seg = tokens.get(seg_start + 1..tgt_end).unwrap_or(&[]);
 
                         if !train_seg.is_empty() {
-                            // --- VALIDATION PATH (Every 20 segments) ---
-                            let is_val = num_chunks % 20 == 0;
-                            if is_val {
-                                self.eval_mode = true;
+                            // Accumulate chunks for batch training.
+                            // Each call contributes one ctx_len-sized segment; once batch_size_file
+                            // segments are collected (or EOS forces a flush), train on the batch.
+                            let max_batch_tokens = batch_size_file * ctx_len;
+                            let seg_len = train_seg.len().min(tgt_seg.len());
+                            let mut offset = 0usize;
+                            while offset < seg_len {
+                                let remaining =
+                                    max_batch_tokens.saturating_sub(batch_train_buf.len());
+                                if remaining == 0 {
+                                    // Flush full batch before consuming more.
+                                    let is_val = num_chunks % 20 == 0;
+                                    if is_val {
+                                        self.eval_mode = true;
+                                    }
+                                    let eps = self.progressive_epsilon(epoch, epochs);
+                                    let loss = self.train_sequence(
+                                        &batch_train_buf,
+                                        &batch_tgt_buf,
+                                        seg_start > 0,
+                                        eps,
+                                    );
+                                    if is_val {
+                                        self.eval_mode = false;
+                                        println!(
+                                            "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
+                                            num_chunks, loss
+                                        );
+                                    } else {
+                                        epoch_loss += loss;
+                                    }
+                                    num_chunks += 1;
+                                    total_tokens += batch_train_buf.len();
+                                    batch_train_buf.clear();
+                                    batch_tgt_buf.clear();
+                                    #[cfg(feature = "wgpu")]
+                                    if self.cfg_tps_sync_every != 0
+                                        && num_chunks % self.cfg_tps_sync_every == 0
+                                    {
+                                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                                            gpu.device.poll(wgpu::Maintain::Wait);
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let take = remaining.min(seg_len - offset);
+                                batch_train_buf
+                                    .extend_from_slice(&train_seg[offset..offset + take]);
+                                batch_tgt_buf.extend_from_slice(&tgt_seg[offset..offset + take]);
+                                offset += take;
                             }
 
-                            // reset_state=true en sub-secuencias después de EOS (seg_start>0).
-                            let eps = self.progressive_epsilon(epoch, epochs);
-                            let loss = self.train_sequence(train_seg, tgt_seg, seg_start > 0, eps);
+                            let flush = batch_train_buf.len() >= max_batch_tokens
+                                || (eos_token != 0 && seg_start > 0); // flush on document boundary
 
-                            if is_val {
-                                self.eval_mode = false;
-                                println!(
-                                    "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
-                                    num_chunks, loss
+                            if flush && !batch_train_buf.is_empty() {
+                                let is_val = num_chunks % 20 == 0;
+                                if is_val {
+                                    self.eval_mode = true;
+                                }
+                                let eps = self.progressive_epsilon(epoch, epochs);
+                                let loss = self.train_sequence(
+                                    &batch_train_buf,
+                                    &batch_tgt_buf,
+                                    seg_start > 0,
+                                    eps,
                                 );
-                            } else {
-                                epoch_loss += loss;
+                                if is_val {
+                                    self.eval_mode = false;
+                                    println!(
+                                        "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
+                                        num_chunks, loss
+                                    );
+                                } else {
+                                    epoch_loss += loss;
+                                }
+                                num_chunks += 1;
+                                total_tokens += batch_train_buf.len();
+                                batch_train_buf.clear();
+                                batch_tgt_buf.clear();
+                                #[cfg(feature = "wgpu")]
+                                if self.cfg_tps_sync_every != 0
+                                    && num_chunks % self.cfg_tps_sync_every == 0
+                                {
+                                    if let Some(gpu) = self.gpu_deq.as_ref() {
+                                        // Validation/debug path: CPU reads results immediately after.
+                                        gpu.device.poll(wgpu::Maintain::Wait);
+                                    }
+                                }
                             }
-
-                            num_chunks += 1;
-                            total_tokens += train_seg.len();
                         }
                     }
 
-                    // Saltar el token EOS y continuar en la siguiente sub-secuencia.
+                    // Skip the EOS token and continue to the next sub-sequence.
                     seg_start = if seg_end < tokens.len() {
                         seg_end + 1
                     } else {
@@ -2027,19 +2293,44 @@ impl Trainer {
                     };
                 }
 
-                // Carry: solapar los últimos min(stride, tokens.len()) tokens para contexto.
+                // Carry: overlap the last min(stride, tokens.len()) tokens for context.
                 let overlap_start = tokens.len().saturating_sub(stride.min(tokens.len()));
-                carry = tokens[overlap_start..].to_vec();
+                carry.clear();
+                carry.extend_from_slice(&tokens[overlap_start..]);
+
+                // Early stop for quick benchmarks / debugging.
+                if num_chunks >= self.cfg_max_chunks {
+                    break;
+                }
 
                 if n == 0 {
+                    // EOF: flush any remaining accumulated chunks (< batch_size_file)
+                    if !batch_train_buf.is_empty() {
+                        let eps = self.progressive_epsilon(epoch, epochs);
+                        let loss =
+                            self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
+                        epoch_loss += loss;
+                        num_chunks += 1;
+                        total_tokens += batch_train_buf.len();
+                        batch_train_buf.clear();
+                        batch_tgt_buf.clear();
+                        #[cfg(feature = "wgpu")]
+                        if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0
+                        {
+                            if let Some(gpu) = self.gpu_deq.as_ref() {
+                                // Validation/debug path: CPU reads results immediately after.
+                                gpu.device.poll(wgpu::Maintain::Wait);
+                            }
+                        }
+                    }
                     break; // EOF
                 }
 
-                // Mini-log cada 10 chunks para ver progreso en tiempo real
+                // Mini-log every 10 chunks to show real-time progress
                 if num_chunks % 10 == 0 && num_chunks > 0 {
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps = total_tokens as f32 / elapsed.max(1e-9);
-                    // Métrica principal: promedio acumulado real de train (no cache GPU).
+                    // Main metric: real accumulated training average (not GPU cache).
                     let current_loss = epoch_loss / num_chunks as f32;
 
                     println!(
@@ -2047,8 +2338,8 @@ impl Trainer {
                         num_chunks, current_loss, tps, elapsed
                     );
 
-                    // Auto-save intra-epoch: solo por tiempo (cada 30 min).
-                    // El guardado por `save_every` ya se aplica por epoch al final del loop.
+                    // Intra-epoch auto-save: time-based only (every 30 min).
+                    // The `save_every` checkpoint is already applied per epoch at the end of the loop.
                     let time_save = last_save_time.elapsed().as_secs() > 1800;
                     if time_save && !checkpoint_path.is_empty() {
                         println!(
@@ -2068,9 +2359,14 @@ impl Trainer {
                 }
             }
 
-            // Vaciar cola GPU al final de cada epoch.
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
+                gpu.tps_epoch_end();
+            }
+            // Flush GPU queue at the end of each epoch.
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = self.gpu_deq.as_ref() {
+                // Validation/end-of-run boundary. We intentionally synchronize before final metrics.
                 gpu.device.poll(wgpu::Maintain::Wait);
             }
 
@@ -2084,13 +2380,22 @@ impl Trainer {
             if epoch % log_every == 0 {
                 let mut gpu_stats = String::new();
                 #[cfg(feature = "wgpu")]
+                if self.cfg_debug_sample_every != 0 {
+                    if let Some(gpu) = self.gpu_deq.as_ref() {
+                        // Optimization: Only read the debug_buffer (small) instead of massive weights (36MB)
+                        let debug = gpu.read_debug_buffer();
+                        let nz_h = debug[9];
+                        // We skip wq_sum during the loop for maximum speed,
+                        // it can be queried at the end of the epoch or on sync.
+                        gpu_stats = format!(" nz_h={:.4}", nz_h);
+                    }
+                }
+                #[cfg(feature = "wgpu")]
                 if let Some(gpu) = self.gpu_deq.as_ref() {
-                    // Optimizamos: Solo leemos el debug_buffer (pequeño) en lugar de pesos masivos (36MB)
-                    let debug = gpu.read_debug_buffer();
-                    let nz_h = debug[9];
-                    // El wq_sum lo omitimos durante el loop para máxima velocidad,
-                    // se puede consultar al final del epoch o en sync.
-                    gpu_stats = format!(" nz_h={:.4}", nz_h);
+                    if let Some(ns) = gpu.read_tps_epoch_ns() {
+                        let tps_gpu = (total_tokens as f64) / (ns / 1e9);
+                        gpu_stats.push_str(&format!(" tps_gpu={:.1}", tps_gpu));
+                    }
                 }
 
                 #[cfg(feature = "wgpu")]
@@ -2128,20 +2433,20 @@ impl Trainer {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Checkpointing: pesos + estado del optimizador
+    // Checkpointing: weights + optimizer state
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Saves the full model plus the optimizer state.
+    /// Saves the full model plus optimizer state.
     /// Format: <path>.aidn (weights) + <path>.opt (Adam moments).
     pub fn save_checkpoint(&mut self, base_path: &str) -> std::io::Result<()> {
-        // Pesos del modelo
+        // Model weights
         self.save_full(&format!("{base_path}.aidn"))?;
 
-        // Sincronizar momentos GPU → CPU Adam antes de guardar
+        // Sync GPU moments to CPU Adam before saving
         #[cfg(feature = "wgpu")]
         self.sync_gpu_moments_to_cpu();
 
-        // Estado del optimizador (con momentos ya poblados)
+        // Optimizer state (with moments already populated)
         self.optimizer
             .save_state(&format!("{base_path}.opt"))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
@@ -2156,14 +2461,14 @@ impl Trainer {
                 .optimizer
                 .load_state(&opt_path)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            // Restaurar momentos Adam en GPU si está disponible
+            // Restore Adam moments on GPU if available
             #[cfg(feature = "wgpu")]
             trainer.sync_cpu_moments_to_gpu();
         }
         Ok(trainer)
     }
 
-    /// Downloads Adam moments from GPU to CPU Adam struct so they can be saved.
+    /// Downloads Adam moments from GPU to CPU Adam struct for saving.
     #[cfg(feature = "wgpu")]
     fn sync_gpu_moments_to_cpu(&mut self) {
         use nalgebra::{DMatrix, DVector};
@@ -2173,6 +2478,7 @@ impl Trainer {
         };
 
         println!("[GPU-CHECK] Starting VRAM checksum before saving...");
+        // Checkpoint checksum path: CPU is about to read GPU moments synchronously.
         gpu.device.poll(wgpu::Maintain::Wait);
 
         // LM Head moments
@@ -2182,9 +2488,9 @@ impl Trainer {
                 let sum_mw: f32 = m_w.iter().map(|x| x.abs()).sum();
                 let sum_vw: f32 = v_w.iter().map(|x| x.abs()).sum();
 
-                // VRAM Checksum: Si los momentos son exactamente cero, algo falló en el mapeo
+                // VRAM Checksum: If moments are exactly zero, something failed in the mapping
                 if sum_mw == 0.0 && sum_vw == 0.0 && self.optimizer.step_count() > 10 {
-                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (LM Moments=0). Aborting to protect checkpoint.");
+                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (LM moments=0). Aborting to protect checkpoint.");
                 }
 
                 println!(
@@ -2210,7 +2516,7 @@ impl Trainer {
             if let Ok((m_emb, v_emb)) = gpu_emb.read_moments(&gpu.device, &gpu.queue) {
                 let sum_me: f32 = m_emb.iter().map(|x| x.abs()).sum();
                 if sum_me == 0.0 && self.optimizer.step_count() > 10 {
-                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (EMB Moments=0). Aborting.");
+                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (EMB moments=0). Aborting.");
                 }
                 println!("    Embedding Moments Checksum: m={:.4}", sum_me);
 
@@ -2263,7 +2569,7 @@ impl Trainer {
         }
     }
 
-    /// Saves the full model (Config + Reasoning + LmHead + Tokenizer) in a single .aidn
+    /// Saves the full model (Config + Reasoning + LmHead + Tokenizer) into a single .aidn
     pub fn save_full(&mut self, path: &str) -> std::io::Result<()> {
         use aideen_core::model::AidenModel;
 
@@ -2272,17 +2578,17 @@ impl Trainer {
 
         let mut model = AidenModel::new(self.config.clone());
 
-        // Empacar pesos de Reasoning
+        // Pack Reasoning weights
         for (k, v) in self.reasoning.export_weights() {
             model.set_weight(&k, v);
         }
 
-        // Empacar pesos de LmHead
+        // Pack LmHead weights
         for (k, v) in self.lm_head.export_weights() {
             model.set_weight(&k, v);
         }
 
-        // Empacar embeddings del Tokenizer
+        // Pack Tokenizer embeddings
         model.set_weight(
             "tokenizer.embeddings",
             self.tokenizer.embeddings.as_slice().to_vec(),
@@ -2299,7 +2605,7 @@ impl Trainer {
             self.tokenizer.vocab_size().to_string(),
         );
 
-        // Persistir estado del Stability Oracle (v13.2)
+        // Persist Stability Oracle state (v13.2)
         model.metadata.insert(
             "adaptive_max_iters".to_string(),
             self.adaptive_max_iters.to_string(),
@@ -2336,7 +2642,7 @@ impl Trainer {
         let model = AidenModel::load(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Reconstruir Tokenizer
+        // Reconstruct Tokenizer
         let emb_data = model.get_weight("tokenizer.embeddings").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "tokenizer.embeddings not found")
         })?;
@@ -2353,8 +2659,8 @@ impl Trainer {
 
         let mut tokenizer = Tokenizer::new_empty(vocab_size, model.config.clone());
 
-        // Restaurar el HF tokenizer (BPE) si está disponible en rutas estándar.
-        // Sin esto, encode() usa el fallback char-level vacío y devuelve [].
+        // Restore the HF tokenizer (BPE) if available at standard paths.
+        // Without this, encode() uses the empty char-level fallback and returns [].
         let tok_paths = [
             "aideen-backbone/tokenizer.json",
             "tokenizer.json",
@@ -2380,23 +2686,23 @@ impl Trainer {
             .as_mut_slice()
             .copy_from_slice(emb_data);
 
-        // Reconstruir Trainer
-        let mut trainer = Trainer::from_tokenizer(tokenizer, 0.001); // LR por defecto
+        // Reconstruct Trainer
+        let mut trainer = Trainer::from_tokenizer(tokenizer, 0.001); // default LR
         trainer.config = model.config.clone();
 
-        // Importar pesos en Reasoning
+        // Import weights into Reasoning
         trainer
             .reasoning
             .import_weights(&model.weights)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Importar pesos en LmHead
+        // Import weights into LmHead
         trainer
             .lm_head
             .import_weights(&model.weights)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Restaurar estado del Stability Oracle (v13.2)
+        // Restore Stability Oracle state (v13.2)
         if let Some(v) = model
             .metadata
             .get("adaptive_max_iters")
@@ -2454,83 +2760,105 @@ impl Trainer {
     #[cfg(feature = "wgpu")]
     pub fn sync_inference_weights(&mut self) {
         if let Some(gpu) = self.gpu_deq.as_ref() {
-            // Sincronizar DEQ Core si se entrenó
-            if let Ok((wq, wk, wv, wo, win, wx, wout, alog, nscale)) = gpu.read_weights() {
-                let to_mat = |vec: Vec<f32>| {
-                    let d_r = self.config.d_r;
-                    nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
-                };
-                // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    let mat_total = h_slots * d_r * d_r;
-                    // Average per-slot matrices into CPU prototype (used for checkpoint only)
-                    let avg_mat = |flat: &[f32]| -> Vec<f32> {
-                        (0..d_r * d_r)
+            // Sync DEQ Core only if weights were uploaded/updated on GPU.
+            if self.gpu_weights_uploaded {
+                if let Ok((wq, wk, wv, wo, win, wx, wout, alog, nscale)) = gpu.read_weights() {
+                    let to_mat = |vec: Vec<f32>| {
+                        let d_r = self.config.d_r;
+                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
+                    };
+                    // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        let mat_total = h_slots * d_r * d_r;
+                        // Average per-slot matrices into CPU prototype (used for checkpoint only)
+                        let avg_mat = |flat: &[f32]| -> Vec<f32> {
+                            (0..d_r * d_r)
+                                .map(|i| {
+                                    (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                        / h_slots as f32
+                                })
+                                .collect()
+                        };
+                        self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(
+                            d_r,
+                            d_r,
+                            &avg_mat(&wq[..mat_total]),
+                        );
+                        self.reasoning.q_bias =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
+                        self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(
+                            d_r,
+                            d_r,
+                            &avg_mat(&wk[..mat_total]),
+                        );
+                        self.reasoning.k_bias =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
+                    }
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
+                        let avg: Vec<f32> = (0..d_r * d_r)
                             .map(|i| {
-                                (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
                                     / h_slots as f32
                             })
-                            .collect()
-                    };
-                    self.reasoning.w_q =
-                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
-                    self.reasoning.q_bias =
-                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
-                    self.reasoning.w_k =
-                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
-                    self.reasoning.k_bias =
-                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
-                }
-                {
+                            .collect();
+                        self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
+                    }
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        // w_o is per-slot on GPU — average slots for CPU prototype (checkpoint only)
+                        let avg: Vec<f32> = (0..d_r * d_r)
+                            .map(|i| {
+                                (0..h_slots).map(|s| wo[s * d_r * d_r + i]).sum::<f32>()
+                                    / h_slots as f32
+                            })
+                            .collect();
+                        self.reasoning.w_o = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
+                    }
+                    // win is h_slots*d*d — average slots for CPU representation.
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
-                    // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
-                    let avg: Vec<f32> = (0..d_r * d_r)
-                        .map(|i| {
-                            (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
-                                / h_slots as f32
-                        })
-                        .collect();
-                    self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
-                }
-                self.reasoning.w_o = to_mat(wo);
-                // win is h_slots*d*d — average slots for CPU representation.
-                let d_r = self.config.d_r;
-                let h_slots = self.config.h_slots;
-                let mut win_avg = vec![0.0f32; d_r * d_r];
-                for s in 0..h_slots {
-                    let base = s * d_r * d_r;
-                    for i in 0..d_r * d_r {
-                        win_avg[i] += win[base + i];
+                    let mut win_avg = vec![0.0f32; d_r * d_r];
+                    for s in 0..h_slots {
+                        let base = s * d_r * d_r;
+                        for i in 0..d_r * d_r {
+                            win_avg[i] += win[base + i];
+                        }
                     }
+                    let inv_slots = 1.0 / h_slots as f32;
+                    for v in &mut win_avg {
+                        *v *= inv_slots;
+                    }
+                    self.reasoning.w_in = to_mat(win_avg);
+                    self.reasoning.w_x = to_mat(wx);
+                    self.reasoning.w_out = to_mat(wout);
+                    {
+                        let h_slots = self.reasoning.config.h_slots;
+                        let d_r = self.reasoning.config.d_r;
+                        self.reasoning.a_log =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
+                    }
+                    self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
+                    self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
+                    self.gpu_cg_weights_uploaded = true;
                 }
-                let inv_slots = 1.0 / h_slots as f32;
-                for v in &mut win_avg {
-                    *v *= inv_slots;
-                }
-                self.reasoning.w_in = to_mat(win_avg);
-                self.reasoning.w_x = to_mat(wx);
-                self.reasoning.w_out = to_mat(wout);
-                {
-                    let h_slots = self.reasoning.config.h_slots;
-                    let d_r = self.reasoning.config.d_r;
-                    self.reasoning.a_log = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
-                }
-                self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
-                self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
-                self.gpu_cg_weights_uploaded = true;
             }
         }
 
-        // Sincronizar Embeddings
+        // Sync Embeddings
         if let Some(gpu_emb) = self.gpu_emb.as_ref() {
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                if let Ok(emb_data) = gpu_emb.read_weights(&gpu.device, &gpu.queue) {
-                    if emb_data.len() == self.tokenizer.embeddings.len() {
-                        self.tokenizer.embeddings.copy_from_slice(&emb_data);
-                        self.gpu_emb_weights_uploaded = true; // Still on GPU
+                if self.gpu_emb_weights_uploaded {
+                    if let Ok(emb_data) = gpu_emb.read_weights(&gpu.device, &gpu.queue) {
+                        if emb_data.len() == self.tokenizer.embeddings.len() {
+                            self.tokenizer.embeddings.copy_from_slice(&emb_data);
+                            self.gpu_emb_weights_uploaded = true; // Still on GPU
+                        }
                     }
                 }
             }

@@ -214,7 +214,7 @@ fn tiny_overfit_run(
     let ctx = seq;
     let tgt = *targets.last().unwrap_or(&0);
 
-    // Loss forward-only sin actualizar.
+    // Forward-only loss without updating.
     let (f_deq, f_emb, f_lm) = (trainer.frozen_deq, trainer.frozen_emb, trainer.frozen_lm);
     trainer.frozen_deq = true;
     trainer.frozen_emb = true;
@@ -237,7 +237,7 @@ fn tiny_overfit_run(
     trainer.frozen_emb = f_emb;
     trainer.frozen_lm = f_lm;
 
-    let _ = eps; // mantenemos firma estable para no romper llamadas.
+    let _ = eps; // keep stable signature so as not to break callers.
     (l0, l1)
 }
 
@@ -444,11 +444,11 @@ fn test_update_direction(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult
         cfg.deq_epsilon,
         gpu.adaptive_damping,
         &s_in_gpu,
-        gpu.reasoning.w_q.as_slice(),
-        gpu.reasoning.w_k.as_slice(),
-        gpu.reasoning.w_v.as_slice(),
-        gpu.reasoning.w_o.as_slice(),
-        gpu.reasoning.w_in.as_slice(),
+        &gpu.reasoning.w_q_gpu_flat(),
+        &gpu.reasoning.w_k_gpu_flat(),
+        &gpu.reasoning.w_v_gpu_flat(),
+        &gpu.reasoning.w_o_gpu_flat(),
+        &gpu.reasoning.w_in_gpu_flat(),
         gpu.reasoning.w_x.as_slice(),
         gpu.reasoning.w_out.as_slice(),
         gpu.reasoning.a_log.as_slice(),
@@ -564,11 +564,11 @@ fn test_deq_step_parity(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult 
         cfg.deq_epsilon,
         damping,
         &s_in,
-        t.reasoning.w_q.as_slice(),
-        t.reasoning.w_k.as_slice(),
-        t.reasoning.w_v.as_slice(),
-        t.reasoning.w_o.as_slice(),
-        t.reasoning.w_in.as_slice(),
+        &t.reasoning.w_q_gpu_flat(),
+        &t.reasoning.w_k_gpu_flat(),
+        &t.reasoning.w_v_gpu_flat(),
+        &t.reasoning.w_o_gpu_flat(),
+        &t.reasoning.w_in_gpu_flat(),
         t.reasoning.w_x.as_slice(),
         t.reasoning.w_out.as_slice(),
         t.reasoning.a_log.as_slice(),
@@ -631,11 +631,11 @@ fn test_h_trace(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult {
             cfg.deq_epsilon,
             damping,
             &s_in,
-            t.reasoning.w_q.as_slice(),
-            t.reasoning.w_k.as_slice(),
-            t.reasoning.w_v.as_slice(),
-            t.reasoning.w_o.as_slice(),
-            t.reasoning.w_in.as_slice(),
+            &t.reasoning.w_q_gpu_flat(),
+            &t.reasoning.w_k_gpu_flat(),
+            &t.reasoning.w_v_gpu_flat(),
+            &t.reasoning.w_o_gpu_flat(),
+            &t.reasoning.w_in_gpu_flat(),
             t.reasoning.w_x.as_slice(),
             t.reasoning.w_out.as_slice(),
             t.reasoning.a_log.as_slice(),

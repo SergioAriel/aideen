@@ -340,6 +340,62 @@ impl GpuEmbeddingTrainer {
         Ok(())
     }
 
+    /// Runs embedding gather and copies the result directly into the DEQ s_buf in the same encoder.
+    /// This avoids an extra command encoder + submit per step in the training hot path.
+    pub fn gather_only_to_sbuf(
+        &self,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        tokens: &[u32],
+        emb_cpu: &[f32],
+        upload_weights: bool,
+        dst_s_buf: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        if tokens.is_empty() || tokens.len() > self.max_seq_len {
+            return Err("token sequence length invalid for GPU embedding gather".to_string());
+        }
+        let d_r = self.config.d_r;
+        let seq_len_u32 = tokens.len() as u32;
+        let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
+
+        let params = EmbeddingParams {
+            d_model: d_r as u32,
+            vocab_size: self.vocab_size as u32,
+            seq_len: seq_len_u32,
+            ctx_len: ctx_u32,
+            lr_bits: 0f32.to_bits(),
+            beta1_bits: 0.9f32.to_bits(),
+            beta2_bits: 0.999f32.to_bits(),
+            eps_bits: 1e-8f32.to_bits(),
+            step_t: 1,
+            ternary_flag: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(&self.token_ids_buf, 0, bytemuck::cast_slice(tokens));
+        if upload_weights {
+            queue.write_buffer(&self.emb_buf, 0, bytemuck::cast_slice(emb_cpu));
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Embedding Gather + Copy Encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Embedding Gather Pass (to s_buf)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gather_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+        }
+        let seq_bytes = (tokens.len() * d_r * std::mem::size_of::<f32>()) as u64;
+        encoder.copy_buffer_to_buffer(&self.seq_buf, 0, dst_s_buf, 0, seq_bytes);
+        queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
     pub fn prepare_sequence_and_query(
         &self,
         device: &wgpu::Device,
@@ -580,7 +636,7 @@ impl GpuEmbeddingTrainer {
         Ok(())
     }
 
-    /// Updates embeddings using the dL/dh gradient already present on the GPU.
+    /// Actualiza embeddings usando el gradiente dL/dh ya presente en la GPU.
     pub fn apply_embedding_update_from_buffer(
         &self,
         device: &wgpu::Device,
@@ -719,7 +775,7 @@ impl GpuEmbeddingTrainer {
         }
     }
 
-    /// Reads Adam moments (m, v) for checkpoint.
+    /// Reads the Adam moments (m, v) for checkpointing.
     pub fn read_moments(
         &self,
         device: &wgpu::Device,
@@ -764,7 +820,7 @@ impl GpuEmbeddingTrainer {
         Ok((m, v))
     }
 
-    /// Uploads saved Adam moments back to the GPU.
+    /// Sube momentos Adam guardados de vuelta a la GPU.
     pub fn write_moments(&self, queue: &wgpu::Queue, m: &[f32], v: &[f32]) {
         queue.write_buffer(&self.m_buf, 0, bytemuck::cast_slice(m));
         queue.write_buffer(&self.v_buf, 0, bytemuck::cast_slice(v));
