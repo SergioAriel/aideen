@@ -105,11 +105,20 @@ impl AideenEngine {
             .await
             .ok_or_else(|| JsValue::from_str("Failed to find a WebGPU adapter in this browser."))?;
 
+        let subgroup_supported = adapter.features().contains(wgpu::Features::SUBGROUP);
+        if subgroup_supported {
+            web_sys::console::log_1(&JsValue::from_str("SUBGROUP supported."));
+        } else {
+            web_sys::console::log_1(&JsValue::from_str(
+                "SUBGROUP not supported; using portable path.",
+            ));
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Aideen Device"),
-                    required_features: wgpu::Features::SUBGROUP,
+                    required_features: wgpu::Features::empty(),
                     required_limits: adapter.limits(),
                     memory_hints: Default::default(),
                 },

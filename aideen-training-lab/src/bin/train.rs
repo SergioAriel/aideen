@@ -36,10 +36,14 @@ fn env_u64(name: &str) -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-fn setup_gpu(_trainer: &mut Trainer) {
+fn setup_gpu(trainer: &mut Trainer) {
     #[cfg(feature = "wgpu")]
     {
-        println!("  Backend: GPU (Metal) ✅ [Auto-managed]");
+        if trainer.gpu_deq.is_some() {
+            println!("  Backend: GPU (Metal) ✅ [Auto-managed]");
+        } else {
+            println!("  Backend: CPU (GPU no disponible)");
+        }
     }
     #[cfg(not(feature = "wgpu"))]
     println!("  Backend: CPU (compile with --features wgpu for GPU)");

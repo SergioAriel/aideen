@@ -14,7 +14,7 @@ struct EmbeddingParams {
     eps_bits: u32,
     step_t: u32,
     ternary_flag: u32,
-    _pad1: u32,
+    num_unique: u32,
     _pad2: u32,
 }
 
@@ -32,11 +32,38 @@ pub struct GpuEmbeddingTrainer {
     pub seq_buf: wgpu::Buffer,
     query_buf: wgpu::Buffer,
     dl_dh_buf: wgpu::Buffer,
+    unique_token_ids_buf: wgpu::Buffer,
+    unique_offsets_buf: wgpu::Buffer,
+    unique_positions_buf: wgpu::Buffer,
     m_buf: wgpu::Buffer,
     v_buf: wgpu::Buffer,
 }
 
 impl GpuEmbeddingTrainer {
+    fn build_unique_token_csr(tokens: &[u32], vocab_size: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        use std::collections::BTreeMap;
+
+        let vocab_max = vocab_size.saturating_sub(1) as u32;
+        let mut positions_by_token: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            positions_by_token
+                .entry(tok.min(vocab_max))
+                .or_default()
+                .push(pos as u32);
+        }
+
+        let mut unique_tokens = Vec::with_capacity(positions_by_token.len());
+        let mut offsets = Vec::with_capacity(positions_by_token.len() + 1);
+        let mut positions = Vec::with_capacity(tokens.len());
+        offsets.push(0);
+        for (tok, poss) in positions_by_token {
+            unique_tokens.push(tok);
+            positions.extend_from_slice(&poss);
+            offsets.push(positions.len() as u32);
+        }
+        (unique_tokens, offsets, positions)
+    }
+
     pub fn new(
         device: &wgpu::Device,
         vocab_size: usize,
@@ -132,6 +159,36 @@ impl GpuEmbeddingTrainer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -203,7 +260,25 @@ impl GpuEmbeddingTrainer {
         });
         let dl_dh_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Embedding dL/dh"),
-            size: (d_r * std::mem::size_of::<f32>()) as u64,
+            size: (max_seq_len * d_r * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let unique_token_ids_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Embedding Unique Token IDs"),
+            size: (max_seq_len * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let unique_offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Embedding Unique Offsets"),
+            size: ((max_seq_len + 1) * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let unique_positions_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Embedding Unique Positions"),
+            size: (max_seq_len * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -260,6 +335,18 @@ impl GpuEmbeddingTrainer {
                     binding: 7,
                     resource: v_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: unique_token_ids_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: unique_offsets_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: unique_positions_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -276,6 +363,9 @@ impl GpuEmbeddingTrainer {
             seq_buf,
             query_buf,
             dl_dh_buf,
+            unique_token_ids_buf,
+            unique_offsets_buf,
+            unique_positions_buf,
             m_buf,
             v_buf,
             config,
@@ -298,7 +388,6 @@ impl GpuEmbeddingTrainer {
         let d_r = self.config.d_r;
         let seq_len_u32 = tokens.len() as u32;
         let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
-
         // eprintln!(
         //     "[EMB] gather_only seq_len={} ctx_len_sent={}",
         //     tokens.len(),
@@ -316,7 +405,7 @@ impl GpuEmbeddingTrainer {
             eps_bits: 1e-8f32.to_bits(),
             step_t: 1,
             ternary_flag: 0,
-            _pad1: 0,
+            num_unique: 0,
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -327,6 +416,8 @@ impl GpuEmbeddingTrainer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Embedding Gather Only Encoder"),
         });
+        let token_grid_x = seq_len_u32.min(65535).max(1);
+        let token_grid_z = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Embedding Gather Pass (no readback)"),
@@ -334,7 +425,7 @@ impl GpuEmbeddingTrainer {
             });
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+            pass.dispatch_workgroups(token_grid_x, (d_r as u32).div_ceil(64), token_grid_z);
         }
         queue.submit(Some(encoder.finish()));
         Ok(())
@@ -369,7 +460,7 @@ impl GpuEmbeddingTrainer {
             eps_bits: 1e-8f32.to_bits(),
             step_t: 1,
             ternary_flag: 0,
-            _pad1: 0,
+            num_unique: 0,
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -381,6 +472,8 @@ impl GpuEmbeddingTrainer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Embedding Gather + Copy Encoder"),
         });
+        let token_grid_x = seq_len_u32.min(65535).max(1);
+        let token_grid_z = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Embedding Gather Pass (to s_buf)"),
@@ -388,7 +481,7 @@ impl GpuEmbeddingTrainer {
             });
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+            pass.dispatch_workgroups(token_grid_x, (d_r as u32).div_ceil(64), token_grid_z);
         }
         let seq_bytes = (tokens.len() * d_r * std::mem::size_of::<f32>()) as u64;
         encoder.copy_buffer_to_buffer(&self.seq_buf, 0, dst_s_buf, 0, seq_bytes);
@@ -430,7 +523,7 @@ impl GpuEmbeddingTrainer {
             eps_bits: 1e-8f32.to_bits(),
             step_t: 1,
             ternary_flag: 0,
-            _pad1: 0,
+            num_unique: 0,
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -446,6 +539,8 @@ impl GpuEmbeddingTrainer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Embedding Prepare Encoder"),
         });
+        let token_grid_x = seq_len_u32.min(65535).max(1);
+        let token_grid_z = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Embedding Gather Pass"),
@@ -453,7 +548,7 @@ impl GpuEmbeddingTrainer {
             });
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+            pass.dispatch_workgroups(token_grid_x, (d_r as u32).div_ceil(64), token_grid_z);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -536,7 +631,7 @@ impl GpuEmbeddingTrainer {
             eps_bits: 1e-8f32.to_bits(),
             step_t: 1,
             ternary_flag: 0,
-            _pad1: 0,
+            num_unique: 0,
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -545,6 +640,8 @@ impl GpuEmbeddingTrainer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Embedding Prepare Encoder (GPU-Only)"),
         });
+        let token_grid_x = seq_len_u32.min(65535).max(1);
+        let token_grid_z = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Embedding Gather Pass"),
@@ -552,7 +649,7 @@ impl GpuEmbeddingTrainer {
             });
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(tokens.len() as u32, (d_r as u32).div_ceil(64), 1);
+            pass.dispatch_workgroups(token_grid_x, (d_r as u32).div_ceil(64), token_grid_z);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -584,7 +681,8 @@ impl GpuEmbeddingTrainer {
         if tokens.is_empty() || tokens.len() > self.max_seq_len {
             return Err("token sequence length invalid for GPU embedding update".to_string());
         }
-        if dl_dh.len() != self.config.d_r {
+        let expected_seq_grads = tokens.len() * self.config.d_r;
+        if dl_dh.len() != self.config.d_r && dl_dh.len() != expected_seq_grads {
             return Err("dl_dh dimension mismatch".to_string());
         }
 
@@ -598,6 +696,9 @@ impl GpuEmbeddingTrainer {
         //     lr,
         //     step
         // );
+        let (unique_tokens, unique_offsets, unique_positions) =
+            Self::build_unique_token_csr(tokens, self.vocab_size);
+        let unique_count = unique_tokens.len() as u32;
         let params = EmbeddingParams {
             d_model: self.config.d_r as u32,
             vocab_size: self.vocab_size as u32,
@@ -609,16 +710,42 @@ impl GpuEmbeddingTrainer {
             eps_bits: eps.to_bits(),
             step_t: step,
             ternary_flag: if ternary { 1 } else { 0 },
-            _pad1: 0,
+            num_unique: unique_count,
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(&self.token_ids_buf, 0, bytemuck::cast_slice(tokens));
-        queue.write_buffer(&self.dl_dh_buf, 0, bytemuck::cast_slice(dl_dh));
+        queue.write_buffer(
+            &self.unique_token_ids_buf,
+            0,
+            bytemuck::cast_slice(&unique_tokens),
+        );
+        queue.write_buffer(
+            &self.unique_offsets_buf,
+            0,
+            bytemuck::cast_slice(&unique_offsets),
+        );
+        queue.write_buffer(
+            &self.unique_positions_buf,
+            0,
+            bytemuck::cast_slice(&unique_positions),
+        );
+        if dl_dh.len() == expected_seq_grads {
+            queue.write_buffer(&self.dl_dh_buf, 0, bytemuck::cast_slice(dl_dh));
+        } else {
+            let mut expanded = vec![0.0f32; expected_seq_grads];
+            for p in 0..tokens.len() {
+                let off = p * self.config.d_r;
+                expanded[off..off + self.config.d_r].copy_from_slice(dl_dh);
+            }
+            queue.write_buffer(&self.dl_dh_buf, 0, bytemuck::cast_slice(&expanded));
+        }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Embedding Update Encoder"),
         });
+        let token_grid_x = unique_count.min(65535).max(1);
+        let token_grid_z = unique_count.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Embedding Update Pass"),
@@ -627,9 +754,9 @@ impl GpuEmbeddingTrainer {
             pass.set_pipeline(&self.update_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(
-                tokens.len() as u32,
+                token_grid_x,
                 (self.config.d_r as u32).div_ceil(64),
-                1,
+                token_grid_z,
             );
         }
         queue.submit(Some(encoder.finish()));
@@ -653,6 +780,9 @@ impl GpuEmbeddingTrainer {
     ) -> Result<(), String> {
         let seq_len_u32 = tokens.len() as u32;
         let ctx_u32 = (self.config.ctx_len as u32).min(seq_len_u32).max(1);
+        let (unique_tokens, unique_offsets, unique_positions) =
+            Self::build_unique_token_csr(tokens, self.vocab_size);
+        let unique_count = unique_tokens.len() as u32;
 
         // eprintln!(
         //     "[EMB] update_from_buf seq_len={} ctx_len_sent={} lr={:.3e} step={}",
@@ -673,20 +803,37 @@ impl GpuEmbeddingTrainer {
             eps_bits: eps.to_bits(),
             step_t: step,
             ternary_flag: if ternary { 1 } else { 0 },
-            _pad1: 0,
+            num_unique: unique_count,
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(&self.token_ids_buf, 0, bytemuck::cast_slice(tokens));
+        queue.write_buffer(
+            &self.unique_token_ids_buf,
+            0,
+            bytemuck::cast_slice(&unique_tokens),
+        );
+        queue.write_buffer(
+            &self.unique_offsets_buf,
+            0,
+            bytemuck::cast_slice(&unique_offsets),
+        );
+        queue.write_buffer(
+            &self.unique_positions_buf,
+            0,
+            bytemuck::cast_slice(&unique_positions),
+        );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Embedding Update Encoder (GPU buffer)"),
         });
 
         // Copiar dL/dh desde el buffer de origen (LM Head) al buffer local de dL/dh
-        let dl_size = (self.config.d_r * 4) as u64;
+        let dl_size = (tokens.len() * self.config.d_r * 4) as u64;
         encoder.copy_buffer_to_buffer(dl_dh_src, 0, &self.dl_dh_buf, 0, dl_size);
 
+        let token_grid_x = unique_count.min(65535).max(1);
+        let token_grid_z = unique_count.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Embedding Update Pass"),
@@ -695,9 +842,9 @@ impl GpuEmbeddingTrainer {
             pass.set_pipeline(&self.update_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(
-                tokens.len() as u32,
+                token_grid_x,
                 (self.config.d_r as u32).div_ceil(64),
-                1,
+                token_grid_z,
             );
         }
         queue.submit(Some(encoder.finish()));

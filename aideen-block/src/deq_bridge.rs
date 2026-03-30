@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-#[repr(C, align(16))]
+#[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct DeqComputeShape {
     pub batch_size: u32,
@@ -11,9 +11,11 @@ pub struct DeqComputeShape {
     pub seq_len: u32,
     pub residual_alpha: f32,
     pub debug_enable: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub token_start: u32,
+    pub token_count: u32,
+    pub diag_zero_win: u32,
+    pub diag_one_iter: u32,
+    pub _pad0: [u32; 3],
 }
 
 #[repr(C)]
@@ -46,7 +48,15 @@ struct SpectralParams {
 
 pub struct RustDeqBridge {
     pub h_slots: u32,
+    exact_forward_layout: bool,
+    pub slot_qkv_probe_enabled: bool,
+    pub slot_attn_minimal_enabled: bool,
     pub pipeline: wgpu::ComputePipeline,
+    pub debug_pipeline: wgpu::ComputePipeline,
+    pub subgroup_pipeline: Option<wgpu::ComputePipeline>,
+    pub subgroup_debug_pipeline: Option<wgpu::ComputePipeline>,
+    pub subgroup_fastpath_enabled: bool,
+    pub pool_pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
     pub update_bind_group: wgpu::BindGroup,
@@ -63,7 +73,6 @@ pub struct RustDeqBridge {
     pub all_weights_buf: wgpu::Buffer,
     pub hcurr_buf: wgpu::Buffer,
     pub hnext_buf: wgpu::Buffer,
-    pub conv_buf: wgpu::Buffer,
     pub scratch_buf: wgpu::Buffer,
     pub hpooled_buf: wgpu::Buffer,
     pub debug_buf: wgpu::Buffer,
@@ -86,14 +95,126 @@ pub fn aw_hist_byte_off(d: u64, h: u64) -> u64 { aw_nscale_byte_off(d, h) + d * 
 pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 { aw_hist_byte_off(d, h) + hist_len * 4 }
 
 impl RustDeqBridge {
+    fn try_build_subgroup_pipelines(
+        device: &wgpu::Device,
+        pipeline_layout: &wgpu::PipelineLayout,
+        fast_constants: &std::collections::HashMap<String, f64>,
+        debug_constants: &std::collections::HashMap<String, f64>,
+    ) -> Option<(wgpu::ComputePipeline, wgpu::ComputePipeline)> {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let subgroup_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("AIDEEN Full DEQ Forward Subgroup Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/deq_forward_subgroup.wgsl").into(),
+                ),
+            });
+            let subgroup_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("DEQ Forward Subgroup Pipeline"),
+                layout: Some(pipeline_layout),
+                module: &subgroup_shader,
+                entry_point: Some("deq_forward_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: fast_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+            let subgroup_debug_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("DEQ Forward Subgroup Debug Pipeline"),
+                    layout: Some(pipeline_layout),
+                    module: &subgroup_shader,
+                    entry_point: Some("deq_forward_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: debug_constants,
+                        zero_initialize_workgroup_memory: true,
+                    },
+                    cache: None,
+            });
+            (subgroup_pipeline, subgroup_debug_pipeline)
+        }));
+        std::panic::set_hook(previous_hook);
+
+        match result {
+            Ok(pair) => Some(pair),
+            Err(_) => None,
+        }
+    }
+
+    fn pipeline_constants(
+        enable_debug_metrics: bool,
+        enable_slot_qkv_probe: bool,
+        enable_slot_attn_minimal: bool,
+    ) -> std::collections::HashMap<String, f64> {
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(
+            "ENABLE_DEBUG_METRICS".to_string(),
+            if enable_debug_metrics { 1.0 } else { 0.0 },
+        );
+        constants.insert(
+            "ENABLE_SLOT_QKV_PROBE".to_string(),
+            if enable_slot_qkv_probe { 1.0 } else { 0.0 },
+        );
+        constants.insert(
+            "ENABLE_SLOT_ATTN_MINIMAL".to_string(),
+            if enable_slot_attn_minimal { 1.0 } else { 0.0 },
+        );
+        constants
+    }
+
+    fn clean_scratch_stride(d_model: u32, h_slots: u32, enable_slot_qkv_probe: bool) -> u32 {
+        let signal = d_model * h_slots;
+        if enable_slot_qkv_probe {
+            signal * 4
+        } else {
+            signal
+        }
+    }
+
+    fn pooled_elements(
+        _exact_forward_layout: bool,
+        batch_size: u32,
+        seq_len: u32,
+        d_model: u32,
+    ) -> u64 {
+        let b = batch_size as u64;
+        let t = seq_len as u64;
+        let d = d_model as u64;
+        b * t * d
+    }
+
+    fn shape_bytes(shape: &DeqComputeShape) -> [u8; 80] {
+        let mut out = [0u8; 80];
+        let raw = bytemuck::bytes_of(shape);
+        out[..raw.len()].copy_from_slice(raw);
+        out
+    }
+
     pub fn new(
         device: &wgpu::Device,
         d_model: u32,
         h_slots: u32,
         max_batch_size: u32,
         max_seq_len: u32,
+        subgroup_supported: bool,
     ) -> Self {
         let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let slot_qkv_probe_enabled = std::env::var("AIDEEN_DEQ_SLOT_QKV_PROBE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let slot_attn_minimal_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_MINIMAL")
             .ok()
             .map(|v| {
                 let vl = v.trim().to_ascii_lowercase();
@@ -168,11 +289,73 @@ impl RustDeqBridge {
             push_constant_ranges: &[],
         });
 
+        let fast_constants = Self::pipeline_constants(
+            false,
+            slot_qkv_probe_enabled,
+            slot_attn_minimal_enabled,
+        );
+        let debug_constants = Self::pipeline_constants(
+            true,
+            slot_qkv_probe_enabled,
+            slot_attn_minimal_enabled,
+        );
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("DEQ Forward Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("deq_forward_main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &fast_constants,
+                zero_initialize_workgroup_memory: true,
+            },
+            cache: None,
+        });
+        let debug_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("DEQ Forward Debug Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("deq_forward_main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &debug_constants,
+                zero_initialize_workgroup_memory: true,
+            },
+            cache: None,
+        });
+        let subgroup_pair = if !use_exact_forward && subgroup_supported {
+            Self::try_build_subgroup_pipelines(
+                device,
+                &pipeline_layout,
+                &fast_constants,
+                &debug_constants,
+            )
+        } else {
+            None
+        };
+        let (subgroup_pipeline, subgroup_debug_pipeline, subgroup_fastpath_enabled) =
+            if let Some((subgroup_pipeline, subgroup_debug_pipeline)) = subgroup_pair {
+                eprintln!("[RustDeqBridge] Subgroup DEQ fast path enabled.");
+                (
+                    Some(subgroup_pipeline),
+                    Some(subgroup_debug_pipeline),
+                    true,
+                )
+            } else {
+                if subgroup_supported && !use_exact_forward {
+                    eprintln!(
+                        "[RustDeqBridge] Subgroup supported by adapter but unavailable in current WGSL toolchain; using portable path."
+                    );
+                }
+                (None, None, false)
+            };
+        let pool_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AIDEEN DEQ Forward Pool Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/deq_forward_pool.wgsl").into()),
+        });
+        let pool_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("DEQ Forward Pool Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &pool_shader,
+            entry_point: Some("deq_forward_pool_main"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -320,7 +503,7 @@ impl RustDeqBridge {
             cache: None,
         });
 
-        let uniform_size = std::mem::size_of::<DeqComputeShape>() as u64;
+        let uniform_size = 80u64;
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Shape Uniform"),
             size: uniform_size,
@@ -371,10 +554,11 @@ impl RustDeqBridge {
         });
 
         let h_bytes = (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
-        // hcurr_buf is doubled: first half = H_curr, second half = M_carry (cross-sequence SSM state).
+        // Clean DEQ core only needs the current hidden state. The old doubled allocation kept
+        // extra carry/state from the historical path, which this solve no longer uses.
         let hcurr_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_curr"),
-            size: h_bytes * 2,
+            size: h_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -395,26 +579,11 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let conv_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Converged"),
-            size: (max_batch_size as u64) * 4u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // Stride por (batch, token):
-        //   q [h*d] + k [h*d] + v [h*d] + attn_out [h*d] + mamba [h*d] + signal [h*d]
-        //   + m_inner [h*d] + hist_ctx [h*d] + attn_weights [h*h] + f_gate [h]
-        //   = d*(8h) + h² + h
-        // deq_forward.wgsl indexa Scratch como:
-        //   (batch_idx * seq_len + t) * scratch_stride
-        // por lo que el buffer debe reservar batch * seq_len * stride.
-        //
-        // BUG (viejo): scratch_stride = d_model * (h_slots * 6 + 1) + h_slots * h_slots;
-        // Faltaba la región m_inner [h*d] y "signal [d]" era incorrecto (es [h*d] con W_in per-slot).
-        // Para d=512, h=8: viejo=25152 floats/token, correcto=28736. Escrituras de attn_weights OOB.
-        let scratch_stride = d_model * h_slots * 8 + h_slots * h_slots + h_slots;
+        // Clean DEQ core scratch layout per (batch, token):
+        //   signal [h*d]
+        // The old full-DEQ layout reserved q/k/v/attn/mamba/history regions that the clean
+        // solve no longer touches.
+        let scratch_stride = Self::clean_scratch_stride(d_model, h_slots, slot_qkv_probe_enabled);
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
             size: (max_batch_size as u64) * (max_seq_len as u64) * (scratch_stride as u64) * 4u64,
@@ -425,7 +594,12 @@ impl RustDeqBridge {
         });
         let hpooled_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_pooled"),
-            size: (max_batch_size as u64) * (max_seq_len as u64) * (d_model as u64) * 4u64,
+            size: Self::pooled_elements(
+                use_exact_forward,
+                max_batch_size,
+                max_seq_len,
+                d_model,
+            ) * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -718,7 +892,15 @@ impl RustDeqBridge {
 
         Self {
             h_slots,
+            exact_forward_layout: use_exact_forward,
+            slot_qkv_probe_enabled,
+            slot_attn_minimal_enabled,
             pipeline,
+            debug_pipeline,
+            subgroup_pipeline,
+            subgroup_debug_pipeline,
+            subgroup_fastpath_enabled,
+            pool_pipeline,
             bind_group_layout,
             update_pipeline,
             update_bind_group,
@@ -733,7 +915,6 @@ impl RustDeqBridge {
             all_weights_buf,
             hcurr_buf,
             hnext_buf,
-            conv_buf,
             scratch_buf,
             hpooled_buf,
             debug_buf,
@@ -1000,25 +1181,14 @@ impl RustDeqBridge {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let c_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Converged Staging"),
-            size: (b * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         encoder.copy_buffer_to_buffer(&self.hnext_buf, 0, &h_staging, 0, (h_size * 4) as u64);
-        encoder.copy_buffer_to_buffer(&self.conv_buf, 0, &c_staging, 0, (b * 4) as u64);
         queue.submit(Some(encoder.finish()));
 
         let h_slice = h_staging.slice(..);
-        let c_slice = c_staging.slice(..);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        // CORRECCIÓN: MAPEAMOS AMBOS BUFFERS!
-        h_slice.map_async(wgpu::MapMode::Read, |_| {});
-        c_slice.map_async(wgpu::MapMode::Read, move |v| {
+        h_slice.map_async(wgpu::MapMode::Read, move |v| {
             let _ = tx.send(v);
         });
 
@@ -1026,10 +1196,8 @@ impl RustDeqBridge {
 
         if let Ok(Ok(())) = rx.recv() {
             let out_h_data = bytemuck::cast_slice(&h_slice.get_mapped_range()).to_vec();
-            let out_c_data = bytemuck::cast_slice(&c_slice.get_mapped_range()).to_vec();
             h_staging.unmap();
-            c_staging.unmap();
-            Ok((out_h_data, out_c_data))
+            Ok((out_h_data, vec![0u32; b]))
         } else {
             Err("GPU Buffer Map Failed")
         }
@@ -1053,8 +1221,13 @@ impl RustDeqBridge {
         norm_scale: &[f32],
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
-        let d_model = shape.d_model as usize;
         let b = shape.batch_size as usize;
+        let pooled_floats = Self::pooled_elements(
+            self.exact_forward_layout,
+            shape.batch_size,
+            shape.seq_len,
+            shape.d_model,
+        ) as usize;
         let mut encoder = self.encode_forward(
             device,
             queue,
@@ -1074,43 +1247,31 @@ impl RustDeqBridge {
 
         let pooled_staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_pooled Staging"),
-            size: (b * (shape.seq_len as usize) * d_model * 4) as u64,
+            size: (pooled_floats * 4) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let c_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Converged Staging"),
-            size: (b * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         encoder.copy_buffer_to_buffer(
             &self.hpooled_buf,
             0,
             &pooled_staging,
             0,
-            (b * (shape.seq_len as usize) * d_model * 4) as u64,
+            (pooled_floats * 4) as u64,
         );
-        encoder.copy_buffer_to_buffer(&self.conv_buf, 0, &c_staging, 0, (b * 4) as u64);
         queue.submit(Some(encoder.finish()));
 
         let pooled_slice = pooled_staging.slice(..);
-        let c_slice = c_staging.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        pooled_slice.map_async(wgpu::MapMode::Read, |_| {});
-        c_slice.map_async(wgpu::MapMode::Read, move |v| {
+        pooled_slice.map_async(wgpu::MapMode::Read, move |v| {
             let _ = tx.send(v);
         });
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
             let out_pooled = bytemuck::cast_slice(&pooled_slice.get_mapped_range()).to_vec();
-            let out_c = bytemuck::cast_slice(&c_slice.get_mapped_range()).to_vec();
             pooled_staging.unmap();
-            c_staging.unmap();
-            Ok((out_pooled, out_c))
+            Ok((out_pooled, vec![0u32; b]))
         } else {
             Err("GPU Buffer Map Failed")
         }
@@ -1123,7 +1284,8 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         shape: &DeqComputeShape,
     ) -> wgpu::CommandEncoder {
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(shape));
+        let shape_bytes = Self::shape_bytes(shape);
+        queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("DEQ Forward GPU-Only Encoder"),
@@ -1134,9 +1296,45 @@ impl RustDeqBridge {
                 label: Some("DEQ Forward GPU-Only Pass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.pipeline);
+            let use_subgroup = self.subgroup_fastpath_enabled
+                && self.subgroup_pipeline.is_some()
+                && self.subgroup_debug_pipeline.is_some();
+            if shape.debug_enable != 0 {
+                if use_subgroup {
+                    cpass.set_pipeline(
+                        self.subgroup_debug_pipeline
+                            .as_ref()
+                            .expect("subgroup debug pipeline present"),
+                    );
+                } else {
+                    cpass.set_pipeline(&self.debug_pipeline);
+                }
+            } else {
+                if use_subgroup {
+                    cpass.set_pipeline(
+                        self.subgroup_pipeline
+                            .as_ref()
+                            .expect("subgroup pipeline present"),
+                    );
+                } else {
+                    cpass.set_pipeline(&self.pipeline);
+                }
+            }
             cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.dispatch_workgroups(shape.batch_size.max(1), 1, 1);
+            cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+        }
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("DEQ Forward Pool Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pool_pipeline);
+            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.dispatch_workgroups(
+                shape.d_model.div_ceil(256).max(1),
+                shape.batch_size.max(1),
+                shape.token_count.max(1),
+            );
         }
         encoder
     }
@@ -1147,8 +1345,21 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         shape: &DeqComputeShape,
     ) {
-        let encoder = self.encode_forward_gpu_only(device, queue, shape);
-        queue.submit(Some(encoder.finish()));
+        let block_tokens = std::env::var("AIDEEN_DEQ_FORWARD_BLOCK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(shape.seq_len.max(1))
+            .max(1);
+
+        let mut token_start = 0u32;
+        while token_start < shape.seq_len {
+            let mut block_shape = *shape;
+            block_shape.token_start = token_start;
+            block_shape.token_count = (shape.seq_len - token_start).min(block_tokens);
+            let encoder = self.encode_forward_gpu_only(device, queue, &block_shape);
+            queue.submit(Some(encoder.finish()));
+            token_start += block_shape.token_count;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1172,6 +1383,12 @@ impl RustDeqBridge {
         let d_model = shape.d_model as usize;
         let b = shape.batch_size as usize;
         let h = shape.h_slots as usize;
+        let pooled_floats = Self::pooled_elements(
+            self.exact_forward_layout,
+            shape.batch_size,
+            shape.seq_len,
+            shape.d_model,
+        ) as usize;
         let mut encoder = self.encode_forward(
             device,
             queue,
@@ -1191,7 +1408,7 @@ impl RustDeqBridge {
 
         let pooled_staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_pooled Staging"),
-            size: (b * (shape.seq_len as usize) * d_model * 4) as u64,
+            size: (pooled_floats * 4) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1201,19 +1418,12 @@ impl RustDeqBridge {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let c_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Converged Staging"),
-            size: (b * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         encoder.copy_buffer_to_buffer(
             &self.hpooled_buf,
             0,
             &pooled_staging,
             0,
-            (b * (shape.seq_len as usize) * d_model * 4) as u64,
+            (pooled_floats * 4) as u64,
         );
         encoder.copy_buffer_to_buffer(
             &self.hnext_buf,
@@ -1222,17 +1432,14 @@ impl RustDeqBridge {
             0,
             (b * h * d_model * 4) as u64,
         );
-        encoder.copy_buffer_to_buffer(&self.conv_buf, 0, &c_staging, 0, (b * 4) as u64);
         queue.submit(Some(encoder.finish()));
 
         let pooled_slice = pooled_staging.slice(..);
         let h_slice = h_staging.slice(..);
-        let c_slice = c_staging.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
         pooled_slice.map_async(wgpu::MapMode::Read, |_| {});
-        h_slice.map_async(wgpu::MapMode::Read, |_| {});
-        c_slice.map_async(wgpu::MapMode::Read, move |v| {
+        h_slice.map_async(wgpu::MapMode::Read, move |v| {
             let _ = tx.send(v);
         });
         device.poll(wgpu::Maintain::Wait);
@@ -1240,11 +1447,9 @@ impl RustDeqBridge {
         if let Ok(Ok(())) = rx.recv() {
             let out_pooled = bytemuck::cast_slice(&pooled_slice.get_mapped_range()).to_vec();
             let out_h = bytemuck::cast_slice(&h_slice.get_mapped_range()).to_vec();
-            let out_c = bytemuck::cast_slice(&c_slice.get_mapped_range()).to_vec();
             pooled_staging.unmap();
             h_staging.unmap();
-            c_staging.unmap();
-            Ok((out_pooled, out_h, out_c))
+            Ok((out_pooled, out_h, vec![0u32; b]))
         } else {
             Err("GPU Buffer Map Failed")
         }
@@ -1306,7 +1511,8 @@ impl RustDeqBridge {
         norm_scale: &[f32],
         update_weights: bool,
     ) -> wgpu::CommandEncoder {
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(shape));
+        let shape_bytes = Self::shape_bytes(shape);
+        queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
         queue.write_buffer(&self.s_buf, 0, bytemuck::cast_slice(s_in));
 
         if update_weights {

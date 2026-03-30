@@ -8,9 +8,11 @@ struct RunUniforms {
     seq_len: u32,
     residual_alpha: f32,
     debug_enable: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    token_start: u32,
+    token_count: u32,
+    diag_zero_win: u32,
+    diag_one_iter: u32,
+    _pad0: vec3<u32>,
 }
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
@@ -80,9 +82,10 @@ fn deq_forward_main(
     var max_contractivity = 0.0;
     let scale = inverseSqrt(max(1.0, f32(d_model)));
 
-    for (var t = 0u; t < shape.seq_len; t = t + 1u) {
+    for (var t = 0u; t < shape.token_count; t = t + 1u) {
+        let global_t = shape.token_start + t;
         // input_signal = W_in * s_t
-        let s_in_base = batch_idx * (shape.seq_len * d_model) + t * d_model;
+        let s_in_base = batch_idx * (shape.seq_len * d_model) + global_t * d_model;
         for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
             var inj = 0.0;
             for (var j = 0u; j < d_model; j = j + 1u) {
@@ -263,7 +266,7 @@ fn deq_forward_main(
             for (var s = 0u; s < h_slots; s = s + 1u) {
                 acc = acc + H_curr[h_base + s * d_model + d];
             }
-            H_pooled[batch_idx * (shape.seq_len * d_model) + t * d_model + d] = acc / f32(h_slots);
+            H_pooled[batch_idx * (shape.seq_len * d_model) + global_t * d_model + d] = acc / f32(h_slots);
         }
         workgroupBarrier();
     }

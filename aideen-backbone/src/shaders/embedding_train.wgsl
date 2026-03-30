@@ -9,7 +9,7 @@ struct EmbeddingParams {
     eps_bits: u32,
     step_t: u32,
     ternary_flag: u32,
-    _pad1: u32,
+    num_unique: u32,
     _pad2: u32,
 };
 
@@ -21,8 +21,12 @@ struct EmbeddingParams {
 @group(0) @binding(5) var<storage, read> dl_dh: array<f32>;
 @group(0) @binding(6) var<storage, read_write> m_emb: array<f32>;
 @group(0) @binding(7) var<storage, read_write> v_emb: array<f32>;
+@group(0) @binding(8) var<storage, read> unique_token_ids: array<u32>;
+@group(0) @binding(9) var<storage, read> unique_offsets: array<u32>;
+@group(0) @binding(10) var<storage, read> unique_positions: array<u32>;
 
 const WG_SIZE: u32 = 256u;
+const TOKEN_GRID_X: u32 = 65535u;
 var<workgroup> local_sums: array<f32, WG_SIZE>;
 var<workgroup> shared_inv_norm: f32;
 
@@ -32,7 +36,7 @@ fn embedding_gather_seq(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let tok_pos = gid.x;
+    let tok_pos = gid.z * TOKEN_GRID_X + gid.x;
     let d = gid.y;
     if (tok_pos >= params.seq_len || d >= params.d_model) {
         return;
@@ -95,20 +99,21 @@ fn embedding_build_query(
     }
 }
 
-// Dispatch: (tokens.len(), d_r/64, 1) workgroups, workgroup_size (1, 64, 1)
+// Dispatch: (min(tokens.len(),65535), d_r/64, ceil(tokens.len()/65535)) workgroups,
+// workgroup_size (1, 64, 1)
 @compute
 @workgroup_size(1, 64, 1)
 fn embedding_adamw_update(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let p = gid.x;
+    _ = lid;
+    let u = gid.z * TOKEN_GRID_X + gid.x;
     let d = gid.y;
 
-    let L = min(params.seq_len, params.ctx_len);
-    if (p >= L || d >= params.d_model) { return; }
+    if (u >= params.num_unique || d >= params.d_model) { return; }
 
-    let v = min(token_ids[p], params.vocab_size - 1u);
+    let v = unique_token_ids[u];
     let idx = v * params.d_model + d;
 
     let lr    = bitcast<f32>(params.lr_bits);
@@ -119,10 +124,13 @@ fn embedding_adamw_update(
     let bc1   = 1.0 - pow(beta1, t_f);
     let bc2   = 1.0 - pow(beta2, t_f);
 
-    let denom = f32(max(L, 1u));
-    let pos_weight = f32(p + 1u) / denom;
-    // Normalize by seq_len (L) to prevent accumulation explosion
-    let grad = (dl_dh[d] * pos_weight) / f32(max(L, 1u));
+    var grad = 0.0;
+    let start = unique_offsets[u];
+    let end = unique_offsets[u + 1u];
+    for (var j = start; j < end; j = j + 1u) {
+        let p = unique_positions[j];
+        grad = grad + dl_dh[p * params.d_model + d];
+    }
 
     let m_new = beta1 * m_emb[idx] + (1.0 - beta1) * grad;
     let v_new = beta2 * v_emb[idx] + (1.0 - beta2) * grad * grad;

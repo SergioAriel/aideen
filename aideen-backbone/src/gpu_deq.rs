@@ -47,6 +47,7 @@ pub struct GpuDeqBackend {
     pub config: ArchitectureConfig,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
+    pub subgroup_supported: bool,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub bridge: RustDeqBridge,
@@ -59,6 +60,8 @@ pub struct GpuDeqBackend {
 
     // Fused update pipeline
     staged_picard_init_pipeline: wgpu::ComputePipeline,
+    staged_picard_clean_init_pipeline: wgpu::ComputePipeline,
+    staged_picard_clean_step_pipeline: wgpu::ComputePipeline,
     staged_picard_gcomb_pipeline: wgpu::ComputePipeline,
     staged_picard_gmix_pipeline: wgpu::ComputePipeline,
     staged_picard_gmix_gscore_pipeline: wgpu::ComputePipeline,
@@ -335,8 +338,8 @@ impl GpuDeqBackend {
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or_else(|| {
-                // Default: hist_gated mode (residual_alpha = -0.5 sentinel).
-                -0.5
+                // Default now is the clean DEQ core: no slot-attention, no history in the solve.
+                -2.0
             });
         alpha
     }
@@ -372,10 +375,16 @@ impl GpuDeqBackend {
             })
             .unwrap_or(false);
         let adapter_features = adapter.features();
+        let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
+        if subgroup_supported {
+            println!("[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.");
+        } else {
+            println!("[GpuDeqBackend] SUBGROUP not supported: using portable workgroup path.");
+        }
         let timestamps_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY)
             && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let tps_timestamp_enabled = wants_timestamps && timestamps_supported;
-        let mut required_features = wgpu::Features::SUBGROUP;
+        let mut required_features = wgpu::Features::empty();
         if tps_timestamp_enabled {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
             required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
@@ -456,6 +465,7 @@ impl GpuDeqBackend {
             config.h_slots as u32,
             forward_batch_cap,
             forward_seq_cap,
+            subgroup_supported,
         );
 
         // AdjointBuffers: only the two buffers actually used by the Picard adjoint.
@@ -491,6 +501,13 @@ impl GpuDeqBackend {
                 include_str!("shaders/staged_adjoint_picard.wgsl").into(),
             ),
         });
+        let staged_picard_clean_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Staged Picard Clean Adjoint Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/staged_adjoint_picard_clean.wgsl").into(),
+                ),
+            });
 
         let bg0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Fused Update BG0 Layout"),
@@ -1024,6 +1041,24 @@ impl GpuDeqBackend {
                 layout: Some(&staged_picard_pl),
                 module: &staged_picard_shader,
                 entry_point: Some("picard_init_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let staged_picard_clean_init_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Clean Init Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_clean_shader,
+                entry_point: Some("picard_clean_init_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let staged_picard_clean_step_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Clean Step Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_clean_shader,
+                entry_point: Some("picard_clean_step_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1747,6 +1782,7 @@ impl GpuDeqBackend {
             config,
             instance,
             adapter,
+            subgroup_supported,
             device: Arc::new(device),
             queue: Arc::new(queue),
             bridge,
@@ -1760,6 +1796,8 @@ impl GpuDeqBackend {
             tps_timestamp_resolve_buf,
             tps_timestamp_readback_buf,
             staged_picard_init_pipeline,
+            staged_picard_clean_init_pipeline,
+            staged_picard_clean_step_pipeline,
             staged_picard_gcomb_pipeline,
             staged_picard_gmix_pipeline,
             staged_picard_gmix_gscore_pipeline,
@@ -1873,11 +1911,10 @@ impl GpuDeqBackend {
             });
         encoder.clear_buffer(&self.bridge.hcurr_buf, 0, None);
         encoder.clear_buffer(&self.bridge.hnext_buf, 0, None);
-        // v14: En wgsl, utilizamos Scratch[mamba_base] como M_t persistente.
-        // Es estrictamente necesario limpiar Scratch al iniciar nueva secuencia.
+        // El clean DEQ reutiliza Scratch como estado transitorio por token; debe quedar limpio
+        // al iniciar una secuencia nueva para no arrastrar señal entre runs.
         encoder.clear_buffer(&self.bridge.scratch_buf, 0, None);
         // Clear TBPTT carry on document reset.
-        // M_carry lives in second half of hcurr_buf — already cleared above.
         encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
         self.queue.submit(Some(encoder.finish()));
     }
@@ -1902,9 +1939,14 @@ impl GpuDeqBackend {
             seq_len,
             residual_alpha: self.cached_residual_alpha,
             debug_enable: if debug_enable { 1 } else { 0 },
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            token_start: 0,
+            token_count: seq_len,
+            // Clean-DEQ diagnostics only:
+            // diag_zero_win != 0 => zero W_in injection
+            // diag_one_iter != 0 => force single-iteration solve
+            diag_zero_win: if std::env::var("AIDEEN_DEQ_DIAG_ZERO_WIN").ok().as_deref() == Some("1") { 1 } else { 0 },
+            diag_one_iter: if std::env::var("AIDEEN_DEQ_DIAG_ONE_ITER").ok().as_deref() == Some("1") { 1 } else { 0 },
+            _pad0: [0, 0, 0],
         }
     }
 
@@ -1995,30 +2037,39 @@ impl GpuDeqBackend {
             aw_hist_byte_off(d, h),
             bytemuck::cast_slice(hist_params.as_slice()),
         );
-        queue.submit([]);
-        self.device.poll(wgpu::Maintain::Wait);
-        if let Ok((wq_check, wk_check, wv_check, wo_check, win_check, _, _, _, _)) =
-            self.read_weights()
-        {
-            let stats = |v: &[f32]| -> (f32, f32, f32) {
-                let min = v.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-                let max = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let abs_mean = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
-                (min, max, abs_mean)
-            };
-            let (q_min, q_max, q_abs) = stats(&wq_check);
-            let (k_min, k_max, k_abs) = stats(&wk_check);
-            let (v_min, v_max, v_abs) = stats(&wv_check);
-            let (o_min, o_max, o_abs) = stats(&wo_check);
-            let (in_min, in_max, in_abs) = stats(&win_check);
-            eprintln!(
-                "[GPU-VERIFY] Post-upload:\n    W_q:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_k:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_v:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_o:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_in: min={:.4}, max={:.4}, abs_mean={:.6}",
-                q_min, q_max, q_abs,
-                k_min, k_max, k_abs,
-                v_min, v_max, v_abs,
-                o_min, o_max, o_abs,
-                in_min, in_max, in_abs
-            );
+        let verify_upload = std::env::var("AIDEEN_GPU_VERIFY_UPLOADS")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        if verify_upload {
+            queue.submit([]);
+            self.device.poll(wgpu::Maintain::Wait);
+            if let Ok((wq_check, wk_check, wv_check, wo_check, win_check, _, _, _, _)) =
+                self.read_weights()
+            {
+                let stats = |v: &[f32]| -> (f32, f32, f32) {
+                    let min = v.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                    let max = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let abs_mean = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
+                    (min, max, abs_mean)
+                };
+                let (q_min, q_max, q_abs) = stats(&wq_check);
+                let (k_min, k_max, k_abs) = stats(&wk_check);
+                let (v_min, v_max, v_abs) = stats(&wv_check);
+                let (o_min, o_max, o_abs) = stats(&wo_check);
+                let (in_min, in_max, in_abs) = stats(&win_check);
+                eprintln!(
+                    "[GPU-VERIFY] Post-upload:\n    W_q:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_k:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_v:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_o:  min={:.4}, max={:.4}, abs_mean={:.6}\n    W_in: min={:.4}, max={:.4}, abs_mean={:.6}",
+                    q_min, q_max, q_abs,
+                    k_min, k_max, k_abs,
+                    v_min, v_max, v_abs,
+                    o_min, o_max, o_abs,
+                    in_min, in_max, in_abs
+                );
+            }
         }
     }
 
@@ -2303,19 +2354,12 @@ impl GpuDeqBackend {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("DEQ Forward (GPU s_buf) Encoder"),
+                label: Some("DEQ Forward (GPU s_buf) Copy Encoder"),
             });
         encoder.copy_buffer_to_buffer(s_buf_gpu, 0, &self.bridge.s_buf, 0, copy_size);
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DEQ Forward Pass (GPU s_buf)"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.bridge.pipeline);
-            cpass.set_bind_group(0, &self.bridge.bind_group, &[]);
-            cpass.dispatch_workgroups(batch_size.max(1), 1, 1);
-        }
         self.queue.submit(Some(encoder.finish()));
+        self.bridge
+            .run_forward_gpu_only(&self.device, &self.queue, &shape);
         Ok(())
     }
 
@@ -2328,6 +2372,16 @@ impl GpuDeqBackend {
         clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
+        if self.cached_residual_alpha <= -1.5 {
+            return self.run_clean_adjoint_picard_no_readback(
+                seq_len,
+                damping,
+                iters,
+                dl_dh_src,
+                clear_slot_rhs,
+                batch_size,
+            );
+        }
         let profile_picard = self.cfg_picard_profile;
         let profile_picard_stages = self.cfg_picard_stage_profile;
         let profile_picard_accum_split = self.cfg_picard_accum_split;
@@ -2360,6 +2414,8 @@ impl GpuDeqBackend {
         let attn_len =
             (batch_size * seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
         let n_entries = batch_size * seq_len * self.config.h_slots as u32;
+        let entry_grid_x = n_entries.min(65535).max(1);
+        let entry_grid_y = n_entries.div_ceil(65535).max(1);
         let d = self.config.d_r as u32;
         let dl_bytes = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
         let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
@@ -2373,6 +2429,8 @@ impl GpuDeqBackend {
         if !profile_picard_stages && !picard_internal_probe {
             let anderson_m = self.anderson_m;
             let n_tokens = batch_size * seq_len;
+            let token_grid_x = n_tokens.min(65535).max(1);
+            let token_grid_y = n_tokens.div_ceil(65535).max(1);
             let needs_final_copy = (iters & 1) == 1;
 
             // Pre-write Anderson params for each iteration before building the encoder.
@@ -2449,13 +2507,13 @@ impl GpuDeqBackend {
                     pass.set_bind_group(0, bg0, &[]);
                     pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
                     pass.set_pipeline(&self.staged_picard_gcomb_pipeline);
-                    pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                    pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                     if fused_gscore {
                         pass.set_pipeline(&self.staged_picard_gmix_gscore_pipeline);
-                        pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                     } else {
                         pass.set_pipeline(&self.staged_picard_gmix_pipeline);
-                        pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                         pass.set_pipeline(&self.staged_picard_gscore_pipeline);
                         pass.dispatch_workgroups(
                             self.config.h_slots.div_ceil(16) as u32,
@@ -2473,9 +2531,12 @@ impl GpuDeqBackend {
                         pass.set_pipeline(&self.staged_picard_accum_q_pipeline);
                         pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
                     } else {
-                        if self.config.d_r <= 512 {
+                        if self.config.d_r <= 512 && self.config.h_slots == 8 {
+                            pass.set_pipeline(&self.staged_picard_accum_opt_token8_pipeline);
+                            pass.dispatch_workgroups(seq_len.max(1), batch_size.max(1), 1);
+                        } else if self.config.d_r <= 512 {
                             pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
-                            pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                            pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                         } else {
                             pass.set_pipeline(&self.staged_picard_accum_pipeline);
                             pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
@@ -2486,11 +2547,16 @@ impl GpuDeqBackend {
                         pass.set_bind_group(1, &self.anderson_bgs[k], &[]);
                         // Store v_next into hist[k % m]
                         pass.set_pipeline(&self.anderson_store_pipeline);
-                        pass.dispatch_workgroups((attn_len as u32).div_ceil(256).max(1), 1, 1);
+                        let store_work_items = (attn_len as u32).div_ceil(256).max(1);
+                        pass.dispatch_workgroups(
+                            store_work_items.min(65535),
+                            store_work_items.div_ceil(65535).max(1),
+                            1,
+                        );
                         // Mix when ≥2 valid pseudo-residuals (k ≥ 2) — produces better gradient
                         if k >= 2 {
                             pass.set_pipeline(&self.anderson_mix_pipeline);
-                            pass.dispatch_workgroups(n_tokens.max(1), 1, 1);
+                            pass.dispatch_workgroups(token_grid_x, token_grid_y, 1);
                         }
                     }
                 }
@@ -2660,8 +2726,8 @@ impl GpuDeqBackend {
                 stage_gcomb_ms += run_stage(
                     "Staged Picard GComb",
                     &self.staged_picard_gcomb_pipeline,
-                    n_entries.max(1),
-                    1,
+                    entry_grid_x,
+                    entry_grid_y,
                     &self.device,
                     &self.queue,
                     if (iter & 1) == 0 {
@@ -2671,34 +2737,51 @@ impl GpuDeqBackend {
                     },
                     &self.staged_picard_bg1,
                 );
-                stage_gmix_ms += run_stage(
-                    "Staged Picard GMix",
-                    &self.staged_picard_gmix_pipeline,
-                    n_entries.max(1),
-                    1,
-                    &self.device,
-                    &self.queue,
-                    if (iter & 1) == 0 {
-                        &self.staged_picard_bg
-                    } else {
-                        &self.staged_picard_bg_alt
-                    },
-                    &self.staged_picard_bg1,
-                );
-                stage_gscore_ms += run_stage(
-                    "Staged Picard GScore",
-                    &self.staged_picard_gscore_pipeline,
-                    self.config.h_slots.div_ceil(16) as u32,
-                    n_entries.div_ceil(16).max(1),
-                    &self.device,
-                    &self.queue,
-                    if (iter & 1) == 0 {
-                        &self.staged_picard_bg
-                    } else {
-                        &self.staged_picard_bg_alt
-                    },
-                    &self.staged_picard_bg1,
-                );
+                if fused_gscore {
+                    stage_gmix_ms += run_stage(
+                        "Staged Picard GMix+GScore",
+                        &self.staged_picard_gmix_gscore_pipeline,
+                        entry_grid_x,
+                        entry_grid_y,
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                } else {
+                    stage_gmix_ms += run_stage(
+                        "Staged Picard GMix",
+                        &self.staged_picard_gmix_pipeline,
+                        entry_grid_x,
+                        entry_grid_y,
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                    stage_gscore_ms += run_stage(
+                        "Staged Picard GScore",
+                        &self.staged_picard_gscore_pipeline,
+                        self.config.h_slots.div_ceil(16) as u32,
+                        n_entries.div_ceil(16).max(1),
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                }
                 if profile_picard_accum_split {
                     stage_accum_ms += run_stage(
                         "Staged Picard Accum Base",
@@ -2725,13 +2808,19 @@ impl GpuDeqBackend {
                             &self.staged_picard_accum_pipeline
                         },
                         if self.config.d_r <= 512 && self.config.h_slots == 8 {
-                            batch_size.saturating_mul(seq_len).max(1)
+                            seq_len.max(1)
                         } else if self.config.d_r <= 512 {
                             n_entries.max(1)
                         } else {
                             d.div_ceil(16)
                         },
-                        if self.config.d_r <= 512 { 1 } else { n_entries.div_ceil(16).max(1) },
+                        if self.config.d_r <= 512 && self.config.h_slots == 8 {
+                            batch_size.max(1)
+                        } else if self.config.d_r <= 512 {
+                            1
+                        } else {
+                            n_entries.div_ceil(16).max(1)
+                        },
                         &self.device,
                         &self.queue,
                         if (iter & 1) == 0 {
@@ -2806,15 +2895,20 @@ impl GpuDeqBackend {
                     pass.set_bind_group(0, bg0, &[]);
                     pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
                     pass.set_pipeline(&self.staged_picard_gcomb_pipeline);
-                    pass.dispatch_workgroups(n_entries.max(1), 1, 1);
-                    pass.set_pipeline(&self.staged_picard_gmix_pipeline);
-                    pass.dispatch_workgroups(n_entries.max(1), 1, 1);
-                    pass.set_pipeline(&self.staged_picard_gscore_pipeline);
-                    pass.dispatch_workgroups(
-                        self.config.h_slots.div_ceil(16) as u32,
-                        n_entries.div_ceil(16).max(1),
-                        1,
-                    );
+                    pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
+                    if fused_gscore {
+                        pass.set_pipeline(&self.staged_picard_gmix_gscore_pipeline);
+                        pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
+                    } else {
+                        pass.set_pipeline(&self.staged_picard_gmix_pipeline);
+                        pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
+                        pass.set_pipeline(&self.staged_picard_gscore_pipeline);
+                        pass.dispatch_workgroups(
+                            self.config.h_slots.div_ceil(16) as u32,
+                            n_entries.div_ceil(16).max(1),
+                            1,
+                        );
+                    }
                     if self.cfg_picard_accum_split {
                         pass.set_pipeline(&self.staged_picard_accum_base_pipeline);
                         pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
@@ -2827,10 +2921,10 @@ impl GpuDeqBackend {
                     } else {
                         if self.config.d_r <= 512 && self.config.h_slots == 8 {
                             pass.set_pipeline(&self.staged_picard_accum_opt_token8_pipeline);
-                            pass.dispatch_workgroups(batch_size.saturating_mul(seq_len).max(1), 1, 1);
+                            pass.dispatch_workgroups(seq_len.max(1), batch_size.max(1), 1);
                         } else if self.config.d_r <= 512 {
                             pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
-                            pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                            pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                         } else {
                             pass.set_pipeline(&self.staged_picard_accum_pipeline);
                             pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
@@ -2899,6 +2993,144 @@ impl GpuDeqBackend {
         Ok(())
     }
 
+    fn run_clean_adjoint_picard_no_readback(
+        &self,
+        seq_len: u32,
+        damping: f32,
+        iters: u32,
+        dl_dh_src: Option<&wgpu::Buffer>,
+        _clear_slot_rhs: bool,
+        batch_size: u32,
+    ) -> Result<(), String> {
+        let params = UpdateUniforms {
+            d_model: self.config.d_r as u32,
+            h_slots: self.config.h_slots as u32,
+            lr: 0.0,
+            grad_scale: 0.0,
+            ternary_flag: 0,
+            weight_decay: 0.0,
+            seq_len,
+            damping,
+            residual_alpha: self.cached_residual_alpha,
+            grad_accum_mode: 0,
+            n_accum: 1,
+            n_total_weights: 0,
+            batch_size,
+            apply_accum: 0,
+            _pad0: 0,
+        };
+        self.queue.write_buffer(
+            &self.fused_update_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+
+        let n_entries = batch_size * seq_len * self.config.h_slots as u32;
+        let entry_grid_x = n_entries.min(65535).max(1);
+        let entry_grid_y = n_entries.div_ceil(65535).max(1);
+        let d = self.config.d_r as u32;
+        let dl_bytes = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
+        let attn_len =
+            (batch_size * seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
+        let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
+        let anderson_m = self.anderson_m;
+        let n_tokens = batch_size * seq_len;
+        let token_grid_x = n_tokens.min(65535).max(1);
+        let token_grid_y = n_tokens.div_ceil(65535).max(1);
+        let needs_final_copy = (iters & 1) == 1;
+
+        if anderson_m > 0 {
+            for k in 0..(iters as usize) {
+                let ap = AndersonParams {
+                    m: anderson_m,
+                    k: k as u32,
+                    slots_per_segment: self.anderson_slots_per_segment,
+                    _pad0: 0,
+                };
+                self.queue.write_buffer(
+                    &self.anderson_params_bufs[k],
+                    0,
+                    bytemuck::bytes_of(&ap),
+                );
+            }
+        }
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Clean Picard Adjoint — All Iters"),
+            });
+        if let Some(dl_dh_src) = dl_dh_src {
+            enc.copy_buffer_to_buffer(dl_dh_src, 0, &self.adj_bufs.b_dl, 0, dl_bytes);
+        }
+        enc.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
+        enc.clear_buffer(&self.fused_weighted_h_buf, 0, None);
+        if anderson_m > 0 {
+            for buf in &self.anderson_hist_bufs {
+                enc.clear_buffer(buf, 0, None);
+            }
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Clean Picard Init"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &self.staged_picard_bg, &[]);
+            pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
+            pass.set_pipeline(&self.staged_picard_clean_init_pipeline);
+            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+        }
+        enc.copy_buffer_to_buffer(
+            &self.fused_weighted_h_buf,
+            0,
+            &self.adj_bufs.b_v_out,
+            0,
+            bytes,
+        );
+
+        for k in 0..(iters as usize) {
+            let bg0 = if (k & 1) == 0 {
+                &self.staged_picard_bg
+            } else {
+                &self.staged_picard_bg_alt
+            };
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Clean Picard Iter"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bg0, &[]);
+            pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
+            pass.set_pipeline(&self.staged_picard_clean_step_pipeline);
+            pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
+            if anderson_m > 0 {
+                pass.set_bind_group(1, &self.anderson_bgs[k], &[]);
+                pass.set_pipeline(&self.anderson_store_pipeline);
+                let store_work_items = (attn_len as u32).div_ceil(256).max(1);
+                pass.dispatch_workgroups(
+                    store_work_items.min(65535),
+                    store_work_items.div_ceil(65535).max(1),
+                    1,
+                );
+                if k >= 2 {
+                    pass.set_pipeline(&self.anderson_mix_pipeline);
+                    pass.dispatch_workgroups(token_grid_x, token_grid_y, 1);
+                }
+            }
+        }
+
+        if needs_final_copy {
+            enc.copy_buffer_to_buffer(
+                &self.fused_weighted_h_buf,
+                0,
+                &self.adj_bufs.b_v_out,
+                0,
+                bytes,
+            );
+        }
+        self.queue.submit(Some(enc.finish()));
+        Ok(())
+    }
+
     pub fn apply_fused_deq_update(
         &self,
         lr: f32,
@@ -2941,7 +3173,8 @@ impl GpuDeqBackend {
         // Use cached config flags — no env::var syscalls in hot path.
         let profile_fused = self.cfg_fused_profile;
         // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
-        let hist_gated = self.cfg_hist_gated;
+        let deq_only = self.cached_residual_alpha <= -1.5;
+        let hist_gated = self.cfg_hist_gated && !deq_only;
         let hist_selective = self.cfg_hist_selective;
         let hist_internal_probe = self.cfg_hist_internal_probe;
         if profile_fused {
@@ -3077,57 +3310,59 @@ impl GpuDeqBackend {
                     }
                 }
             }
-            add_pass_3d!(
-                &self.fused_update_stage1a_pipeline,
-                d.div_ceil(16),
-                (batch_size * seq_len).div_ceil(16),
-                hs
-            );
-            add_pass!(&self.fused_update_stage1b_pipeline, n, 1);
-            add_pass!(
-                &self.fused_update_stage2_pipeline,
-                hs.div_ceil(16),
-                n.div_ceil(16)
-            );
-            add_pass!(
-                &self.fused_update_stage3_pipeline,
-                d.div_ceil(16),
-                n.div_ceil(16)
-            );
-            add_pass!(
-                &self.fused_update_stage4_wo_win_pipeline,
-                d.div_ceil(16),
-                d.div_ceil(16)
-            );
-            add_pass_3d!(
-                &self.fused_update_stage4_wq_pipeline,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                hs
-            );
-            add_pass!(
-                &self.fused_update_stage4_prep_wk_pipeline,
-                d.div_ceil(16),
-                (batch_size * seq_len * hs).div_ceil(16)
-            );
-            add_pass!(
-                &self.fused_update_stage4_prep_wv_pipeline,
-                d.div_ceil(16),
-                (batch_size * seq_len * hs).div_ceil(16)
-            );
-            add_pass_3d!(
-                &self.fused_update_stage4_wk_pipeline,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                hs
-            );
-            add_pass_3d!(
-                &self.fused_update_stage4_wv_pipeline,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                hs
-            );
-            add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
+            if !deq_only {
+                add_pass_3d!(
+                    &self.fused_update_stage1a_pipeline,
+                    d.div_ceil(16),
+                    (batch_size * seq_len).div_ceil(16),
+                    hs
+                );
+                add_pass!(&self.fused_update_stage1b_pipeline, n, 1);
+                add_pass!(
+                    &self.fused_update_stage2_pipeline,
+                    hs.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass!(
+                    &self.fused_update_stage3_pipeline,
+                    d.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass!(
+                    &self.fused_update_stage4_wo_win_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16)
+                );
+                add_pass_3d!(
+                    &self.fused_update_stage4_wq_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs
+                );
+                add_pass!(
+                    &self.fused_update_stage4_prep_wk_pipeline,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16)
+                );
+                add_pass!(
+                    &self.fused_update_stage4_prep_wv_pipeline,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16)
+                );
+                add_pass_3d!(
+                    &self.fused_update_stage4_wk_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs
+                );
+                add_pass_3d!(
+                    &self.fused_update_stage4_wv_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs
+                );
+                add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
+            }
             if grad_accum_mode == 1 && apply_accum {
                 add_pass!(
                     &self.fused_update_apply_grad_pipeline,
@@ -3365,131 +3600,133 @@ impl GpuDeqBackend {
                     }
                 }
             }
-            run_stage_3d(
-                &self.device,
-                &self.queue,
-                "stage1a",
-                &self.fused_update_stage1a_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                (batch_size * seq_len).div_ceil(16),
-                hs,
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage1b",
-                &self.fused_update_stage1b_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                n,
-                1,
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage2",
-                &self.fused_update_stage2_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                hs.div_ceil(16),
-                n.div_ceil(16),
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage3",
-                &self.fused_update_stage3_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                n.div_ceil(16),
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage4_wo_win",
-                &self.fused_update_stage4_wo_win_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                profile_fused,
-            );
-            run_stage_3d(
-                &self.device,
-                &self.queue,
-                "stage4_wq",
-                &self.fused_update_stage4_wq_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                hs,
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage4_prep_wk",
-                &self.fused_update_stage4_prep_wk_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                (batch_size * seq_len * hs).div_ceil(16),
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage4_prep_wv",
-                &self.fused_update_stage4_prep_wv_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                (batch_size * seq_len * hs).div_ceil(16),
-                profile_fused,
-            );
-            run_stage_3d(
-                &self.device,
-                &self.queue,
-                "stage4_wk",
-                &self.fused_update_stage4_wk_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                hs,
-                profile_fused,
-            );
-            run_stage_3d(
-                &self.device,
-                &self.queue,
-                "stage4_wv",
-                &self.fused_update_stage4_wv_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                hs,
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "stage4_bias",
-                &self.fused_update_stage4_bias_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(64),
-                1,
-                profile_fused,
-            );
+            if !deq_only {
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "stage1a",
+                    &self.fused_update_stage1a_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    (batch_size * seq_len).div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage1b",
+                    &self.fused_update_stage1b_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    n,
+                    1,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage2",
+                    &self.fused_update_stage2_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    hs.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage3",
+                    &self.fused_update_stage3_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage4_wo_win",
+                    &self.fused_update_stage4_wo_win_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "stage4_wq",
+                    &self.fused_update_stage4_wq_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage4_prep_wk",
+                    &self.fused_update_stage4_prep_wk_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage4_prep_wv",
+                    &self.fused_update_stage4_prep_wv_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16),
+                    profile_fused,
+                );
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "stage4_wk",
+                    &self.fused_update_stage4_wk_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "stage4_wv",
+                    &self.fused_update_stage4_wv_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage4_bias",
+                    &self.fused_update_stage4_bias_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(64),
+                    1,
+                    profile_fused,
+                );
+            }
             if grad_accum_mode == 1 && apply_accum {
                 run_stage(
                     &self.device,

@@ -39,11 +39,18 @@ impl ComputeState {
             }
         };
 
+        let subgroup_supported = adapter.features().contains(wgpu::Features::SUBGROUP);
+        if subgroup_supported {
+            eprintln!("[ComputeState] SUBGROUP supported.");
+        } else {
+            eprintln!("[ComputeState] SUBGROUP not supported; falling back to portable path.");
+        }
+
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Aideen-Block-V8"),
-                    required_features: wgpu::Features::SUBGROUP,
+                    required_features: wgpu::Features::empty(),
                     required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },

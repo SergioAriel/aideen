@@ -37,6 +37,8 @@ struct UpdateUniforms {
 
 const ACCUM_SHARED_D: u32 = 512u;
 const ACCUM_TOKEN_H8: u32 = 8u;
+const ENTRY_GRID_X: u32 = 65535u;
+const TOKEN_GRID_X: u32 = 65535u;
 var<workgroup> accum_vsum: array<f32, 512>;
 var<workgroup> accum_ksum: array<f32, 512>;
 var<workgroup> accum_qgrad: array<f32, 512>;
@@ -45,6 +47,14 @@ var<workgroup> accum_ksum_h8: array<f32, 4096>;
 
 fn entry_base(entry: u32, d: u32) -> u32 {
     return entry * d;
+}
+
+fn entry_workgroup_index(wid: vec3<u32>) -> u32 {
+    return wid.y * ENTRY_GRID_X + wid.x;
+}
+
+fn token_workgroup_index(wid: vec3<u32>) -> u32 {
+    return wid.y * TOKEN_GRID_X + wid.x;
 }
 
 fn scratch_stride(d: u32, h_slots: u32) -> u32 {
@@ -147,7 +157,7 @@ fn picard_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
                      @builtin(workgroup_id) wid: vec3<u32>) {
     let lane = lid.x;
-    let entry = wid.x;
+    let entry = entry_workgroup_index(wid);
     let d = params.d_model;
     let h_slots = params.h_slots;
     let n_entries = params.batch_size * params.seq_len * h_slots;
@@ -193,7 +203,7 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
 fn picard_gmix_main(@builtin(local_invocation_id) lid: vec3<u32>,
                     @builtin(workgroup_id) wid: vec3<u32>) {
     let lane = lid.x;
-    let entry = wid.x;
+    let entry = entry_workgroup_index(wid);
     let d = params.d_model;
     let h_slots = params.h_slots;
     let n_entries = params.batch_size * params.seq_len * h_slots;
@@ -217,7 +227,7 @@ fn picard_gmix_main(@builtin(local_invocation_id) lid: vec3<u32>,
 fn picard_gmix_gscore_main(@builtin(local_invocation_id) lid: vec3<u32>,
                            @builtin(workgroup_id) wid: vec3<u32>) {
     let lane = lid.x;
-    let entry = wid.x;
+    let entry = entry_workgroup_index(wid);
     let d = params.d_model;
     let h_slots = params.h_slots;
     let n_entries = params.batch_size * params.seq_len * h_slots;
@@ -695,7 +705,7 @@ var<workgroup> anderson_beta: array<f32, 3>;  // mixing coefficients
 // Store current v_next into ring-buffer slot k%m
 @compute @workgroup_size(256, 1, 1)
 fn anderson_store_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = gid.y * ENTRY_GRID_X + gid.x;
     let d = params.d_model;
     let n_entries = params.batch_size * params.seq_len * params.h_slots;
     let attn_len = n_entries * d;
@@ -713,7 +723,7 @@ fn anderson_mix_main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
-    let token = wid.x;
+    let token = token_workgroup_index(wid);
     let lane  = lid.x;
     let d       = params.d_model;
     let h_slots = params.h_slots;

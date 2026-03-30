@@ -132,6 +132,8 @@ pub struct Trainer {
     cfg_ssm_debug: bool,           // AIDEEN_SSM_DEBUG
     cfg_max_chunks: usize,         // AIDEEN_MAX_CHUNKS
     cfg_adj_iters_override: Option<u32>, // AIDEEN_ADJ_ITERS_OVERRIDE
+    cfg_system_cost_audit: bool,   // AIDEEN_SYSTEM_COST_AUDIT
+    cfg_system_cost_wait: bool,    // AIDEEN_SYSTEM_COST_WAIT
 }
 
 impl Trainer {
@@ -147,6 +149,108 @@ impl Trainer {
 
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
+    }
+
+    fn gib(bytes: f64) -> f64 {
+        bytes / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    fn clean_deq_mode_active() -> bool {
+        if Self::env_flag("AIDEEN_DEQ_ONLY") {
+            return true;
+        }
+        if std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok()
+        {
+            return false;
+        }
+        true
+    }
+
+    fn default_hist_min_iters() -> u32 {
+        if Self::clean_deq_mode_active() { 1 } else { 20 }
+    }
+
+    fn estimate_forward_bandwidth_bytes(
+        batch_size: u32,
+        seq_len: u32,
+        max_iters: u32,
+        d_r: usize,
+        h_slots: usize,
+    ) -> (f64, f64, f64, f64) {
+        let d = d_r as f64;
+        let h = h_slots as f64;
+        let b = batch_size as f64;
+        let t = seq_len as f64;
+        let iters = max_iters as f64;
+        let f32_bytes = std::mem::size_of::<f32>() as f64;
+
+        if Self::clean_deq_mode_active() {
+            let win_bytes = b * t * (h * d * d * f32_bytes);
+            return (0.0, 0.0, win_bytes, 0.0);
+        }
+
+        // Lower bounds derived from the hot dense matrices touched in deq_forward.wgsl.
+        let qkv_bytes = b * t * iters * (3.0 * h * d * d * f32_bytes);
+        let wo_bytes = b * t * iters * (h * d * d * f32_bytes);
+        let win_bytes = b * t * (h * d * d * f32_bytes);
+        let hist_lower_bound = b * t * ((d * d + h * d * d + d * d) * f32_bytes);
+
+        (qkv_bytes, wo_bytes, win_bytes, hist_lower_bound)
+    }
+
+    fn decode_forward_debug_metrics(
+        fw: &[f32],
+        h_slots: usize,
+    ) -> (f32, f32, f32, f32, f32, f32, f32) {
+        if fw.len() > 11 && fw[8] == 901.0 {
+            let seq = fw[10].max(1.0);
+            let slot_count = fw[11]
+                .max(1.0)
+                .min(h_slots as f32)
+                .round() as usize;
+            let mut max_delta = 0.0f32;
+            let mut hit_count = 0.0f32;
+            let mut avg_iters_sum = 0.0f32;
+            let mut contractivity = 0.0f32;
+            let mut max_h = 0.0f32;
+            for slot in 0..slot_count {
+                let base = 32 + slot * 5;
+                if fw.len() <= base + 4 {
+                    break;
+                }
+                max_delta = max_delta.max(fw[base]);
+                hit_count += fw[base + 1];
+                avg_iters_sum += fw[base + 2];
+                contractivity = contractivity.max(fw[base + 3]);
+                max_h = max_h.max(fw[base + 4]);
+            }
+            let avg_iters = if slot_count > 0 {
+                avg_iters_sum / slot_count as f32
+            } else {
+                0.0
+            };
+            let hit_den = seq * slot_count.max(1) as f32;
+            return (seq, max_h, avg_iters, hit_count, max_delta, contractivity, hit_den);
+        }
+
+        let heartbeat = if fw.len() > 10 { fw[10] } else { 0.0 };
+        let max_h = if fw.len() > 11 { fw[11] } else { 0.0 };
+        let avg_iters = if fw.len() > 13 { fw[13] } else { 0.0 };
+        let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
+        let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
+        let contractivity = if fw.len() > 21 { fw[21] } else { 0.0 };
+        (
+            heartbeat.max(1.0),
+            max_h,
+            avg_iters,
+            hit_count,
+            max_delta,
+            contractivity,
+            heartbeat.max(1.0),
+        )
     }
 
     fn lmhead_backward_sampled(
@@ -285,7 +389,10 @@ impl Trainer {
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
                 .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
             cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(20).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or_else(Self::default_hist_min_iters)
+                .max(1),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -295,6 +402,8 @@ impl Trainer {
             cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok()),
+            cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
+            cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -369,7 +478,10 @@ impl Trainer {
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
                 .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
             cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(20).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or_else(Self::default_hist_min_iters)
+                .max(1),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -379,6 +491,8 @@ impl Trainer {
             cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok()),
+            cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
+            cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -644,6 +758,16 @@ impl Trainer {
         } else {
             base_lr * self.training_config.lm_lr_mult
         };
+        let audit_cost = self.cfg_system_cost_audit;
+        let mut audit_gather_ms = 0.0f64;
+        let mut audit_forward_ms = 0.0f64;
+        let mut audit_lm_ms = 0.0f64;
+        let mut audit_picard_ms = 0.0f64;
+        let mut audit_update_ms = 0.0f64;
+        let mut audit_embed_ms = 0.0f64;
+        let mut audit_sync_ms = 0.0f64;
+        let mut audit_renorm_ms = 0.0f64;
+        let mut audit_renorm_calls = 0u32;
 
         // Sync CPU lm_head only when frozen/debug paths need it — not on every training step.
         #[cfg(feature = "wgpu")]
@@ -669,6 +793,13 @@ impl Trainer {
             // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
             let per_seq_len = (num_tokens as u32) / fwd_batch_size;
             let single_query_mode = query.len() == self.config.d_r && num_tokens == 1;
+            let audit_forward_bytes = Self::estimate_forward_bandwidth_bytes(
+                fwd_batch_size,
+                per_seq_len,
+                self.adaptive_max_iters,
+                self.config.d_r,
+                self.config.h_slots,
+            );
             if single_query_mode {
                 // train_step path: match CPU semantics by feeding the pooled query vector.
                 let q_bytes = bytemuck::cast_slice(query.as_slice());
@@ -688,6 +819,7 @@ impl Trainer {
                     .write_buffer(&gpu.bridge.hnext_buf, 0, bytemuck::cast_slice(&h_init));
             } else {
                 // train_sequence path: use token sequence embeddings.
+                let gather_t0 = std::time::Instant::now();
                 let emb_needs_upload = !self.gpu_emb_weights_uploaded;
                 let _ = gpu_emb.gather_only_to_sbuf(
                     &gpu.queue,
@@ -700,12 +832,16 @@ impl Trainer {
                 if emb_needs_upload {
                     self.gpu_emb_weights_uploaded = true;
                 }
+                if audit_cost {
+                    audit_gather_ms += gather_t0.elapsed().as_secs_f64() * 1e3;
+                }
             }
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
             let debug_every = self.cfg_debug_sample_every;
             let debug_enable = debug_every != 0
                 && (self.optimizer.step_count() % debug_every == 0);
+            let forward_t0 = std::time::Instant::now();
             let _ = gpu.run_forward(
                 fwd_batch_size,
                 per_seq_len,
@@ -714,15 +850,19 @@ impl Trainer {
                 epsilon,
                 debug_enable,
             );
+            if audit_cost && self.cfg_system_cost_wait {
+                // Audit-only: force GPU completion so forward_ms reflects execution, not enqueue.
+                gpu.device.poll(wgpu::Maintain::Wait);
+            }
+            if audit_cost {
+                audit_forward_ms += forward_t0.elapsed().as_secs_f64() * 1e3;
+            }
             // Use cached debug buffer — refresh deferred to end of step (after GPU is idle).
             // The DEQ-INVALID streak check needs 3 consecutive failures, so 1-step lag is safe.
             let fw = self.cached_debug_buf.clone();
-            let heartbeat = if fw.len() > 10 { fw[10] } else { 1.0 };
-            let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
-            let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
-            let contractivity = if fw.len() > 21 { fw[21] } else { 0.0 };
-            let seq = heartbeat.max(1.0);
-            let hit_ratio = hit_count.max(0.0) / seq;
+            let (seq, _max_h_dbg, _avg_iters_dbg, hit_count, max_delta, contractivity, hit_den) =
+                Self::decode_forward_debug_metrics(&fw, self.config.h_slots);
+            let hit_ratio = hit_count.max(0.0) / hit_den.max(1.0);
             // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
             // also being non-contractive. Non-monotone convergence (contr transiently > 1
             // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
@@ -747,7 +887,14 @@ impl Trainer {
                 self.emergency_left = 3;
                 self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
                 #[cfg(feature = "wgpu")]
-                let _ = gpu.renormalize_spectral();
+                {
+                    let renorm_t0 = std::time::Instant::now();
+                    let _ = gpu.renormalize_spectral();
+                    if audit_cost {
+                        audit_renorm_ms += renorm_t0.elapsed().as_secs_f64() * 1e3;
+                        audit_renorm_calls += 1;
+                    }
+                }
                 lm_lr = 0.0;
             }
             if !self.gpu_lm_weights_uploaded {
@@ -771,6 +918,7 @@ impl Trainer {
             // For eval_mode (validation) we still read synchronously since there's no adjoint.
             // For train mode, loss is read after apply_gradient_update when GPU is already idle.
             let read_loss_now = self.eval_mode;
+            let lm_t0 = std::time::Instant::now();
             let current_loss_sync = gpu_lm
                 .train_step_no_readback(
                     &gpu.device,
@@ -784,6 +932,9 @@ impl Trainer {
                     read_loss_now,
                 )
                 .unwrap_or(0.0);
+            if audit_cost {
+                audit_lm_ms += lm_t0.elapsed().as_secs_f64() * 1e3;
+            }
             if self.eval_mode {
                 self.last_gpu_loss = current_loss_sync;
             }
@@ -806,6 +957,7 @@ impl Trainer {
                 // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
                 // aplica el weight update completo en GPU. Un solo path, siempre correcto.
                 let batch_size = fwd_batch_size;
+                let picard_t0 = std::time::Instant::now();
                 let _ = gpu.run_staged_adjoint_picard_no_readback(
                     per_seq_len,
                     self.reasoning.damping,
@@ -814,12 +966,16 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
+                if audit_cost {
+                    audit_picard_ms += picard_t0.elapsed().as_secs_f64() * 1e3;
+                }
                 let grad_accum = self.cfg_grad_accum;
                 // Cross-step gradient accumulation:
                 // Each train_step() call accumulates gradients from a different sequence.
                 // Weight update is applied only every grad_accum steps.
                 let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
                 let apply_accum = grad_accum == 1 || self.grad_accum_counter + 1 >= grad_accum;
+                let update_t0 = std::time::Instant::now();
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
                     self.config.deq_grad_scale,
@@ -832,6 +988,9 @@ impl Trainer {
                     batch_size,
                     apply_accum,
                 );
+                if audit_cost {
+                    audit_update_ms += update_t0.elapsed().as_secs_f64() * 1e3;
+                }
                 self.grad_accum_counter += 1;
                 if self.grad_accum_counter >= grad_accum {
                     self.grad_accum_counter = 0;
@@ -842,7 +1001,11 @@ impl Trainer {
                         let should_read = every != 0
                             && (every == 1 || (self.optimizer.step_count() % every == 0));
                         if should_read {
+                            let sync_t0 = std::time::Instant::now();
                             self.last_gpu_loss = gpu_lm.read_cached_loss(&gpu.device);
+                            if audit_cost {
+                                audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
+                            }
                         }
                         current_loss = self.last_gpu_loss;
                     }
@@ -850,7 +1013,11 @@ impl Trainer {
                     let debug_every = self.cfg_debug_sample_every;
                     if debug_every != 0
                         && (self.optimizer.step_count() % debug_every == 0) {
+                        let sync_t0 = std::time::Instant::now();
                         self.cached_debug_buf = gpu.read_debug_buffer();
+                        if audit_cost {
+                            audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
+                        }
                     }
                 } else {
                     // Intermediate grad_accum step: no weight update poll yet.
@@ -860,7 +1027,11 @@ impl Trainer {
                         let should_read = every != 0
                             && (every == 1 || (self.optimizer.step_count() % every == 0));
                         if should_read {
+                            let sync_t0 = std::time::Instant::now();
                             self.last_gpu_loss = gpu_lm.read_cached_loss(&gpu.device);
+                            if audit_cost {
+                                audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
+                            }
                         }
                         current_loss = self.last_gpu_loss;
                     }
@@ -1065,12 +1236,18 @@ impl Trainer {
                 // Spectral Renormalization (Periodic)
                 let renorm_every = self.config.renorm_every_steps.max(1);
                 if self.optimizer.step_count() % renorm_every == 0 {
+                    let renorm_t0 = std::time::Instant::now();
                     let _ = gpu.renormalize_spectral();
+                    if audit_cost {
+                        audit_renorm_ms += renorm_t0.elapsed().as_secs_f64() * 1e3;
+                        audit_renorm_calls += 1;
+                    }
                 }
             }
 
             if !self.frozen_emb {
                 let emb_lr = base_lr * self.training_config.emb_lr_mult;
+                let embed_t0 = std::time::Instant::now();
                 let _ = gpu_emb.apply_embedding_update_from_buffer(
                     &gpu.device,
                     &gpu.queue,
@@ -1084,6 +1261,9 @@ impl Trainer {
                     self.optimizer.step_count() as u32,
                     self.training_config.ternary,
                 );
+                if audit_cost {
+                    audit_embed_ms += embed_t0.elapsed().as_secs_f64() * 1e3;
+                }
                 self.gpu_emb_weights_uploaded = true;
             }
 
@@ -1095,22 +1275,22 @@ impl Trainer {
             let debug_every = self.cfg_debug_sample_every;
             if debug_every != 0
                 && (self.optimizer.step_count() % debug_every == 0) {
+                let sync_t0 = std::time::Instant::now();
                 self.cached_debug_buf = gpu.read_debug_buffer();
+                if audit_cost {
+                    audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
+                }
             }
             if !self.cached_debug_buf.is_empty() {
                 let fw = &self.cached_debug_buf;
 
                 let rs_cg = 0.0f32;
 
-                let heartbeat = if fw.len() > 10 { fw[10] } else { 0.0 }; // seq
-                let max_h = if fw.len() > 11 { fw[11] } else { 0.0 };
-                let avg_iters = if fw.len() > 13 { fw[13] } else { 0.0 };
-                let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
-                let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
+                let (heartbeat, max_h, avg_iters, hit_count, max_delta, contractivity, hit_den) =
+                    Self::decode_forward_debug_metrics(fw, self.config.h_slots);
                 let _last_delta = if fw.len() > 17 { fw[17] } else { 0.0 };
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
                 let total_elems = if fw.len() > 19 { fw[19] } else { 0.0 };
-                let contractivity = if fw.len() > 21 { fw[21] } else { 0.0 };
                 let inj_rms = if fw.len() > 22 { fw[22] } else { 0.0 };
                 let hist_rms = if fw.len() > 23 { fw[23] } else { 0.0 };
                 let hist_ratio = if fw.len() > 24 { fw[24] } else { 0.0 };
@@ -1173,7 +1353,7 @@ impl Trainer {
 
                 let seq = heartbeat.max(1.0);
                 let hit = hit_count.max(0.0);
-                let hit_ratio = hit / seq;
+                let hit_ratio = hit / hit_den.max(1.0);
 
                 // ---------- v13.2 Stability Oracle Logic ----------
 
@@ -1195,7 +1375,12 @@ impl Trainer {
                     self.contractivity_hi_streak = 0;
                 }
                 if self.contractivity_hi_streak >= 3 || contractivity > 1.20 {
+                    let renorm_t0 = std::time::Instant::now();
                     let _ = gpu.renormalize_spectral();
+                    if audit_cost {
+                        audit_renorm_ms += renorm_t0.elapsed().as_secs_f64() * 1e3;
+                        audit_renorm_calls += 1;
+                    }
                     self.contractivity_hi_streak = 0;
                     if contractivity > 1.20 {
                         self.emergency_left = 2; // 2 windows de debug (~20 steps)
@@ -1283,7 +1468,14 @@ impl Trainer {
                     self.max_delta_hi_streak = 0;
                     // Trigger spectral renorm immediately
                     #[cfg(feature = "wgpu")]
-                    let _ = gpu.renormalize_spectral();
+                    {
+                        let renorm_t0 = std::time::Instant::now();
+                        let _ = gpu.renormalize_spectral();
+                        if audit_cost {
+                            audit_renorm_ms += renorm_t0.elapsed().as_secs_f64() * 1e3;
+                            audit_renorm_calls += 1;
+                        }
+                    }
                 }
 
                 // Countdown de modos temporales
@@ -1311,7 +1503,7 @@ impl Trainer {
                     "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
                     hit_i,
-                    seq,
+                    hit_den,
                     100.0 * hit_ratio,
                     contractivity,
                     max_delta,
@@ -1431,6 +1623,46 @@ impl Trainer {
                     }
                     println!("    \x1b[90m[GPU-TOKENS]{}\x1b[0m", per_token);
                 }
+            }
+
+            if audit_cost {
+                eprintln!(
+                    "[SYSTEM-COST] step={} gather={:.2}ms forward={:.2}ms lm={:.2}ms picard={:.2}ms update={:.2}ms embed={:.2}ms sync={:.2}ms renorm={:.2}ms calls={} total={:.2}ms",
+                    self.optimizer.step_count(),
+                    audit_gather_ms,
+                    audit_forward_ms,
+                    audit_lm_ms,
+                    audit_picard_ms,
+                    audit_update_ms,
+                    audit_embed_ms,
+                    audit_sync_ms,
+                    audit_renorm_ms,
+                    audit_renorm_calls,
+                    audit_gather_ms
+                        + audit_forward_ms
+                        + audit_lm_ms
+                        + audit_picard_ms
+                        + audit_update_ms
+                        + audit_embed_ms
+                        + audit_sync_ms
+                        + audit_renorm_ms,
+                );
+                let (qkv_bytes, wo_bytes, win_bytes, hist_lower_bound) = audit_forward_bytes;
+                let dense_lower_bound = qkv_bytes + wo_bytes + win_bytes + hist_lower_bound;
+                let forward_secs = (audit_forward_ms / 1e3).max(1e-9);
+                eprintln!(
+                    "[FORWARD-BW] step={} batch={} seq={} iters_cap={} qkv_lb={:.3}GiB wo_lb={:.3}GiB win_once={:.3}GiB hist_lb={:.3}GiB dense_lb={:.3}GiB dense_lb_bw={:.1}GiB/s",
+                    self.optimizer.step_count(),
+                    fwd_batch_size,
+                    per_seq_len,
+                    self.adaptive_max_iters,
+                    Self::gib(qkv_bytes),
+                    Self::gib(wo_bytes),
+                    Self::gib(win_bytes),
+                    Self::gib(hist_lower_bound),
+                    Self::gib(dense_lower_bound),
+                    Self::gib(dense_lower_bound) / forward_secs,
+                );
             }
 
             return current_loss;
@@ -1594,7 +1826,7 @@ impl Trainer {
                     let current_loss_disp = epoch_loss / num_chunks as f32;
 
                     println!(
-                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
+                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps_avg={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
                         num_chunks, current_loss_disp, instant_tps, t_start.elapsed().as_secs_f32()
                     );
 
@@ -2279,7 +2511,7 @@ impl Trainer {
                     let current_loss = epoch_loss / num_chunks as f32;
 
                     println!(
-                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
+                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps_avg={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
                         num_chunks, current_loss, tps, elapsed
                     );
 
@@ -2357,7 +2589,7 @@ impl Trainer {
                 };
 
                 println!(
-                    "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps={:>8.1}  time={:.2}s  tokens={} {}",
+                    "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
                     display_loss, current_lr, tps, elapsed, total_tokens, gpu_stats
                 );
             }

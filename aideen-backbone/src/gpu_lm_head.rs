@@ -21,6 +21,7 @@ struct TrainParams {
 pub struct GpuLmHeadTrainer {
     pub config: ArchitectureConfig,
     pub vocab_size: usize,
+    sample_capacity: usize,
     h_buf: wgpu::Buffer,
     w_buf: wgpu::Buffer,
     b_buf: wgpu::Buffer,
@@ -55,6 +56,27 @@ pub struct GpuLmHeadTrainer {
 }
 
 impl GpuLmHeadTrainer {
+    fn build_sampled_indices(&mut self, targets: &[u32]) -> u32 {
+        let desired = self.config.num_samples.max(targets.len()).min(self.sample_capacity);
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse.extend_from_slice(targets);
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
+
+        let mut seen: std::collections::HashSet<u32> =
+            self.sampled_indices_reuse.iter().copied().collect();
+        let mut rng = rand::thread_rng();
+        while self.sampled_indices_reuse.len() < desired {
+            use rand::Rng;
+            let candidate = rng.gen_range(0..self.vocab_size as u32);
+            if seen.insert(candidate) {
+                self.sampled_indices_reuse.push(candidate);
+            }
+        }
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.len() as u32
+    }
+
     fn make_probs_bg_for_h(&self, device: &wgpu::Device, h_buf: &wgpu::Buffer) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LM Unified BG (external h)"),
@@ -363,6 +385,7 @@ impl GpuLmHeadTrainer {
             .unwrap_or(1)
             .max(1);
         let safe_ctx = config.ctx_len.max(1024) * lm_batch_size;
+        let sample_capacity = config.num_samples.max(safe_ctx);
         let h_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM h_pooled"),
             size: (d_r * safe_ctx * 4) as u64,
@@ -448,7 +471,7 @@ impl GpuLmHeadTrainer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let scratch_floats = (safe_ctx * config.num_samples)
+        let scratch_floats = (safe_ctx * sample_capacity)
             + safe_ctx
             + (safe_ctx * config.d_r)
             + safe_ctx
@@ -467,7 +490,7 @@ impl GpuLmHeadTrainer {
         });
         let sampled_indices_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM Sampled Indices"),
-            size: (config.num_samples * 4) as u64,
+            size: (sample_capacity * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -565,6 +588,7 @@ impl GpuLmHeadTrainer {
         Self {
             config,
             vocab_size,
+            sample_capacity,
             h_buf,
             w_buf,
             b_buf,
@@ -638,23 +662,9 @@ impl GpuLmHeadTrainer {
         }
 
         // Sampled Softmax: targets + random negatives — reuse buffer to avoid heap alloc per step.
-        let max_samples = self.config.num_samples;
-        let mut rng = rand::thread_rng();
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse
-            .reserve(max_samples + targets.len());
-        self.sampled_indices_reuse.extend_from_slice(targets);
-        self.sampled_indices_reuse.truncate(max_samples);
-        let needed = max_samples.saturating_sub(self.sampled_indices_reuse.len());
-        for _ in 0..needed {
-            use rand::Rng;
-            self.sampled_indices_reuse
-                .push(rng.gen_range(0..self.vocab_size as u32));
-        }
-        self.sampled_indices_reuse.sort_unstable();
-        self.sampled_indices_reuse.dedup();
-        self.sampled_indices_reuse.truncate(max_samples);
-        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        self.sampled_indices_reuse.reserve(self.sample_capacity);
+        let actual_num_samples = self.build_sampled_indices(targets);
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -715,6 +725,9 @@ impl GpuLmHeadTrainer {
             label: Some("LM Train Encoder"),
         });
         encoder.clear_buffer(&self.loss_buf, 0, None);
+        let seq_len_u32 = seq_len as u32;
+        let t_grid_x = seq_len_u32.min(65535).max(1);
+        let t_grid_y = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Probs Pass"),
@@ -722,9 +735,10 @@ impl GpuLmHeadTrainer {
             });
             pass.set_pipeline(&self.probs_pipeline);
             pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, 1, 1);
+            pass.dispatch_workgroups(t_grid_x, t_grid_y, 1);
         }
-        let t_parts = seq_len as u32;
+        let t_parts_x = t_grid_x;
+        let t_parts_y = t_grid_y;
         if self.fused_b19 {
             // Fused path: use the same update kernel as non-fused to guarantee
             // numerical equivalence (avoids drift seen with lm_dw_accum_main).
@@ -746,7 +760,7 @@ impl GpuLmHeadTrainer {
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &self.probs_bg, &[]);
-                pass.dispatch_workgroups(t_parts, 1, 1);
+                pass.dispatch_workgroups(t_parts_x, t_parts_y, 1);
             }
         } else {
             {
@@ -767,7 +781,7 @@ impl GpuLmHeadTrainer {
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &self.probs_bg, &[]);
-                pass.dispatch_workgroups(t_parts, 1, 1);
+                pass.dispatch_workgroups(t_parts_x, t_parts_y, 1);
             }
         }
         // Ternary project is now fused into update_pipeline
@@ -825,24 +839,9 @@ impl GpuLmHeadTrainer {
     ) -> Result<(f32, Vec<u8>), String> {
         let seq_len = targets.len();
 
-        let max_samples = self.config.num_samples;
-        let mut rng = rand::thread_rng();
-        // Reuse pre-allocated buffer to avoid heap allocation per training step.
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse
-            .reserve(max_samples + targets.len());
-        self.sampled_indices_reuse.extend_from_slice(targets);
-        let needed = max_samples.saturating_sub(targets.len());
-        for _ in 0..needed {
-            use rand::Rng;
-            self.sampled_indices_reuse
-                .push(rng.gen_range(0..self.vocab_size as u32));
-        }
-        self.sampled_indices_reuse.sort_unstable();
-        self.sampled_indices_reuse.dedup();
-        // Truncar a max_samples para no desbordar sampled_indices_buf.
-        self.sampled_indices_reuse.truncate(max_samples);
-        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        self.sampled_indices_reuse.reserve(self.sample_capacity);
+        let actual_num_samples = self.build_sampled_indices(targets);
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -904,6 +903,9 @@ impl GpuLmHeadTrainer {
             encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
             self.make_probs_bg_for_h(device, &self.h_buf)
         };
+        let seq_len_u32 = seq_len as u32;
+        let t_grid_x = seq_len_u32.min(65535).max(1);
+        let t_grid_y = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Probs Pass"),
@@ -911,9 +913,10 @@ impl GpuLmHeadTrainer {
             });
             pass.set_pipeline(&self.probs_pipeline);
             pass.set_bind_group(0, &probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, 1, 1);
+            pass.dispatch_workgroups(t_grid_x, t_grid_y, 1);
         }
-        let t_parts = seq_len as u32;
+        let t_parts_x = t_grid_x;
+        let t_parts_y = t_grid_y;
         if self.fused_b19 {
             // Fused path: use the same update kernel as non-fused to guarantee
             // numerical equivalence (avoids drift seen with lm_dw_accum_main).
@@ -935,7 +938,7 @@ impl GpuLmHeadTrainer {
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &probs_bg, &[]);
-                pass.dispatch_workgroups(t_parts, 1, 1);
+                pass.dispatch_workgroups(t_parts_x, t_parts_y, 1);
             }
         } else {
             {
@@ -956,7 +959,7 @@ impl GpuLmHeadTrainer {
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &probs_bg, &[]);
-                pass.dispatch_workgroups(t_parts, 1, 1);
+                pass.dispatch_workgroups(t_parts_x, t_parts_y, 1);
             }
         }
         // Ternary project is now fused into update_pipeline
@@ -1009,23 +1012,9 @@ impl GpuLmHeadTrainer {
     ) -> Result<f32, String> {
         let seq_len = targets.len();
 
-        let max_samples = self.config.num_samples;
-        let mut rng = rand::thread_rng();
-        // Reuse pre-allocated buffer to avoid heap allocation per training step.
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse
-            .reserve(max_samples + targets.len());
-        self.sampled_indices_reuse.extend_from_slice(targets);
-        let needed = max_samples.saturating_sub(targets.len());
-        for _ in 0..needed {
-            use rand::Rng;
-            self.sampled_indices_reuse
-                .push(rng.gen_range(0..self.vocab_size as u32));
-        }
-        self.sampled_indices_reuse.sort_unstable();
-        self.sampled_indices_reuse.dedup();
-        self.sampled_indices_reuse.truncate(max_samples);
-        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        self.sampled_indices_reuse.reserve(self.sample_capacity);
+        let actual_num_samples = self.build_sampled_indices(targets);
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -1076,6 +1065,9 @@ impl GpuLmHeadTrainer {
             self.make_probs_bg_for_h(device, &self.h_buf)
         };
         encoder.clear_buffer(&self.loss_buf, 0, None);
+        let seq_len_u32 = seq_len as u32;
+        let t_grid_x = seq_len_u32.min(65535).max(1);
+        let t_grid_y = seq_len_u32.div_ceil(65535).max(1);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Probs Pass"),
@@ -1083,9 +1075,10 @@ impl GpuLmHeadTrainer {
             });
             pass.set_pipeline(&self.probs_pipeline);
             pass.set_bind_group(0, &probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, 1, 1);
+            pass.dispatch_workgroups(t_grid_x, t_grid_y, 1);
         }
-        let t_parts = seq_len as u32;
+        let t_parts_x = t_grid_x;
+        let t_parts_y = t_grid_y;
         if self.fused_b19 {
             // Fused path: use the same update kernel as non-fused to guarantee
             // numerical equivalence (avoids drift seen with lm_dw_accum_main).
@@ -1107,7 +1100,7 @@ impl GpuLmHeadTrainer {
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &probs_bg, &[]);
-                pass.dispatch_workgroups(t_parts, 1, 1);
+                pass.dispatch_workgroups(t_parts_x, t_parts_y, 1);
             }
         } else {
             {
@@ -1128,7 +1121,7 @@ impl GpuLmHeadTrainer {
                 });
                 pass.set_pipeline(&self.backprop_pipeline);
                 pass.set_bind_group(0, &probs_bg, &[]);
-                pass.dispatch_workgroups(t_parts, 1, 1);
+                pass.dispatch_workgroups(t_parts_x, t_parts_y, 1);
             }
         }
         // Ternary project is now fused into update_pipeline

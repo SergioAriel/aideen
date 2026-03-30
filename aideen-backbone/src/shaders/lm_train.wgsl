@@ -4,11 +4,13 @@
 // Architecture: Sampled Softmax + RMSNorm + AdamW
 //
 // Pipelines (dispatch sizes set by gpu_lm_head.rs):
-//   1. lm_probs_main         (seq_len, 1, 1)   – forward: RMSNorm, softmax, loss
+//   1. lm_probs_main         (min(seq_len,65535), ceil(seq_len/65535), 1)
+//                                         – forward: RMSNorm, softmax, loss
 //   2. lm_update_main        (d/16, k/16, 1)   – fused: accumulate dW + AdamW (no-fused path)
 //   3. lm_dw_accum_main      (d/16, k/16, 1)   – accumulate dW only (fused path)
 //   4. lm_apply_adamw_main   (d/16, k/16, 1)   – apply AdamW to accumulated dW (fused path)
-//   5. lm_backprop_h_t_main  (seq_len, 1, 1)   – backprop dL/dh to DEQ
+//   5. lm_backprop_h_t_main  (min(seq_len,65535), ceil(seq_len/65535), 1)
+//                                         – backprop dL/dh to DEQ
 //
 // Bindings: 0-15 (16 total, matching bgl_probs in gpu_lm_head.rs)
 // =============================================================================
@@ -50,9 +52,11 @@ struct TrainParams {
 // so the reduction lives entirely in workgroup memory.
 
 const WG_SIZE: u32 = 256u;
+const TOKEN_GRID_X: u32 = 65535u;
 
 fn probs_idx(t: u32, k: u32)    -> u32 { return t * params.num_samples + k; }
 fn s_h_rms_idx(t: u32, d: u32) -> u32 { return t * params.d_model + d; }
+fn token_workgroup_index(wgid: vec3<u32>) -> u32 { return wgid.y * TOKEN_GRID_X + wgid.x; }
 
 // =============================================================================
 // Workgroup shared memory
@@ -66,7 +70,7 @@ var<workgroup> s_logits: array<f32, 512>;
 
 // =============================================================================
 // Pipeline 1: lm_probs_main
-// Dispatch: (seq_len, 1, 1) — one workgroup per token
+// Dispatch: (min(seq_len,65535), ceil(seq_len/65535), 1) — one workgroup per token
 // Computes: RMSNorm(h_t), sampled logits, softmax, cross-entropy loss
 // Writes:   probs[t,*], rms_buf[t], s_h_rms[t,*], loss_out (atomic)
 // =============================================================================
@@ -75,7 +79,7 @@ fn lm_probs_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>
 ) {
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
 
@@ -280,7 +284,7 @@ fn lm_apply_adamw_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // =============================================================================
 // Pipeline 5: lm_backprop_h_t_main
-// Dispatch: (seq_len, 1, 1) — one workgroup per token
+// Dispatch: (min(seq_len,65535), ceil(seq_len/65535), 1) — one workgroup per token
 // Computes: dL/dh_t = sum_k(p_k - 1_hot_k) * W_k via RMSNorm backward
 // Writes:   dl_dh[t * d_model ... (t+1)*d_model]  (one row per token)
 // Note:     Rust copies dl_dh[0..d_model] to staging, so writes must be
@@ -293,13 +297,14 @@ fn lm_backprop_h_t_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>
 ) {
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
 
     let d_model  = params.d_model;
     let base     = t * d_model;
     let target_v = target_indices[t];
+    let seq_scale = 1.0 / max(1.0, f32(params.seq_len));
 
     // Cache probs for this token into workgroup memory
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
@@ -323,6 +328,7 @@ fn lm_backprop_h_t_main(
             let one_hot = select(0.0, 1.0, v == target_v);
             dldy += (p - one_hot) * w_lm[v * d_model + d];
         }
+        dldy = dldy * seq_scale;
         dl_dh_temp[base + d] = dldy;
         // Accumulate dot product for RMSNorm backward: sum_d dldy * g[d] * h[d]
         local_rms_dot += dldy * g_lm[d] * h_pooled[base + d];
@@ -376,7 +382,7 @@ fn lm_backprop_rms_reduce_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>
 ) {
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
     let d_model = params.d_model;
@@ -415,7 +421,7 @@ fn lm_backprop_reduce_main(
 ) {
     // Final accumulation of dl_dh across all tokens — no-op in current Rust path.
     // Kept for pipeline compatibility.
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
 }

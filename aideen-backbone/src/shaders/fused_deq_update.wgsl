@@ -219,6 +219,10 @@ fn token_minner_base(t: u32, d: u32, h_slots: u32) -> u32 {
     return token_signal_base(t, d, h_slots) + h_slots * d;
 }
 
+fn token_hist_ctx_base(t: u32, d: u32, h_slots: u32) -> u32 {
+    return token_minner_base(t, d, h_slots) + h_slots * d;
+}
+
 var<workgroup> hist_reduce_u: array<f32, 64>;
 var<workgroup> hist_reduce_aux: array<f32, 64>;
 var<workgroup> hist_carry_vec: array<f32, 1024>;
@@ -305,9 +309,12 @@ fn fused_attn_stage1b_main(
             let a = Scratch[attn_weight_base + qs * h_slots + ks];
             let k_off = ks * d;
             mix = mix + a * Scratch[v_base + k_off + dim];
-            // V_fixed path: W_v is applied to (signal + slot_anchor), so g_wv must use
+            // External slot-context path: W_v is applied to (signal + slot_anchor + hist_ctx),
+            // so g_wv must use the same source vector to keep forward/backward consistent.
             // the same source vector to keep forward/backward consistent.
-            let src = Scratch[signal_base + k_off + dim] + AllWeights[aw_hist_base(params.d_model, params.h_slots) +slot_anchor + k_off + dim];
+            let src = Scratch[signal_base + k_off + dim]
+                + AllWeights[aw_hist_base(params.d_model, params.h_slots) +slot_anchor + k_off + dim]
+                + Scratch[token_hist_ctx_base(t_abs, d, h_slots) + k_off + dim];
             weighted_h = weighted_h + a * src;
         }
         let out_idx = entry_base(entry, d) + dim;
@@ -473,7 +480,9 @@ fn fused_attn_stage4_wq_main(
         let token_b = tile + local_row;
         if (token_b < n_tokens) {
             stage4_mat_b_tile[local_row * 16u + local_col] =
-                h_star[token_b * h_slots * d + slot * d + col];
+                Scratch[token_signal_base(token_b, d, h_slots) + slot * d + col]
+                + AllWeights[aw_hist_base(d, h_slots) + slot_anchor_base(d, h_slots) + slot * d + col]
+                + Scratch[token_hist_ctx_base(token_b, d, h_slots) + slot * d + col];
         } else {
             stage4_mat_b_tile[local_row * 16u + local_col] = 0.0;
         }
@@ -592,7 +601,9 @@ fn fused_attn_stage4_wk_main(
         let token_b = tile + local_row;
         if (token_b < n_tokens) {
             stage4_mat_b_tile[local_row * 16u + local_col] =
-                h_star[token_b * h_slots * d + slot * d + col];
+                Scratch[token_signal_base(token_b, d, h_slots) + slot * d + col]
+                + AllWeights[aw_hist_base(d, h_slots) + slot_anchor_base(d, h_slots) + slot * d + col]
+                + Scratch[token_hist_ctx_base(token_b, d, h_slots) + slot * d + col];
         } else {
             stage4_mat_b_tile[local_row * 16u + local_col] = 0.0;
         }
@@ -653,7 +664,8 @@ fn fused_attn_stage4_wv_main(
             let signal_base_t = token_signal_base(token_a, d, h_slots);
             stage4_mat_a_tile[local_row * 16u + local_col] =
                 Scratch[signal_base_t + slot * d + row]
-                + AllWeights[aw_hist_base(d, h_slots) + slot_anchor_base(d, h_slots) + slot * d + row];
+                + AllWeights[aw_hist_base(d, h_slots) + slot_anchor_base(d, h_slots) + slot * d + row]
+                + Scratch[token_hist_ctx_base(token_a, d, h_slots) + slot * d + row];
         } else {
             stage4_mat_a_tile[local_row * 16u + local_col] = 0.0;
         }
