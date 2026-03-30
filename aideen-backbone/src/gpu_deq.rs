@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025-2026 Juan Marchetto & Sergio Solis
+// Copyright (c) 2025-2026 Sergio Ariel Solis and Juan Patricio Marchetto
 
 use aideen_block::deq_bridge::{
     aw_alog_byte_off, aw_hist_byte_off, aw_nscale_byte_off, aw_total_bytes, aw_win_byte_off,
