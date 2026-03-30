@@ -655,7 +655,10 @@ impl GpuLmHeadTrainer {
         self.sampled_indices_reuse.dedup();
         self.sampled_indices_reuse.truncate(max_samples);
         let actual_num_samples = self.sampled_indices_reuse.len() as u32;
-        assert!(actual_num_samples <= 512, "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512");
+        assert!(
+            actual_num_samples <= 512,
+            "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512"
+        );
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -844,7 +847,10 @@ impl GpuLmHeadTrainer {
         // Truncate to max_samples to avoid overflowing sampled_indices_buf.
         self.sampled_indices_reuse.truncate(max_samples);
         let actual_num_samples = self.sampled_indices_reuse.len() as u32;
-        assert!(actual_num_samples <= 512, "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512");
+        assert!(
+            actual_num_samples <= 512,
+            "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512"
+        );
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -1028,7 +1034,10 @@ impl GpuLmHeadTrainer {
         self.sampled_indices_reuse.dedup();
         self.sampled_indices_reuse.truncate(max_samples);
         let actual_num_samples = self.sampled_indices_reuse.len() as u32;
-        assert!(actual_num_samples <= 512, "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512");
+        assert!(
+            actual_num_samples <= 512,
+            "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512"
+        );
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(

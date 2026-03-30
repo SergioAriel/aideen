@@ -653,7 +653,6 @@ impl GpuDeqBackend {
             ],
         });
 
-
         // bg1_layout: 10 read_write bindings — used by staged_picard_pl (staged_adjoint_picard.wgsl)
         // fused_update_bg1_layout: 1 binding — AllWeights for fused_deq_update.wgsl @group(1)
         let fused_update_bg1_layout =
@@ -1843,7 +1842,6 @@ impl GpuDeqBackend {
         }
     }
 
-
     // --- WEIGHTS ---
 
     pub fn upload_weights(
@@ -2413,7 +2411,11 @@ impl GpuDeqBackend {
                             pass.dispatch_workgroups(n_entries.max(1), 1, 1);
                         } else {
                             pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                            pass.dispatch_workgroups(
+                                d.div_ceil(16),
+                                n_entries.div_ceil(16).max(1),
+                                1,
+                            );
                         }
                     }
                     // Anderson: store current v_next into ring buffer, then mix.
@@ -2651,14 +2653,26 @@ impl GpuDeqBackend {
                     );
                 } else {
                     stage_accum_ms += run_stage(
-                        if self.config.d_r <= 512 { "Staged Picard Accum Opt" } else { "Staged Picard Accum" },
+                        if self.config.d_r <= 512 {
+                            "Staged Picard Accum Opt"
+                        } else {
+                            "Staged Picard Accum"
+                        },
                         if self.config.d_r <= 512 {
                             &self.staged_picard_accum_opt_pipeline
                         } else {
                             &self.staged_picard_accum_pipeline
                         },
-                        if self.config.d_r <= 512 { n_entries.max(1) } else { d.div_ceil(16) },
-                        if self.config.d_r <= 512 { 1 } else { n_entries.div_ceil(16).max(1) },
+                        if self.config.d_r <= 512 {
+                            n_entries.max(1)
+                        } else {
+                            d.div_ceil(16)
+                        },
+                        if self.config.d_r <= 512 {
+                            1
+                        } else {
+                            n_entries.div_ceil(16).max(1)
+                        },
                         &self.device,
                         &self.queue,
                         if (iter & 1) == 0 {
@@ -2757,7 +2771,11 @@ impl GpuDeqBackend {
                             pass.dispatch_workgroups(n_entries.max(1), 1, 1);
                         } else {
                             pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                            pass.dispatch_workgroups(
+                                d.div_ceil(16),
+                                n_entries.div_ceil(16).max(1),
+                                1,
+                            );
                         }
                     }
                 }
@@ -3351,17 +3369,17 @@ impl GpuDeqBackend {
                 n.div_ceil(16),
                 profile_fused,
             );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "stage4",
-                    &self.fused_update_stage4_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    d.div_ceil(16),
-                    d.div_ceil(16),
-                    profile_fused,
-                );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage4",
+                &self.fused_update_stage4_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                d.div_ceil(16),
+                profile_fused,
+            );
             if grad_accum_mode == 1 && apply_accum {
                 run_stage(
                     &self.device,

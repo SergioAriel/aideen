@@ -383,7 +383,8 @@ impl MambaSlotReasoning {
                 for c in 0..d {
                     // Slightly smaller jitter than W_q/W_k to keep output stable.
                     let i = r * d + c;
-                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin() * jitter_scale;
+                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin()
+                        * jitter_scale;
                     mat[(r, c)] += jitter;
                 }
             }

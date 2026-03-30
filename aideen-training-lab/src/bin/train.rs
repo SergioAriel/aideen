@@ -169,7 +169,9 @@ fn run_large_file(
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
     } else {
-        let corpus = corpus.as_ref().expect("Char-level tokenizer requires corpus in memory.");
+        let corpus = corpus
+            .as_ref()
+            .expect("Char-level tokenizer requires corpus in memory.");
         println!("  Tokenizer: Char-level — scanning vocab...");
         Tokenizer::from_text(corpus, config_default.clone())
     };
@@ -202,7 +204,9 @@ fn run_large_file(
             tokens_len, vocab_size
         );
     } else {
-        let corpus = corpus.as_ref().expect("Corpus in memory required for tokenization.");
+        let corpus = corpus
+            .as_ref()
+            .expect("Corpus in memory required for tokenization.");
         println!("  Tokenizing {txt_path} → {bin_path} ...");
         {
             use std::io::Write;
