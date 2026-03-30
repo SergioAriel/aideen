@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 Sergio Ariel Solis and Juan Patricio Marchetto
+
 //! Main training loop for AIDEEN.
 //!
 //! Pipeline per step:
@@ -2029,6 +2032,7 @@ impl Trainer {
         save_every: usize,
         checkpoint_path: &str,
         skip_chunks: usize,
+        val_ratio: f64,
     ) -> std::io::Result<()> {
         use std::io::{Read, Seek, SeekFrom};
 
@@ -2046,6 +2050,26 @@ impl Trainer {
         let stride = (ctx_len / 2).max(1);
         let chunk_tokens = ctx_len + 1;
         let chunk_bytes = chunk_tokens * 4;
+
+        // Held-out validation split: the last val_ratio fraction of the file is reserved.
+        let val_ratio = val_ratio.clamp(0.0, 0.5);
+        let val_start_byte = if val_ratio > 0.0 {
+            let raw = (file_size as f64 * (1.0 - val_ratio)) as usize;
+            // Round down to nearest chunk_bytes boundary.
+            (raw / chunk_bytes) * chunk_bytes
+        } else {
+            file_size // no held-out set: train on entire file
+        };
+        let train_file_size = val_start_byte;
+        if val_ratio > 0.0 {
+            let val_bytes = file_size - val_start_byte;
+            println!(
+                "  [VAL-HOLDOUT] Held-out split: train={:.2} MB, val={:.2} MB (ratio={:.2})",
+                train_file_size as f64 / 1_048_576.0,
+                val_bytes as f64 / 1_048_576.0,
+                val_ratio
+            );
+        }
         // Batch accumulation: collect batch_size chunks before training.
         // Without this, AIDEEN_BATCH_SIZE=N with 256-token chunks would give per_seq_len=256/N=32,
         // training on 32-token windows instead of 256. Fix: accumulate N chunks → N×256 tokens →
@@ -2103,6 +2127,7 @@ impl Trainer {
             // Prefetch next chunk on a background thread to overlap disk I/O with GPU work.
             let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
             let path_owned = path.to_string();
+            let read_limit = train_file_size; // stop before held-out validation data
             std::thread::spawn(move || {
                 let mut f = match std::fs::File::open(&path_owned) {
                     Ok(f) => f,
@@ -2117,8 +2142,15 @@ impl Trainer {
                         return;
                     }
                 }
+                let mut bytes_read = skip_offset as usize;
                 loop {
-                    let mut buf = vec![0u8; chunk_bytes];
+                    let remaining = read_limit.saturating_sub(bytes_read);
+                    if remaining == 0 {
+                        let _ = tx.send((Vec::new(), 0));
+                        break;
+                    }
+                    let to_read = chunk_bytes.min(remaining);
+                    let mut buf = vec![0u8; to_read];
                     let n = match f.read(&mut buf) {
                         Ok(n) => n,
                         Err(_) => 0,
@@ -2127,6 +2159,7 @@ impl Trainer {
                         let _ = tx.send((Vec::new(), 0));
                         break;
                     }
+                    bytes_read += n;
                     buf.truncate(n);
                     if tx.send((buf, n)).is_err() {
                         break;
@@ -2415,6 +2448,67 @@ impl Trainer {
                     "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps={:>8.1}  time={:.2}s  tokens={} {}",
                     display_loss, current_lr, tps, elapsed, total_tokens, gpu_stats
                 );
+            }
+
+            // ── Held-out validation evaluation ──────────────────────────────
+            if val_ratio > 0.0 && val_start_byte < file_size {
+                self.eval_mode = true;
+                self.reset_state();
+                let mut val_file = std::fs::File::open(path)?;
+                val_file.seek(SeekFrom::Start(val_start_byte as u64))?;
+
+                let mut val_loss_sum = 0.0f32;
+                let mut val_chunks = 0usize;
+                let mut val_carry: Vec<u32> = Vec::new();
+
+                loop {
+                    let mut buf = vec![0u8; chunk_bytes];
+                    let n = match val_file.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(_) => 0,
+                    };
+
+                    let mut vtokens: Vec<u32> = Vec::with_capacity(chunk_tokens + stride);
+                    vtokens.extend_from_slice(&val_carry);
+                    val_carry.clear();
+                    if n > 0 {
+                        let aligned = n & !3;
+                        vtokens.extend_from_slice(bytemuck::cast_slice(&buf[..aligned]));
+                    }
+
+                    if vtokens.len() < 2 {
+                        break;
+                    }
+
+                    let train_end = vtokens.len().saturating_sub(1);
+                    let input = &vtokens[..train_end];
+                    let target = &vtokens[1..];
+                    let seg_len = input.len().min(target.len());
+                    if seg_len > 0 {
+                        let eps = self.progressive_epsilon(epoch, epochs);
+                        let loss = self.train_sequence(input, target, false, eps);
+                        val_loss_sum += loss;
+                        val_chunks += 1;
+                    }
+
+                    // Carry overlap for context continuity.
+                    let overlap_start = vtokens.len().saturating_sub(stride.min(vtokens.len()));
+                    val_carry = vtokens[overlap_start..].to_vec();
+
+                    if n == 0 {
+                        break;
+                    }
+                }
+
+                self.eval_mode = false;
+
+                if val_chunks > 0 {
+                    let avg_val_loss = val_loss_sum / val_chunks as f32;
+                    println!(
+                        "    \x1b[96m[VAL-HOLDOUT] val_loss={:.4} ({} chunks)\x1b[0m",
+                        avg_val_loss, val_chunks
+                    );
+                }
             }
 
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {

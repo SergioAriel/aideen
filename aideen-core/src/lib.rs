@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 Sergio Ariel Solis and Juan Patricio Marchetto
+
 //! aideen-core
 //! ─────────────────────────────────────────────
 //! Mathematical contracts and base types (MRCE + S).
