@@ -36,7 +36,7 @@ const MAX_SLOTS: u32 = 8u;
 const MIX_TILE: u32 = 128u;
 
 var<workgroup> shared_vals: array<f32, WG_SIZE>;
-var<workgroup> unconverged_count: atomic<u32>;
+var<workgroup> hit_count: atomic<u32>;
 var<workgroup> max_delta_seen: f32;
 var<workgroup> last_delta: f32;
 var<workgroup> s_delta: array<f32, WG_SIZE>;
@@ -90,6 +90,10 @@ fn hist_alpha_max() -> f32 {
 var<workgroup> attn_w: array<f32, 64>;
 // Tiled cache for mix vector during W_o * mix projection.
 var<workgroup> mix_tile: array<f32, MIX_TILE>;
+// Tiled cache for H_curr during fused Q/K/V matmul.
+var<workgroup> h_tile: array<f32, WG_SIZE>;
+// Tiled cache for prev_mamba / carry during W_hist prelude matmul.
+var<workgroup> prev_tile: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(256, 1, 1)
 fn deq_forward_main(
@@ -140,7 +144,7 @@ fn deq_forward_main(
     let full_mamba_mode = !deq_only_mode && !no_mamba_mode && !init_mamba_mode && !hist_gated_mode && !fixed_mamba_mode;
 
     if (tid == 0u) {
-        atomicStore(&unconverged_count, 0u);
+        atomicStore(&hit_count, 0u);
         max_delta_seen = 0.0;
         last_delta = 0.0;
         curr_contractivity = 0.0;
@@ -167,7 +171,7 @@ fn deq_forward_main(
 
     for (var t = 0u; t < shape.seq_len; t = t + 1u) {
         // --- Per-token Memory Striding for BPTT ---
-        let scratch_stride = d_model * (h_slots * 7u) + h_slots * h_slots + h_slots;
+        let scratch_stride = d_model * (h_slots * 8u) + h_slots * h_slots + h_slots;
         let batch_scratch_t = (batch_idx * shape.seq_len + t) * scratch_stride;
         let q_base = batch_scratch_t;
         let k_base = q_base + h_slots * d_model;
@@ -176,7 +180,8 @@ fn deq_forward_main(
         let mamba_base = attn_base + h_slots * d_model;
         let signal_base = mamba_base + h_slots * d_model;
         let m_inner_base = signal_base + h_slots * d_model;
-        let attn_weight_base = m_inner_base + h_slots * d_model;
+        let hist_ctx_base = m_inner_base + h_slots * d_model;
+        let attn_weight_base = hist_ctx_base + h_slots * d_model;
         let f_gate_scratch_base = attn_weight_base + h_slots * h_slots;
         let hist_mat_len = d_model * d_model;
         let hist_scale_base = hist_mat_len;
@@ -214,6 +219,17 @@ fn deq_forward_main(
         let b_forget_base = w_forget_base + h_slots * d_model;
 
         let h_base_t = (batch_idx * shape.seq_len + t) * total_elements;
+
+        // Keep a dedicated copy of the forward historical context used by the DEQ loop.
+        // Backward treats this branch as stop-gradient, so retaining the exact forward
+        // value restores forward/backward consistency and avoids recomputing W_hist.
+        for (var s = 0u; s < h_slots; s = s + 1u) {
+            let off = s * d_model;
+            for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+                Scratch[hist_ctx_base + off + d_out] = 0.0;
+            }
+        }
+        workgroupBarrier();
 
         // input_signal_s = W_in_s * s_t  (per-slot: each slot has its own W_in matrix)
         let s_in_base = batch_idx * (shape.seq_len * d_model) + t * d_model;
@@ -331,28 +347,46 @@ fn deq_forward_main(
                 let prev_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
                 var local_hist_sumsq = 0.0;
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
-                    // Hist-gated product route: history must come from M_{t-1}, not from a
-                    // permanent additive bias. A non-zero bias keeps the historical channel
-                    // "on" even when the temporal carrier is empty and breaks the intended
-                    // semantics of the interface.
                     var u = 0.0;
                     if (t > 0u) {
                         let prev_mamba =
                             (batch_idx * shape.seq_len + t - 1u) * scratch_stride
                             + h_slots * 4u * d_model;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let prev_v = Scratch[prev_mamba + off + j] / prev_rms;
-                            u = u + AllWeights[aw_hist +d_out * d_model + j] * prev_v;
+                        // Tiled matmul: load prev[tile] cooperatively, accumulate W_hist * prev
+                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                            let j_load = tile + tid;
+                            if (j_load < d_model) {
+                                prev_tile[tid] = Scratch[prev_mamba + off + j_load] / prev_rms;
+                            } else {
+                                prev_tile[tid] = 0.0;
+                            }
+                            workgroupBarrier();
+                            let tile_lim = min(WG_SIZE, d_model - tile);
+                            for (var tj = 0u; tj < tile_lim; tj = tj + 1u) {
+                                u = u + AllWeights[aw_hist + d_out * d_model + tile + tj] * prev_tile[tj];
+                            }
+                            workgroupBarrier();
                         }
-                        u = u + AllWeights[aw_hist +hist_scale_base + off + d_out]
+                        u = u + AllWeights[aw_hist + hist_scale_base + off + d_out]
                             * (Scratch[prev_mamba + off + d_out] / prev_rms);
                     } else {
                         let carry_base = shape.batch_size * total_elements + batch_idx * total_elements + off;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let prev_v = H_curr[carry_base + j] / prev_rms;
-                            u = u + AllWeights[aw_hist +d_out * d_model + j] * prev_v;
+                        // Tiled matmul: load carry[tile] cooperatively, accumulate W_hist * carry
+                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                            let j_load = tile + tid;
+                            if (j_load < d_model) {
+                                prev_tile[tid] = H_curr[carry_base + j_load] / prev_rms;
+                            } else {
+                                prev_tile[tid] = 0.0;
+                            }
+                            workgroupBarrier();
+                            let tile_lim = min(WG_SIZE, d_model - tile);
+                            for (var tj = 0u; tj < tile_lim; tj = tj + 1u) {
+                                u = u + AllWeights[aw_hist + d_out * d_model + tile + tj] * prev_tile[tj];
+                            }
+                            workgroupBarrier();
                         }
-                        u = u + AllWeights[aw_hist +hist_scale_base + off + d_out]
+                        u = u + AllWeights[aw_hist + hist_scale_base + off + d_out]
                             * (H_curr[carry_base + d_out] / prev_rms);
                     }
                     Scratch[m_inner_base + off + d_out] = u;
@@ -397,6 +431,7 @@ fn deq_forward_main(
                 let hist_mod = 1.0 + tanh(gate_dyn);
                 for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                     Scratch[m_inner_base + off + d_out] *= hist_mod;
+                    Scratch[hist_ctx_base + off + d_out] = Scratch[m_inner_base + off + d_out];
                 }
                 // Forget gate: f[s] = σ(b_f[s] + dot(W_f[s,:], H_curr[t-1,s,:]) / sqrt(d))
                 // Uses H_curr (h*_{t-1}), ∂/∂h=0. Applied in post-convergence SSM recurrence.
@@ -564,24 +599,46 @@ fn deq_forward_main(
                 }
                 workgroupBarrier();
 
-                // Q/K/V per slot
+                // Q/K/V per slot — Fused Tiled MatMul
+                // Loads H_curr[off + j] once per tile into h_tile (shared memory),
+                // then accumulates Q, K, V from the same tile in a single pass.
+                // Index layout unchanged: w_idx = s * d² + j * d + d_out.
                 for (var s = 0u; s < h_slots; s = s + 1u) {
                     let off = s * d_model;
+                    let w_base = s * d_model * d_model;
                     var v_sum = 0.0;
                     for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                         var q = 0.0;
                         var k = 0.0;
                         var v = 0.0;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let h_val = H_curr[h_base + off + j];
-                            let w_idx = s * d_model * d_model + j * d_model + d_out;
-                            q = q + AllWeights[aw_wq +w_idx] * h_val;
-                            k = k + AllWeights[aw_wk +w_idx] * h_val;
-                            if (!v_fixed && !v_lag) { v = v + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val; }
+                        // --- Fused tile loop: load H_curr once, compute Q/K/V ---
+                        for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                            // Cooperative load of H_curr tile into shared memory
+                            let j_load = tile + tid;
+                            if (j_load < d_model) {
+                                h_tile[tid] = H_curr[h_base + off + j_load];
+                            } else {
+                                h_tile[tid] = 0.0;
+                            }
+                            workgroupBarrier();
+
+                            // Accumulate Q, K, V from the cached tile
+                            let tile_limit = min(WG_SIZE, d_model - tile);
+                            for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                                let j = tile + tj;
+                                let h_val = h_tile[tj];
+                                let w_idx = w_base + j * d_model + d_out;
+                                q = q + AllWeights[aw_wq + w_idx] * h_val;
+                                k = k + AllWeights[aw_wk + w_idx] * h_val;
+                                if (!v_fixed && !v_lag) {
+                                    v = v + AllWeights[aw_wv + w_idx] * h_val;
+                                }
+                            }
+                            workgroupBarrier();
                         }
-                        // Per-slot Q/K bias: appended after h_slots matrices in W_q/W_k buffers.
-                        q = q + AllWeights[aw_wq +h_slots * d_model * d_model + s * d_model + d_out];
-                        k = k + AllWeights[aw_wk +h_slots * d_model * d_model + s * d_model + d_out];
+                        // Per-slot Q/K bias
+                        q = q + AllWeights[aw_wq + h_slots * d_model * d_model + s * d_model + d_out];
+                        k = k + AllWeights[aw_wk + h_slots * d_model * d_model + s * d_model + d_out];
                         Scratch[q_base + off + d_out] = q;
                         Scratch[k_base + off + d_out] = k;
                         if (!v_fixed && !v_lag) {
@@ -590,9 +647,6 @@ fn deq_forward_main(
                         }
                     }
                     if (!v_fixed && !v_lag) {
-                        // Workgroup reduction to get the global v_rms (not per-thread partial).
-                        // Bug: original code used per-thread v_sum (2 elements / 512) giving
-                        // v_rms ≈ v_global / 16 and v_gain ≈ 16× correct → Jacobian ≫ 1.
                         shared_vals[tid] = v_sum;
                         workgroupBarrier();
                         for (var stride_vr = WG_SIZE / 2u; stride_vr > 0u; stride_vr = stride_vr >> 1u) {
@@ -602,8 +656,8 @@ fn deq_forward_main(
                             workgroupBarrier();
                         }
                         let v_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-12);
-                        let v_scale = AllWeights[aw_hist +v_scale_base];
-                        let v_norm_scale = AllWeights[aw_hist +v_norm_scale_base];
+                        let v_scale = AllWeights[aw_hist + v_scale_base];
+                        let v_norm_scale = AllWeights[aw_hist + v_norm_scale_base];
                         let v_cap = max(1e-6, inj_rms_curr);
                         let v_gain = (v_scale * v_norm_scale) * (v_cap / max(v_rms, 1e-6));
                         for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
@@ -613,6 +667,7 @@ fn deq_forward_main(
                         workgroupBarrier();
                     }
                 }
+
                 workgroupBarrier();
 
                 // Precompute score matrix once per iter (independent of d_out).
@@ -687,14 +742,18 @@ fn deq_forward_main(
                 // Build mixed V vector per query slot once:
                 // mix[qs, j] = Σ_ks attn_w[qs,ks] * V[ks,j]
                 // Reuse mamba_base as temporary buffer during the DEQ loop.
-                for (var qs = 0u; qs < h_slots; qs = qs + 1u) {
-                    let q_off = qs * d_model;
-                    for (var j = tid; j < d_model; j = j + WG_SIZE) {
+                // Optimization: load V[:, j] once per j and reuse across all qs.
+                for (var j = tid; j < d_model; j = j + WG_SIZE) {
+                    var vks: array<f32, MAX_SLOTS>;
+                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                        vks[ks] = Scratch[v_base + ks * d_model + j];
+                    }
+                    for (var qs = 0u; qs < h_slots; qs = qs + 1u) {
                         var mix = 0.0;
                         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                            mix = mix + attn_w[qs * h_slots + ks] * Scratch[v_base + ks * d_model + j];
+                            mix = mix + attn_w[qs * h_slots + ks] * vks[ks];
                         }
-                        Scratch[mamba_base + q_off + j] = mix;
+                        Scratch[mamba_base + qs * d_model + j] = mix;
                     }
                 }
                 workgroupBarrier();
@@ -721,11 +780,25 @@ fn deq_forward_main(
                 if (v_lag && !v_fixed) {
                     for (var s = 0u; s < h_slots; s = s + 1u) {
                         let off = s * d_model;
+                        let w_base = s * d_model * d_model;
                         for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                             var v_next = 0.0;
-                            for (var j = 0u; j < d_model; j = j + 1u) {
-                                let h_val = H_curr[h_base + off + j];
-                                v_next = v_next + AllWeights[aw_wv + s * d_model * d_model + j * d_model + d_out] * h_val;
+                            // Tiled matmul to reuse H_curr tile from shared memory.
+                            for (var tile = 0u; tile < d_model; tile = tile + WG_SIZE) {
+                                let j_load = tile + tid;
+                                if (j_load < d_model) {
+                                    h_tile[tid] = H_curr[h_base + off + j_load];
+                                } else {
+                                    h_tile[tid] = 0.0;
+                                }
+                                workgroupBarrier();
+                                let tile_limit = min(WG_SIZE, d_model - tile);
+                                for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                                    let j = tile + tj;
+                                    let h_val = h_tile[tj];
+                                    v_next = v_next + AllWeights[aw_wv + w_base + j * d_model + d_out] * h_val;
+                                }
+                                workgroupBarrier();
                             }
                             let v_scale = AllWeights[aw_hist +v_scale_base];
                             Scratch[v_base + off + d_out] = v_next * v_scale;
@@ -877,7 +950,7 @@ fn deq_forward_main(
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     var hist_ctx = 0.0;
                     if (hist_gated_mode && hist_inject > 0.5 && hist_minner_zero < 0.5) {
-                        hist_ctx = Scratch[m_inner_base + off + d];
+                        hist_ctx = Scratch[hist_ctx_base + off + d];
                     }
                     let slot_bias = AllWeights[aw_hist +slot_anchor_base + off + d];
                     // attn_signal is the only h-dependent term (∂slot_bias/∂h = 0,
@@ -988,7 +1061,7 @@ fn deq_forward_main(
             let d = last_delta;
             max_delta_seen = max(max_delta_seen, d);
             if (!converged) {
-                atomicAdd(&unconverged_count, 1u);
+                atomicAdd(&hit_count, 1u);
             }
         }
         workgroupBarrier();
@@ -1135,8 +1208,8 @@ fn deq_forward_main(
         DebugLog[11] = max_h_seen;
         DebugLog[12] = H_curr[h_base];
         DebugLog[13] = f32(total_iters) / max(1.0, f32(shape.seq_len));
-        DebugLog[14] = select(0.0, 1.0, atomicLoad(&unconverged_count) == 0u);
-        DebugLog[15] = f32(atomicLoad(&unconverged_count));
+        DebugLog[14] = select(0.0, 1.0, atomicLoad(&hit_count) == 0u);
+        DebugLog[15] = f32(atomicLoad(&hit_count));
         DebugLog[16] = max_delta_seen;
         DebugLog[17] = last_delta;
         DebugLog[18] = 0.0;
@@ -1188,7 +1261,7 @@ fn deq_forward_main(
 
         // Per-token debug (slot 0) when seq_len is small: H_rms, V_rms, attn_rms.
         if (tid == 0u && shape.seq_len <= 16u) {
-            let scratch_stride = d_model * h_slots * 7u + h_slots * h_slots + h_slots;
+            let scratch_stride = d_model * h_slots * 8u + h_slots * h_slots + h_slots;
             let base_out = 200u; // leave room for existing debug slots
             for (var t = 0u; t < shape.seq_len; t = t + 1u) {
                 let h_base_t = (t * h_slots) * d_model;
