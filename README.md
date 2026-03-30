@@ -5,7 +5,7 @@
 ![WGSL](https://img.shields.io/badge/WGSL-24_shaders-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Mamba-style selective state memory (SSM)** instead of stacked transformer layers — achieving comparable quality with significantly fewer parameters.
+Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Mamba-style selective state memory (SSM)** instead of stacked transformer layers — reusing a single parameter block via fixed-point iteration instead of stacking 24-96 layers. Quantifying the efficiency trade-offs vs. transformers is an active research goal.
 
 Designed to run on consumer GPUs (AMD, Intel, NVIDIA) via [wgpu](https://wgpu.rs/) / WebGPU, without dependence on CUDA or cloud providers.
 
