@@ -43,10 +43,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 - Per-slot W_o architecture improvement
 - 7,290 chunks processed in 16 hours from scratch
 
-**Benchmark (DEQ vs Transformer):**
-- Initial run (100K tokens, 3 seeds, p=0.0001): AIDEEN 4.17 vs Transformer 2.98
-- Root cause analysis: DEQ trains from random initialization where spectral norms exceed the contractivity threshold (σ > 1.0). The training pipeline loads a pre-trained checkpoint where spectral renormalization has already established σ < 0.10 (contractivity < 0.85, 0% unconverged). The benchmark initializes from random weights, requiring a warm-up phase (~1000+ steps of spectral renorm) before the fixed-point iteration can converge. This is an inherent property of DEQ architectures — they need spectral conditioning before convergence is guaranteed
-- Corrected benchmark with warm-up protocol in progress. Hyperparameters also fixed (max_iters 6→16, renorm_every 50→4)
+**Benchmark (DEQ vs Transformer, 100K tokens, 3 seeds):**
+
+| Experiment | AIDEEN (DEQ) | Transformer | p-value |
+|------------|-------------|-------------|---------|
+| EXP1 Iso-Data | 4.17 ± 0.00 | 3.00 ± 0.02 | 0.0001 |
+| EXP2 Iso-Time (120s) | 4.17 ± 0.00 | 3.38 ± 0.01 | 0.0001 |
+| EXP3 Inference NLL | 4.17 ± 0.00 | 2.96 ± 0.02 | <0.0001 |
+
+The transformer outperforms at 100K tokens. DEQ architectures require spectral pre-conditioning from random initialization — the training pipeline achieves 0% unconverged (contractivity < 0.85) on a pre-conditioned checkpoint, but the benchmark starts from random weights where spectral norms exceed the contractivity threshold. This is an inherent property of implicit-depth models. Full-corpus benchmark with warm-up protocol is a Phase 1 deliverable
 
 **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens) tokenized for larger-scale training
 
