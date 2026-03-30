@@ -26,9 +26,9 @@ pub struct GpuLmHeadTrainer {
     b_buf: wgpu::Buffer,
     pub dl_dh_buf: wgpu::Buffer,
     pub dl_dh_temp_buf: wgpu::Buffer,
-    _dl_dh_rms_red_buf: wgpu::Buffer,
 
     loss_buf: wgpu::Buffer,
+    rms_buf: wgpu::Buffer,
     g_buf: wgpu::Buffer,
     moments_w_buf: wgpu::Buffer, // Combined m_w, v_w (Vocab * D_model * vec2)
     moments_b_buf: wgpu::Buffer, // Combined m_b, v_b (Vocab * vec2)
@@ -36,25 +36,98 @@ pub struct GpuLmHeadTrainer {
     params_buf: wgpu::Buffer,
     target_indices_buf: wgpu::Buffer,
     sampled_indices_buf: wgpu::Buffer,
+    s_h_rms_buf: wgpu::Buffer,
     dl_staging_buf: wgpu::Buffer,
     loss_staging_buf: wgpu::Buffer,
 
     probs_pipeline: wgpu::ComputePipeline,
+    probs_bgl: wgpu::BindGroupLayout,
     probs_bg: wgpu::BindGroup,
 
     update_pipeline: wgpu::ComputePipeline,
-
     backprop_pipeline: wgpu::ComputePipeline,
-    backprop_rms_reduce_pipeline: wgpu::ComputePipeline,
-    backprop_rms_apply_pipeline: wgpu::ComputePipeline,
-    backprop_reduce_pipeline: wgpu::ComputePipeline,
-    _ternary_pipeline: wgpu::ComputePipeline,
-    _s_h_rms_buf: wgpu::Buffer,
+    lm_scratch_buf: wgpu::Buffer,
+    fused_b19: bool,
+    cfg_lm_debug: bool,
     last_sampled_indices: Vec<u32>,
     last_num_samples: u32,
+    sampled_indices_reuse: Vec<u32>, // pre-alloc to avoid heap alloc per training step
 }
 
 impl GpuLmHeadTrainer {
+    fn make_probs_bg_for_h(&self, device: &wgpu::Device, h_buf: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("LM Unified BG (external h)"),
+            layout: &self.probs_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: h_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.dl_dh_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.loss_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.moments_w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.moments_b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.target_indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.lm_scratch_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.g_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.moments_g_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.rms_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.dl_dh_temp_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.sampled_indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.s_h_rms_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
     pub fn new(device: &wgpu::Device, vocab_size: usize, config: ArchitectureConfig) -> Self {
         let d_r = config.d_r;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -226,16 +299,6 @@ impl GpuLmHeadTrainer {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 16,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
             ],
         });
 
@@ -286,73 +349,7 @@ impl GpuLmHeadTrainer {
             cache: None,
         });
 
-        // --- PIPELINE 3.5: Backprop RMS Reduce ---
-        let backprop_rms_reduce_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("LM Backprop RMS Reduce Pipeline"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("LM Backprop RMS Reduce PL"),
-                        bind_group_layouts: &[&bgl_probs],
-                        push_constant_ranges: &[],
-                    }),
-                ),
-                module: &shader,
-                entry_point: Some("lm_backprop_rms_reduce_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        // --- PIPELINE 3.6: Backprop RMS Apply ---
-        let backprop_rms_apply_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("LM Backprop RMS Apply Pipeline"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("LM Backprop RMS Apply PL"),
-                        bind_group_layouts: &[&bgl_probs],
-                        push_constant_ranges: &[],
-                    }),
-                ),
-                module: &shader,
-                entry_point: Some("lm_backprop_rms_apply_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        // --- PIPELINE 4: Backprop Reduce ---
-        let backprop_reduce_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("LM Backprop Reduce Pipeline"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("LM Backprop Reduce PL"),
-                        bind_group_layouts: &[&bgl_probs],
-                        push_constant_ranges: &[],
-                    }),
-                ),
-                module: &shader,
-                entry_point: Some("lm_backprop_reduce_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
         // --- PIPELINE 5: Ternary Project ---
-        let ternary_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("LM Ternary Pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("LM Ternary PL"),
-                    bind_group_layouts: &[&bgl_probs],
-                    push_constant_ranges: &[],
-                }),
-            ),
-            module: &shader,
-            entry_point: Some("lm_project_ternary_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM Params"),
             size: 64,
@@ -404,6 +401,12 @@ impl GpuLmHeadTrainer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let rms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("LM RMS"),
+            size: (safe_ctx * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
 
         // Consolidated Moments — COPY_SRC needed for checkpoint readback
         let moments_w_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -445,15 +448,14 @@ impl GpuLmHeadTrainer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let probs_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("LM Probs Temp"),
-            size: (safe_ctx * config.num_samples * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let rms_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("LM RMS"),
-            size: (safe_ctx * 4) as u64,
+        let scratch_floats = (safe_ctx * config.num_samples)
+            + safe_ctx
+            + (safe_ctx * config.d_r)
+            + safe_ctx
+            + (safe_ctx * config.d_r);
+        let lm_scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("LM Scratch"),
+            size: (scratch_floats * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -463,12 +465,6 @@ impl GpuLmHeadTrainer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let dl_dh_rms_red_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("LM dL/dh RMS Reduce"),
-            size: (safe_ctx * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let sampled_indices_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM Sampled Indices"),
             size: (config.num_samples * 4) as u64,
@@ -476,9 +472,9 @@ impl GpuLmHeadTrainer {
             mapped_at_creation: false,
         });
         let s_h_rms_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("LM Head S_h_rms"),
-            size: (safe_ctx * config.d_r * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            label: Some("LM s_h_rms"),
+            size: (safe_ctx * d_r * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
@@ -537,7 +533,7 @@ impl GpuLmHeadTrainer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: probs_buf.as_entire_binding(),
+                    resource: lm_scratch_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
@@ -563,10 +559,6 @@ impl GpuLmHeadTrainer {
                     binding: 15,
                     resource: s_h_rms_buf.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: dl_dh_rms_red_buf.as_entire_binding(),
-                },
             ],
         });
 
@@ -577,8 +569,8 @@ impl GpuLmHeadTrainer {
             w_buf,
             b_buf,
             dl_dh_buf,
-            _dl_dh_rms_red_buf: dl_dh_rms_red_buf,
             loss_buf,
+            rms_buf,
             g_buf,
             moments_w_buf,
             moments_b_buf,
@@ -587,19 +579,32 @@ impl GpuLmHeadTrainer {
             target_indices_buf,
             dl_dh_temp_buf,
             sampled_indices_buf,
+            s_h_rms_buf,
             dl_staging_buf,
             loss_staging_buf,
             probs_pipeline,
+            probs_bgl: bgl_probs,
             probs_bg,
             update_pipeline,
             backprop_pipeline,
-            backprop_rms_reduce_pipeline,
-            backprop_rms_apply_pipeline,
-            backprop_reduce_pipeline,
-            _ternary_pipeline: ternary_pipeline,
-            _s_h_rms_buf: s_h_rms_buf,
+            lm_scratch_buf,
+            fused_b19: std::env::var("AIDEEN_LM_FUSED_B19")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(false),
+            cfg_lm_debug: std::env::var("AIDEEN_LM_DEBUG")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(false),
             last_sampled_indices: Vec::new(),
             last_num_samples: 0,
+            sampled_indices_reuse: Vec::new(),
         }
     }
 
@@ -632,44 +637,43 @@ impl GpuLmHeadTrainer {
             // println!("Warning: h_pooled dimension mismatch (expected {}, got {})", d_r * seq_len, h_pooled.len());
         }
 
-        // Sampled Softmax: targets + random negatives — zero allocs
+        // Sampled Softmax: targets + random negatives — reuse buffer to avoid heap alloc per step.
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
-        let mut sampled_indices = Vec::with_capacity(max_samples);
-        sampled_indices.extend_from_slice(targets);
-        if sampled_indices.len() > max_samples {
-            sampled_indices.truncate(max_samples);
-        } else {
-            let needed = max_samples - sampled_indices.len();
-            for _ in 0..needed {
-                use rand::Rng;
-                sampled_indices.push(rng.gen_range(0..self.vocab_size as u32));
-            }
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse
+            .reserve(max_samples + targets.len());
+        self.sampled_indices_reuse.extend_from_slice(targets);
+        self.sampled_indices_reuse.truncate(max_samples);
+        let needed = max_samples.saturating_sub(self.sampled_indices_reuse.len());
+        for _ in 0..needed {
+            use rand::Rng;
+            self.sampled_indices_reuse
+                .push(rng.gen_range(0..self.vocab_size as u32));
         }
-        sampled_indices.sort_unstable();
-        sampled_indices.dedup();
-        // Final guard to ensure we don't exceed the buffer if dedup didn't shrink it enough
-        if sampled_indices.len() > max_samples {
-            sampled_indices.truncate(max_samples);
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
+        self.sampled_indices_reuse.truncate(max_samples);
+        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        assert!(actual_num_samples <= 512, "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512");
+        if self.cfg_lm_debug {
+            let tgt0 = targets.get(0).copied().unwrap_or(0);
+            eprintln!(
+                "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
+                seq_len, actual_num_samples, tgt0
+            );
         }
-        let actual_num_samples = sampled_indices.len() as u32;
-        assert!(
-            actual_num_samples <= 512,
-            "num_samples ({actual_num_samples}) exceeds lm_train.wgsl shared memory limit of 512"
+        std::mem::swap(
+            &mut self.sampled_indices_reuse,
+            &mut self.last_sampled_indices,
         );
-        self.last_sampled_indices = sampled_indices.clone();
         self.last_num_samples = actual_num_samples;
+        let sampled_indices = &self.last_sampled_indices;
 
-        let lm_batch_cap = std::env::var("AIDEEN_BATCH_SIZE")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
-        if seq_len > self.config.ctx_len * lm_batch_cap {
+        if seq_len > self.config.ctx_len {
             return Err(format!(
                 "seq_len {} exceeds architectural limit of {}",
-                seq_len,
-                self.config.ctx_len * lm_batch_cap
+                seq_len, self.config.ctx_len
             ));
         }
 
@@ -711,6 +715,7 @@ impl GpuLmHeadTrainer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("LM Train Encoder"),
         });
+        encoder.clear_buffer(&self.loss_buf, 0, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Probs Pass"),
@@ -720,55 +725,52 @@ impl GpuLmHeadTrainer {
             pass.set_bind_group(0, &self.probs_bg, &[]);
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Update Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.update_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            let v_parts = (actual_num_samples + 15) / 16;
-            let d_parts = (d_r as u32 + 15) / 16;
-            pass.dispatch_workgroups(d_parts, v_parts, 1);
+        let t_parts = seq_len as u32;
+        if self.fused_b19 {
+            // Fused path: use the same update kernel as non-fused to guarantee
+            // numerical equivalence (avoids drift seen with lm_dw_accum_main).
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Update Pass (fused)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.update_pipeline);
+                pass.set_bind_group(0, &self.probs_bg, &[]);
+                let v_parts = (actual_num_samples + 15) / 16;
+                let d_parts = (d_r as u32 + 15) / 16;
+                pass.dispatch_workgroups(d_parts, v_parts, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Backprop T Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backprop_pipeline);
+                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.dispatch_workgroups(t_parts, 1, 1);
+            }
+        } else {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Update Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.update_pipeline);
+                pass.set_bind_group(0, &self.probs_bg, &[]);
+                let v_parts = (actual_num_samples + 15) / 16;
+                let d_parts = (d_r as u32 + 15) / 16;
+                pass.dispatch_workgroups(d_parts, v_parts, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Backprop T Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backprop_pipeline);
+                pass.set_bind_group(0, &self.probs_bg, &[]);
+                pass.dispatch_workgroups(t_parts, 1, 1);
+            }
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop T Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, d_r as u32, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop RMS Reduce Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_rms_reduce_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop RMS Apply Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_rms_apply_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, d_r as u32, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop Reduce Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_reduce_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            let d_parts = (d_r as u32 + 255) / 256;
-            pass.dispatch_workgroups(d_parts, 1, 1);
-        }
-
         // Ternary project is now fused into update_pipeline
 
         encoder.copy_buffer_to_buffer(
@@ -788,12 +790,16 @@ impl GpuLmHeadTrainer {
         loss_slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback path: block until mapped dl/loss are ready.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
             let dl = bytemuck::cast_slice(&dl_slice.get_mapped_range()).to_vec();
             let loss_int = bytemuck::cast_slice::<u8, i32>(&loss_slice.get_mapped_range())[0];
             let loss = loss_int as f32 / 10000.0;
+            if self.cfg_lm_debug {
+                eprintln!("    [LM-DEBUG] loss_int={}", loss_int);
+            }
             self.dl_staging_buf.unmap();
             self.loss_staging_buf.unmap();
             Ok((loss, dl))
@@ -822,24 +828,38 @@ impl GpuLmHeadTrainer {
 
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
-        let mut sampled_indices = Vec::with_capacity(max_samples + targets.len());
-        sampled_indices.extend_from_slice(targets);
+        // Reuse pre-allocated buffer to avoid heap allocation per training step.
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse
+            .reserve(max_samples + targets.len());
+        self.sampled_indices_reuse.extend_from_slice(targets);
         let needed = max_samples.saturating_sub(targets.len());
         for _ in 0..needed {
             use rand::Rng;
-            sampled_indices.push(rng.gen_range(0..self.vocab_size as u32));
+            self.sampled_indices_reuse
+                .push(rng.gen_range(0..self.vocab_size as u32));
         }
-        sampled_indices.sort_unstable();
-        sampled_indices.dedup();
-        // Truncar a max_samples para no desbordar sampled_indices_buf.
-        sampled_indices.truncate(max_samples);
-        let actual_num_samples = sampled_indices.len() as u32;
-        assert!(
-            actual_num_samples <= 512,
-            "num_samples ({actual_num_samples}) exceeds lm_train.wgsl shared memory limit of 512"
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
+        // Truncate to max_samples to avoid overflowing sampled_indices_buf.
+        self.sampled_indices_reuse.truncate(max_samples);
+        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        assert!(actual_num_samples <= 512, "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512");
+        if self.cfg_lm_debug {
+            let tgt0 = targets.get(0).copied().unwrap_or(0);
+            eprintln!(
+                "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
+                seq_len, actual_num_samples, tgt0
+            );
+        }
+        // Swap buffers: sampled_indices_reuse ↔ last_sampled_indices (no copy, just pointer swap).
+        std::mem::swap(
+            &mut self.sampled_indices_reuse,
+            &mut self.last_sampled_indices,
         );
-        self.last_sampled_indices = sampled_indices.clone();
         self.last_num_samples = actual_num_samples;
+        // Use last_sampled_indices for the rest of this call.
+        let sampled_indices = &self.last_sampled_indices;
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -860,7 +880,7 @@ impl GpuLmHeadTrainer {
         queue.write_buffer(
             &self.sampled_indices_buf,
             0,
-            bytemuck::cast_slice(&sampled_indices),
+            bytemuck::cast_slice(sampled_indices),
         );
         if upload_weights {
             queue.write_buffer(&self.w_buf, 0, bytemuck::cast_slice(w_cpu));
@@ -879,66 +899,68 @@ impl GpuLmHeadTrainer {
             label: Some("LM Train Encoder (buffer input)"),
         });
 
-        let copy_size = (self.config.d_r * seq_len * 4) as u64;
-        encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+        let probs_bg = if h_offset == 0 {
+            self.make_probs_bg_for_h(device, h_src)
+        } else {
+            let copy_size = (self.config.d_r * seq_len * 4) as u64;
+            encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+            self.make_probs_bg_for_h(device, &self.h_buf)
+        };
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("LM Probs Pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.probs_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.set_bind_group(0, &probs_bg, &[]);
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Update Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.update_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            let v_parts = (actual_num_samples + 15) / 16;
-            let d_parts = (self.config.d_r as u32 + 15) / 16;
-            pass.dispatch_workgroups(d_parts, v_parts, 1);
+        let t_parts = seq_len as u32;
+        if self.fused_b19 {
+            // Fused path: use the same update kernel as non-fused to guarantee
+            // numerical equivalence (avoids drift seen with lm_dw_accum_main).
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Update Pass (fused, buffer input)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.update_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                let v_parts = (actual_num_samples + 15) / 16;
+                let d_parts = (self.config.d_r as u32 + 15) / 16;
+                pass.dispatch_workgroups(d_parts, v_parts, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Backprop T Pass (buffer input)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backprop_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                pass.dispatch_workgroups(t_parts, 1, 1);
+            }
+        } else {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Update Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.update_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                let v_parts = (actual_num_samples + 15) / 16;
+                let d_parts = (self.config.d_r as u32 + 15) / 16;
+                pass.dispatch_workgroups(d_parts, v_parts, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Backprop T Pass (buffer input)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backprop_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                pass.dispatch_workgroups(t_parts, 1, 1);
+            }
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop T Pass (buffer input)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop RMS Reduce Pass (buffer input)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_rms_reduce_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop RMS Apply Pass (buffer input)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_rms_apply_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop Reduce Pass (buffer input)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_reduce_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            let d_parts = (self.config.d_r as u32 + 255) / 256;
-            pass.dispatch_workgroups(d_parts, 1, 1);
-        }
-
         // Ternary project is now fused into update_pipeline
 
         encoder.copy_buffer_to_buffer(
@@ -958,6 +980,7 @@ impl GpuLmHeadTrainer {
         loss_slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback path: block until mapped dl/loss are ready.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -972,8 +995,8 @@ impl GpuLmHeadTrainer {
         }
     }
 
-    /// Executes LM Head training without reading results back to the CPU.
-    /// Ideal for chaining with DEQ backpropagation on the GPU.
+    /// Runs the LM Head training step without reading results back to the CPU.
+    /// Ideal for chaining with DEQ back-propagation on the GPU.
     pub fn train_step_no_readback(
         &mut self,
         device: &wgpu::Device,
@@ -990,24 +1013,37 @@ impl GpuLmHeadTrainer {
 
         let max_samples = self.config.num_samples;
         let mut rng = rand::thread_rng();
-        let mut sampled_indices = Vec::with_capacity(max_samples + targets.len());
-        sampled_indices.extend_from_slice(targets);
+        // Reuse pre-allocated buffer to avoid heap allocation per training step.
+        self.sampled_indices_reuse.clear();
+        self.sampled_indices_reuse
+            .reserve(max_samples + targets.len());
+        self.sampled_indices_reuse.extend_from_slice(targets);
         let needed = max_samples.saturating_sub(targets.len());
         for _ in 0..needed {
             use rand::Rng;
-            sampled_indices.push(rng.gen_range(0..self.vocab_size as u32));
+            self.sampled_indices_reuse
+                .push(rng.gen_range(0..self.vocab_size as u32));
         }
-        sampled_indices.sort_unstable();
-        sampled_indices.dedup();
-        // Truncar a max_samples para no desbordar sampled_indices_buf
-        sampled_indices.truncate(max_samples);
-        let actual_num_samples = sampled_indices.len() as u32;
-        assert!(
-            actual_num_samples <= 512,
-            "num_samples ({actual_num_samples}) exceeds lm_train.wgsl shared memory limit of 512"
+        self.sampled_indices_reuse.sort_unstable();
+        self.sampled_indices_reuse.dedup();
+        self.sampled_indices_reuse.truncate(max_samples);
+        let actual_num_samples = self.sampled_indices_reuse.len() as u32;
+        assert!(actual_num_samples <= 512, "actual_num_samples ({actual_num_samples}) exceeds GPU workgroup limit of 512");
+        if self.cfg_lm_debug {
+            let tgt0 = targets.get(0).copied().unwrap_or(0);
+            eprintln!(
+                "    [LM-DEBUG] seq_len={} num_samples={} target0={}",
+                seq_len, actual_num_samples, tgt0
+            );
+        }
+        // Swap buffers: sampled_indices_reuse ↔ last_sampled_indices (no copy, just pointer swap).
+        std::mem::swap(
+            &mut self.sampled_indices_reuse,
+            &mut self.last_sampled_indices,
         );
-        self.last_sampled_indices = sampled_indices.clone();
         self.last_num_samples = actual_num_samples;
+        // Use last_sampled_indices for the rest of this call.
+        let sampled_indices = &self.last_sampled_indices;
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -1035,8 +1071,13 @@ impl GpuLmHeadTrainer {
             label: Some("LM Train Encoder (NO READBACK)"),
         });
 
-        let copy_size = (self.config.d_r * seq_len * 4) as u64;
-        encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+        let probs_bg = if h_offset == 0 {
+            self.make_probs_bg_for_h(device, h_src)
+        } else {
+            let copy_size = (self.config.d_r * seq_len * 4) as u64;
+            encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
+            self.make_probs_bg_for_h(device, &self.h_buf)
+        };
         encoder.clear_buffer(&self.loss_buf, 0, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1044,58 +1085,55 @@ impl GpuLmHeadTrainer {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.probs_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
+            pass.set_bind_group(0, &probs_bg, &[]);
             pass.dispatch_workgroups(seq_len as u32, 1, 1);
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Update Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.update_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            let v_parts = (actual_num_samples + 15) / 16;
-            let d_parts = (self.config.d_r as u32 + 15) / 16;
-            pass.dispatch_workgroups(d_parts, v_parts, 1);
+        let t_parts = seq_len as u32;
+        if self.fused_b19 {
+            // Fused path: use the same update kernel as non-fused to guarantee
+            // numerical equivalence (avoids drift seen with lm_dw_accum_main).
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Update Pass (fused, no readback)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.update_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                let v_parts = (actual_num_samples + 15) / 16;
+                let d_parts = (self.config.d_r as u32 + 15) / 16;
+                pass.dispatch_workgroups(d_parts, v_parts, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Backprop T Pass (NO READBACK)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backprop_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                pass.dispatch_workgroups(t_parts, 1, 1);
+            }
+        } else {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Update Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.update_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                let v_parts = (actual_num_samples + 15) / 16;
+                let d_parts = (self.config.d_r as u32 + 15) / 16;
+                pass.dispatch_workgroups(d_parts, v_parts, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("LM Backprop T Pass (NO READBACK)"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backprop_pipeline);
+                pass.set_bind_group(0, &probs_bg, &[]);
+                pass.dispatch_workgroups(t_parts, 1, 1);
+            }
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop T Pass (NO READBACK)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop RMS Reduce Pass (NO READBACK)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_rms_reduce_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop RMS Apply Pass (NO READBACK)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_rms_apply_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            pass.dispatch_workgroups(seq_len as u32, self.config.d_r as u32, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("LM Backprop Reduce Pass (NO READBACK)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.backprop_reduce_pipeline);
-            pass.set_bind_group(0, &self.probs_bg, &[]);
-            let d_parts = (self.config.d_r as u32 + 255) / 256;
-            pass.dispatch_workgroups(d_parts, 1, 1);
-        }
-
         // Ternary project is now fused into update_pipeline
 
         // Always copy loss to staging so read_cached_loss() can retrieve it later.
@@ -1106,12 +1144,13 @@ impl GpuLmHeadTrainer {
             return Ok(0.0); // Don't block — caller reads loss via read_cached_loss()
         }
 
-        // Leer pérdida (solo si se solicita)
+        // Read back the loss (only if requested)
         let slice = self.loss_staging_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        // Immediate CPU readback path: caller consumes the mapped loss now.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1133,7 +1172,9 @@ impl GpuLmHeadTrainer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        device.poll(wgpu::Maintain::Wait); // <--- CAMBIADO de Poll a Wait para evitar Deadlock
+        // Use Wait to ensure we can unmap before the next submission.
+        // Immediate CPU readback path: caller consumes the mapped loss now.
+        device.poll(wgpu::Maintain::Wait);
         if let Ok(Ok(())) = rx.recv() {
             let data = slice.get_mapped_range();
             let loss_int = i32::from_le_bytes(data[0..4].try_into().unwrap());
@@ -1171,6 +1212,7 @@ impl GpuLmHeadTrainer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1208,6 +1250,7 @@ impl GpuLmHeadTrainer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
 
         if let Ok(Ok(())) = rx.recv() {
@@ -1265,6 +1308,7 @@ impl GpuLmHeadTrainer {
         g_slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
         if let Ok(Ok(())) = rx.recv() {
             let w = bytemuck::cast_slice(&w_slice.get_mapped_range()).to_vec();
@@ -1279,9 +1323,9 @@ impl GpuLmHeadTrainer {
         }
     }
 
-    /// Reads Adam moments (m, v) from the GPU for checkpoint.
-    /// Returns (m_w, v_w, m_b, v_b, m_g, v_g) -- all as Vec<f32>.
-    /// The GPU format is interleaved float2: [m0, v0, m1, v1, ...].
+    /// Reads Adam moments (m, v) from the GPU for checkpointing.
+    /// Returns (m_w, v_w, m_b, v_b, m_g, v_g) — all as Vec<f32>.
+    /// GPU format is interleaved float2: [m0, v0, m1, v1, ...].
     pub fn read_moments(
         &self,
         device: &wgpu::Device,
@@ -1327,6 +1371,7 @@ impl GpuLmHeadTrainer {
         mg_sl.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Immediate CPU readback helper.
         device.poll(wgpu::Maintain::Wait);
 
         if rx.recv().ok().and_then(|r| r.ok()).is_none() {
@@ -1385,7 +1430,7 @@ impl GpuLmHeadTrainer {
     }
 
     /// Uploads w, b, g to the GPU without dispatching any kernel.
-    /// Use to initialize weights the first time before `train_step_no_readback`.
+    /// Use to initialise weights before the first `train_step_no_readback`.
     pub fn upload_weights_only(
         &self,
         queue: &wgpu::Queue,
