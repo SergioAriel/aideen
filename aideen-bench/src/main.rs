@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025-2026 Juan Marchetto & Sergio Solis
+// Copyright (c) 2025-2026 Sergio Ariel Solis and Juan Patricio Marchetto
 
 //! bench_harness — AIDEEN (DEQ+SSM) vs Transformer: benchmark defensible.
 //!
