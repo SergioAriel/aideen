@@ -923,8 +923,8 @@ impl Reasoning for MambaSlotReasoning {
             let h_slot = h.slot(k);
             let attn_k = h_attn.slot(k);
 
-            // v14: En el loop DEQ, solo combinamos atención e inyección de contexto.
-            // La conexión residual interna ha sido purgada para forzar p(J)<1.
+            // v14: In the DEQ loop, we only combine attention and context injection.
+            // The internal residual connection has been purged to enforce p(J)<1.
             let combined = attn_k + &input_signal;
             let slot_bias = self.slot_anchor.row(k).transpose().into_owned();
             let f_h = self.rms_norm(&(combined + slot_bias));

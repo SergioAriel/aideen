@@ -147,7 +147,7 @@ impl BlockBackend for WgpuBlockBackend {
                 })
         };
 
-        // Output buffer: read_write + MAP_READ para poder leer el resultado
+        // Output buffer: read_write + MAP_READ so we can read the result
         let out_size = (d as usize * std::mem::size_of::<f32>()) as u64;
         let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -218,15 +218,15 @@ impl BlockBackend for WgpuBlockBackend {
             });
             pass.set_pipeline(&self.bridge.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            // workgroup_size(256,1,1), 1 token → 1 workgroup en X, d_model workgroups en Y
+            // workgroup_size(256,1,1), 1 token → 1 workgroup in X, d_model workgroups in Y
             pass.dispatch_workgroups(1, d, 1);
         }
 
-        // Copiar resultado a readback buffer
+        // Copy result to readback buffer
         encoder.copy_buffer_to_buffer(&out_buf, 0, &readback_buf, 0, out_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Readback síncrono usando pollster
+        // Synchronous readback using pollster
         let result = pollster::block_on(async {
             let (sender, receiver) = futures::channel::oneshot::channel();
             readback_buf

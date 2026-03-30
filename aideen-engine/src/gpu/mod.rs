@@ -192,7 +192,7 @@ impl ComputeBackend for WgpuBackend {
             cpass.dispatch_workgroups(wg_count, 1, 1);
         }
 
-        // Leer resultado
+        // Read result
         let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging_buffer"),
             size: out_size,

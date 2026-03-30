@@ -79,15 +79,15 @@ impl PeerRegistry {
     // ── Privados ──────────────────────────────────────────────────────────────
 
     fn insert(&mut self, mut p: PeerEntry) {
-        // C: normalizar domains a lowercase al ingresar (evita fragmentación "Math" vs "math")
+        // C: normalize domains to lowercase on insert (avoids fragmentation "Math" vs "math")
         p.domains = p.domains.iter().map(|d| d.to_lowercase()).collect();
 
-        // Limpiar dominios anteriores si el entry ya existía (upsert)
+        // Clean previous domains if the entry already existed (upsert)
         if let Some(old) = self.by_id.get(&p.node_id) {
             for d in &old.domains {
                 if let Some(set) = self.by_domain.get_mut(d) {
                     set.remove(&p.node_id);
-                    // B: limpiar keys vacíos para no ensuciar memoria
+                    // B: clean empty keys to avoid polluting memory
                     if set.is_empty() {
                         self.by_domain.remove(d);
                     }

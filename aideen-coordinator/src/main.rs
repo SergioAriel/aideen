@@ -1,11 +1,11 @@
 /// AIDEEN Coordinator — router + logger MVP.
 ///
 /// Per-connection state:
-///   Waiting → HelloReceived → Delegated → (puede recibir Discovery / recibir Update)
+///   Waiting → HelloReceived → Delegated → (can receive Discovery / receive Update)
 ///
 /// Zero-Trust:
-///   - Discovery recibido antes de Delegated → responde Error { code: 403 }
-///   - Todos los mensajes fuera de secuencia → Error { code: 400 }
+///   - Discovery received before Delegated → responds Error { code: 403 }
+///   - All out-of-sequence messages → Error { code: 400 }
 ///
 /// Framing identical to QuicChannel: u32 LE (length) + bincode(NetMsg).
 use aideen_core::protocol::{AckKind, KeyDelegation, NetMsg, ParamId, QuantizedDelta};
@@ -15,7 +15,6 @@ use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 
 // ── Framing (identical to QuicChannel) ─────────────────────────────────────
 
@@ -70,7 +69,7 @@ fn configure_server() -> (ServerConfig, Vec<u8>) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== AIDEEN Coordinator v1 (router + logger) ===");
 
-    // Llaves
+    // Keys
     let (root_sk, _root_pk) = generate_master_keys();
     let (critic_sk, critic_pk) = generate_master_keys();
 
@@ -119,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("[coord] client: {}", conn.remote_address());
 
-            // Dos uni streams: uno para recibir (client→coord), uno para enviar (coord→client)
+            // Two uni streams: one for receiving (client→coord), one for sending (coord→client)
             let (tx, rx) = tokio::join!(conn.open_uni(), conn.accept_uni());
             let mut tx = match tx {
                 Ok(s) => s,
@@ -175,7 +174,7 @@ async fn handle_session(
                     bundle_version
                 );
                 state = SessionState::HelloReceived { node_id };
-                // Enviar Delegation
+                // Send Delegation
                 send_msg(tx, delegation).await?;
             }
 
@@ -191,7 +190,7 @@ async fn handle_session(
                 println!("[coord] Ack Delegation epoch={} ok={}", version, ok);
                 let nid = *node_id;
                 state = SessionState::Delegated { node_id: nid };
-                // Enviar Update demo
+                // Send demo Update
                 send_msg(tx, update).await?;
             }
 
@@ -267,7 +266,7 @@ async fn handle_session(
                     tx,
                     &NetMsg::Error {
                         code: 400,
-                        msg: format!("unexpected message in current state"),
+                        msg: "unexpected message in current state".to_string(),
                     },
                 )
                 .await?;

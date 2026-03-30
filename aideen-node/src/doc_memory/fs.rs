@@ -42,15 +42,15 @@ struct DocRecord {
 pub struct FsDocMemory {
     dir: PathBuf,
     manifest: Vec<DocRecord>,
-    // Índice invertido global en memoria: token → [(doc_id, chunk_id, tf)]
+    // Global inverted index in memory: token → [(doc_id, chunk_id, tf)]
     inverted: HashMap<String, Vec<(DocId, ChunkId, u32)>>,
     next_doc_id: DocId,
-    chunk_size: usize, // bytes por chunk
-    overlap: usize,    // bytes de solapamiento entre chunks
+    chunk_size: usize, // bytes per chunk
+    overlap: usize,    // overlap bytes between chunks
 }
 
 impl FsDocMemory {
-    /// Abre o crea el store en `<base_dir>/<agent_id>/docs/`.
+    /// Opens or creates the store at `<base_dir>/<agent_id>/docs/`.
     /// Reconstructs the global index from disk at startup.
     pub fn open(base_dir: &str, agent_id: &str) -> Result<Self, String> {
         let dir = PathBuf::from(base_dir).join(agent_id).join("docs");
@@ -283,7 +283,7 @@ impl DocMemory for FsDocMemory {
             })
             .collect();
 
-        // 4) Índice local → disco + merge en índice global en memoria
+        // 4) Local index → disk + merge into global in-memory index
         let local_index = Self::build_local_index(&chunks);
         self.save_local_index(doc_id, &local_index)?;
         for (tok, posts) in local_index {

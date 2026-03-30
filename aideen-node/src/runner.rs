@@ -172,10 +172,10 @@ pub struct NodeRunner<R, C, E, M, B> {
     pub beta0: f32,
     pub beta_min: f32,
     pub beta_max: f32,
-    // 5L — dial + seguridad:
+    // 5L — dial + security:
     /// QUIC channel factory. Default: NullChannelFactory (no real dial).
     pub channel_factory: Arc<dyn ChannelFactory>,
-    /// TOFU + pinning de fingerprints TLS por peer.
+    /// TOFU + TLS fingerprint pinning per peer.
     pub trust_store: TrustStore,
     /// Circuit breakers per NodeId — exponential backoff on dial failures.
     pub peer_failures: PeerFailures,

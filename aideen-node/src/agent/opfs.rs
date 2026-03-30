@@ -115,7 +115,7 @@ async fn agent_dir(agent_id: &str) -> Result<FileSystemDirectoryHandle, String> 
 }
 
 async fn read_bytes(dir: &FileSystemDirectoryHandle, name: &str) -> Result<Vec<u8>, String> {
-    // Sin create:true → devuelve error si el archivo no existe (el caller lo trata como vacío)
+    // Without create:true → returns error if the file does not exist (caller treats it as empty)
     let fh: FileSystemFileHandle = JsFuture::from(dir.get_file_handle(name))
         .await
         .map_err(|e| format!("OPFS getFileHandle({}): {:?}", name, e))?

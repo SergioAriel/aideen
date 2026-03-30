@@ -141,7 +141,7 @@ mod tests {
         let h: DVector<f32> = DVector::from_element(4, 0.0);
         let fh: DVector<f32> = DVector::from_element(4, 1.0);
         let result = damped_update(&h, &fh, 0.5);
-        // β=0.5 → resultado = 0.5*1 + 0.5*0 = 0.5
+        // β=0.5 → result = 0.5*1 + 0.5*0 = 0.5
         assert!(
             (result[0] - 0.5).abs() < 1e-6,
             "damped_update with beta=0.5 should yield 0.5"
