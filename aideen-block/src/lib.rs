@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 Juan Marchetto & Sergio Solis
+
 pub mod async_bridge;
 pub mod deq_bridge;
 pub mod mamba;

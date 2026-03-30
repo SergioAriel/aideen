@@ -8,7 +8,7 @@ Thank you for your interest in contributing to AIDEEN.
 # Clone and build
 git clone https://github.com/SergioAriel/aideen.git
 cd aideen
-cargo build --workspace
+cargo build --release --workspace
 
 # Run tests (CPU-only crates — GPU crates require wgpu-compatible hardware)
 cargo test --workspace --exclude aideen-block --exclude aideen-engine --exclude aideen-backbone
@@ -17,12 +17,32 @@ cargo test --workspace --exclude aideen-block --exclude aideen-engine --exclude 
 cargo test --release --features wgpu -p aideen-backbone
 ```
 
-## Before Submitting a PR
+## Running Training
 
-1. Open an issue first to discuss significant changes.
-2. Ensure `cargo fmt --all` passes.
-3. Ensure `cargo clippy --workspace` has no warnings.
-4. Add tests for new functionality.
+```bash
+# Requires a wgpu-compatible GPU (Vulkan/Metal/DX12)
+cargo run --release --features wgpu -p aideen-training --bin train -- --file path/to/corpus.txt
+
+# Resume from checkpoint
+cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --resume model_large
+```
+
+See the doc comment in `aideen-training-lab/src/bin/train.rs` for all CLI flags.
+
+## How to Contribute
+
+1. Fork the repository and create a feature branch (`git checkout -b my-feature`).
+2. Open an issue first to discuss significant changes.
+3. Make your changes, following the code style below.
+4. Push your branch and open a Pull Request against `main`.
+
+Look for issues labeled [**good first issue**](https://github.com/SergioAriel/aideen/labels/good%20first%20issue) if you want a place to start.
+
+## Code Style
+
+- Format all code with `cargo fmt --all`.
+- Ensure `cargo clippy --workspace` produces no warnings.
+- Add tests for new functionality.
 
 ## Architecture
 
