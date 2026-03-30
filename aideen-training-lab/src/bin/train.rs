@@ -1,27 +1,27 @@
-//! Binary de entrenamiento de AIDEEN.
+//! AIDEEN training binary.
 //!
-//! # Notas de arquitectura para futuros LLMs que lean esto
+//! # Architecture notes for future LLMs reading this
 //!
-//! ## Cuantización (1.58b / BitNet)
-//! FASE 1: Entrenar en float32. FASE 2: reentrenar desde cero con `ternary = true` (QAT/STE).
-//! NO hacer post-training quantization — a 1.58b destruye la calidad. El STE ya está
-//! implementado en los shaders GPU (embedding_train.wgsl, lm_train.wgsl, fused_deq_update.wgsl).
+//! ## Quantization (1.58b / BitNet)
+//! PHASE 1: Train in float32. PHASE 2: retrain from scratch with `ternary = true` (QAT/STE).
+//! Do NOT use post-training quantization — at 1.58b it destroys quality. The STE is already
+//! implemented in the GPU shaders (embedding_train.wgsl, lm_train.wgsl, fused_deq_update.wgsl).
 //!
-//! ## Atención uniforme — riesgo crítico a monitorear
-//! En pesos random, `attn_ent = log(8) = 2.079` siempre (entropía máxima, slots idénticos).
-//! Para que el DEQ sea poderoso, los slots DEBEN especializarse durante el entrenamiento
-//! (attn_ent debe bajar de 2.079). Si no ocurre, los 8 slots colapsan a lo mismo y la
-//! capacidad de razonamiento paralelo se desperdicia completamente.
-//! Monitorear `attn_ent` en GPU-DEBUG. Si no baja después de ~1000 pasos reales, investigar.
+//! ## Uniform attention — critical risk to monitor
+//! With random weights, `attn_ent = log(8) = 2.079` always (maximum entropy, identical slots).
+//! For the DEQ to be powerful, the slots MUST specialize during training
+//! (attn_ent must drop below 2.079). If this doesn't happen, all 8 slots collapse to the same
+//! and parallel reasoning capacity is completely wasted.
+//! Monitor `attn_ent` in GPU-DEBUG. If it doesn't drop after ~1000 real steps, investigate.
 //!
-//! ## Modos de uso:
-//!   # Modo rápido — dataset.txt existente (pequeño, para tests)
+//! ## Usage modes:
+//!   # Fast mode — existing dataset.txt (small, for tests)
 //!   cargo run --release --features wgpu -p aideen-training --bin train
 //!
-//!   # Modo archivo grande — cualquier .txt (streaming, sin límite de RAM)
+//!   # Large file mode — any .txt (streaming, no RAM limit)
 //!   cargo run --release --features wgpu -p aideen-training --bin train -- --file path/to/corpus.txt
 //!
-//!   # Modo checkpoint — continuar desde un checkpoint previo
+//!   # Checkpoint mode — resume from a previous checkpoint
 //!   cargo run --release --features wgpu -p aideen-training --bin train -- --file corpus.txt --resume model
 
 use aideen_backbone::tokenizer::Tokenizer;
@@ -56,6 +56,7 @@ fn main() {
     let mut freeze_deq = false;
     let mut freeze_emb = false;
     let mut freeze_lm = false;
+    let mut skip_chunks: usize = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -89,6 +90,12 @@ fn main() {
             "--freeze-deq" => freeze_deq = true,
             "--freeze-emb" => freeze_emb = true,
             "--freeze-lm" => freeze_lm = true,
+            "--skip-chunks" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    skip_chunks = v.parse().unwrap_or(0);
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -96,7 +103,7 @@ fn main() {
 
     // Require explicit --file to avoid silent fallback to the tiny dataset.
     let Some(ref txt_path) = large_file else {
-        eprintln!("ERROR: falta --file <corpus.txt>. El modo fallback fue deshabilitado.");
+        eprintln!("ERROR: missing --file <corpus.txt>. Fallback mode has been disabled.");
         std::process::exit(2);
     };
     run_large_file(
@@ -108,11 +115,12 @@ fn main() {
         freeze_deq,
         freeze_emb,
         freeze_lm,
+        skip_chunks,
     );
 }
 
-/// Entrena sobre un .txt grande usando streaming (sin límite de RAM).
-/// Tokeniza el texto, lo escribe a un .bin temporal y llama train_on_file.
+/// Trains on a large .txt file using streaming (no RAM limit).
+/// Tokenizes the text, writes it to a temporary .bin and calls train_on_file.
 fn run_large_file(
     txt_path: &str,
     resume_path: Option<String>,
@@ -122,10 +130,14 @@ fn run_large_file(
     freeze_deq: bool,
     freeze_emb: bool,
     freeze_lm: bool,
+    skip_chunks: usize,
 ) {
-    println!("  Modo: archivo grande → {txt_path}");
+    println!("  Mode: large file → {txt_path}");
+    if skip_chunks > 0 {
+        println!("  Skipping first {skip_chunks} chunks (--skip-chunks)");
+    }
 
-    // ── Resolver ruta real del dataset ─────────────────────────────────────
+    // ── Resolve real dataset path ────────────────────────────────────────
     let (resolved_path, corpus) = match fs::read_to_string(txt_path) {
         Ok(c) => (txt_path.to_string(), Some(c)),
         Err(_) => {
@@ -145,20 +157,20 @@ fn run_large_file(
                     break;
                 }
             }
-            found.expect("No se puede encontrar el dataset en ninguna ruta conocida.")
+            found.expect("Cannot find the dataset in any known path.")
         }
     };
     let txt_path = resolved_path;
 
-    // ── Construir tokenizer ────────────────────────────────────────────────
+    // ── Build tokenizer ─────────────────────────────────────────────────
     let config_default = ArchitectureConfig::default();
     let tok_path = find_tokenizer_path();
     let mut tok = if let Some(ref path) = tok_path {
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
     } else {
-        let corpus = corpus.as_ref().expect("Tokenizer char-level requiere corpus en memoria.");
-        println!("  Tokenizer: Char-level — escaneando vocab...");
+        let corpus = corpus.as_ref().expect("Char-level tokenizer requires corpus in memory.");
+        println!("  Tokenizer: Char-level — scanning vocab...");
         Tokenizer::from_text(corpus, config_default.clone())
     };
 
@@ -171,7 +183,7 @@ fn run_large_file(
 
     let vocab_size = tok.vocab_size();
 
-    // ── Tokenizar y escribir .bin (o reutilizar cache) ─────────────────────
+    // ── Tokenize and write .bin (or reuse cache) ──────────────────────────
     let bin_path = format!("{txt_path}.tokens.bin");
     let txt_meta = fs::metadata(&txt_path).ok();
     let bin_meta = fs::metadata(&bin_path).ok();
@@ -186,26 +198,26 @@ fn run_large_file(
         let bin_bytes = bin_meta.unwrap().len() as usize;
         let tokens_len = bin_bytes / 4;
         println!(
-            "  Cache OK: reutilizando {bin_path} ({} tokens, vocab={})",
+            "  Cache OK: reusing {bin_path} ({} tokens, vocab={})",
             tokens_len, vocab_size
         );
     } else {
-        let corpus = corpus.as_ref().expect("Corpus en memoria requerido para tokenizar.");
-        println!("  Tokenizando {txt_path} → {bin_path} ...");
+        let corpus = corpus.as_ref().expect("Corpus in memory required for tokenization.");
+        println!("  Tokenizing {txt_path} → {bin_path} ...");
         {
             use std::io::Write;
             let tokens = tok.encode(corpus);
             let byte_data: &[u8] = bytemuck::cast_slice(&tokens);
 
-            // Asegurar que el directorio padre existe
+            // Ensure the parent directory exists
             if let Some(parent) = std::path::Path::new(&bin_path).parent() {
                 if !parent.as_os_str().is_empty() {
                     let _ = fs::create_dir_all(parent);
                 }
             }
 
-            let mut f = fs::File::create(&bin_path).expect("No se puede crear .bin");
-            f.write_all(byte_data).expect("Error escribiendo .bin");
+            let mut f = fs::File::create(&bin_path).expect("Cannot create .bin");
+            f.write_all(byte_data).expect("Error writing .bin");
             println!(
                 "  {} chars → {} tokens, vocab={} → {:.2} MB",
                 corpus.len(),
@@ -224,8 +236,8 @@ fn run_large_file(
 
     let train_seed = env_u64("AIDEEN_TRAIN_SEED");
     let mut trainer = if let Some(ref base) = resume_path {
-        println!("  Resumiendo desde checkpoint: {base}");
-        Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
+        println!("  Resuming from checkpoint: {base}");
+        Trainer::load_checkpoint(base).expect("Error loading checkpoint")
     } else {
         if let Some(seed) = train_seed {
             println!("  Init seed: {seed}");
@@ -254,14 +266,14 @@ fn run_large_file(
 
     setup_gpu(&mut trainer);
     if trainer.training_config.ternary {
-        println!("  Bit-Dieta (Ternary 1.58-bit) activo 🔥  [STE durante training]");
+        println!("  Bit-Diet (Ternary 1.58-bit) active 🔥  [STE during training]");
     }
     println!();
 
     // EOS token:
-    // En este pipeline no inyectamos un token EOS explícito en el stream de training.
-    // Usar 2 para BPE fragmentaba por un token común (p.ej. '#') y anulaba la pérdida.
-    // 0 desactiva el split por EOS en train_on_file.
+    // In this pipeline we do not inject an explicit EOS token into the training stream.
+    // Using 2 for BPE was splitting on a common token (e.g. '#') and canceling the loss.
+    // 0 disables the EOS split in train_on_file.
     let eos_token: u32 = 0;
 
     let t0 = std::time::Instant::now();
@@ -273,14 +285,15 @@ fn run_large_file(
             eos_token,
             save_every,
             checkpoint_base,
+            skip_chunks,
         )
-        .expect("Error durante train_on_file");
+        .expect("Error during train_on_file");
 
-    println!("\n  Tiempo total: {:.1}s", t0.elapsed().as_secs_f32());
+    println!("\n  Total time: {:.1}s", t0.elapsed().as_secs_f32());
     println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());
 
     if save_every == 0 {
-        println!("  [Skip] save/generate desactivado (save_every=0)");
+        println!("  [Skip] save/generate disabled (save_every=0)");
         return;
     }
     save_and_generate(&mut trainer, checkpoint_base);
@@ -313,17 +326,17 @@ fn save_and_generate(trainer: &mut Trainer, base: &str) {
                 aidn_size as f64 / 1_048_576.0
             );
         }
-        Err(e) => println!("  Error guardando checkpoint: {e}"),
+        Err(e) => println!("  Error saving checkpoint: {e}"),
     }
 
     println!();
-    println!("── Generación ──────────────────────────────────");
+    println!("── Generation ──────────────────────────────────");
     let prompts = [
-        "la inteligencia artificial",
-        "cada neurona",
-        "aideen es una red",
-        "el equilibrio profundo",
-        "la red neuronal distribuida",
+        "artificial intelligence",
+        "each neuron",
+        "aideen is a network",
+        "deep equilibrium",
+        "the distributed neural network",
     ];
     for prompt in &prompts {
         let generated = trainer.generate(prompt, 40, 0.8, 0.9, 40, 1.1);
@@ -332,5 +345,5 @@ fn save_and_generate(trainer: &mut Trainer, base: &str) {
     }
 
     println!();
-    println!("✅ AIDEEN training completo.");
+    println!("✅ AIDEEN training complete.");
 }

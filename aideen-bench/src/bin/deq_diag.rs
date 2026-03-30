@@ -137,7 +137,7 @@ fn test_forward_parity(cfg: &ArchitectureConfig, tokens: &[u32]) -> TestResult {
         return TestResult {
             name: "forward_parity_cpu_vs_gpu",
             status: "SKIP",
-            detail: "gpu_deq=None (no backend disponible)".to_string(),
+            detail: "gpu_deq=None (no backend available)".to_string(),
         };
     }
 
@@ -214,7 +214,7 @@ fn tiny_overfit_run(
     let ctx = seq;
     let tgt = *targets.last().unwrap_or(&0);
 
-    // Loss forward-only sin actualizar.
+    // Forward-only loss without updating.
     let (f_deq, f_emb, f_lm) = (trainer.frozen_deq, trainer.frozen_emb, trainer.frozen_lm);
     trainer.frozen_deq = true;
     trainer.frozen_emb = true;
@@ -237,7 +237,7 @@ fn tiny_overfit_run(
     trainer.frozen_emb = f_emb;
     trainer.frozen_lm = f_lm;
 
-    let _ = eps; // mantenemos firma estable para no romper llamadas.
+    let _ = eps; // keep stable signature so as not to break callers.
     (l0, l1)
 }
 
