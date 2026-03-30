@@ -271,10 +271,10 @@ enum Budget {
     Time(Duration),
 }
 
-// ── Loop de entrenamiento compartido ─────────────────────────────────────────
+// ── Shared training loop ────────────────────────────────────────────────────
 //
-// Ambos modelos reciben los mismos batches en el mismo orden.
-// El tiempo de eval se excluye del secs_train de cada modelo.
+// Both models receive the same batches in the same order.
+// Eval time is excluded from secs_train for each model.
 
 fn train_loop(
     eval_every: usize,
@@ -794,8 +794,40 @@ fn run_single_seed(
         Backend::Gpu => CandleBackend::Metal,
     };
 
-    // EXP 1: iso-data
+    // ── Spectral warm-up phase (DEQ only) ─────────────────────────────────
+    // DEQ requires spectral pre-conditioning before convergence.
+    // Warm-up is NOT counted in the iso-data comparison.
+    let warmup_steps: usize = std::env::var("AIDEEN_BENCH_WARMUP_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let mut aideen1 = build_aideen(vocab_size, ds.vocab.clone(), seed, ai_backend);
+    if warmup_steps > 0 {
+        println!(
+            "  [WARM-UP] DEQ spectral conditioning: {warmup_steps} steps (not counted in comparison)"
+        );
+        let mut rng_wu = StdRng::seed_from_u64(seed ^ 0x0A41_0000);
+        for step in 0..warmup_steps {
+            let start = rng_wu.gen_range(0..ds.train.len().saturating_sub(CTX_LEN + 1));
+            let tokens_in = &ds.train[start..start + CTX_LEN];
+            let targets = &ds.train[start + 1..start + CTX_LEN + 1];
+            let _loss =
+                aideen1.train_sequence(tokens_in, targets, true, aideen1.config.deq_epsilon);
+            if step % 200 == 0 {
+                if let Some(ref gpu) = aideen1.gpu_deq {
+                    let fw = gpu.read_debug_buffer();
+                    let contr = if fw.len() > 21 { fw[21] } else { 0.0 };
+                    let iters = if fw.len() > 13 { fw[13] } else { 0.0 };
+                    println!(
+                        "    [WARM-UP] step {step}: contractivity={contr:.3}, avg_iters={iters:.1}"
+                    );
+                }
+            }
+        }
+        println!("  [WARM-UP] Complete. DEQ pre-conditioned for benchmark.");
+    }
+
+    // EXP 1: iso-data
     let mut tf1 =
         CandleTransformer::new(cfg_tf.clone(), LR as f64, tf_cb).expect("tf candle init exp1");
     let mut ai1 = ModelRun::new("AIDEEN", aideen_params(vocab_size));

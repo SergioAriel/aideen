@@ -115,17 +115,17 @@ impl Adam {
 
 impl Adam {
     // ─────────────────────────────────────────────────────────────────────
-    // Checkpointing — serialización binaria sin dependencias extra
+    // Checkpointing — binary serialization without extra dependencies
     //
-    // Formato del archivo .opt:
+    // File format (.opt):
     //   [0..8]   magic "AIDENOPT"
     //   [8..16]  step count (u64 LE)
-    //   luego N entradas:
-    //     [u32 LE] longitud del key en bytes
+    //   then N entries:
+    //     [u32 LE] key length in bytes
     //     [u8 * key_len] key UTF-8
-    //     [u8]  tipo: 0 = vec (DVector/DMatrix aplanado), 1 = mat
-    //     [u32 LE] número de elementos f32
-    //     [f32 * n LE] datos
+    //     [u8]  type: 0 = vec (DVector/DMatrix flattened), 1 = mat
+    //     [u32 LE] number of f32 elements
+    //     [f32 * n LE] data
     // ─────────────────────────────────────────────────────────────────────
 
     pub fn save_state(&self, path: &str) -> Result<(), String> {

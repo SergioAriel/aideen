@@ -2,7 +2,7 @@ use aideen_core::agent::{AgentEvent, AgentStore, InMemoryAgentStore, NullAgentSt
 
 // ── Test 1 ────────────────────────────────────────────────────────────────
 
-/// NullAgentStore.get_pref siempre devuelve None.
+/// NullAgentStore.get_pref always returns None.
 #[test]
 fn test_null_store_get_returns_none() {
     let store = NullAgentStore;
@@ -12,7 +12,7 @@ fn test_null_store_get_returns_none() {
 
 // ── Test 2 ────────────────────────────────────────────────────────────────
 
-/// AgentEvent::TickAttractor sobrevive un round-trip bincode.
+/// AgentEvent::TickAttractor survives a bincode round-trip.
 #[test]
 fn test_agent_event_serializes_bincode() {
     let event = AgentEvent::TickAttractor {
@@ -23,14 +23,14 @@ fn test_agent_event_serializes_bincode() {
         unix_ts: 1_700_000_000,
     };
 
-    let bytes = bincode::serialize(&event).expect("serialización debe funcionar");
-    let decoded: AgentEvent = bincode::deserialize(&bytes).expect("deserialización debe funcionar");
+    let bytes = bincode::serialize(&event).expect("serialization must succeed");
+    let decoded: AgentEvent = bincode::deserialize(&bytes).expect("deserialization must succeed");
     assert_eq!(event, decoded);
 }
 
 // ── Test 3 ────────────────────────────────────────────────────────────────
 
-/// NullAgentStore.recent_events siempre devuelve [].
+/// NullAgentStore.recent_events always returns [].
 #[test]
 fn test_null_store_recent_empty() {
     let mut store = NullAgentStore;
@@ -56,7 +56,7 @@ fn test_in_memory_pref_round_trip() {
 
 // ── Test 5 ────────────────────────────────────────────────────────────────
 
-/// InMemoryAgentStore: append_event + recent_events en orden inverso.
+/// InMemoryAgentStore: append_event + recent_events in reverse order.
 #[test]
 fn test_in_memory_events_recent_order() {
     let mut store = InMemoryAgentStore::new();

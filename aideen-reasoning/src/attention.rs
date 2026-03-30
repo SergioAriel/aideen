@@ -1,2 +1,2 @@
-// Placeholder para el mecanismo de atención si se requiere a nivel de Razonamiento
-// nalgebra no es ideal para multi-head attention denso, esto migrará a GPU (WGSL) en aideen-node
+// Placeholder for the attention mechanism if required at the Reasoning level
+// nalgebra is not ideal for dense multi-head attention, this will migrate to GPU (WGSL) in aideen-node

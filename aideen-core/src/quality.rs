@@ -149,7 +149,7 @@ pub fn compute_slot_diversity(h: &HSlots) -> f32 {
     }
 
     let mean_dist = total_dist / pairs as f32;
-    // Normalizamos con sigmoid para mantener el rango (0, 1)
+    // Normalize with sigmoid to keep the range (0, 1)
     1.0 / (1.0 + (-mean_dist).exp())
 }
 

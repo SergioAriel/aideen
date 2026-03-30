@@ -5,7 +5,7 @@ use aideen_node::runner::RouterStatsAccumulator;
 
 const NODE_ID: [u8; 32] = [1u8; 32];
 
-// ── Test 1: flush devuelve None antes de alcanzar flush_every ─────────────────
+// ── Test 1: flush returns None before reaching flush_every ────────────────────
 
 #[test]
 fn test_accumulator_no_flush_before_n() {
@@ -15,11 +15,11 @@ fn test_accumulator_no_flush_before_n() {
     }
     assert!(
         acc.flush(NODE_ID).is_none(),
-        "no debe flush antes de 5 ticks"
+        "must not flush before 5 ticks"
     );
 }
 
-// ── Test 2: flush devuelve Some al llegar a N y resetea ──────────────────────
+// ── Test 2: flush returns Some when reaching N and resets ────────────────────
 
 #[test]
 fn test_accumulator_flush_at_n_and_reset() {
@@ -29,7 +29,7 @@ fn test_accumulator_flush_at_n_and_reset() {
     acc.record(1.0, Some("expert_a"));
 
     let msg = acc.flush(NODE_ID);
-    assert!(msg.is_some(), "debe flush al llegar a 3 ticks");
+    assert!(msg.is_some(), "must flush when reaching 3 ticks");
 
     match msg.unwrap() {
         NetMsg::RouterStats { window_ticks, .. } => {
@@ -38,11 +38,11 @@ fn test_accumulator_flush_at_n_and_reset() {
         _ => panic!("expected RouterStats"),
     }
 
-    // Después del flush, vuelve a None
-    assert!(acc.flush(NODE_ID).is_none(), "debe resetear tras flush");
+    // After flush, goes back to None
+    assert!(acc.flush(NODE_ID).is_none(), "must reset after flush");
 }
 
-// ── Test 3: q_mean, q_min, q_max correctos ───────────────────────────────────
+// ── Test 3: q_mean, q_min, q_max correct ─────────────────────────────────────
 
 #[test]
 fn test_accumulator_q_stats() {

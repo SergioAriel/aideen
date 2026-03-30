@@ -44,19 +44,19 @@ fn test_cosine_ordering_similar_before_orthogonal() {
     let results = mem.query(&vec2(1.0, 0.0), 2);
     assert_eq!(results.len(), 2);
 
-    // El primer resultado debe ser a (más similar a (1,0))
+    // The first result must be a (most similar to (1,0))
     let first = &results[0];
     let cos_first = first.dot(&vec2(1.0, 0.0)) / first.norm();
     let cos_second = results[1].dot(&vec2(1.0, 0.0)) / results[1].norm();
     assert!(
         cos_first >= cos_second,
-        "primer resultado debe tener mayor similitud cosine que el segundo"
+        "first result must have higher cosine similarity than the second"
     );
 }
 
 // ── Test 3 ────────────────────────────────────────────────────────────────
 
-/// k > n → devuelve n resultados (no k).
+/// k > n → returns n results (not k).
 #[test]
 fn test_insert_k_clamps_to_n() {
     let mut mem = AttractorMemory::new(2);

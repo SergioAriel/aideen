@@ -225,9 +225,9 @@ impl QuicChannel {
 
 // ── FingerprintCapture ────────────────────────────────────────────────────────
 
-/// Verifier TLS custom: acepta cualquier cert y captura su fingerprint SHA-256.
+/// Custom TLS verifier: accepts any cert and captures its SHA-256 fingerprint.
 /// TOFU/pinning validation occurs after the handshake in TrustStore.
-/// verify_tls12/13_signature → assertion() — seguridad es post-handshake.
+/// verify_tls12/13_signature → assertion() — security is post-handshake.
 #[derive(Debug)]
 struct FingerprintCapture {
     fingerprint: Arc<OnceLock<[u8; 32]>>,

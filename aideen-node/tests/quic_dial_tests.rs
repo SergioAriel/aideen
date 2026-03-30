@@ -133,10 +133,10 @@ fn test_quic_channel_factory_dial_loopback() {
             let server_addr = ep.local_addr().unwrap();
             let _ = addr_tx.send(server_addr);
 
-            // Aceptar 1 conexión y hacer echo de 1 mensaje
+            // Accept 1 connection and echo 1 message
             if let Some(incoming) = ep.accept().await {
                 let conn = incoming.await.unwrap();
-                // Aceptar stream uni del cliente
+                // Accept uni stream from the client
                 let mut recv = conn.accept_uni().await.unwrap();
                 let mut len_buf = [0u8; 4];
                 recv.read_exact(&mut len_buf).await.unwrap();
