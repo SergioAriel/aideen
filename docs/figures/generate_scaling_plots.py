@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate scaling analysis plots for AIDEEN grant application.
+"""Generate scaling analysis plots for AIDEEN.
 
 Produces two figures:
   1. scaling_analysis.png   -- val_loss (smoothed) vs wall time (hours)

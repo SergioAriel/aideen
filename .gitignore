@@ -20,10 +20,18 @@ dataset.txt
 
 # Training logs and runtime artifacts
 training_logs/
-run_*.log
-*.log.bak
+*.log
+training_incidents.md
 model_large*
 model.*
+
+# Training scripts (contain local paths)
+run_training.sh
+launch_training_tty.sh
+watchdog_training.sh
+
+# Benchmark logs
+bench_*.log
 
 # Python
 __pycache__/
@@ -49,6 +57,7 @@ aideen-bench/results/invalid
 
 # Internal docs (not for public repo)
 docs/internal/
+docs/grants/
 docs/ChatGPT-*
 
 # Scripts (local dev tooling, not part of the engine)

@@ -9,7 +9,7 @@ Generates:
     docs/figures/loss_curve.png
     docs/figures/throughput.png
     docs/figures/training_report.png
-    docs/figures/grant_loss_curve.png
+    docs/figures/loss_curve_overview.png
     docs/figures/convergence_table.txt
 """
 
@@ -214,9 +214,9 @@ def main():
     ax2.grid(True, alpha=0.12)
     ax2.set_ylim(bottom=0, top=12)
     fig2.tight_layout()
-    fig2.savefig(fig_dir / "grant_loss_curve.png", dpi=200, bbox_inches="tight", facecolor="white")
+    fig2.savefig(fig_dir / "loss_curve_overview.png", dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig2)
-    print(f"  Saved: grant_loss_curve.png")
+    print(f"  Saved: loss_curve_overview.png")
 
     # ── Detail loss ──
     fig3, ax3 = plt.subplots(figsize=(10, 5.5))
