@@ -25,8 +25,8 @@ pub trait Reasoning {
     /// solution H*. Updates the temporal state that will be passed to the
     /// next sequential token.
     fn temporal_step(&self, _m_prev: &HSlots, h_star: &HSlots) -> HSlots {
-        // Implementación por defecto: identidad (sin memoria a corto plazo explícita)
-        // o sobrescribir con el último estado convergido.
+        // Default implementation: identity (no explicit short-term memory)
+        // or overwrite with the last converged state.
         h_star.clone()
     }
 }

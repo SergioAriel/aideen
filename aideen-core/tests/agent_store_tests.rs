@@ -76,13 +76,10 @@ fn test_in_memory_events_recent_order() {
     let recent = store.recent_events(3);
     assert_eq!(recent.len(), 3);
 
-    // Orden inverso: el más reciente (unix_ts=4) debe ser primero
+    // Reverse order: most recent (unix_ts=4) must be first
     if let AgentEvent::TickAttractor { unix_ts, .. } = &recent[0] {
-        assert_eq!(
-            *unix_ts, 4,
-            "primer resultado debe ser el evento más reciente"
-        );
+        assert_eq!(*unix_ts, 4, "first result must be the most recent event");
     } else {
-        panic!("se esperaba TickAttractor");
+        panic!("expected TickAttractor");
     }
 }

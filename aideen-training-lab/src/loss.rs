@@ -1,26 +1,26 @@
-//! Cross-entropy loss y su gradiente analítico.
+//! Cross-entropy loss and its analytic gradient.
 
 use nalgebra::DVector;
 
-/// Cross-entropy loss entre logits y un target one-hot.
-/// `logits`: output crudo del LmHead [vocab_size].
-/// `target`: índice del token correcto.
+/// Cross-entropy loss between logits and a one-hot target.
+/// `logits`: raw output from LmHead [vocab_size].
+/// `target`: index of the correct token.
 pub fn cross_entropy(logits: &DVector<f32>, target: u32) -> f32 {
     let probs = softmax(logits);
-    let p = probs[target as usize].max(1e-10); // clamp para evitar log(0)
+    let p = probs[target as usize].max(1e-10); // clamp to avoid log(0)
     -p.ln()
 }
 
-/// Gradiente de cross-entropy respecto a logits.
+/// Cross-entropy gradient with respect to logits.
 /// dL/d_logits = softmax(logits) - one_hot(target)
-/// Esta es la fórmula analítica exacta — no requiere autograd.
+/// This is the exact analytic formula — no autograd required.
 pub fn cross_entropy_grad(logits: &DVector<f32>, target: u32) -> DVector<f32> {
     let mut grad = softmax(logits);
     grad[target as usize] -= 1.0;
     grad
 }
 
-/// Softmax estable (restar max para evitar overflow).
+/// Stable softmax (subtract max to avoid overflow).
 fn softmax(logits: &DVector<f32>) -> DVector<f32> {
     let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: DVector<f32> = logits.map(|l| (l - max_l).exp());

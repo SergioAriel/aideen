@@ -9,7 +9,7 @@ pub struct Adam {
     pub beta1: f32,
     pub beta2: f32,
     pub eps: f32,
-    // Momentos por nombre de parámetro
+    // Moments by parameter name
     m_mat: HashMap<String, DMatrix<f32>>,
     v_mat: HashMap<String, DMatrix<f32>>,
     m_vec: HashMap<String, DVector<f32>>,
@@ -32,7 +32,7 @@ impl Adam {
         }
     }
 
-    /// Incrementar el step counter (llamar una vez por train_step).
+    /// Increment the step counter (call once per train_step).
     pub fn tick(&mut self) {
         self.t += 1;
     }
@@ -41,7 +41,7 @@ impl Adam {
         self.t
     }
 
-    // ── Accesores para sincronizar momentos GPU ↔ CPU ────────────────────
+    // ── Accessors for synchronising GPU ↔ CPU moments ─────────────────────
     pub fn set_mat(&mut self, key: &str, val: DMatrix<f32>) {
         self.m_mat.insert(key.to_string(), val);
     }
@@ -55,7 +55,7 @@ impl Adam {
         self.m_vec.get(key)
     }
 
-    /// Actualiza una DMatrix in-place con Adam.
+    /// Updates a DMatrix in-place with Adam.
     pub fn step_matrix(&mut self, name: &str, w: &mut DMatrix<f32>, grad: &DMatrix<f32>) {
         let key = name.to_string();
         let (nrows, ncols) = (w.nrows(), w.ncols());
@@ -87,7 +87,7 @@ impl Adam {
         }
     }
 
-    /// Actualiza un DVector in-place con Adam.
+    /// Updates a DVector in-place with Adam.
     pub fn step_vector(&mut self, name: &str, w: &mut DVector<f32>, grad: &DVector<f32>) {
         let key = name.to_string();
         let len = w.len();

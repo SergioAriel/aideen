@@ -281,7 +281,7 @@ fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
             loss,
         });
 
-        // Actualizar cada estado Mamba por slot independientemente
+        // Update each Mamba state per slot independently
         for k in 0..h_slots {
             let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
                 1.0 / (1.0 + trainer.reasoning.a_log[(k, d)].exp())

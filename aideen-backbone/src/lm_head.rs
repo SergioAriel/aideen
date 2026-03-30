@@ -202,7 +202,7 @@ impl LmHead {
                 data_w.len()
             ));
         }
-        // Convertir de Row-Major (del archivo/GPU) a Col-Major (nalgebra)
+        // Convert from Row-Major (file/GPU) to Col-Major (nalgebra)
         let mut matrix_w = nalgebra::DMatrix::zeros(vocab_size, d_r);
         for i in 0..vocab_size {
             for j in 0..d_r {

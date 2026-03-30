@@ -636,7 +636,7 @@ impl GpuEmbeddingTrainer {
         Ok(())
     }
 
-    /// Actualiza embeddings usando el gradiente dL/dh ya presente en la GPU.
+    /// Updates embeddings using the dL/dh gradient already present on the GPU.
     pub fn apply_embedding_update_from_buffer(
         &self,
         device: &wgpu::Device,

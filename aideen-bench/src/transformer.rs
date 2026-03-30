@@ -7,7 +7,7 @@ use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-// ─── Configuración ────────────────────────────────────────────────────────────
+// ─── Configuration ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct TransformerConfig {
@@ -61,7 +61,7 @@ impl LayerNorm {
         }
     }
 
-    /// Forward: retorna (normalized, mean, inv_std, x_centered) para backward.
+    /// Forward: returns (normalized, mean, inv_std, x_centered) for backward.
     fn forward(&self, x: &DVector<f32>) -> (DVector<f32>, f32, f32, DVector<f32>) {
         let n = x.len() as f32;
         let mean = x.sum() / n;
@@ -233,7 +233,7 @@ impl Transformer {
         self.cfg.param_count()
     }
 
-    /// Entrena un batch de tokens, retorna loss.
+    /// Trains a batch of tokens, returns loss.
     /// tokens: secuencia de longitud T, targets = tokens[1..]
     pub fn train_step(&mut self, tokens: &[u32], opt: &mut MiniAdam) -> f32 {
         if tokens.len() < 2 {
@@ -248,7 +248,7 @@ impl Transformer {
         loss
     }
 
-    /// Calcula validation loss sin actualizar pesos.
+    /// Computes validation loss without updating weights.
     pub fn val_loss(&self, tokens: &[u32]) -> f32 {
         if tokens.len() < 2 {
             return 0.0;
@@ -717,7 +717,7 @@ impl Transformer {
     }
 }
 
-// ─── Utilidades ───────────────────────────────────────────────────────────────
+// ─── Utilities ───────────────────────────────────────────────────────────────
 
 fn causal_softmax(scores: &DMatrix<f32>) -> DMatrix<f32> {
     let t = scores.nrows();

@@ -33,12 +33,12 @@ use rand::{Rng, SeedableRng};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use transformer_candle::{CandleBackend, CandleTransformer, CandleTransformerConfig};
 
-// ── Presupuesto del experimento ───────────────────────────────────────────────
-/// Contexto por batch — ambos modelos ven la misma longitud.
+// ── Experiment budget ────────────────────────────────────────────────────────
+/// Context per batch — both models see the same length.
 const CTX_LEN: usize = 128;
 /// DEQ hidden dimension → ~283 K params with vocab=65.
 const D_R_AIDEEN: usize = 192;
-/// Learning rate compartido.
+/// Shared learning rate.
 const LR: f32 = 1e-3;
 /// Iso-data: tokens que ve cada modelo (EXP 1).
 const TOTAL_TOKENS: usize = 1_000_000;
@@ -164,7 +164,7 @@ impl ModelRun {
     }
 }
 
-// ── Construcción de modelos ───────────────────────────────────────────────────
+// ── Model construction ───────────────────────────────────────────────────────
 
 fn build_aideen(vocab_size: usize, vocab: Vec<char>, seed: u64, backend: Backend) -> Trainer {
     let mut cfg = ArchitectureConfig::default();
@@ -263,7 +263,7 @@ fn eval_tf(tf: &CandleTransformer, val: &[u32]) -> f32 {
     sum / n as f32
 }
 
-// ── Condición de parada ───────────────────────────────────────────────────────
+// ── Stop condition ───────────────────────────────────────────────────────────
 
 enum Budget {
     Tokens(usize),
@@ -294,7 +294,7 @@ fn train_loop(
     let wall_start = Instant::now();
     let mut sampler = StdRng::seed_from_u64(sampler_seed);
 
-    // Acumuladores entre evals
+    // Accumulators between evals
     let mut ai_loss_sum = 0.0f32;
     let mut tf_loss_sum = 0.0f32;
     let mut ai_tok_int = 0usize;

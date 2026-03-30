@@ -1958,7 +1958,7 @@ impl GpuDeqBackend {
         }
     }
 
-    // --- MÉTODOS DE EJECUCIÓN ---
+    // --- EXECUTION METHODS ---
 
     pub fn run_forward_deq(
         &self,

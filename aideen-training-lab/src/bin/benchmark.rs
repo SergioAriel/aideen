@@ -83,7 +83,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
                 trainer.reasoning.set_backend(gpu);
                 println!("  Hardware Backend: Metal GPU ✅");
             } else {
-                println!("  Hardware Backend: Fallback a CPU ❌");
+                println!("  Hardware Backend: Fallback to CPU ❌");
                 return;
             }
         }

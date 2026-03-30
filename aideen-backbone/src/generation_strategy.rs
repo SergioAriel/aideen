@@ -169,8 +169,8 @@ impl DeqAutoRegStrategy {
             }
             generated.push(next_tok);
 
-            // ③ Actualizar query con el token generado
-            // Usamos el tamaño real de current_query (D_R + D_SIM) para evitar mismatch
+            // ③ Update query with the generated token
+            // Use the actual size of current_query (D_R + D_SIM) to avoid mismatch
             let tok_embed = Self::embed_tokens(&[next_tok], current_query.len());
             current_query = (&current_query + &tok_embed) * 0.5;
         }
