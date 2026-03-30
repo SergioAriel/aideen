@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 Juan Marchetto & Sergio Solis
+
 use bytemuck::{Pod, Zeroable};
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
