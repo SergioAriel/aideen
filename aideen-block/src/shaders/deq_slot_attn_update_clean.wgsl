@@ -123,12 +123,26 @@ fn deq_slot_attn_update_main(
     }
     workgroupBarrier();
 
-    for (var d = tid; d < d_model; d = d + WG_SIZE) {
-        var attn = 0.0;
+    if (d_model == WG_SIZE * 2u) {
+        let d0 = tid;
+        let d1 = tid + WG_SIZE;
+        var attn0 = 0.0;
+        var attn1 = 0.0;
         for (var h = 0u; h < head_dim; h = h + 1u) {
-            attn = attn + AllWeights[wo_mat_base + h * d_model + d] * head_mix[h];
+            let mix = head_mix[h];
+            attn0 = attn0 + AllWeights[wo_mat_base + h * d_model + d0] * mix;
+            attn1 = attn1 + AllWeights[wo_mat_base + h * d_model + d1] * mix;
         }
-        Scratch[attn_base + d] = attn;
+        Scratch[attn_base + d0] = attn0;
+        Scratch[attn_base + d1] = attn1;
+    } else {
+        for (var d = tid; d < d_model; d = d + WG_SIZE) {
+            var attn = 0.0;
+            for (var h = 0u; h < head_dim; h = h + 1u) {
+                attn = attn + AllWeights[wo_mat_base + h * d_model + d] * head_mix[h];
+            }
+            Scratch[attn_base + d] = attn;
+        }
     }
     workgroupBarrier();
 
@@ -162,6 +176,7 @@ fn deq_slot_attn_update_main(
             let val = shape.damping * f_h + (1.0 - shape.damping) * h_prev;
             local_max_delta = max(local_max_delta, abs(val - h_prev));
             H_curr[h_base + slot_off + d] = val;
+            H_next[h_base_t + slot_off + d] = val;
         }
         shared_vals[tid] = local_max_delta;
         workgroupBarrier();

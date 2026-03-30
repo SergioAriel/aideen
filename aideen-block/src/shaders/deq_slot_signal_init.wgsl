@@ -55,14 +55,30 @@ fn deq_slot_signal_init_main(
     let win_base = aw_win_base(d_model, h_slots) + slot_idx * d_model * d_model;
     let zero_win_diag = shape.diag_zero_win != 0u;
 
-    for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
-        var inj = 0.0;
+    if (d_model == WG_SIZE * 2u) {
+        let d0 = tid;
+        let d1 = tid + WG_SIZE;
+        var inj0 = 0.0;
+        var inj1 = 0.0;
         if (!zero_win_diag) {
             for (var j = 0u; j < d_model; j = j + 1u) {
-                inj = inj + AllWeights[win_base + j * d_model + d_out] * S_in[s_in_base + j];
+                let s = S_in[s_in_base + j];
+                inj0 = inj0 + AllWeights[win_base + j * d_model + d0] * s;
+                inj1 = inj1 + AllWeights[win_base + j * d_model + d1] * s;
             }
         }
-        Scratch[signal_base + d_out] = inj;
+        Scratch[signal_base + d0] = inj0;
+        Scratch[signal_base + d1] = inj1;
+    } else {
+        for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+            var inj = 0.0;
+            if (!zero_win_diag) {
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    inj = inj + AllWeights[win_base + j * d_model + d_out] * S_in[s_in_base + j];
+                }
+            }
+            Scratch[signal_base + d_out] = inj;
+        }
     }
     workgroupBarrier();
 

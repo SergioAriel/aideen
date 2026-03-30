@@ -52,6 +52,7 @@ pub struct RustDeqBridge {
     pub slot_qkv_probe_enabled: bool,
     pub slot_attn_minimal_enabled: bool,
     pub slot_attn_real_staged_enabled: bool,
+    pub slot_attn_real_unified_enabled: bool,
     pub pipeline: wgpu::ComputePipeline,
     pub debug_pipeline: wgpu::ComputePipeline,
     pub subgroup_pipeline: Option<wgpu::ComputePipeline>,
@@ -60,6 +61,7 @@ pub struct RustDeqBridge {
     pub signal_init_pipeline: Option<wgpu::ComputePipeline>,
     pub slot_qkv_pipeline: Option<wgpu::ComputePipeline>,
     pub slot_attn_update_pipeline: Option<wgpu::ComputePipeline>,
+    pub slot_attn_unified_pipeline: Option<wgpu::ComputePipeline>,
     pub pool_pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
@@ -232,6 +234,13 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let slot_attn_real_unified_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let slot_attn_head_dim = std::env::var("AIDEEN_DEQ_SLOT_ATTN_HEAD_DIM")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -384,7 +393,7 @@ impl RustDeqBridge {
             compilation_options: Default::default(),
             cache: None,
         });
-        let (signal_init_pipeline, slot_qkv_pipeline, slot_attn_update_pipeline) =
+        let (signal_init_pipeline, slot_qkv_pipeline, slot_attn_update_pipeline, slot_attn_unified_pipeline) =
             if slot_attn_real_staged_enabled {
                 let signal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("AIDEEN DEQ SlotAttn Signal Init Shader"),
@@ -404,6 +413,16 @@ impl RustDeqBridge {
                         include_str!("shaders/deq_slot_attn_update_clean.wgsl").into(),
                     ),
                 });
+                let unified_shader = if slot_attn_real_unified_enabled {
+                    Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("AIDEEN DEQ SlotAttn Unified Shader"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            include_str!("shaders/deq_slot_attn_unified_clean.wgsl").into(),
+                        ),
+                    }))
+                } else {
+                    None
+                };
                 let mut slot_attn_constants = std::collections::HashMap::new();
                 slot_attn_constants.insert(
                     "SLOT_ATTN_HEAD_DIM".to_string(),
@@ -445,13 +464,27 @@ impl RustDeqBridge {
                         cache: None,
                     },
                 );
+                let slot_attn_unified_pipeline = unified_shader.as_ref().map(|shader| {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("DEQ SlotAttn Unified Pipeline"),
+                        layout: Some(&pipeline_layout),
+                        module: shader,
+                        entry_point: Some("deq_slot_attn_unified_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &slot_attn_constants,
+                            zero_initialize_workgroup_memory: true,
+                        },
+                        cache: None,
+                    })
+                });
                 (
                     Some(signal_init_pipeline),
                     Some(slot_qkv_pipeline),
                     Some(slot_attn_update_pipeline),
+                    slot_attn_unified_pipeline,
                 )
             } else {
-                (None, None, None)
+                (None, None, None, None)
             };
 
         let update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -995,6 +1028,7 @@ impl RustDeqBridge {
             slot_qkv_probe_enabled,
             slot_attn_minimal_enabled,
             slot_attn_real_staged_enabled,
+            slot_attn_real_unified_enabled,
             pipeline,
             debug_pipeline,
             subgroup_pipeline,
@@ -1003,6 +1037,7 @@ impl RustDeqBridge {
             signal_init_pipeline,
             slot_qkv_pipeline,
             slot_attn_update_pipeline,
+            slot_attn_unified_pipeline,
             pool_pipeline,
             bind_group_layout,
             update_pipeline,
@@ -1395,53 +1430,67 @@ impl RustDeqBridge {
         });
 
         if self.slot_attn_real_staged_enabled {
-            let signal_init_pipeline = self
-                .signal_init_pipeline
-                .as_ref()
-                .expect("slot attention signal-init pipeline present");
-            let slot_qkv_pipeline = self
-                .slot_qkv_pipeline
-                .as_ref()
-                .expect("slot attention qkv pipeline present");
-            let slot_attn_update_pipeline = self
-                .slot_attn_update_pipeline
-                .as_ref()
-                .expect("slot attention update pipeline present");
-            for token_local in 0..shape.token_count.max(1) {
-                let mut token_shape = *shape;
-                token_shape.token_start = shape.token_start + token_local;
-                token_shape.token_count = 1;
-                let token_shape_bytes = Self::shape_bytes(&token_shape);
-                queue.write_buffer(&self.uniform_buf, 0, &token_shape_bytes);
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("DEQ SlotAttn Signal Init Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(signal_init_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+            if self.slot_attn_real_unified_enabled {
+                let slot_attn_unified_pipeline = self
+                    .slot_attn_unified_pipeline
+                    .as_ref()
+                    .expect("slot attention unified pipeline present");
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("DEQ SlotAttn Unified Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(slot_attn_unified_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+            } else {
+                let signal_init_pipeline = self
+                    .signal_init_pipeline
+                    .as_ref()
+                    .expect("slot attention signal-init pipeline present");
+                let slot_qkv_pipeline = self
+                    .slot_qkv_pipeline
+                    .as_ref()
+                    .expect("slot attention qkv pipeline present");
+                let slot_attn_update_pipeline = self
+                    .slot_attn_update_pipeline
+                    .as_ref()
+                    .expect("slot attention update pipeline present");
+                for token_local in 0..shape.token_count.max(1) {
+                    let mut token_shape = *shape;
+                    token_shape.token_start = shape.token_start + token_local;
+                    token_shape.token_count = 1;
+                    let token_shape_bytes = Self::shape_bytes(&token_shape);
+                    queue.write_buffer(&self.uniform_buf, 0, &token_shape_bytes);
+                    {
+                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("DEQ SlotAttn Signal Init Pass"),
+                            timestamp_writes: None,
+                        });
+                        cpass.set_pipeline(signal_init_pipeline);
+                        cpass.set_bind_group(0, &self.bind_group, &[]);
+                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                    }
+                    {
+                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("DEQ SlotAttn QKV Pass"),
+                            timestamp_writes: None,
+                        });
+                        cpass.set_pipeline(slot_qkv_pipeline);
+                        cpass.set_bind_group(0, &self.bind_group, &[]);
+                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                    }
+                    {
+                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("DEQ SlotAttn Update Pass"),
+                            timestamp_writes: None,
+                        });
+                        cpass.set_pipeline(slot_attn_update_pipeline);
+                        cpass.set_bind_group(0, &self.bind_group, &[]);
+                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                    }
                 }
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("DEQ SlotAttn QKV Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(slot_qkv_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                }
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("DEQ SlotAttn Update Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(slot_attn_update_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                }
+                queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
             }
-            queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
         } else {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("DEQ Forward GPU-Only Pass"),
