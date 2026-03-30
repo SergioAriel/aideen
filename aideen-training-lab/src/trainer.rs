@@ -111,7 +111,7 @@ pub struct Trainer {
 
     // --- TPS tracking for GPU-DEBUG log ---
     debug_last_time: Option<std::time::Instant>,
-    debug_tokens_accum: u32,   // tokens processed since last GPU-DEBUG print
+    debug_tokens_accum: u32, // tokens processed since last GPU-DEBUG print
 
     // --- Debug buffer cache (avoid blocking GPU readback every step) ---
     // read_debug_buffer() calls device.poll(Maintain::Wait) — blocks CPU until GPU finishes.
@@ -125,7 +125,7 @@ pub struct Trainer {
     cfg_fwd_batch_size: u32,       // AIDEEN_BATCH_SIZE (for forward dispatch)
     cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
     cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
-    cfg_tps_sync_every: usize, // AIDEEN_TPS_SYNC_EVERY
+    cfg_tps_sync_every: usize,     // AIDEEN_TPS_SYNC_EVERY
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
     cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
     cfg_wv_debug: bool,            // AIDEEN_DEQ_WV_DEBUG
@@ -275,17 +275,32 @@ impl Trainer {
             cached_debug_buf: Vec::new(),
             last_gpu_loss: 0.0,
             cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(20).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(20)
+                .max(1),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -359,17 +374,32 @@ impl Trainer {
             cached_debug_buf: Vec::new(),
             last_gpu_loss: 0.0,
             cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(20).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(20)
+                .max(1),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -704,8 +734,7 @@ impl Trainer {
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
             let debug_every = self.cfg_debug_sample_every;
-            let debug_enable = debug_every != 0
-                && (self.optimizer.step_count() % debug_every == 0);
+            let debug_enable = debug_every != 0 && (self.optimizer.step_count() % debug_every == 0);
             let _ = gpu.run_forward(
                 fwd_batch_size,
                 per_seq_len,
@@ -758,10 +787,7 @@ impl Trainer {
                 let g_raw = w_head.get("head.g").unwrap();
 
                 let w_sum: f32 = w_raw.iter().map(|&x| x.abs()).sum();
-                println!(
-                    "[GPU-LM] Syncing LM Head weights... (abs_sum={:.4})",
-                    w_sum
-                );
+                println!("[GPU-LM] Syncing LM Head weights... (abs_sum={:.4})", w_sum);
 
                 gpu_lm.upload_weights_only(&gpu.queue, w_raw, b_raw, g_raw);
                 self.gpu_lm_weights_uploaded = true;
@@ -848,8 +874,7 @@ impl Trainer {
                     }
                     // Refresh debug buffer cache if this is a sample step.
                     let debug_every = self.cfg_debug_sample_every;
-                    if debug_every != 0
-                        && (self.optimizer.step_count() % debug_every == 0) {
+                    if debug_every != 0 && (self.optimizer.step_count() % debug_every == 0) {
                         self.cached_debug_buf = gpu.read_debug_buffer();
                     }
                 } else {
@@ -1093,8 +1118,7 @@ impl Trainer {
             // --- DIAGNÓSTICOS GPU (v13.1 Auto-Healing) ---
             // Reuse cached debug buffer to avoid blocking GPU every diagnostic step.
             let debug_every = self.cfg_debug_sample_every;
-            if debug_every != 0
-                && (self.optimizer.step_count() % debug_every == 0) {
+            if debug_every != 0 && (self.optimizer.step_count() % debug_every == 0) {
                 self.cached_debug_buf = gpu.read_debug_buffer();
             }
             if !self.cached_debug_buf.is_empty() {
@@ -1303,8 +1327,8 @@ impl Trainer {
                 } else {
                     "NORMAL"
                 };
-                let conv_ok =
-                    unconverged_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
+                let conv_ok = unconverged_ratio <= 0.05
+                    || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
                 let unconverged_i = unconverged.round() as i32;
                 println!(
@@ -1561,8 +1585,7 @@ impl Trainer {
                 num_chunks += 1;
                 interval_tokens += batch_ctx.len();
                 #[cfg(feature = "wgpu")]
-                if self.cfg_tps_sync_every != 0
-                    && num_chunks % self.cfg_tps_sync_every == 0 {
+                if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0 {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
                         // Progress/TPS sync point only. This is outside the per-step GPU hot path
                         // and exists so reported throughput reflects completed GPU work.
@@ -2111,7 +2134,11 @@ impl Trainer {
                 }
             });
             let mut epoch_loss = 0.0f32;
-            let mut num_chunks = if skip_chunks > 0 && epoch == 0 { skip_chunks } else { 0 };
+            let mut num_chunks = if skip_chunks > 0 && epoch == 0 {
+                skip_chunks
+            } else {
+                0
+            };
             let mut total_tokens = 0usize;
             // Buffer of unconsumed tokens from the previous chunk (for overlapping window).
             let mut carry: Vec<u32> = Vec::with_capacity(stride);
@@ -2171,7 +2198,8 @@ impl Trainer {
                             let seg_len = train_seg.len().min(tgt_seg.len());
                             let mut offset = 0usize;
                             while offset < seg_len {
-                                let remaining = max_batch_tokens.saturating_sub(batch_train_buf.len());
+                                let remaining =
+                                    max_batch_tokens.saturating_sub(batch_train_buf.len());
                                 if remaining == 0 {
                                     // Flush full batch before consuming more.
                                     let is_val = num_chunks % 20 == 0;
@@ -2200,7 +2228,8 @@ impl Trainer {
                                     batch_tgt_buf.clear();
                                     #[cfg(feature = "wgpu")]
                                     if self.cfg_tps_sync_every != 0
-                                        && num_chunks % self.cfg_tps_sync_every == 0 {
+                                        && num_chunks % self.cfg_tps_sync_every == 0
+                                    {
                                         if let Some(gpu) = self.gpu_deq.as_ref() {
                                             gpu.device.poll(wgpu::Maintain::Wait);
                                         }
@@ -2209,7 +2238,8 @@ impl Trainer {
                                 }
 
                                 let take = remaining.min(seg_len - offset);
-                                batch_train_buf.extend_from_slice(&train_seg[offset..offset + take]);
+                                batch_train_buf
+                                    .extend_from_slice(&train_seg[offset..offset + take]);
                                 batch_tgt_buf.extend_from_slice(&tgt_seg[offset..offset + take]);
                                 offset += take;
                             }
@@ -2223,8 +2253,12 @@ impl Trainer {
                                     self.eval_mode = true;
                                 }
                                 let eps = self.progressive_epsilon(epoch, epochs);
-                                let loss =
-                                    self.train_sequence(&batch_train_buf, &batch_tgt_buf, seg_start > 0, eps);
+                                let loss = self.train_sequence(
+                                    &batch_train_buf,
+                                    &batch_tgt_buf,
+                                    seg_start > 0,
+                                    eps,
+                                );
                                 if is_val {
                                     self.eval_mode = false;
                                     println!(
@@ -2240,7 +2274,8 @@ impl Trainer {
                                 batch_tgt_buf.clear();
                                 #[cfg(feature = "wgpu")]
                                 if self.cfg_tps_sync_every != 0
-                                    && num_chunks % self.cfg_tps_sync_every == 0 {
+                                    && num_chunks % self.cfg_tps_sync_every == 0
+                                {
                                     if let Some(gpu) = self.gpu_deq.as_ref() {
                                         // Validation/debug path: CPU reads results immediately after.
                                         gpu.device.poll(wgpu::Maintain::Wait);
@@ -2272,15 +2307,16 @@ impl Trainer {
                     // EOF: flush any remaining accumulated chunks (< batch_size_file)
                     if !batch_train_buf.is_empty() {
                         let eps = self.progressive_epsilon(epoch, epochs);
-                        let loss = self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
+                        let loss =
+                            self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
                         epoch_loss += loss;
                         num_chunks += 1;
                         total_tokens += batch_train_buf.len();
                         batch_train_buf.clear();
                         batch_tgt_buf.clear();
                         #[cfg(feature = "wgpu")]
-                        if self.cfg_tps_sync_every != 0
-                            && num_chunks % self.cfg_tps_sync_every == 0 {
+                        if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0
+                        {
                             if let Some(gpu) = self.gpu_deq.as_ref() {
                                 // Validation/debug path: CPU reads results immediately after.
                                 gpu.device.poll(wgpu::Maintain::Wait);
@@ -2383,10 +2419,7 @@ impl Trainer {
 
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {
                 if let Err(e) = self.save_checkpoint(checkpoint_path) {
-                    eprintln!(
-                        "[checkpoint] Error saving to '{}': {}",
-                        checkpoint_path, e
-                    );
+                    eprintln!("[checkpoint] Error saving to '{}': {}", checkpoint_path, e);
                 } else {
                     eprintln!(
                         "[checkpoint] Saved to '{}' (epoch {})",
@@ -2730,82 +2763,89 @@ impl Trainer {
             // Sync DEQ Core only if weights were uploaded/updated on GPU.
             if self.gpu_weights_uploaded {
                 if let Ok((wq, wk, wv, wo, win, wx, wout, alog, nscale)) = gpu.read_weights() {
-                let to_mat = |vec: Vec<f32>| {
-                    let d_r = self.config.d_r;
-                    nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
-                };
-                // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    let mat_total = h_slots * d_r * d_r;
-                    // Average per-slot matrices into CPU prototype (used for checkpoint only)
-                    let avg_mat = |flat: &[f32]| -> Vec<f32> {
-                        (0..d_r * d_r)
+                    let to_mat = |vec: Vec<f32>| {
+                        let d_r = self.config.d_r;
+                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
+                    };
+                    // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        let mat_total = h_slots * d_r * d_r;
+                        // Average per-slot matrices into CPU prototype (used for checkpoint only)
+                        let avg_mat = |flat: &[f32]| -> Vec<f32> {
+                            (0..d_r * d_r)
+                                .map(|i| {
+                                    (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                        / h_slots as f32
+                                })
+                                .collect()
+                        };
+                        self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(
+                            d_r,
+                            d_r,
+                            &avg_mat(&wq[..mat_total]),
+                        );
+                        self.reasoning.q_bias =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
+                        self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(
+                            d_r,
+                            d_r,
+                            &avg_mat(&wk[..mat_total]),
+                        );
+                        self.reasoning.k_bias =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
+                    }
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
+                        let avg: Vec<f32> = (0..d_r * d_r)
                             .map(|i| {
-                                (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
                                     / h_slots as f32
                             })
-                            .collect()
-                    };
-                    self.reasoning.w_q =
-                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
-                    self.reasoning.q_bias =
-                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
-                    self.reasoning.w_k =
-                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
-                    self.reasoning.k_bias =
-                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
-                }
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
-                    let avg: Vec<f32> = (0..d_r * d_r)
-                        .map(|i| {
-                            (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
-                                / h_slots as f32
-                        })
-                        .collect();
-                    self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
-                }
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    // w_o is per-slot on GPU — average slots for CPU prototype (checkpoint only)
-                    let avg: Vec<f32> = (0..d_r * d_r)
-                        .map(|i| {
-                            (0..h_slots).map(|s| wo[s * d_r * d_r + i]).sum::<f32>()
-                                / h_slots as f32
-                        })
-                        .collect();
-                    self.reasoning.w_o = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
-                }
-                // win is h_slots*d*d — average slots for CPU representation.
-                let d_r = self.config.d_r;
-                let h_slots = self.config.h_slots;
-                let mut win_avg = vec![0.0f32; d_r * d_r];
-                for s in 0..h_slots {
-                    let base = s * d_r * d_r;
-                    for i in 0..d_r * d_r {
-                        win_avg[i] += win[base + i];
+                            .collect();
+                        self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
                     }
-                }
-                let inv_slots = 1.0 / h_slots as f32;
-                for v in &mut win_avg {
-                    *v *= inv_slots;
-                }
-                self.reasoning.w_in = to_mat(win_avg);
-                self.reasoning.w_x = to_mat(wx);
-                self.reasoning.w_out = to_mat(wout);
-                {
-                    let h_slots = self.reasoning.config.h_slots;
-                    let d_r = self.reasoning.config.d_r;
-                    self.reasoning.a_log = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
-                }
-                self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
-                self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
-                self.gpu_cg_weights_uploaded = true;
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        // w_o is per-slot on GPU — average slots for CPU prototype (checkpoint only)
+                        let avg: Vec<f32> = (0..d_r * d_r)
+                            .map(|i| {
+                                (0..h_slots).map(|s| wo[s * d_r * d_r + i]).sum::<f32>()
+                                    / h_slots as f32
+                            })
+                            .collect();
+                        self.reasoning.w_o = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
+                    }
+                    // win is h_slots*d*d — average slots for CPU representation.
+                    let d_r = self.config.d_r;
+                    let h_slots = self.config.h_slots;
+                    let mut win_avg = vec![0.0f32; d_r * d_r];
+                    for s in 0..h_slots {
+                        let base = s * d_r * d_r;
+                        for i in 0..d_r * d_r {
+                            win_avg[i] += win[base + i];
+                        }
+                    }
+                    let inv_slots = 1.0 / h_slots as f32;
+                    for v in &mut win_avg {
+                        *v *= inv_slots;
+                    }
+                    self.reasoning.w_in = to_mat(win_avg);
+                    self.reasoning.w_x = to_mat(wx);
+                    self.reasoning.w_out = to_mat(wout);
+                    {
+                        let h_slots = self.reasoning.config.h_slots;
+                        let d_r = self.reasoning.config.d_r;
+                        self.reasoning.a_log =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
+                    }
+                    self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
+                    self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
+                    self.gpu_cg_weights_uploaded = true;
                 }
             }
         }
