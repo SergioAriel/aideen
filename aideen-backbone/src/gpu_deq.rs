@@ -1,6 +1,6 @@
 use aideen_block::deq_bridge::{
     aw_alog_byte_off, aw_hist_byte_off, aw_nscale_byte_off, aw_total_bytes, aw_win_byte_off,
-    aw_wk_byte_off, aw_wo_byte_off, aw_wout_byte_off, aw_wqk_bytes, aw_wv_byte_off, aw_wx_byte_off,
+    aw_wk_byte_off, aw_wo_byte_off, aw_wout_byte_off, aw_wv_byte_off, aw_wx_byte_off,
     DeqComputeShape, RustDeqBridge,
 };
 use aideen_core::state::ArchitectureConfig;
@@ -23,6 +23,17 @@ struct UpdateUniforms {
     n_accum: u32,         // accumulation count (for apply_grad_update_main)
     n_total_weights: u32, // total AllWeights elements (for apply_grad_update_main)
     batch_size: u32,      // number of sequences processed in parallel
+    apply_accum: u32,     // 1=apply accumulated gradients (apply_grad_update_main)
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct AndersonParams {
+    m: u32,
+    k: u32,
+    slots_per_segment: u32,
+    _pad0: u32,
 }
 
 /// Minimal buffers needed by the Picard adjoint path (replaces the old RustCgBridge).
@@ -40,13 +51,20 @@ pub struct GpuDeqBackend {
     pub queue: Arc<wgpu::Queue>,
     pub bridge: RustDeqBridge,
     pub adj_bufs: AdjointBuffers,
+    tps_timestamp_enabled: bool,
+    tps_timestamp_period: f32,
+    tps_timestamp_query: Option<wgpu::QuerySet>,
+    tps_timestamp_resolve_buf: Option<wgpu::Buffer>,
+    tps_timestamp_readback_buf: Option<wgpu::Buffer>,
 
     // Fused update pipeline
-    fused_adjoint_picard_pipeline: wgpu::ComputePipeline,
     staged_picard_init_pipeline: wgpu::ComputePipeline,
     staged_picard_gcomb_pipeline: wgpu::ComputePipeline,
     staged_picard_gmix_pipeline: wgpu::ComputePipeline,
+    staged_picard_gmix_gscore_pipeline: wgpu::ComputePipeline,
     staged_picard_gscore_pipeline: wgpu::ComputePipeline,
+    staged_picard_accum_base_pipeline: wgpu::ComputePipeline,
+    staged_picard_accum_opt_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_v_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_k_pipeline: wgpu::ComputePipeline,
@@ -59,12 +77,9 @@ pub struct GpuDeqBackend {
     fused_update_hist_prep_pipeline: wgpu::ComputePipeline,
     fused_update_hist_mat_pipeline: wgpu::ComputePipeline,
     fused_update_hist_scale_pipeline: wgpu::ComputePipeline,
-    _fused_update_hist_bias_pipeline: wgpu::ComputePipeline,
     fused_update_hist_gate_pipeline: wgpu::ComputePipeline,
     fused_update_hist_mprev_pipeline: wgpu::ComputePipeline,
     fused_update_hist_tbptt_pipeline: wgpu::ComputePipeline,
-    _fused_update_hist_xprep_pipeline: wgpu::ComputePipeline,
-    _fused_update_hist_hrhs_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wout_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wx_pipeline: wgpu::ComputePipeline,
     fused_update_hist_alog_pipeline: wgpu::ComputePipeline,
@@ -73,14 +88,12 @@ pub struct GpuDeqBackend {
     fused_update_hist_wgate_pipeline: wgpu::ComputePipeline,
     fused_update_hist_forget_pipeline: wgpu::ComputePipeline,
     fused_update_apply_grad_pipeline: wgpu::ComputePipeline,
-    fused_adjoint_bg: wgpu::BindGroup,
-    fused_adjoint_weights_bg: wgpu::BindGroup,
     staged_picard_bg: wgpu::BindGroup,
+    staged_picard_bg_alt: wgpu::BindGroup,
     staged_picard_bg1: wgpu::BindGroup,
     fused_update_bg0: wgpu::BindGroup,
     fused_update_bg1: wgpu::BindGroup,
     pub fused_update_params_buf: wgpu::Buffer,
-    fused_v_next_buf: wgpu::Buffer, // State for Picard Adjoint
     fused_mix_buf: wgpu::Buffer,
     fused_weighted_h_buf: wgpu::Buffer,
     fused_gmix_buf: wgpu::Buffer,
@@ -94,6 +107,53 @@ pub struct GpuDeqBackend {
     staged_wo_t_buf: wgpu::Buffer,
     tbptt_carry_buf: wgpu::Buffer,
     pub all_gradients_buf: wgpu::Buffer,
+
+    // Anderson acceleration for adjoint Picard
+    anderson_m: u32, // ring buffer depth (effective window = m-1)
+    anderson_hist_bufs: Vec<wgpu::Buffer>, // segmented ring buffer slots
+    anderson_slots_per_segment: u32,
+    anderson_params_bufs: Vec<wgpu::Buffer>, // one 16-byte uniform per iteration slot
+    anderson_bgs: Vec<wgpu::BindGroup>,      // one bind group per iteration slot
+    anderson_store_pipeline: wgpu::ComputePipeline,
+    anderson_mix_pipeline: wgpu::ComputePipeline,
+
+    // --- Hot-path cached env vars (parsed once at construction, not per training step) ---
+    // Avoids ~52 syscalls/step from std::env::var calls in apply_fused_deq_update and adjoint.
+    pub cached_residual_alpha: f32,
+    cfg_hist_gated: bool,
+    cfg_hist_selective: bool,
+    cfg_slot_anchor_zero: bool,
+    cfg_rms_floor: f32,
+    cfg_contr_floor: f32,
+    cfg_hist_zero: bool,
+    cfg_hist_minner_zero: bool,
+    cfg_hist_force_nomamba: bool,
+    cfg_hist_prelude_skip: bool,
+    cfg_hist_loop_force_nomamba: bool,
+    cfg_signal_zero: bool,
+    cfg_attn_out_mode: f32,
+    cfg_attn_uniform: bool,
+    cfg_attn_freeze: bool,
+    cfg_v_fixed: bool,
+    cfg_v_lag: bool,
+    cfg_v_scale: f32,
+    cfg_signal_scale: f32,
+    cfg_v_gate_scale: f32,
+    cfg_v_gate_bias: f32,
+    cfg_v_norm: bool,
+    cfg_v_norm_scale: f32,
+    cfg_hist_train_carrier: bool,
+    cfg_hist_train_wx: bool,
+    cfg_hist_train_wout: bool,
+    cfg_hist_train_alog: bool,
+    cfg_hist_train_delta: bool,
+    cfg_hist_internal_probe: bool,
+    cfg_fused_profile: bool,
+    cfg_picard_profile: bool,
+    cfg_picard_stage_profile: bool,
+    cfg_picard_accum_split: bool,
+    cfg_picard_internal_probe: bool,
+    cfg_picard_gscore_fused: bool,
 }
 
 impl GpuDeqBackend {
@@ -125,7 +185,11 @@ impl GpuDeqBackend {
         for s in 0..h {
             wv_t.extend_from_slice(&Self::transpose_square(&wv[s * d * d..(s + 1) * d * d], d));
         }
-        let wo_t = Self::transpose_square(wo, d);
+        // W_o is per-slot: h_slots blocks of d×d, each must be transposed separately.
+        let mut wo_t = Vec::with_capacity(h * d * d);
+        for s in 0..h {
+            wo_t.extend_from_slice(&Self::transpose_square(&wo[s * d * d..(s + 1) * d * d], d));
+        }
         queue.write_buffer(&self.staged_wq_t_buf, 0, bytemuck::cast_slice(&wq_t));
         queue.write_buffer(&self.staged_wk_t_buf, 0, bytemuck::cast_slice(&wk_t));
         queue.write_buffer(&self.staged_wv_t_buf, 0, bytemuck::cast_slice(&wv_t));
@@ -155,121 +219,43 @@ impl GpuDeqBackend {
         out.extend_from_slice(hist_slot_scale);
         out.extend_from_slice(hist_slot_bias);
         out.extend_from_slice(hist_gate_logit);
-        if Self::env_flag("AIDEEN_DEQ_SLOT_ANCHOR_ZERO") {
+        if self.cfg_slot_anchor_zero {
             out.extend(std::iter::repeat(0.0).take(h * d));
         } else {
             out.extend_from_slice(slot_anchor);
         }
         out.extend_from_slice(w_delta);
         out.extend_from_slice(b_delta);
-        out.push(if Self::hist_selective_from_env() {
+        out.push(if self.cfg_hist_selective { 1.0 } else { 0.0 });
+        // Warmup factor for alpha_min (0..1). Default to 1.0 so inference is unaffected.
+        out.push(1.0);
+        out.push(self.cfg_rms_floor);
+        out.push(self.cfg_contr_floor);
+        out.push(if self.cfg_hist_zero { 0.0 } else { 1.0 });
+        out.push(if self.cfg_hist_minner_zero { 1.0 } else { 0.0 });
+        out.push(if self.cfg_hist_force_nomamba {
             1.0
         } else {
             0.0
         });
-        // Warmup factor for alpha_min (0..1). Default to 1.0 so inference is unaffected.
-        out.push(1.0);
-        let rms_floor = Self::env_f32("AIDEEN_DEQ_RMS_FLOOR")
-            .unwrap_or(0.0)
-            .max(0.0);
-        let contr_floor = Self::env_f32("AIDEEN_DEQ_CONTR_RMS_FLOOR")
-            .unwrap_or(0.0)
-            .max(0.0);
-        out.push(rms_floor);
-        out.push(contr_floor);
-        let hist_inject = if Self::env_flag("AIDEEN_DEQ_HIST_ZERO") {
-            0.0
-        } else {
-            1.0
-        };
-        out.push(hist_inject);
-        let hist_minner_zero = if Self::env_flag("AIDEEN_DEQ_HIST_MINNER_ZERO") {
+        out.push(if self.cfg_hist_prelude_skip { 1.0 } else { 0.0 });
+        out.push(if self.cfg_hist_loop_force_nomamba {
             1.0
         } else {
             0.0
-        };
-        out.push(hist_minner_zero);
-        let hist_force_nomamba = if Self::env_flag("AIDEEN_DEQ_HIST_FORCE_NOMAMBA") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_force_nomamba);
-        let hist_prelude_skip = if Self::env_flag("AIDEEN_DEQ_HIST_PRELUDE_SKIP") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_prelude_skip);
-        let hist_loop_force_nomamba = if Self::env_flag("AIDEEN_DEQ_HIST_LOOP_FORCE_NOMAMBA") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(hist_loop_force_nomamba);
-        let signal_zero = if Self::env_flag("AIDEEN_DEQ_SIGNAL_ZERO") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(signal_zero);
-        let attn_out_mode = Self::env_f32("AIDEEN_DEQ_ATTN_OUT_MODE")
-            .unwrap_or(0.0)
-            .clamp(0.0, 2.0);
-        out.push(attn_out_mode);
-        let attn_uniform = if Self::env_flag("AIDEEN_DEQ_ATTN_UNIFORM") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(attn_uniform);
-        let attn_freeze = if Self::env_flag("AIDEEN_DEQ_ATTN_FREEZE") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(attn_freeze);
-        let v_fixed = if std::env::var("AIDEEN_DEQ_V_FIXED")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false)
-        {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(v_fixed);
-        let v_lag = if Self::env_flag("AIDEEN_DEQ_V_LAG") {
-            1.0
-        } else {
-            0.0
-        };
-        out.push(v_lag);
-        let v_scale = Self::env_f32("AIDEEN_DEQ_V_SCALE")
-            .unwrap_or(1.0)
-            .clamp(0.01, 10.0);
-        out.push(v_scale);
-        let signal_scale = Self::env_f32("AIDEEN_DEQ_SIGNAL_SCALE")
-            .unwrap_or(1.0)
-            .clamp(0.01, 10.0);
-        out.push(signal_scale);
-        // V gating (scalar per slot) — disabled by default.
-        let v_gate_scale = Self::env_f32("AIDEEN_DEQ_V_GATE_SCALE").unwrap_or(0.0);
-        let v_gate_bias = Self::env_f32("AIDEEN_DEQ_V_GATE_BIAS").unwrap_or(0.0);
-        out.push(v_gate_scale);
-        out.push(v_gate_bias);
-        // V normalization (per-slot RMS) with optional learned scale.
-        let v_norm = if Self::env_flag("AIDEEN_DEQ_V_NORM") {
-            1.0
-        } else {
-            0.0
-        };
-        let v_norm_scale = Self::env_f32("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
-        out.push(v_norm);
-        out.push(v_norm_scale);
+        });
+        out.push(if self.cfg_signal_zero { 1.0 } else { 0.0 });
+        out.push(self.cfg_attn_out_mode);
+        out.push(if self.cfg_attn_uniform { 1.0 } else { 0.0 });
+        out.push(if self.cfg_attn_freeze { 1.0 } else { 0.0 });
+        out.push(if self.cfg_v_fixed { 1.0 } else { 0.0 });
+        out.push(if self.cfg_v_lag { 1.0 } else { 0.0 });
+        out.push(self.cfg_v_scale);
+        out.push(self.cfg_signal_scale);
+        out.push(self.cfg_v_gate_scale);
+        out.push(self.cfg_v_gate_bias);
+        out.push(if self.cfg_v_norm { 1.0 } else { 0.0 });
+        out.push(self.cfg_v_norm_scale);
         // W_gate_hist: h_slots × d_model dynamic gate query matrix (after 21 scalars)
         out.extend_from_slice(w_gate_hist);
         // Forget gate parameters: W_forget (h×d) and b_forget (h)
@@ -307,18 +293,14 @@ impl GpuDeqBackend {
             .unwrap_or(true)
     }
 
-    fn env_flag(name: &str) -> bool {
-        std::env::var(name)
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false)
-    }
-
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
+    }
+
+    fn env_u32(name: &str) -> Option<u32> {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
     }
 
     fn residual_alpha_from_env() -> f32 {
@@ -376,6 +358,26 @@ impl GpuDeqBackend {
         };
 
         println!("[GpuDeqBackend] Adapter: {}", adapter.get_info().name);
+        let wants_timestamps = std::env::var("AIDEEN_TPS_GPU_TIMESTAMPS")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let adapter_features = adapter.features();
+        let timestamps_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+            && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let tps_timestamp_enabled = wants_timestamps && timestamps_supported;
+        let mut required_features = wgpu::Features::SUBGROUP;
+        if tps_timestamp_enabled {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+            required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        } else if wants_timestamps {
+            eprintln!(
+                "[GpuDeqBackend] TIMESTAMP_QUERY not supported or missing TIMESTAMP_QUERY_INSIDE_ENCODERS."
+            );
+        }
         let mut limits = adapter.limits();
         limits.max_storage_buffers_per_shader_stage = 16;
 
@@ -384,7 +386,7 @@ impl GpuDeqBackend {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("AIDEEN DEQ GPU"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -397,6 +399,41 @@ impl GpuDeqBackend {
                 eprintln!("[GpuDeqBackend] request_device failed: {err:?}");
                 return None;
             }
+        };
+
+        let (
+            tps_timestamp_enabled,
+            tps_timestamp_period,
+            tps_timestamp_query,
+            tps_timestamp_resolve_buf,
+            tps_timestamp_readback_buf,
+        ) = if tps_timestamp_enabled {
+            let query = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("AIDEEN TPS Timestamp QuerySet"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("AIDEEN TPS Timestamp Resolve"),
+                size: 2 * std::mem::size_of::<u64>() as u64,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::QUERY_RESOLVE,
+                mapped_at_creation: false,
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("AIDEEN TPS Timestamp Readback"),
+                size: 2 * std::mem::size_of::<u64>() as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (
+                true,
+                queue.get_timestamp_period(),
+                Some(query),
+                Some(resolve),
+                Some(readback),
+            )
+        } else {
+            (false, 0.0, None, None, None)
         };
 
         // Read batch_size from env — scales all forward+backward buffers.
@@ -442,93 +479,11 @@ impl GpuDeqBackend {
             label: Some("Fused DEQ Update Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fused_deq_update.wgsl").into()),
         });
-        let adjoint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Fused Picard Adjoint Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/fused_adjoint_picard.wgsl").into(),
-            ),
-        });
         let staged_picard_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Staged Picard Adjoint Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/staged_adjoint_picard.wgsl").into(),
             ),
-        });
-
-        let bg_adjoint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Fused Picard Adjoint BG Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, // params
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, // b_in (dl_dh_pooled)
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, // H_star
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3, // v_state
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4, // v_final (result)
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5, // NormScale
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6, // Scratch
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
         });
 
         let bg0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -698,52 +653,6 @@ impl GpuDeqBackend {
             ],
         });
 
-        let bg_adjoint_weights_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Fused Picard Adjoint Weights BG Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
 
         // bg1_layout: 10 read_write bindings — used by staged_picard_pl (staged_adjoint_picard.wgsl)
         // fused_update_bg1_layout: 1 binding — AllWeights for fused_deq_update.wgsl @group(1)
@@ -945,15 +854,6 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let fused_update_hist_bias_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Bias Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_bias_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
         let fused_update_hist_gate_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Fused DEQ Update Hist Gate Pipeline"),
@@ -978,24 +878,6 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_hist_stage_tbptt_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_xprep_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist XPrep Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_xprep_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_hrhs_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist HRhs Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_hrhs_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1071,21 +953,6 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let fused_adjoint_picard_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused Picard Adjoint Pipeline"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("Picard Adjoint PL"),
-                        bind_group_layouts: &[&bg_adjoint_layout, &bg_adjoint_weights_layout],
-                        push_constant_ranges: &[],
-                    }),
-                ),
-                module: &adjoint_shader,
-                entry_point: Some("fused_adjoint_picard_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
         let staged_picard_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Staged Picard PL"),
             bind_group_layouts: &[&bg0_layout, &bg1_layout],
@@ -1118,6 +985,15 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let staged_picard_gmix_gscore_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard GMix+GScore Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("picard_gmix_gscore_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let staged_picard_gscore_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Staged Picard GScore Pipeline"),
@@ -1133,6 +1009,24 @@ impl GpuDeqBackend {
                 layout: Some(&staged_picard_pl),
                 module: &staged_picard_shader,
                 entry_point: Some("picard_accum_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let staged_picard_accum_base_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Accum Base Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("picard_accum_base_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let staged_picard_accum_opt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Accum Opt Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("picard_accum_opt_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1163,6 +1057,159 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        // Anderson acceleration setup
+        let anderson_m_val = Self::env_u32("AIDEEN_ANDERSON_M").unwrap_or(4);
+        let anderson_bg1_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Anderson BG1 Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let anderson_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Anderson PL"),
+            bind_group_layouts: &[&bg0_layout, &anderson_bg1_layout],
+            push_constant_ranges: &[],
+        });
+        // Ring buffer: m × max_attn_len floats (segment into <=4 buffers to stay under buffer limits)
+        let anderson_attn_len_max = (forward_batch_cap as usize).max(1)
+            * config.ctx_len.max(1)
+            * config.h_slots
+            * config.d_r;
+        let anderson_m_alloc = anderson_m_val.max(1);
+        let max_storage_bytes = (device.limits().max_storage_buffer_binding_size as usize)
+            .min(device.limits().max_buffer_size as usize);
+        let slot_bytes = anderson_attn_len_max * 4;
+        if slot_bytes > max_storage_bytes {
+            return None;
+        }
+        let slots_per_segment = (max_storage_bytes / slot_bytes).max(1);
+        let segment_count = (anderson_m_alloc as usize + slots_per_segment - 1) / slots_per_segment;
+        if segment_count > 4 {
+            return None;
+        }
+        let mut anderson_hist_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(4);
+        for seg in 0..4 {
+            let slots_in_seg = if seg < segment_count {
+                slots_per_segment
+            } else {
+                1
+            };
+            let size = (slots_in_seg * slot_bytes) as u64;
+            anderson_hist_bufs.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Anderson Hist Buffer seg {}", seg)),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        const ANDERSON_MAX_ITERS: usize = 16;
+        let mut anderson_params_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(ANDERSON_MAX_ITERS);
+        let mut anderson_bgs: Vec<wgpu::BindGroup> = Vec::with_capacity(ANDERSON_MAX_ITERS);
+        for k in 0..ANDERSON_MAX_ITERS {
+            let pbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Anderson Params k={}", k)),
+                size: std::mem::size_of::<AndersonParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Anderson BG k={}", k)),
+                layout: &anderson_bg1_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pbuf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: anderson_hist_bufs[0].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: anderson_hist_bufs[1].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: anderson_hist_bufs[2].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: anderson_hist_bufs[3].as_entire_binding(),
+                    },
+                ],
+            });
+            anderson_params_bufs.push(pbuf);
+            anderson_bgs.push(bg);
+        }
+        let anderson_store_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Anderson Store Pipeline"),
+                layout: Some(&anderson_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("anderson_store_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let anderson_mix_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Anderson Mix Pipeline"),
+                layout: Some(&anderson_pl),
+                module: &staged_picard_shader,
+                entry_point: Some("anderson_mix_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         let fused_update_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Update Params"),
             size: std::mem::size_of::<UpdateUniforms>() as u64,
@@ -1229,14 +1276,6 @@ impl GpuDeqBackend {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let fused_v_next_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Fused Picard Adjoint State Buffer"),
-            size: attn_entries * 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let w_mat_bytes = (config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
         let wv_mat_bytes =
             (config.h_slots * config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
@@ -1260,7 +1299,7 @@ impl GpuDeqBackend {
         });
         let staged_wo_t_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staged Picard Wo^T Buffer"),
-            size: w_mat_bytes,
+            size: wv_mat_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1427,11 +1466,79 @@ impl GpuDeqBackend {
                 },
             ],
         });
+        let staged_picard_bg_alt = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Staged Picard BG0 Alt"),
+            layout: &bg0_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fused_update_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fused_weighted_h_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bridge.s_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bridge.hnext_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bridge.debug_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: adj_dl_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: bridge.scratch_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: fused_mix_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: adj_v_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: fused_gmix_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: fused_gscore_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: fused_qgrad_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: fused_hist_ctx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: fused_hist_delta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: tbptt_carry_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: all_gradients_buf.as_entire_binding(),
+                },
+            ],
+        });
         let d64 = config.d_r as u64;
         let h64 = config.h_slots as u64;
         let aw_mat_sz = std::num::NonZeroU64::new(d64 * d64 * 4);
-        let aw_wv_sz = std::num::NonZeroU64::new(h64 * d64 * d64 * 4);
-        let aw_wqk_sz = std::num::NonZeroU64::new(aw_wqk_bytes(d64, h64));
         let aw_win_sz = std::num::NonZeroU64::new(h64 * d64 * d64 * 4);
         let aw_alog_sz = std::num::NonZeroU64::new(h64 * d64 * 4);
         let aw_nscale_sz = std::num::NonZeroU64::new(d64 * 4);
@@ -1512,84 +1619,6 @@ impl GpuDeqBackend {
             ],
         });
 
-        let fused_adjoint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Fused Picard Adjoint BG"),
-            layout: &bg_adjoint_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fused_update_params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: adj_dl_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bridge.hnext_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: adj_v_out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: fused_v_next_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bridge.all_weights_buf,
-                        offset: aw_nscale_byte_off(d64, h64),
-                        size: aw_nscale_sz,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: bridge.scratch_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let fused_adjoint_weights_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Fused Picard Adjoint Weights BG"),
-            layout: &bg_adjoint_weights_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bridge.all_weights_buf,
-                        offset: 0,
-                        size: aw_wqk_sz,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bridge.all_weights_buf,
-                        offset: aw_wk_byte_off(d64, h64),
-                        size: aw_wqk_sz,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bridge.all_weights_buf,
-                        offset: aw_wv_byte_off(d64, h64),
-                        size: aw_wv_sz,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bridge.all_weights_buf,
-                        offset: aw_wo_byte_off(d64, h64),
-                        size: aw_mat_sz,
-                    }),
-                },
-            ],
-        });
-
         let fused_update_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Fused Update BG1 (AllWeights)"),
             layout: &fused_update_bg1_layout,
@@ -1598,6 +1627,63 @@ impl GpuDeqBackend {
                 resource: bridge.all_weights_buf.as_entire_binding(),
             }],
         });
+        // Parse all hot-path env vars once at construction.
+        let cached_residual_alpha = Self::residual_alpha_from_env();
+        let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
+        let cfg_hist_selective = Self::hist_selective_from_env();
+        let bool_flag = |s: &str| -> Option<bool> {
+            std::env::var(s).ok().map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+        };
+        let f32_flag =
+            |s: &str| -> Option<f32> { std::env::var(s).ok().and_then(|v| v.parse::<f32>().ok()) };
+        let cfg_hist_train_carrier = bool_flag("AIDEEN_HIST_TRAIN_CARRIER").unwrap_or(false);
+        let cfg_hist_train_wx = bool_flag("AIDEEN_HIST_TRAIN_WX").unwrap_or(cfg_hist_train_carrier);
+        let cfg_hist_train_wout = bool_flag("AIDEEN_HIST_TRAIN_WOUT").unwrap_or(false);
+        let cfg_hist_train_alog = bool_flag("AIDEEN_HIST_TRAIN_ALOG").unwrap_or(cfg_hist_selective);
+        let cfg_hist_train_delta =
+            bool_flag("AIDEEN_HIST_TRAIN_DELTA").unwrap_or(cfg_hist_selective);
+        let cfg_hist_internal_probe = bool_flag("AIDEEN_HIST_INTERNAL_PROBE").unwrap_or(false);
+        let cfg_fused_profile = bool_flag("AIDEEN_FUSED_PROFILE").unwrap_or(false);
+        let cfg_slot_anchor_zero = bool_flag("AIDEEN_DEQ_SLOT_ANCHOR_ZERO").unwrap_or(false);
+        let cfg_rms_floor = f32_flag("AIDEEN_DEQ_RMS_FLOOR").unwrap_or(0.0).max(0.0);
+        let cfg_contr_floor = f32_flag("AIDEEN_DEQ_CONTR_RMS_FLOOR")
+            .unwrap_or(0.0)
+            .max(0.0);
+        let cfg_hist_zero = bool_flag("AIDEEN_DEQ_HIST_ZERO").unwrap_or(false);
+        let cfg_hist_minner_zero = bool_flag("AIDEEN_DEQ_HIST_MINNER_ZERO").unwrap_or(false);
+        let cfg_hist_force_nomamba = bool_flag("AIDEEN_DEQ_HIST_FORCE_NOMAMBA").unwrap_or(false);
+        let cfg_hist_prelude_skip = bool_flag("AIDEEN_DEQ_HIST_PRELUDE_SKIP").unwrap_or(false);
+        let cfg_hist_loop_force_nomamba =
+            bool_flag("AIDEEN_DEQ_HIST_LOOP_FORCE_NOMAMBA").unwrap_or(false);
+        let cfg_signal_zero = bool_flag("AIDEEN_DEQ_SIGNAL_ZERO").unwrap_or(false);
+        let cfg_attn_out_mode = f32_flag("AIDEEN_DEQ_ATTN_OUT_MODE")
+            .unwrap_or(0.0)
+            .clamp(0.0, 2.0);
+        let cfg_attn_uniform = bool_flag("AIDEEN_DEQ_ATTN_UNIFORM").unwrap_or(false);
+        let cfg_attn_freeze = bool_flag("AIDEEN_DEQ_ATTN_FREEZE").unwrap_or(false);
+        let cfg_v_fixed = bool_flag("AIDEEN_DEQ_V_FIXED").unwrap_or(false);
+        let cfg_v_lag = bool_flag("AIDEEN_DEQ_V_LAG").unwrap_or(false);
+        let cfg_v_scale = f32_flag("AIDEEN_DEQ_V_SCALE")
+            .unwrap_or(1.0)
+            .clamp(0.01, 10.0);
+        let cfg_signal_scale = f32_flag("AIDEEN_DEQ_SIGNAL_SCALE")
+            .unwrap_or(1.0)
+            .clamp(0.01, 10.0);
+        let cfg_v_gate_scale = f32_flag("AIDEEN_DEQ_V_GATE_SCALE").unwrap_or(0.0);
+        let cfg_v_gate_bias = f32_flag("AIDEEN_DEQ_V_GATE_BIAS").unwrap_or(0.0);
+        let cfg_v_norm = bool_flag("AIDEEN_DEQ_V_NORM").unwrap_or(false);
+        let cfg_v_norm_scale = f32_flag("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
+        let cfg_picard_profile = bool_flag("AIDEEN_PICARD_PROFILE").unwrap_or(false);
+        let cfg_picard_stage_profile = bool_flag("AIDEEN_PICARD_STAGE_PROFILE").unwrap_or(false);
+        let cfg_picard_accum_split = bool_flag("AIDEEN_PICARD_ACCUM_SPLIT")
+            .or_else(|| bool_flag("AIDEEN_PICARD_ACCUM_SPLIT_PROFILE"))
+            .unwrap_or(false);
+        let cfg_picard_internal_probe = bool_flag("AIDEEN_PICARD_INTERNAL_PROBE").unwrap_or(false);
+        let cfg_picard_gscore_fused = bool_flag("AIDEEN_PICARD_GSCORE_FUSED").unwrap_or(false);
+
         Some(Self {
             config,
             instance,
@@ -1609,11 +1695,18 @@ impl GpuDeqBackend {
                 b_dl: adj_dl_buf,
                 b_v_out: adj_v_out_buf,
             },
-            fused_adjoint_picard_pipeline,
+            tps_timestamp_enabled,
+            tps_timestamp_period,
+            tps_timestamp_query,
+            tps_timestamp_resolve_buf,
+            tps_timestamp_readback_buf,
             staged_picard_init_pipeline,
             staged_picard_gcomb_pipeline,
             staged_picard_gmix_pipeline,
+            staged_picard_gmix_gscore_pipeline,
             staged_picard_gscore_pipeline,
+            staged_picard_accum_base_pipeline,
+            staged_picard_accum_opt_pipeline,
             staged_picard_accum_pipeline,
             staged_picard_accum_v_pipeline,
             staged_picard_accum_k_pipeline,
@@ -1626,12 +1719,9 @@ impl GpuDeqBackend {
             fused_update_hist_prep_pipeline,
             fused_update_hist_mat_pipeline,
             fused_update_hist_scale_pipeline,
-            _fused_update_hist_bias_pipeline: fused_update_hist_bias_pipeline,
             fused_update_hist_gate_pipeline,
             fused_update_hist_mprev_pipeline,
             fused_update_hist_tbptt_pipeline,
-            _fused_update_hist_xprep_pipeline: fused_update_hist_xprep_pipeline,
-            _fused_update_hist_hrhs_pipeline: fused_update_hist_hrhs_pipeline,
             fused_update_hist_wout_pipeline,
             fused_update_hist_wx_pipeline,
             fused_update_hist_alog_pipeline,
@@ -1640,14 +1730,12 @@ impl GpuDeqBackend {
             fused_update_hist_wgate_pipeline,
             fused_update_hist_forget_pipeline,
             fused_update_apply_grad_pipeline,
-            fused_adjoint_bg,
-            fused_adjoint_weights_bg,
             staged_picard_bg,
+            staged_picard_bg_alt,
             staged_picard_bg1,
             fused_update_bg0,
             fused_update_bg1,
             fused_update_params_buf,
-            fused_v_next_buf,
             fused_mix_buf,
             fused_weighted_h_buf,
             fused_gmix_buf,
@@ -1661,6 +1749,48 @@ impl GpuDeqBackend {
             staged_wo_t_buf,
             tbptt_carry_buf,
             all_gradients_buf,
+            anderson_m: anderson_m_val,
+            anderson_hist_bufs,
+            anderson_slots_per_segment: slots_per_segment as u32,
+            anderson_params_bufs,
+            anderson_bgs,
+            anderson_store_pipeline,
+            anderson_mix_pipeline,
+            cached_residual_alpha,
+            cfg_hist_gated,
+            cfg_hist_selective,
+            cfg_slot_anchor_zero,
+            cfg_rms_floor,
+            cfg_contr_floor,
+            cfg_hist_zero,
+            cfg_hist_minner_zero,
+            cfg_hist_force_nomamba,
+            cfg_hist_prelude_skip,
+            cfg_hist_loop_force_nomamba,
+            cfg_signal_zero,
+            cfg_attn_out_mode,
+            cfg_attn_uniform,
+            cfg_attn_freeze,
+            cfg_v_fixed,
+            cfg_v_lag,
+            cfg_v_scale,
+            cfg_signal_scale,
+            cfg_v_gate_scale,
+            cfg_v_gate_bias,
+            cfg_v_norm,
+            cfg_v_norm_scale,
+            cfg_hist_train_carrier,
+            cfg_hist_train_wx,
+            cfg_hist_train_wout,
+            cfg_hist_train_alog,
+            cfg_hist_train_delta,
+            cfg_hist_internal_probe,
+            cfg_fused_profile,
+            cfg_picard_profile,
+            cfg_picard_stage_profile,
+            cfg_picard_accum_split,
+            cfg_picard_internal_probe,
+            cfg_picard_gscore_fused,
         })
     }
 
@@ -1695,6 +1825,7 @@ impl GpuDeqBackend {
         max_iters: u32,
         epsilon: f32,
         damping: f32,
+        debug_enable: bool,
     ) -> DeqComputeShape {
         DeqComputeShape {
             batch_size,
@@ -1704,20 +1835,14 @@ impl GpuDeqBackend {
             epsilon,
             damping,
             seq_len,
-            residual_alpha: Self::residual_alpha_from_env(),
+            residual_alpha: self.cached_residual_alpha,
+            debug_enable: if debug_enable { 1 } else { 0 },
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 
-    #[allow(dead_code)]
-    fn picard_damping_from_env() -> f32 {
-        // Damping for Picard fixed-point iterations (was: cg_damping_from_env).
-        // hist_gated is default, so 0.90 is the default damping.
-        if std::env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1") {
-            0.95
-        } else {
-            0.90
-        }
-    }
 
     // --- WEIGHTS ---
 
@@ -1853,7 +1978,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
-        let shape = self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping);
+        let shape =
+            self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward(
             &self.device,
             &self.queue,
@@ -1892,7 +2018,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
-        let shape = self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping);
+        let shape =
+            self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward_pooled(
             &self.device,
             &self.queue,
@@ -1926,8 +2053,14 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool, // <--- ARREGLADO: Agregado el argumento faltante
     ) -> Result<Vec<f32>, &'static str> {
-        let shape =
-            self.build_compute_shape(batch_size, 1, self.config.max_deq_iters as u32, 5e-4, 0.9);
+        let shape = self.build_compute_shape(
+            batch_size,
+            1,
+            self.config.max_deq_iters as u32,
+            5e-4,
+            0.9,
+            true,
+        );
 
         // ARREGLADO: Extraemos el primer elemento de la tupla (Vec<f32>, Vec<u32>)
         match self.bridge.run_forward(
@@ -1970,7 +2103,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<u32>), &'static str> {
-        let shape = self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping);
+        let shape =
+            self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward_pooled_with_state(
             &self.device,
             &self.queue,
@@ -2008,7 +2142,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(), &'static str> {
-        let shape = self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping);
+        let shape =
+            self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward_no_readback(
             &self.device,
             &self.queue,
@@ -2046,7 +2181,8 @@ impl GpuDeqBackend {
         a_log: &[f32],
         norm: &[f32],
     ) -> Result<(), &'static str> {
-        let shape = self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping);
+        let shape =
+            self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.queue
             .write_buffer(&self.bridge.uniform_buf, 0, bytemuck::bytes_of(&shape));
 
@@ -2118,59 +2254,6 @@ impl GpuDeqBackend {
         Ok(())
     }
 
-    pub fn run_fused_adjoint_picard_no_readback(
-        &self,
-        seq_len: u32,
-        damping: f32,
-    ) -> Result<(), String> {
-        let params = UpdateUniforms {
-            d_model: self.config.d_r as u32,
-            h_slots: self.config.h_slots as u32,
-            lr: 0.0,
-            grad_scale: 0.0,
-            ternary_flag: 0,
-            weight_decay: 0.0,
-            seq_len,
-            damping,
-            residual_alpha: Self::residual_alpha_from_env(),
-            grad_accum_mode: 0,
-            n_accum: 1,
-            n_total_weights: 0,
-            batch_size: 1,
-        };
-        self.queue.write_buffer(
-            &self.fused_update_params_buf,
-            0,
-            bytemuck::bytes_of(&params),
-        );
-
-        let zero_len = (seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
-        let zeros = vec![0.0f32; zero_len];
-        self.queue
-            .write_buffer(&self.adj_bufs.b_v_out, 0, bytemuck::cast_slice(&zeros));
-        self.queue
-            .write_buffer(&self.fused_v_next_buf, 0, bytemuck::cast_slice(&zeros));
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Picard Adjoint Only"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Picard Adjoint Only"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.fused_adjoint_picard_pipeline);
-            pass.set_bind_group(0, &self.fused_adjoint_bg, &[]);
-            pass.set_bind_group(1, &self.fused_adjoint_weights_bg, &[]);
-            pass.dispatch_workgroups(seq_len, 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
-        Ok(())
-    }
-
     pub fn run_staged_adjoint_picard_no_readback(
         &self,
         seq_len: u32,
@@ -2180,35 +2263,12 @@ impl GpuDeqBackend {
         clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
-        let profile_picard = std::env::var("AIDEEN_PICARD_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let profile_picard_stages = std::env::var("AIDEEN_PICARD_STAGE_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let profile_picard_accum_split = std::env::var("AIDEEN_PICARD_ACCUM_SPLIT_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let picard_internal_probe = std::env::var("AIDEEN_PICARD_INTERNAL_PROBE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
+        let profile_picard = self.cfg_picard_profile;
+        let profile_picard_stages = self.cfg_picard_stage_profile;
+        let profile_picard_accum_split = self.cfg_picard_accum_split;
+        let picard_internal_probe = self.cfg_picard_internal_probe;
         let total_t0 = std::time::Instant::now();
+        let fused_gscore = self.cfg_picard_gscore_fused;
         let params = UpdateUniforms {
             d_model: self.config.d_r as u32,
             h_slots: self.config.h_slots as u32,
@@ -2218,11 +2278,13 @@ impl GpuDeqBackend {
             weight_decay: 0.0,
             seq_len,
             damping,
-            residual_alpha: Self::residual_alpha_from_env(),
+            residual_alpha: self.cached_residual_alpha,
             grad_accum_mode: 0,
             n_accum: 1,
             n_total_weights: 0,
             batch_size,
+            apply_accum: 0,
+            _pad0: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2230,11 +2292,173 @@ impl GpuDeqBackend {
             bytemuck::bytes_of(&params),
         );
 
-        // Mirror the CG path contract: staged Picard consumes cg_bridge.b_dl as
+        let attn_len =
+            (batch_size * seq_len * self.config.h_slots as u32 * self.config.d_r as u32) as usize;
+        let n_entries = batch_size * seq_len * self.config.h_slots as u32;
+        let d = self.config.d_r as u32;
+        let dl_bytes = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
+        let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
+
+        // Active training adjoint path:
+        // - v_state / v_next ping-pong between adj_bufs.b_v_out and fused_weighted_h_buf
+        // - fused_hist_delta_buf is not read by staged_adjoint_picard.wgsl
+        //
+        // T1-B: Batch dl_copy + zero + init + all Picard iterations into a single encoder
+        // in the normal path, eliminating iters+3 queue.submit() calls per adjoint call.
+        if !profile_picard_stages && !picard_internal_probe {
+            let anderson_m = self.anderson_m;
+            let n_tokens = batch_size * seq_len;
+            let needs_final_copy = (iters & 1) == 1;
+
+            // Pre-write Anderson params for each iteration before building the encoder.
+            if anderson_m > 0 {
+                for k in 0..(iters as usize) {
+                    let ap = AndersonParams {
+                        m: anderson_m,
+                        k: k as u32,
+                        slots_per_segment: self.anderson_slots_per_segment,
+                        _pad0: 0,
+                    };
+                    self.queue.write_buffer(
+                        &self.anderson_params_bufs[k],
+                        0,
+                        bytemuck::bytes_of(&ap),
+                    );
+                }
+            }
+
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Staged Picard Adjoint — All Iters"),
+                });
+            // Optional dl_dh copy (replaces separate dl_encoder submit).
+            if let Some(dl_dh_src) = dl_dh_src {
+                enc.copy_buffer_to_buffer(dl_dh_src, 0, &self.adj_bufs.b_dl, 0, dl_bytes);
+            }
+            // Zero buffers (replaces separate zero_encoder submit).
+            enc.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
+            enc.clear_buffer(&self.fused_weighted_h_buf, 0, None);
+            enc.clear_buffer(&self.fused_gmix_buf, 0, None);
+            if clear_slot_rhs {
+                enc.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
+            }
+            enc.clear_buffer(&self.fused_qgrad_buf, 0, None);
+            enc.clear_buffer(&self.fused_gscore_buf, 0, None);
+            // Clear Anderson history ring buffer
+            if anderson_m > 0 {
+                for buf in &self.anderson_hist_bufs {
+                    enc.clear_buffer(buf, 0, None);
+                }
+            }
+            // Init pass (replaces separate init_encoder submit).
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Staged Picard Init"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &self.staged_picard_bg, &[]);
+                pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
+                pass.set_pipeline(&self.staged_picard_init_pipeline);
+                pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+            }
+            enc.copy_buffer_to_buffer(
+                &self.fused_weighted_h_buf,
+                0,
+                &self.adj_bufs.b_v_out,
+                0,
+                bytes,
+            );
+            // All Picard iterations + optional Anderson mixing per iteration.
+            for k in 0..(iters as usize) {
+                let bg0 = if (k & 1) == 0 {
+                    &self.staged_picard_bg
+                } else {
+                    &self.staged_picard_bg_alt
+                };
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Staged Picard Iter"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_bind_group(0, bg0, &[]);
+                    pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
+                    pass.set_pipeline(&self.staged_picard_gcomb_pipeline);
+                    pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                    if fused_gscore {
+                        pass.set_pipeline(&self.staged_picard_gmix_gscore_pipeline);
+                        pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                    } else {
+                        pass.set_pipeline(&self.staged_picard_gmix_pipeline);
+                        pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        pass.set_pipeline(&self.staged_picard_gscore_pipeline);
+                        pass.dispatch_workgroups(
+                            self.config.h_slots.div_ceil(16) as u32,
+                            n_entries.div_ceil(16).max(1),
+                            1,
+                        );
+                    }
+                    if self.cfg_picard_accum_split {
+                        pass.set_pipeline(&self.staged_picard_accum_base_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_v_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_k_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_q_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    } else {
+                        if self.config.d_r <= 512 {
+                            pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
+                            pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        } else {
+                            pass.set_pipeline(&self.staged_picard_accum_pipeline);
+                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        }
+                    }
+                    // Anderson: store current v_next into ring buffer, then mix.
+                    if anderson_m > 0 {
+                        pass.set_bind_group(1, &self.anderson_bgs[k], &[]);
+                        // Store v_next into hist[k % m]
+                        pass.set_pipeline(&self.anderson_store_pipeline);
+                        pass.dispatch_workgroups((attn_len as u32).div_ceil(256).max(1), 1, 1);
+                        // Mix when ≥2 valid pseudo-residuals (k ≥ 2) — produces better gradient
+                        if k >= 2 {
+                            pass.set_pipeline(&self.anderson_mix_pipeline);
+                            pass.dispatch_workgroups(n_tokens.max(1), 1, 1);
+                        }
+                    }
+                }
+            }
+            if needs_final_copy {
+                enc.copy_buffer_to_buffer(
+                    &self.fused_weighted_h_buf,
+                    0,
+                    &self.adj_bufs.b_v_out,
+                    0,
+                    bytes,
+                );
+            }
+            self.queue.submit(Some(enc.finish()));
+            if profile_picard {
+                // Profiling path only: stall CPU so stage timings measure GPU completion,
+                // not just command submission latency.
+                self.device.poll(wgpu::Maintain::Wait);
+                eprintln!(
+                    "[PICARD-PROFILE] seq_len={} iters={} total={}ms (batched encoder)",
+                    seq_len,
+                    iters,
+                    total_t0.elapsed().as_millis()
+                );
+            }
+            return Ok(());
+        }
+
+        // Profile / probe path: per-stage/per-iter encoders for accurate timings and readbacks.
+        // Mirror the adjoint contract: staged Picard consumes adj_bufs.b_dl as
         // the pooled upstream gradient source. Without this copy, Picard can
         // iterate on a stale/zero rhs even when the LM head produced dl/dh.
         if let Some(dl_dh_src) = dl_dh_src {
-            let dl_bytes = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
             let mut dl_encoder =
                 self.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2256,25 +2480,17 @@ impl GpuDeqBackend {
         // Picard adjoint must start from v_state = 0 each call to solve (I - J^T)v = b.
         // Leaving b_v_out stale carries state across steps and breaks the linear solve.
         zero_encoder.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
-        zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
-        // `fused_mix_buf` carries the staged Picard `g_comb` output when we come from the
-        // precomputed adjoint path. Hist-gated temporal kernels consume that signal first;
-        // clearing it here would silently zero the historical backward path before it runs.
-        // Stage1b overwrites the whole buffer later, so no explicit clear is needed.
         zero_encoder.clear_buffer(&self.fused_weighted_h_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_gmix_buf, 0, None);
         if clear_slot_rhs {
             zero_encoder.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
         }
-        zero_encoder.clear_buffer(&self.fused_hist_delta_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
         zero_encoder.clear_buffer(&self.fused_gscore_buf, 0, None);
         self.queue.submit(Some(zero_encoder.finish()));
         let zero_ms = zero_t0.elapsed().as_millis();
         let prep_ms = prep_t0.elapsed().as_millis();
 
-        let n_entries = batch_size * seq_len * self.config.h_slots as u32;
-        let d = self.config.d_r as u32;
         let init_t0 = std::time::Instant::now();
         {
             let mut encoder = self
@@ -2292,11 +2508,6 @@ impl GpuDeqBackend {
                 pass.set_pipeline(&self.staged_picard_init_pipeline);
                 pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
             }
-            let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
-            // The staged Picard shader writes its init/output state into binding 8.
-            // In the current staged bind-group that binding is `fused_weighted_h_buf`,
-            // not `fused_v_next_buf`. Copying `fused_v_next_buf` here seeds `b_v_out`
-            // with zeros and kills the rerun branch before the first iteration.
             encoder.copy_buffer_to_buffer(
                 &self.fused_weighted_h_buf,
                 0,
@@ -2307,6 +2518,7 @@ impl GpuDeqBackend {
             self.queue.submit(Some(encoder.finish()));
         }
         let init_ms = init_t0.elapsed().as_millis();
+        let needs_final_copy = (iters & 1) == 1;
         if picard_internal_probe {
             let sample_t = (seq_len as usize / 2)
                 .max(1)
@@ -2351,7 +2563,7 @@ impl GpuDeqBackend {
         let mut stage_accum_v_ms = 0u128;
         let mut stage_accum_k_ms = 0u128;
         let mut stage_accum_q_ms = 0u128;
-        for _ in 0..iters {
+        for iter in 0..iters {
             if profile_picard_stages {
                 let run_stage = |label: &str,
                                  pipeline: &wgpu::ComputePipeline,
@@ -2387,7 +2599,11 @@ impl GpuDeqBackend {
                     1,
                     &self.device,
                     &self.queue,
-                    &self.staged_picard_bg,
+                    if (iter & 1) == 0 {
+                        &self.staged_picard_bg
+                    } else {
+                        &self.staged_picard_bg_alt
+                    },
                     &self.staged_picard_bg1,
                 );
                 stage_gmix_ms += run_stage(
@@ -2397,7 +2613,11 @@ impl GpuDeqBackend {
                     1,
                     &self.device,
                     &self.queue,
-                    &self.staged_picard_bg,
+                    if (iter & 1) == 0 {
+                        &self.staged_picard_bg
+                    } else {
+                        &self.staged_picard_bg_alt
+                    },
                     &self.staged_picard_bg1,
                 );
                 stage_gscore_ms += run_stage(
@@ -2407,19 +2627,48 @@ impl GpuDeqBackend {
                     n_entries.div_ceil(16).max(1),
                     &self.device,
                     &self.queue,
-                    &self.staged_picard_bg,
+                    if (iter & 1) == 0 {
+                        &self.staged_picard_bg
+                    } else {
+                        &self.staged_picard_bg_alt
+                    },
                     &self.staged_picard_bg1,
                 );
-                stage_accum_ms += run_stage(
-                    "Staged Picard Accum",
-                    &self.staged_picard_accum_pipeline,
-                    d.div_ceil(16),
-                    n_entries.div_ceil(16).max(1),
-                    &self.device,
-                    &self.queue,
-                    &self.staged_picard_bg,
-                    &self.staged_picard_bg1,
-                );
+                if profile_picard_accum_split {
+                    stage_accum_ms += run_stage(
+                        "Staged Picard Accum Base",
+                        &self.staged_picard_accum_base_pipeline,
+                        d.div_ceil(16),
+                        n_entries.div_ceil(16).max(1),
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                } else {
+                    stage_accum_ms += run_stage(
+                        if self.config.d_r <= 512 { "Staged Picard Accum Opt" } else { "Staged Picard Accum" },
+                        if self.config.d_r <= 512 {
+                            &self.staged_picard_accum_opt_pipeline
+                        } else {
+                            &self.staged_picard_accum_pipeline
+                        },
+                        if self.config.d_r <= 512 { n_entries.max(1) } else { d.div_ceil(16) },
+                        if self.config.d_r <= 512 { 1 } else { n_entries.div_ceil(16).max(1) },
+                        &self.device,
+                        &self.queue,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
+                        &self.staged_picard_bg1,
+                    );
+                }
                 if profile_picard_accum_split {
                     stage_accum_v_ms += run_stage(
                         "Staged Picard Accum V",
@@ -2428,7 +2677,11 @@ impl GpuDeqBackend {
                         n_entries.div_ceil(16).max(1),
                         &self.device,
                         &self.queue,
-                        &self.staged_picard_bg,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
                         &self.staged_picard_bg1,
                     );
                     stage_accum_k_ms += run_stage(
@@ -2438,7 +2691,11 @@ impl GpuDeqBackend {
                         n_entries.div_ceil(16).max(1),
                         &self.device,
                         &self.queue,
-                        &self.staged_picard_bg,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
                         &self.staged_picard_bg1,
                     );
                     stage_accum_q_ms += run_stage(
@@ -2448,27 +2705,14 @@ impl GpuDeqBackend {
                         n_entries.div_ceil(16).max(1),
                         &self.device,
                         &self.queue,
-                        &self.staged_picard_bg,
+                        if (iter & 1) == 0 {
+                            &self.staged_picard_bg
+                        } else {
+                            &self.staged_picard_bg_alt
+                        },
                         &self.staged_picard_bg1,
                     );
                 }
-                let t0 = std::time::Instant::now();
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Staged Picard Copy"),
-                        });
-                let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
-                encoder.copy_buffer_to_buffer(
-                    &self.fused_weighted_h_buf,
-                    0,
-                    &self.adj_bufs.b_v_out,
-                    0,
-                    bytes,
-                );
-                self.queue.submit(Some(encoder.finish()));
-                self.device.poll(wgpu::Maintain::Wait);
-                stage_copy_ms += t0.elapsed().as_millis();
             } else {
                 let iter_t0 = std::time::Instant::now();
                 let mut encoder =
@@ -2476,12 +2720,17 @@ impl GpuDeqBackend {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("Staged Picard Adjoint"),
                         });
+                let bg0 = if (iter & 1) == 0 {
+                    &self.staged_picard_bg
+                } else {
+                    &self.staged_picard_bg_alt
+                };
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("Staged Picard GComb"),
                         timestamp_writes: None,
                     });
-                    pass.set_bind_group(0, &self.staged_picard_bg, &[]);
+                    pass.set_bind_group(0, bg0, &[]);
                     pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
                     pass.set_pipeline(&self.staged_picard_gcomb_pipeline);
                     pass.dispatch_workgroups(n_entries.max(1), 1, 1);
@@ -2493,23 +2742,56 @@ impl GpuDeqBackend {
                         n_entries.div_ceil(16).max(1),
                         1,
                     );
-                    pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                    pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    if self.cfg_picard_accum_split {
+                        pass.set_pipeline(&self.staged_picard_accum_base_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_v_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_k_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        pass.set_pipeline(&self.staged_picard_accum_q_pipeline);
+                        pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                    } else {
+                        if self.config.d_r <= 512 {
+                            pass.set_pipeline(&self.staged_picard_accum_opt_pipeline);
+                            pass.dispatch_workgroups(n_entries.max(1), 1, 1);
+                        } else {
+                            pass.set_pipeline(&self.staged_picard_accum_pipeline);
+                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                        }
+                    }
                 }
-                let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
-                encoder.copy_buffer_to_buffer(
-                    &self.fused_weighted_h_buf,
-                    0,
-                    &self.adj_bufs.b_v_out,
-                    0,
-                    bytes,
-                );
                 self.queue.submit(Some(encoder.finish()));
                 submit_ms += iter_t0.elapsed().as_millis();
             }
         }
+        if needs_final_copy {
+            let bytes = (attn_len * std::mem::size_of::<f32>()) as u64;
+            let t0 = std::time::Instant::now();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Staged Picard Final Copy"),
+                });
+            encoder.copy_buffer_to_buffer(
+                &self.fused_weighted_h_buf,
+                0,
+                &self.adj_bufs.b_v_out,
+                0,
+                bytes,
+            );
+            self.queue.submit(Some(encoder.finish()));
+            if profile_picard_stages {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            stage_copy_ms += t0.elapsed().as_millis();
+        }
         let poll_t0 = std::time::Instant::now();
-        if !profile_picard_stages {
+        if profile_picard_stages {
+            // Only poll(Wait) in profiling mode for per-stage timing accuracy.
+            // In normal operation, the caller (apply_gradient_update) provides the
+            // final sync barrier — no need to stall CPU here between adjoint and update.
+            // Profiling path only: caller in normal training keeps adjoint->update asynchronous.
             self.device.poll(wgpu::Maintain::Wait);
         }
         let poll_ms = poll_t0.elapsed().as_millis();
@@ -2552,6 +2834,7 @@ impl GpuDeqBackend {
         grad_accum_mode: u32,
         n_accum: u32,
         batch_size: u32,
+        apply_accum: bool,
     ) -> Result<(), String> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
@@ -2566,245 +2849,237 @@ impl GpuDeqBackend {
             weight_decay,
             seq_len,
             damping,
-            residual_alpha: Self::residual_alpha_from_env(),
+            residual_alpha: self.cached_residual_alpha,
             grad_accum_mode,
             n_accum,
             n_total_weights,
             batch_size,
+            apply_accum: if apply_accum { 1 } else { 0 },
+            _pad0: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
             0,
             bytemuck::bytes_of(&params),
         );
-        let profile_fused = std::env::var("AIDEEN_FUSED_PROFILE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        // El trainer siempre corre run_staged_adjoint_picard_no_readback antes de llamar
-        // esta función — el adjoint siempre está precomputado. El inline Picard de abajo
-        // queda comentado como referencia del diseño original.
-        // let use_precomputed_adjoint =
-        //     std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1")
-        //         || std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() == Some("1")
-        //         || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1")
-        //         || std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1");
+        // Use cached config flags — no env::var syscalls in hot path.
+        let profile_fused = self.cfg_fused_profile;
         // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
-        let hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
-        let hist_selective = hist_gated && Self::hist_selective_from_env();
-        let hist_internal_probe = std::env::var("AIDEEN_HIST_INTERNAL_PROBE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
+        let hist_gated = self.cfg_hist_gated;
+        let hist_selective = self.cfg_hist_selective;
+        let hist_internal_probe = self.cfg_hist_internal_probe;
         if profile_fused {
             // Drain any previously queued GPU work (notably CG) so per-stage fused timings
             // do not absorb unrelated latency from earlier submissions.
             self.device.poll(wgpu::Maintain::Wait);
         }
-        let mut zero_encoder =
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Fused Update Zero Buffers"),
-                });
-        // fused_mix_buf NO se limpia — el staged Picard ya lo llenó con g_comb correcto.
-        // (antes se limpiaba para el path inline Picard que ya no se usa)
-        // if !hist_gated {
-        //     zero_encoder.clear_buffer(&self.fused_mix_buf, 0, None);
-        // }
-        zero_encoder.clear_buffer(&self.fused_weighted_h_buf, 0, None);
-        zero_encoder.clear_buffer(&self.fused_gmix_buf, 0, None);
-        zero_encoder.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
-        zero_encoder.clear_buffer(&self.fused_hist_delta_buf, 0, None);
-        zero_encoder.clear_buffer(&self.fused_gscore_buf, 0, None);
-        zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
-        // b_v_out y fused_v_next_buf ya no se usan — eran output del inline Picard.
-        // if !use_precomputed_adjoint {
-        //     zero_encoder.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
-        //     zero_encoder.clear_buffer(&self.fused_v_next_buf, 0, None);
-        // }
-        self.queue.submit(Some(zero_encoder.finish()));
-        if profile_fused {
-            self.device.poll(wgpu::Maintain::Wait);
+        if profile_fused || hist_internal_probe {
+            let mut zero_encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Fused Update Zero Buffers"),
+                    });
+            // fused_mix_buf NO se limpia — el staged Picard ya lo llenó con g_comb correcto.
+            // (antes se limpiaba para el path inline Picard que ya no se usa)
+            // if !hist_gated {
+            //     zero_encoder.clear_buffer(&self.fused_mix_buf, 0, None);
+            // }
+            zero_encoder.clear_buffer(&self.fused_weighted_h_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_gmix_buf, 0, None);
+            // Profile/probe path is intentionally conservative: we zero every temp that may be
+            // inspected mid-flight so debug reads never depend on prior work left in buffers.
+            zero_encoder.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_hist_delta_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_gscore_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
+            self.queue.submit(Some(zero_encoder.finish()));
+            if profile_fused {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
         }
         let d = self.config.d_r as u32;
         let n = batch_size * seq_len * self.config.h_slots as u32;
         let hs = self.config.h_slots as u32;
-
-        let run_stage = |device: &wgpu::Device,
-                         queue: &wgpu::Queue,
-                         label: &str,
-                         pipeline: &wgpu::ComputePipeline,
-                         bg0: &wgpu::BindGroup,
-                         bg1: &wgpu::BindGroup,
-                         x: u32,
-                         y: u32,
-                         profile: bool| {
-            let t0 = std::time::Instant::now();
-            let mut encoder = device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(label),
-                    timestamp_writes: None,
+        // T1-A: Batch all compute stages into a single command encoder for the normal
+        // (non-profile, non-probe) training path, eliminating ~20 queue.submit() calls/step.
+        if !profile_fused && !hist_internal_probe {
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Fused Update — All Stages"),
                 });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bg0, &[]);
-                pass.set_bind_group(1, bg1, &[]);
-                pass.dispatch_workgroups(x, y, 1);
+            // weighted_h/gmix/gscore/qgrad are fully overwritten by stage1b/stage1a/stage2/stage3
+            // before any consumer reads them in the normal fused-update path.
+            // Keep hist_ctx/hist_delta clears: their producers do not cover every regime as cleanly.
+            // Normal hot path still zeros hist_ctx/hist_delta because the history producers do
+            // not provably cover every selective/gated regime. qgrad/gscore stay untouched here
+            // because stage2/stage3 fully overwrite them before any read.
+            enc.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
+            enc.clear_buffer(&self.fused_hist_delta_buf, 0, None);
+            // add_pass!: append one compute pass (one pipeline) to `enc`.
+            // Macro expansion is inline so `enc` / `self` are captured correctly
+            // without closure-capture lifetime issues.
+            macro_rules! add_pass {
+                ($pipeline:expr, $x:expr, $y:expr) => {{
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline($pipeline);
+                    pass.set_bind_group(0, &self.fused_update_bg0, &[]);
+                    pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                    pass.dispatch_workgroups($x, $y, 1);
+                }};
             }
-            queue.submit(Some(encoder.finish()));
-            if profile {
-                device.poll(wgpu::Maintain::Wait);
-                eprintln!("[FUSED-PROFILE] {label}: {} ms", t0.elapsed().as_millis());
-            }
-        };
-
-        // INLINE PICARD — comentado. El trainer siempre corre run_staged_adjoint_picard_no_readback
-        // antes de llamar esta función. El staged Picard (staged_adjoint_picard.wgsl) escribe
-        // correctamente a fused_mix_buf. El inline Picard escribía a cg_bridge.b_v_out (buffer
-        // equivocado), dejando fused_mix_buf en cero → stage1a computaba gradiente cero.
-        // if !use_precomputed_adjoint {
-        //     run_stage(
-        //         &self.device, &self.queue,
-        //         "Picard Adjoint (BPTT)",
-        //         &self.fused_adjoint_picard_pipeline,
-        //         &self.fused_adjoint_bg,
-        //         &self.fused_adjoint_weights_bg,
-        //         seq_len, 1, profile_fused,
-        //     );
-        // }
-
-        if hist_gated {
-            let train_hist_carrier = std::env::var("AIDEEN_HIST_TRAIN_CARRIER")
-                .ok()
-                .map(|v| {
-                    let vl = v.trim().to_ascii_lowercase();
-                    vl == "1" || vl == "true" || vl == "yes"
-                })
-                // Root-cause finding: even with consistent selective TBPTT, opening W_x/W_out
-                // from step 0 lets the carrier learn against an interface that is still weak.
-                // Keep the carrier frozen by default so the historical interface learns first;
-                // explicit opt-in remains available via env override.
-                .unwrap_or(false);
-            let train_hist_wx = std::env::var("AIDEEN_HIST_TRAIN_WX")
-                .ok()
-                .map(|v| {
-                    let vl = v.trim().to_ascii_lowercase();
-                    vl == "1" || vl == "true" || vl == "yes"
-                })
-                .unwrap_or(train_hist_carrier);
-            let train_hist_wout = std::env::var("AIDEEN_HIST_TRAIN_WOUT")
-                .ok()
-                .map(|v| {
-                    let vl = v.trim().to_ascii_lowercase();
-                    vl == "1" || vl == "true" || vl == "yes"
-                })
-                // Root-cause finding: reopening W_out together with W_x makes the memory-space
-                // basis itself drift while the historical interface is still adapting. That is
-                // a different failure mode from "carrier collapse", and it destabilizes long
-                // runs even when the carrier magnitude is healthy. Keep W_out frozen by default
-                // in the first carrier-reopen phase; explicit opt-in remains available.
-                .unwrap_or(false);
-            let train_hist_alog = std::env::var("AIDEEN_HIST_TRAIN_ALOG")
-                .ok()
-                .map(|v| {
-                    let vl = v.trim().to_ascii_lowercase();
-                    vl == "1" || vl == "true" || vl == "yes"
-                })
-                .unwrap_or(hist_selective);
-            let train_hist_delta = std::env::var("AIDEEN_HIST_TRAIN_DELTA")
-                .ok()
-                .map(|v| {
-                    let vl = v.trim().to_ascii_lowercase();
-                    vl == "1" || vl == "true" || vl == "yes"
-                })
-                .unwrap_or(hist_selective);
-            run_stage(
-                &self.device,
-                &self.queue,
-                "hist_prep",
-                &self.fused_update_hist_prep_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                n,
-                1,
-                profile_fused,
-            );
-            let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
-            if train_hist_temporal {
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "hist_mprev",
-                    &self.fused_update_hist_mprev_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    n,
-                    1,
-                    profile_fused,
-                );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "hist_tbptt",
-                    &self.fused_update_hist_tbptt_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    batch_size * hs,
-                    1,
-                    profile_fused,
-                );
-                if hist_internal_probe {
-                    let sample_t = (seq_len as usize / 2)
-                        .max(1)
-                        .min(seq_len.saturating_sub(1) as usize);
-                    let n_entries = seq_len as usize * self.config.h_slots;
-                    let n_floats = n_entries * self.config.d_r;
-                    let hist_rhs = self.read_storage_buffer(
-                        &self.fused_hist_ctx_buf,
-                        n_floats,
-                        "Hist Probe RHS Readback",
-                    );
-                    let hist_delta = self.read_storage_buffer(
-                        &self.fused_hist_delta_buf,
-                        n_floats,
-                        "Hist Probe Delta Readback",
-                    );
-                    let (rhs_mean, rhs_max, rhs_nz) = Self::summarize_token_block(
-                        &hist_rhs,
-                        sample_t,
-                        self.config.h_slots,
-                        self.config.d_r,
-                    );
-                    let (delta_mean, delta_max, delta_nz) = Self::summarize_token_block(
-                        &hist_delta,
-                        sample_t,
-                        self.config.h_slots,
-                        self.config.d_r,
-                    );
-                    eprintln!(
-                        "[HIST-INTERNAL] pre-rerun sample_t={} rhs(mean/max/nz)={:.6e}/{:.6e}/{}/{} delta(mean/max/nz)={:.6e}/{:.6e}/{}/{}",
-                        sample_t,
-                        rhs_mean,
-                        rhs_max,
-                        rhs_nz,
-                        self.config.h_slots * self.config.d_r,
-                        delta_mean,
-                        delta_max,
-                        delta_nz,
-                        self.config.h_slots * self.config.d_r,
-                    );
+            if hist_gated {
+                let train_hist_carrier = self.cfg_hist_train_carrier;
+                let train_hist_wx = self.cfg_hist_train_wx;
+                let train_hist_wout = self.cfg_hist_train_wout;
+                let train_hist_alog = self.cfg_hist_train_alog;
+                let train_hist_delta = self.cfg_hist_train_delta;
+                let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
+                add_pass!(&self.fused_update_hist_prep_pipeline, n, 1);
+                if train_hist_temporal {
+                    add_pass!(&self.fused_update_hist_mprev_pipeline, n, 1);
+                    add_pass!(&self.fused_update_hist_tbptt_pipeline, batch_size * hs, 1);
+                    add_pass!(&self.fused_update_hist_prep_pipeline, n, 1);
                 }
+                add_pass!(&self.fused_update_hist_gate_pipeline, hs.div_ceil(64), 1);
+                add_pass!(
+                    &self.fused_update_hist_mat_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16)
+                );
+                add_pass!(
+                    &self.fused_update_hist_scale_pipeline,
+                    d.div_ceil(16),
+                    hs.div_ceil(16)
+                );
+                add_pass!(
+                    &self.fused_update_hist_wgate_pipeline,
+                    d.div_ceil(16),
+                    hs.div_ceil(16)
+                );
+                if train_hist_temporal {
+                    add_pass!(&self.fused_update_hist_mprev_pipeline, n, 1);
+                    add_pass!(&self.fused_update_hist_tbptt_pipeline, batch_size * hs, 1);
+                    add_pass!(
+                        &self.fused_update_hist_forget_pipeline,
+                        d.div_ceil(16),
+                        hs.div_ceil(16)
+                    );
+                    if train_hist_alog {
+                        add_pass!(&self.fused_update_hist_alog_pipeline, d.div_ceil(64), 1);
+                    }
+                    if train_hist_wout {
+                        add_pass!(
+                            &self.fused_update_hist_wout_pipeline,
+                            d.div_ceil(16),
+                            d.div_ceil(16)
+                        );
+                    }
+                    if train_hist_wx {
+                        add_pass!(
+                            &self.fused_update_hist_wx_pipeline,
+                            d.div_ceil(16),
+                            d.div_ceil(16)
+                        );
+                    }
+                    if train_hist_delta && hist_selective {
+                        add_pass!(
+                            &self.fused_update_hist_wdelta_pipeline,
+                            d.div_ceil(16),
+                            d.div_ceil(16)
+                        );
+                        add_pass!(&self.fused_update_hist_bdelta_pipeline, d.div_ceil(64), 1);
+                    }
+                }
+            }
+            add_pass!(&self.fused_update_stage1a_pipeline, n, 1);
+            add_pass!(&self.fused_update_stage1b_pipeline, n, 1);
+            add_pass!(
+                &self.fused_update_stage2_pipeline,
+                hs.div_ceil(16),
+                n.div_ceil(16)
+            );
+            add_pass!(
+                &self.fused_update_stage3_pipeline,
+                d.div_ceil(16),
+                n.div_ceil(16)
+            );
+            add_pass!(
+                &self.fused_update_stage4_pipeline,
+                d.div_ceil(16),
+                d.div_ceil(16)
+            );
+            if grad_accum_mode == 1 && apply_accum {
+                add_pass!(
+                    &self.fused_update_apply_grad_pipeline,
+                    n_total_weights.div_ceil(256),
+                    1
+                );
+            }
+            self.queue.submit(Some(enc.finish()));
+            // Non-blocking queue drain for long batched encoders. This preserves overlap while
+            // letting Metal advance work and release memory pressure.
+            self.device.poll(wgpu::Maintain::Poll);
+        } else {
+            // Profile / probe path: per-stage encoders for accurate per-stage timings
+            // and mid-sequence GPU readbacks (hist_internal_probe).
+            let mut zero_encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Fused Update Zero Buffers"),
+                    });
+            zero_encoder.clear_buffer(&self.fused_weighted_h_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_gmix_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_hist_delta_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_gscore_buf, 0, None);
+            zero_encoder.clear_buffer(&self.fused_qgrad_buf, 0, None);
+            self.queue.submit(Some(zero_encoder.finish()));
+            if profile_fused {
+                // Profiling path only: per-stage timings require completion, not queued work.
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            let run_stage = |device: &wgpu::Device,
+                             queue: &wgpu::Queue,
+                             label: &str,
+                             pipeline: &wgpu::ComputePipeline,
+                             bg0: &wgpu::BindGroup,
+                             bg1: &wgpu::BindGroup,
+                             x: u32,
+                             y: u32,
+                             profile: bool| {
+                let t0 = std::time::Instant::now();
+                let mut encoder = device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg0, &[]);
+                    pass.set_bind_group(1, bg1, &[]);
+                    pass.dispatch_workgroups(x, y, 1);
+                }
+                queue.submit(Some(encoder.finish()));
+                if profile {
+                    device.poll(wgpu::Maintain::Wait);
+                    eprintln!("[FUSED-PROFILE] {label}: {} ms", t0.elapsed().as_millis());
+                }
+            };
+            if hist_gated {
+                let train_hist_carrier = self.cfg_hist_train_carrier;
+                let train_hist_wx = self.cfg_hist_train_wx;
+                let train_hist_wout = self.cfg_hist_train_wout;
+                let train_hist_alog = self.cfg_hist_train_alog;
+                let train_hist_delta = self.cfg_hist_train_delta;
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "hist_prep_final",
+                    "hist_prep",
                     &self.fused_update_hist_prep_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
@@ -2812,214 +3087,299 @@ impl GpuDeqBackend {
                     1,
                     profile_fused,
                 );
-            }
-            // Interface-only training must consume the projected historical context
-            // directly from hist_prep. Running TBPTT first overwrites gmix_buf with
-            // carrier gradients and changes the objective of the gate update.
-            run_stage(
-                &self.device,
-                &self.queue,
-                "hist_gate",
-                &self.fused_update_hist_gate_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                hs.div_ceil(64),
-                1,
-                profile_fused,
-            );
-            // HistParams gradients are defined on the projected context produced by
-            // hist_prep. They do not depend on the temporal TBPTT state and must be
-            // computed before any carrier-stage kernels reuse the shared scratch.
-            run_stage(
-                &self.device,
-                &self.queue,
-                "hist_mat",
-                &self.fused_update_hist_mat_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                d.div_ceil(16),
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "hist_scale",
-                &self.fused_update_hist_scale_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                hs.div_ceil(16),
-                profile_fused,
-            );
-            run_stage(
-                &self.device,
-                &self.queue,
-                "hist_wgate",
-                &self.fused_update_hist_wgate_pipeline,
-                &self.fused_update_bg0,
-                &self.fused_update_bg1,
-                d.div_ceil(16),
-                hs.div_ceil(16),
-                profile_fused,
-            );
-            if train_hist_temporal {
+                let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
+                if train_hist_temporal {
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "hist_mprev",
+                        &self.fused_update_hist_mprev_pipeline,
+                        &self.fused_update_bg0,
+                        &self.fused_update_bg1,
+                        n,
+                        1,
+                        profile_fused,
+                    );
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "hist_tbptt",
+                        &self.fused_update_hist_tbptt_pipeline,
+                        &self.fused_update_bg0,
+                        &self.fused_update_bg1,
+                        batch_size * hs,
+                        1,
+                        profile_fused,
+                    );
+                    if hist_internal_probe {
+                        let sample_t = (seq_len as usize / 2)
+                            .max(1)
+                            .min(seq_len.saturating_sub(1) as usize);
+                        let n_entries = seq_len as usize * self.config.h_slots;
+                        let n_floats = n_entries * self.config.d_r;
+                        let hist_rhs = self.read_storage_buffer(
+                            &self.fused_hist_ctx_buf,
+                            n_floats,
+                            "Hist Probe RHS Readback",
+                        );
+                        let hist_delta = self.read_storage_buffer(
+                            &self.fused_hist_delta_buf,
+                            n_floats,
+                            "Hist Probe Delta Readback",
+                        );
+                        let (rhs_mean, rhs_max, rhs_nz) = Self::summarize_token_block(
+                            &hist_rhs,
+                            sample_t,
+                            self.config.h_slots,
+                            self.config.d_r,
+                        );
+                        let (delta_mean, delta_max, delta_nz) = Self::summarize_token_block(
+                            &hist_delta,
+                            sample_t,
+                            self.config.h_slots,
+                            self.config.d_r,
+                        );
+                        eprintln!(
+                            "[HIST-INTERNAL] pre-rerun sample_t={} rhs(mean/max/nz)={:.6e}/{:.6e}/{}/{} delta(mean/max/nz)={:.6e}/{:.6e}/{}/{}",
+                            sample_t,
+                            rhs_mean,
+                            rhs_max,
+                            rhs_nz,
+                            self.config.h_slots * self.config.d_r,
+                            delta_mean,
+                            delta_max,
+                            delta_nz,
+                            self.config.h_slots * self.config.d_r,
+                        );
+                    }
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "hist_prep_final",
+                        &self.fused_update_hist_prep_pipeline,
+                        &self.fused_update_bg0,
+                        &self.fused_update_bg1,
+                        n,
+                        1,
+                        profile_fused,
+                    );
+                }
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "hist_mprev_final",
-                    &self.fused_update_hist_mprev_pipeline,
+                    "hist_gate",
+                    &self.fused_update_hist_gate_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
-                    n,
+                    hs.div_ceil(64),
                     1,
                     profile_fused,
                 );
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "hist_tbptt_final",
-                    &self.fused_update_hist_tbptt_pipeline,
+                    "hist_mat",
+                    &self.fused_update_hist_mat_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
-                    batch_size * hs,
-                    1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
                     profile_fused,
                 );
-                // Forget gate backward: uses weighted_h_buf from hist_tbptt_final.
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "hist_forget",
-                    &self.fused_update_hist_forget_pipeline,
+                    "hist_scale",
+                    &self.fused_update_hist_scale_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
                     d.div_ceil(16),
                     hs.div_ceil(16),
                     profile_fused,
                 );
-                if train_hist_alog {
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "hist_wgate",
+                    &self.fused_update_hist_wgate_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    hs.div_ceil(16),
+                    profile_fused,
+                );
+                if train_hist_temporal {
                     run_stage(
                         &self.device,
                         &self.queue,
-                        "hist_alog",
-                        &self.fused_update_hist_alog_pipeline,
+                        "hist_mprev_final",
+                        &self.fused_update_hist_mprev_pipeline,
                         &self.fused_update_bg0,
                         &self.fused_update_bg1,
-                        d.div_ceil(64),
+                        n,
                         1,
                         profile_fused,
                     );
-                }
-                if train_hist_wout {
                     run_stage(
                         &self.device,
                         &self.queue,
-                        "hist_wout",
-                        &self.fused_update_hist_wout_pipeline,
+                        "hist_tbptt_final",
+                        &self.fused_update_hist_tbptt_pipeline,
                         &self.fused_update_bg0,
                         &self.fused_update_bg1,
-                        d.div_ceil(16),
-                        d.div_ceil(16),
-                        profile_fused,
-                    );
-                }
-                if train_hist_wx {
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_wx",
-                        &self.fused_update_hist_wx_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        d.div_ceil(16),
-                        d.div_ceil(16),
-                        profile_fused,
-                    );
-                }
-                if train_hist_delta && hist_selective {
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_wdelta",
-                        &self.fused_update_hist_wdelta_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        d.div_ceil(16),
-                        d.div_ceil(16),
-                        profile_fused,
-                    );
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_bdelta",
-                        &self.fused_update_hist_bdelta_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        d.div_ceil(64),
+                        batch_size * hs,
                         1,
                         profile_fused,
                     );
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "hist_forget",
+                        &self.fused_update_hist_forget_pipeline,
+                        &self.fused_update_bg0,
+                        &self.fused_update_bg1,
+                        d.div_ceil(16),
+                        hs.div_ceil(16),
+                        profile_fused,
+                    );
+                    if train_hist_alog {
+                        run_stage(
+                            &self.device,
+                            &self.queue,
+                            "hist_alog",
+                            &self.fused_update_hist_alog_pipeline,
+                            &self.fused_update_bg0,
+                            &self.fused_update_bg1,
+                            d.div_ceil(64),
+                            1,
+                            profile_fused,
+                        );
+                    }
+                    if train_hist_wout {
+                        run_stage(
+                            &self.device,
+                            &self.queue,
+                            "hist_wout",
+                            &self.fused_update_hist_wout_pipeline,
+                            &self.fused_update_bg0,
+                            &self.fused_update_bg1,
+                            d.div_ceil(16),
+                            d.div_ceil(16),
+                            profile_fused,
+                        );
+                    }
+                    if train_hist_wx {
+                        run_stage(
+                            &self.device,
+                            &self.queue,
+                            "hist_wx",
+                            &self.fused_update_hist_wx_pipeline,
+                            &self.fused_update_bg0,
+                            &self.fused_update_bg1,
+                            d.div_ceil(16),
+                            d.div_ceil(16),
+                            profile_fused,
+                        );
+                    }
+                    if train_hist_delta && hist_selective {
+                        run_stage(
+                            &self.device,
+                            &self.queue,
+                            "hist_wdelta",
+                            &self.fused_update_hist_wdelta_pipeline,
+                            &self.fused_update_bg0,
+                            &self.fused_update_bg1,
+                            d.div_ceil(16),
+                            d.div_ceil(16),
+                            profile_fused,
+                        );
+                        run_stage(
+                            &self.device,
+                            &self.queue,
+                            "hist_bdelta",
+                            &self.fused_update_hist_bdelta_pipeline,
+                            &self.fused_update_bg0,
+                            &self.fused_update_bg1,
+                            d.div_ceil(64),
+                            1,
+                            profile_fused,
+                        );
+                    }
                 }
             }
-        }
-        run_stage(
-            &self.device,
-            &self.queue,
-            "stage1a",
-            &self.fused_update_stage1a_pipeline,
-            &self.fused_update_bg0,
-            &self.fused_update_bg1,
-            n,
-            1,
-            profile_fused,
-        );
-        run_stage(
-            &self.device,
-            &self.queue,
-            "stage1b",
-            &self.fused_update_stage1b_pipeline,
-            &self.fused_update_bg0,
-            &self.fused_update_bg1,
-            n,
-            1,
-            profile_fused,
-        );
-        run_stage(
-            &self.device,
-            &self.queue,
-            "stage2",
-            &self.fused_update_stage2_pipeline,
-            &self.fused_update_bg0,
-            &self.fused_update_bg1,
-            hs.div_ceil(16),
-            n.div_ceil(16),
-            profile_fused,
-        );
-        run_stage(
-            &self.device,
-            &self.queue,
-            "stage3",
-            &self.fused_update_stage3_pipeline,
-            &self.fused_update_bg0,
-            &self.fused_update_bg1,
-            d.div_ceil(16),
-            n.div_ceil(16),
-            profile_fused,
-        );
-        run_stage(
-            &self.device,
-            &self.queue,
-            "stage4",
-            &self.fused_update_stage4_pipeline,
-            &self.fused_update_bg0,
-            &self.fused_update_bg1,
-            d.div_ceil(16),
-            d.div_ceil(16),
-            profile_fused,
-        );
-        if !profile_fused {
-            self.device.poll(wgpu::Maintain::Poll);
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage1a",
+                &self.fused_update_stage1a_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                n,
+                1,
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage1b",
+                &self.fused_update_stage1b_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                n,
+                1,
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage2",
+                &self.fused_update_stage2_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                hs.div_ceil(16),
+                n.div_ceil(16),
+                profile_fused,
+            );
+            run_stage(
+                &self.device,
+                &self.queue,
+                "stage3",
+                &self.fused_update_stage3_pipeline,
+                &self.fused_update_bg0,
+                &self.fused_update_bg1,
+                d.div_ceil(16),
+                n.div_ceil(16),
+                profile_fused,
+            );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "stage4",
+                    &self.fused_update_stage4_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    profile_fused,
+                );
+            if grad_accum_mode == 1 && apply_accum {
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "apply_grad",
+                    &self.fused_update_apply_grad_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    n_total_weights.div_ceil(256),
+                    1,
+                    profile_fused,
+                );
+            }
+            if !profile_fused {
+                // Same rationale as the normal hot path: keep queue moving without inserting a
+                // hard CPU barrier when profiling is disabled.
+                self.device.poll(wgpu::Maintain::Poll);
+            }
         }
         Ok(())
     }
@@ -3045,11 +3405,13 @@ impl GpuDeqBackend {
             weight_decay,
             seq_len: 1,
             damping: 0.0,
-            residual_alpha: Self::residual_alpha_from_env(),
+            residual_alpha: self.cached_residual_alpha,
             grad_accum_mode: 0, // unused by apply_grad_update_main but set for clarity
             n_accum,
             n_total_weights,
             batch_size: 1,
+            apply_accum: 0,
+            _pad0: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3072,6 +3434,8 @@ impl GpuDeqBackend {
             pass.dispatch_workgroups(n_total_weights.div_ceil(256), 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        // Explicit API boundary: callers expect accumulated gradients to be fully applied when
+        // this method returns, so this is a real synchronization point, not a hot-path stall.
         self.device.poll(wgpu::Maintain::Wait);
         Ok(())
     }
@@ -3128,6 +3492,84 @@ impl GpuDeqBackend {
         self.bridge.read_debug_buffer(&self.device, &self.queue)
     }
 
+    pub fn tps_epoch_begin(&self) {
+        if !self.tps_timestamp_enabled {
+            return;
+        }
+        let Some(qs) = self.tps_timestamp_query.as_ref() else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("AIDEEN TPS Timestamp Begin"),
+            });
+        encoder.write_timestamp(qs, 0);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn tps_epoch_end(&self) {
+        if !self.tps_timestamp_enabled {
+            return;
+        }
+        let (Some(qs), Some(resolve), Some(readback)) = (
+            self.tps_timestamp_query.as_ref(),
+            self.tps_timestamp_resolve_buf.as_ref(),
+            self.tps_timestamp_readback_buf.as_ref(),
+        ) else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("AIDEEN TPS Timestamp End"),
+            });
+        encoder.write_timestamp(qs, 1);
+        encoder.resolve_query_set(qs, 0..2, resolve, 0);
+        encoder.copy_buffer_to_buffer(
+            resolve,
+            0,
+            readback,
+            0,
+            2 * std::mem::size_of::<u64>() as u64,
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn read_tps_epoch_ns(&self) -> Option<f64> {
+        if !self.tps_timestamp_enabled {
+            return None;
+        }
+        let buf = self.tps_timestamp_readback_buf.as_ref()?;
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        // Readback helper: Wait is required because the CPU consumes mapped data immediately.
+        self.device.poll(wgpu::Maintain::Wait);
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            buf.unmap();
+            return None;
+        }
+        let data = slice.get_mapped_range();
+        let ts: &[u64] = bytemuck::cast_slice(&data);
+        if ts.len() < 2 {
+            drop(data);
+            buf.unmap();
+            return None;
+        }
+        let start = ts[0];
+        let end = ts[1];
+        drop(data);
+        buf.unmap();
+        if end <= start {
+            return None;
+        }
+        let period = self.tps_timestamp_period as f64;
+        Some((end - start) as f64 * period)
+    }
+
     pub fn read_scratch_buffer(&self) -> Vec<f32> {
         self.bridge.read_scratch_buffer(&self.device, &self.queue)
     }
@@ -3156,6 +3598,7 @@ impl GpuDeqBackend {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // Readback helper: Wait is required because the CPU consumes mapped data immediately.
         self.device.poll(wgpu::Maintain::Wait);
         if let Ok(Ok(())) = rx.recv() {
             let out: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
@@ -3326,72 +3769,22 @@ impl GpuDeqBackend {
         )
     }
 
-    /// Reconstructs the forward historical context `c_{t,k}` used by the
-    /// hist-gated DEQ branch from persisted scratch state and history params.
-    /// This is the semantically correct debug signal for hist_gated; the
-    /// fused_hist_ctx_buf storage is reused by backward and cannot be trusted
-    /// as a forward-context probe after training steps.
+    /// Reads the exact forward historical context `c_{t,k}` retained in Scratch.
+    /// This matches the constant term injected into the DEQ loop, including the
+    /// dynamic `hist_mod` scaling applied in the forward prelude.
     pub fn read_hist_gated_ctx_forward(&self, seq_len: u32) -> Vec<f32> {
         let d = self.config.d_r;
         let h_slots = self.config.h_slots;
         let scratch = self.read_scratch_buffer();
-        let hist_off = aw_hist_byte_off(d as u64, h_slots as u64);
-        let hist_params = self.read_storage_buffer_at(
-            &self.bridge.all_weights_buf,
-            hist_off,
-            Self::history_params_len(d, h_slots),
-            "Hist Gated Params Readback Staging",
-        );
-        let scratch_stride = d * (h_slots * 6 + 1) + h_slots * h_slots;
-        let mamba_base = h_slots * 4 * d;
-        let signal_base = mamba_base + h_slots * d;
-        let hist_mat_len = d * d;
-        let hist_scale_base = hist_mat_len;
-        let hist_bias_base = hist_scale_base + h_slots * d;
-        let hist_gate_base = hist_bias_base + h_slots * d;
+        let scratch_stride = d * h_slots * 8 + h_slots * h_slots + h_slots;
+        let hist_ctx_base = h_slots * d * 7;
 
         let mut out = vec![0.0f32; seq_len as usize * h_slots * d];
         for t in 0..seq_len as usize {
             let token_base = t * scratch_stride;
-            let mut inj_sumsq = 0.0f32;
-            for i in 0..d {
-                let inj = scratch[token_base + signal_base + i];
-                inj_sumsq += inj * inj;
-            }
-            let inj_rms = (inj_sumsq / d.max(1) as f32 + 1e-6).sqrt();
-            for s in 0..h_slots {
-                let gate_logit = hist_params[hist_gate_base + s];
-                let alpha = 0.08 + 0.20 * (1.0 / (1.0 + (-gate_logit).exp()));
-                let out_base = (t * h_slots + s) * d;
-                if t == 0 {
-                    continue;
-                }
-                let prev_base = (t - 1) * scratch_stride + mamba_base + s * d;
-                let scale_base = hist_scale_base + s * d;
-                let mut prev_sumsq = 0.0f32;
-                for j in 0..d {
-                    let prev = scratch[prev_base + j];
-                    prev_sumsq += prev * prev;
-                }
-                let prev_rms = (prev_sumsq / d.max(1) as f32 + 1e-6).sqrt();
-                let mut hist_sumsq = 0.0f32;
-                for dim_out in 0..d {
-                    let mut u = hist_params[scale_base + dim_out]
-                        * (scratch[prev_base + dim_out] / prev_rms);
-                    let row_base = dim_out * d;
-                    for j in 0..d {
-                        u += hist_params[row_base + j] * (scratch[prev_base + j] / prev_rms);
-                    }
-                    out[out_base + dim_out] = u;
-                    hist_sumsq += u * u;
-                }
-                let hist_rms = (hist_sumsq / d.max(1) as f32 + 1e-6).sqrt();
-                let tau = inj_rms;
-                let hist_scale = (tau / hist_rms.max(1e-6)).min(1.0);
-                for dim_out in 0..d {
-                    out[out_base + dim_out] *= alpha * hist_scale;
-                }
-            }
+            let src = token_base + hist_ctx_base;
+            let dst = t * h_slots * d;
+            out[dst..dst + h_slots * d].copy_from_slice(&scratch[src..src + h_slots * d]);
         }
         out
     }
@@ -3600,7 +3993,7 @@ impl GpuDeqBackend {
         let d = self.config.d_r;
         let h_slots = self.config.h_slots;
         let scratch = self.read_scratch_buffer();
-        let scratch_stride = d * (h_slots * 6 + 1) + h_slots * h_slots;
+        let scratch_stride = d * h_slots * 8 + h_slots * h_slots + h_slots;
         let mamba_base = h_slots * 4 * d;
         let mut rms = vec![0.0f32; seq_len as usize];
         for t in 0..seq_len as usize {
@@ -3624,17 +4017,16 @@ impl GpuDeqBackend {
         max_iters: u32,
         damping: f32,
         epsilon: f32,
+        debug_enable: bool,
     ) -> Result<(), &'static str> {
-        let shape = aideen_block::deq_bridge::DeqComputeShape {
+        let shape = self.build_compute_shape(
             batch_size,
-            d_model: self.config.d_r as u32, // ✅ consistencia total con el pipeline
-            h_slots: self.config.h_slots as u32,
+            seq_len,
             max_iters,
             epsilon,
             damping,
-            seq_len,
-            residual_alpha: Self::residual_alpha_from_env(),
-        };
+            debug_enable,
+        );
 
         self.bridge
             .run_forward_gpu_only(&self.device, &self.queue, &shape);
