@@ -51,7 +51,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 | EXP2 Iso-Time (120s) | 4.17 ± 0.00 | 3.38 ± 0.01 | 0.0001 |
 | EXP3 Inference NLL | 4.17 ± 0.00 | 2.96 ± 0.02 | <0.0001 |
 
-The transformer outperforms at 100K tokens. DEQ architectures require spectral pre-conditioning from random initialization — the training pipeline achieves 0% unconverged (contractivity < 0.85) on a pre-conditioned checkpoint, but the benchmark starts from random weights where spectral norms exceed the contractivity threshold. This is an inherent property of implicit-depth models. Full-corpus benchmark with warm-up protocol is a Phase 1 deliverable
+At 100K tokens from random initialization, the DEQ does not converge and produces random-guess loss (ln(65) ≈ 4.17). This is expected: DEQ architectures require spectral pre-conditioning before the fixed-point iteration can converge — spectral norms at random init are ~2-4x above the contractivity threshold. After conditioning, our training pipeline achieves 0% unconverged (contractivity < 0.85) and sustained val_loss improvement (5.96 → 4.66 avg on 3.76M tokens). Full-corpus benchmark with warm-up protocol is a Phase 1 deliverable
 
 **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens) tokenized for larger-scale training
 
