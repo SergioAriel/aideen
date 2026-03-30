@@ -1,11 +1,11 @@
-//! Training loop principal de AIDEEN.
+//! Main training loop for AIDEEN.
 //!
-//! Pipeline por step:
+//! Pipeline per step:
 //!   ① tokenizer.embed_context(tokens) → query D_R
 //!   ② query → DEQ forward → H*
 //!   ③ H* → LmHead → logits
 //!   ④ loss = cross_entropy(logits, target)
-//!   ⑤ backward LmHead + backward embedding (analítico)
+//!   ⑤ backward LmHead + backward embedding (analytical)
 //!   ⑥ backward DEQ (implicit diff via CG)
 //!   ⑦ Adam update (embeddings + LmHead + DEQ)
 //!   ⑧ renormalize_weights() (spectral norm)
@@ -27,16 +27,16 @@ use aideen_backbone::gpu_embedding::GpuEmbeddingTrainer;
 #[cfg(feature = "wgpu")]
 use aideen_backbone::gpu_lm_head::GpuLmHeadTrainer;
 
-/// Configuración del training (hiperparámetros).
+/// Training configuration (hyperparameters).
 pub struct TrainingConfig {
     pub lr: f32,
-    /// LR mínimo al final del cosine schedule (default: lr/10).
+    /// Minimum LR at the end of the cosine schedule (default: lr/10).
     pub lr_min: f32,
     pub epochs: usize,
     pub log_every: usize,
-    /// Warmup epochs: LR sube linealmente de lr_min a lr.
+    /// Warmup epochs: LR ramps linearly from lr_min to lr.
     pub warmup_epochs: usize,
-    /// Experimento "Bit-Dieta": Proyecta pesos a valores ternarios (-1, 0, 1).
+    /// "Bit-Diet" experiment: Projects weights to ternary values (-1, 0, 1).
     pub ternary: bool,
     pub emb_lr_mult: f32,
     pub lm_lr_mult: f32,
@@ -82,7 +82,7 @@ pub struct Trainer {
     pub lm_head: LmHead,
     pub tokenizer: Tokenizer,
     pub optimizer: Adam,
-    // Flags de ablatación y validación
+    // Ablation and validation flags
     pub frozen_deq: bool,
     pub frozen_emb: bool,
     pub frozen_lm: bool,
@@ -201,7 +201,7 @@ impl Trainer {
     fn apply_experimental_profile_from_env(&mut self) {
         let exp = Self::env_flag("AIDEEN_DEQ_EXPERIMENTAL");
         let alpha_env = Self::env_f32("AIDEEN_DEQ_RESIDUAL_ALPHA").map(|v| v.clamp(0.0, 1.0));
-        let alpha = alpha_env.unwrap_or(0.0); // v14: Matemáticamente probado que requiere 0.0
+        let alpha = alpha_env.unwrap_or(0.0); // v14: Mathematically proven to require 0.0
         self.reasoning.residual_alpha = alpha;
 
         if exp {
@@ -216,7 +216,7 @@ impl Trainer {
         }
     }
 
-    /// Crea un Trainer con un tokenizer pre-construido.
+    /// Creates a Trainer with a pre-built tokenizer.
     pub fn from_tokenizer(tokenizer: Tokenizer, lr: f32) -> Self {
         let config = tokenizer.config.clone();
 
@@ -300,8 +300,8 @@ impl Trainer {
         trainer
     }
 
-    /// Igual que `from_tokenizer`, pero forzando inicialización determinística
-    /// de los pesos de reasoning (DEQ core) para reproducibilidad por seed.
+    /// Same as `from_tokenizer`, but forcing deterministic initialization
+    /// of the reasoning weights (DEQ core) for seed-based reproducibility.
     pub fn from_tokenizer_seeded(tokenizer: Tokenizer, lr: f32, seed: u64) -> Self {
         let config = tokenizer.config.clone();
 
@@ -426,11 +426,11 @@ impl Trainer {
         }
     }
 
-    /// Reinicia los estados cognitivos (slots) tanto en CPU como en GPU.
+    /// Resets cognitive states (slots) on both CPU and GPU.
     pub fn reset_state(&mut self) {
-        // MambaSlotReasoning es stateless entre llamadas: el DEQ recomputa h* desde cero
-        // en cada forward pass, por lo que no hay estado oculto persistente que limpiar.
-        // reset_state sirve para forzar que la próxima secuencia no comparta contexto.
+        // MambaSlotReasoning is stateless between calls: the DEQ recomputes h* from scratch
+        // on each forward pass, so there is no persistent hidden state to clear.
+        // reset_state forces the next sequence to not share context.
         self.m_prev = None;
         #[cfg(feature = "wgpu")]
         if let Some(gpu) = self.gpu_deq.as_ref() {
@@ -438,10 +438,10 @@ impl Trainer {
         }
     }
 
-    /// Ejecuta un paso de entrenamiento dado un slice de tokens.
-    /// `context`: tokens de contexto (input)
-    /// `target`: token a predecir
-    /// `reset_state`: si es true, limpia el estado oculto antes de procesar.
+    /// Executes a training step given a slice of tokens.
+    /// `context`: context tokens (input)
+    /// `target`: token to predict
+    /// `reset_state`: if true, clears hidden state before processing.
     pub fn train_step(&mut self, context: &[u32], target: u32, reset_state: bool) -> f32 {
         if reset_state {
             self.reset_state();
@@ -495,9 +495,9 @@ impl Trainer {
         0.0
     }
 
-    /// Paso de entrenamiento para una secuencia completa (Sequence Fusing).
-    /// Procesa 1..N tokens en una única ráfaga GPU.
-    /// `reset_state`: si es true, limpia el estado oculto antes de empezar la secuencia.
+    /// Training step for a full sequence (Sequence Fusing).
+    /// Processes 1..N tokens in a single GPU burst.
+    /// `reset_state`: if true, clears hidden state before starting the sequence.
     pub fn train_sequence(
         &mut self,
         tokens: &[u32],
@@ -524,8 +524,8 @@ impl Trainer {
             let out = (|| {
                 self.ensure_gpu_trainers(&gpu);
 
-                // Arreglo defensivo para evitar underflow si seq_len < ctx_len.
-                // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
+                // Defensive fix to avoid underflow if seq_len < ctx_len.
+                // For batch > 1, the training loop passes B*ctx_len tokens — do not truncate.
                 let fwd_batch_size_ts: usize = self.cfg_fwd_batch_size.max(1) as usize;
                 let seq_len = tokens.len().min(targets.len());
                 let actual_ctx_len = if fwd_batch_size_ts > 1 {
@@ -599,7 +599,7 @@ impl Trainer {
             self.put_gpu(gpu);
             return out;
         }
-        // CPU fallback: recorre la secuencia por pasos autoregresivos.
+        // CPU fallback: iterate through the sequence with autoregressive steps.
         let seq_len = tokens.len().min(targets.len());
         if seq_len == 0 {
             return 0.0;
@@ -719,10 +719,10 @@ impl Trainer {
             let fw = self.cached_debug_buf.clone();
             let heartbeat = if fw.len() > 10 { fw[10] } else { 1.0 };
             let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
-            let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
+            let unconverged_count = if fw.len() > 15 { fw[15] } else { 0.0 };
             let contractivity = if fw.len() > 21 { fw[21] } else { 0.0 };
             let seq = heartbeat.max(1.0);
-            let hit_ratio = hit_count.max(0.0) / seq;
+            let unconverged_ratio = unconverged_count.max(0.0) / seq;
             // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
             // also being non-contractive. Non-monotone convergence (contr transiently > 1
             // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
@@ -736,10 +736,10 @@ impl Trainer {
             }
             if self.invalid_hi_streak >= 3 {
                 eprintln!(
-                    "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
+                    "    [DEQ-INVALID] step={} contr={:.3} unconverged_ratio={:.3} maxΔ={:.3e} seq={:.0}",
                     self.optimizer.step_count(),
                     contractivity,
-                    hit_ratio,
+                    unconverged_ratio,
                     max_delta,
                     seq
                 );
@@ -759,7 +759,7 @@ impl Trainer {
 
                 let w_sum: f32 = w_raw.iter().map(|&x| x.abs()).sum();
                 println!(
-                    "[GPU-LM] Sincronizando pesos del LM Head... (abs_sum={:.4})",
+                    "[GPU-LM] Syncing LM Head weights... (abs_sum={:.4})",
                     w_sum
                 );
 
@@ -800,11 +800,11 @@ impl Trainer {
             }
 
             if !self.frozen_deq && !invalid_fixed_point {
-                // ⑥ Backward DEQ — Picard Adjoint (GPU, siempre).
+                // ⑥ Backward DEQ — Picard Adjoint (GPU, always).
                 // Skip when DEQ diverged (invalid_fixed_point): gradients from a non-converged
                 // forward pass are unreliable (∂L/∂θ via implicit diff requires h* to exist).
-                // staged Picard llena fused_mix_buf con g_comb, luego apply_fused_deq_update
-                // aplica el weight update completo en GPU. Un solo path, siempre correcto.
+                // Staged Picard fills fused_mix_buf with g_comb, then apply_fused_deq_update
+                // applies the full weight update on GPU. Single path, always correct.
                 let batch_size = fwd_batch_size;
                 let _ = gpu.run_staged_adjoint_picard_no_readback(
                     per_seq_len,
@@ -869,18 +869,18 @@ impl Trainer {
                 self.gpu_cg_weights_uploaded = true;
 
                 // =============================================================================
-                // [LEGACY — NO UTILIZADO] CPU fallback path (CG en CPU con h* leído del GPU).
+                // [LEGACY — NOT USED] CPU fallback path (CG on CPU with h* read from GPU).
                 //
-                // Reemplazado por: run_staged_adjoint_picard_no_readback() + apply_fused_deq_update()
-                // (path GPU completo, líneas arriba de este bloque).
+                // Replaced by: run_staged_adjoint_picard_no_readback() + apply_fused_deq_update()
+                // (full GPU path, lines above this block).
                 //
-                // Este bloque nunca ejecuta (if false). Lo que hace:
-                //   1. Lee h* del GPU, recalcula en CPU via reasoning.step()
-                //   2. Corre deq_implicit_grad (CG numérico con finite differences)
-                //   3. Aplica weight update en CPU y re-sube todo a GPU
+                // This block never executes (if false). What it does:
+                //   1. Reads h* from GPU, recomputes on CPU via reasoning.step()
+                //   2. Runs deq_implicit_grad (numerical CG with finite differences)
+                //   3. Applies weight update on CPU and re-uploads everything to GPU
                 //
-                // Problemas: latencia de readback, CG escalar (O(N²) por iter),
-                // no soporta W_hist ni hist_gate (solo W_q/W_k/W_v/W_o/W_in/NormScale).
+                // Issues: readback latency, scalar CG (O(N^2) per iter),
+                // does not support W_hist or hist_gate (only W_q/W_k/W_v/W_o/W_in/NormScale).
                 // =============================================================================
                 if false {
                     // Strict path: CPU CG with GPU's h_star.
@@ -1105,7 +1105,7 @@ impl Trainer {
                 let heartbeat = if fw.len() > 10 { fw[10] } else { 0.0 }; // seq
                 let max_h = if fw.len() > 11 { fw[11] } else { 0.0 };
                 let avg_iters = if fw.len() > 13 { fw[13] } else { 0.0 };
-                let hit_count = if fw.len() > 15 { fw[15] } else { 0.0 };
+                let unconverged_count = if fw.len() > 15 { fw[15] } else { 0.0 };
                 let max_delta = if fw.len() > 16 { fw[16] } else { 0.0 };
                 let _last_delta = if fw.len() > 17 { fw[17] } else { 0.0 };
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
@@ -1172,8 +1172,8 @@ impl Trainer {
                 }
 
                 let seq = heartbeat.max(1.0);
-                let hit = hit_count.max(0.0);
-                let hit_ratio = hit / seq;
+                let unconverged = unconverged_count.max(0.0);
+                let unconverged_ratio = unconverged / seq;
 
                 // ---------- v13.2 Stability Oracle Logic ----------
 
@@ -1198,18 +1198,18 @@ impl Trainer {
                     let _ = gpu.renormalize_spectral();
                     self.contractivity_hi_streak = 0;
                     if contractivity > 1.20 {
-                        self.emergency_left = 2; // 2 windows de debug (~20 steps)
+                        self.emergency_left = 2; // 2 debug windows (~20 steps)
                     }
                 }
 
                 // 3. Forward Iters Hysteresis (v13.3)
-                // For very short sequences (e.g. seq=1), hit_ratio is not informative
+                // For very short sequences (e.g. seq=1), unconverged_ratio is not informative
                 // and tends to force unnecessary iteration growth.
                 if seq >= 8.0 {
-                    if hit_ratio > 0.08 {
+                    if unconverged_ratio > 0.08 {
                         self.hit_hi_streak += 1;
                         self.hit_lo_streak = 0;
-                    } else if hit_ratio < 0.03 {
+                    } else if unconverged_ratio < 0.03 {
                         self.hit_lo_streak += 1;
                         self.hit_hi_streak = 0;
                     } else {
@@ -1231,24 +1231,24 @@ impl Trainer {
                     }
                 }
 
-                // Subir iters si se está pegando al techo sostenidamente
+                // Increase iters if consistently hitting the ceiling
                 if self.hit_hi_streak >= 2 {
                     self.adaptive_max_iters = (self.adaptive_max_iters + 1).min(12);
                     self.hit_hi_streak = 0;
                 }
 
-                // Bajar iters si está sobrado por un buen rato
+                // Decrease iters if consistently overprovisioned
                 if self.hit_lo_streak >= 10 {
                     self.adaptive_max_iters = self.adaptive_max_iters.saturating_sub(1).max(4);
                     self.hit_lo_streak = 0;
                 }
 
-                // BOOST de Damping por inestabilidad puntual o hit ratio alto
-                if hit_ratio > 0.20 || max_delta > 1e-3 {
-                    self.damping_boost_left = 2; // 2 windows de debug (~20 steps)
+                // Damping BOOST on transient instability or high unconverged ratio
+                if unconverged_ratio > 0.20 || max_delta > 1e-3 {
+                    self.damping_boost_left = 2; // 2 debug windows (~20 steps)
                 }
 
-                // Detector de crecimiento explosivo o inestabilidad pura (Stability Guardrail)
+                // Explosive growth or pure instability detector (Stability Guardrail)
                 let growth = if self.last_max_h > 0.0 {
                     max_h / self.last_max_h
                 } else {
@@ -1256,7 +1256,7 @@ impl Trainer {
                 };
                 self.last_max_h = max_h;
 
-                // Evita falsos positivos cuando las activaciones aún son diminutas.
+                // Avoid false positives when activations are still tiny.
                 if self.last_max_h > 1e-2 && max_h > 1e-2 && growth > 1.20 {
                     self.max_h_growth_streak += 1;
                 } else {
@@ -1269,15 +1269,15 @@ impl Trainer {
                     self.max_delta_hi_streak = 0;
                 }
 
-                // EMERGENCY Triggers: crecimiento rápido, NaNs, residuo inaceptable sostenido
-                // o Divergencia (>1.20).
+                // EMERGENCY Triggers: rapid growth, NaNs, sustained unacceptable residual
+                // or divergence (>1.20).
                 if self.max_h_growth_streak >= 3
                     || self.max_delta_hi_streak >= 3
                     || max_h.is_nan()
                     || max_delta.is_nan()
                     || contractivity > 1.20
                 {
-                    self.emergency_left = 3; // 3 windows de debug (~30 steps)
+                    self.emergency_left = 3; // 3 debug windows (~30 steps)
                     self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
                     self.max_h_growth_streak = 0;
                     self.max_delta_hi_streak = 0;
@@ -1294,7 +1294,7 @@ impl Trainer {
                     self.emergency_left -= 1;
                 }
 
-                // Determinar modo y damping efectivo
+                // Determine mode and effective damping
                 let damping_eff = self.damping_eff();
                 let mode_str = if self.emergency_left > 0 {
                     "EMERG"
@@ -1304,15 +1304,15 @@ impl Trainer {
                     "NORMAL"
                 };
                 let conv_ok =
-                    hit_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
+                    unconverged_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
-                let hit_i = hit.round() as i32;
+                let unconverged_i = unconverged.round() as i32;
                 println!(
-                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
+                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: unconverged={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
-                    hit_i,
+                    unconverged_i,
                     seq,
-                    100.0 * hit_ratio,
+                    100.0 * unconverged_ratio,
                     contractivity,
                     max_delta,
                     rs_cg,
@@ -1376,7 +1376,7 @@ impl Trainer {
                     hist_wd
                 );
 
-                // GPU-SSM per-slot decay diagnostics (activar con AIDEEN_SSM_DEBUG=1).
+                // GPU-SSM per-slot decay diagnostics (enable with AIDEEN_SSM_DEBUG=1).
                 if self.cfg_ssm_debug {
                     let carrier = gpu.read_hist_carrier_params_full();
                     let d_r = self.config.d_r;
@@ -1449,7 +1449,7 @@ impl Trainer {
         0.0
     }
 
-    /// Cosine LR schedule con warmup.
+    /// Cosine LR schedule with warmup.
     fn cosine_lr(&self, epoch: usize, total_epochs: usize) -> f32 {
         let lr_max = self.training_config.lr;
         let lr_min = self.training_config.lr_min;
@@ -1463,7 +1463,7 @@ impl Trainer {
         }
     }
 
-    /// Schedule de Epsilon progresivo para el solver DEQ.
+    /// Progressive epsilon schedule for the DEQ solver.
     fn progressive_epsilon(&self, epoch: usize, total_epochs: usize) -> f32 {
         let progress = epoch as f32 / total_epochs.max(1) as f32;
         if progress < 0.20 {
@@ -1477,7 +1477,7 @@ impl Trainer {
         }
     }
 
-    /// Ejecuta el training loop sobre un corpus tokenizado.
+    /// Executes the training loop over a tokenized corpus.
     pub fn train_on_tokens(&mut self, tokens: &[u32], epochs: usize, log_every: usize) {
         if tokens.len() < 2 {
             return;
@@ -1537,11 +1537,11 @@ impl Trainer {
                     );
                 }
 
-                // Detectar si el primer token es un separador/EOS (ej: 0)
-                // En muchos datasets tokenizados, el 0 se usa para marcar inicio/fin de doc.
+                // Detect if the first token is a separator/EOS (e.g. 0)
+                // In many tokenized datasets, 0 is used to mark document start/end.
                 let mut reset_requested = false;
                 if i == 0 {
-                    reset_requested = true; // Siempre reset al inicio del epoch
+                    reset_requested = true; // Always reset at epoch start
                 } else if !batch_ctx.is_empty() && (batch_ctx[0] == 0 || batch_ctx[0] == 2) {
                     reset_requested = true;
                 }
@@ -1624,7 +1624,7 @@ impl Trainer {
                 }
             }
             let elapsed = t_start.elapsed().as_secs_f32();
-            // Usar tokens reales procesados, no num_chunks * ctx_len (que sobre-cuenta el último chunk).
+            // Use actual processed tokens, not num_chunks * ctx_len (which over-counts the last chunk).
             let tokens_processed = train_tokens.len();
             let tps = tokens_processed as f32 / elapsed.max(1e-9);
 
@@ -1664,7 +1664,7 @@ impl Trainer {
         }
     }
 
-    /// Genera texto a partir de un prompt.
+    /// Generates text from a prompt.
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -1676,7 +1676,7 @@ impl Trainer {
     ) -> String {
         #[cfg(feature = "wgpu")]
         {
-            // Política de inferencia: priorizar GPU; fallback a CPU si no hay dispositivo.
+            // Inference policy: prefer GPU; fall back to CPU if no device available.
             if !self.reasoning.has_backend() {
                 let _ = self.configure_inference_backend(true);
             }
@@ -1788,8 +1788,8 @@ impl Trainer {
         self.tokenizer.decode(&tokens[prompt_len..])
     }
 
-    /// Versión streaming de generate: llama a `on_token` con cada fragmento de texto
-    /// generado en tiempo real, sin esperar a que termine la generación completa.
+    /// Streaming version of generate: calls `on_token` with each text fragment
+    /// generated in real-time, without waiting for the full generation to finish.
     pub fn generate_stream<F: FnMut(&str)>(
         &mut self,
         prompt: &str,
@@ -1933,8 +1933,8 @@ impl Trainer {
         self.tokenizer.decode(tokens)
     }
 
-    /// Calcula la cross-entropy loss sobre una secuencia sin actualizar pesos.
-    /// Útil para validación limpia (forward-only, sin backprop).
+    /// Computes cross-entropy loss over a sequence without updating weights.
+    /// Useful for clean validation (forward-only, no backprop).
     pub fn eval_loss(&self, tokens: &[u32]) -> f32 {
         if tokens.len() < 2 {
             return f32::NAN;
@@ -1976,8 +1976,8 @@ impl Trainer {
     // Gradient clipping global (L2 norm)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Escala `grad` in-place si su norma L2 supera `max_norm`.
-    /// Equivalente a `clip_grad_norm_` de PyTorch para un único tensor.
+    /// Scales `grad` in-place if its L2 norm exceeds `max_norm`.
+    /// Equivalent to PyTorch's `clip_grad_norm_` for a single tensor.
     fn clip_grad_norm(grad: &mut nalgebra::DVector<f32>, max_norm: f32) {
         let norm = grad.norm();
         if norm > max_norm {
@@ -1986,16 +1986,17 @@ impl Trainer {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Streaming dataloader — entrenamiento desde archivo binario de tokens
+    // Streaming dataloader — training from binary token file
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Entrena sobre un archivo binario de tokens u32 (little-endian).
+    /// Trains on a binary file of u32 tokens (little-endian).
     ///
-    /// El archivo puede tener cualquier tamaño: se lee en chunks de `ctx_len + 1`
-    /// tokens con una ventana solapada de `overlap` tokens para preservar contexto
-    /// entre chunks. Cuando aparece el token `eos_token` se reinicia el contexto.
+    /// The file can be any size: it is read in chunks of `ctx_len + 1` tokens
+    /// with an overlapping window of `overlap` tokens to preserve context
+    /// between chunks. When the `eos_token` appears, context is reset.
     ///
-    /// `save_every`: guarda checkpoint cada N epochs (0 = nunca).
+    /// `save_every`: saves checkpoint every N epochs (0 = never).
+    /// `skip_chunks`: number of chunks to skip at start of first epoch (for resuming).
     pub fn train_on_file(
         &mut self,
         path: &str,
@@ -2004,20 +2005,21 @@ impl Trainer {
         eos_token: u32,
         save_every: usize,
         checkpoint_path: &str,
+        skip_chunks: usize,
     ) -> std::io::Result<()> {
-        use std::io::Read;
+        use std::io::{Read, Seek, SeekFrom};
 
         let file_size = std::fs::metadata(path)?.len() as usize;
         let total_file_tokens = file_size / 4;
         if total_file_tokens < 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "El archivo tiene menos de 2 tokens",
+                "File has fewer than 2 tokens",
             ));
         }
 
         let ctx_len = self.config.ctx_len.max(1);
-        // Ventana solapada: leemos ctx_len + 1 tokens, avanzamos ctx_len/2 para contexto continuo.
+        // Overlapping window: read ctx_len + 1 tokens, advance ctx_len/2 for continuous context.
         let stride = (ctx_len / 2).max(1);
         let chunk_tokens = ctx_len + 1;
         let chunk_bytes = chunk_tokens * 4;
@@ -2038,7 +2040,7 @@ impl Trainer {
                 gpu.tps_epoch_begin();
             }
 
-            // v13.1 Adaptive Epoch Schedule (Piso de iteraciones)
+            // v13.1 Adaptive Epoch Schedule (iteration floor)
             let deq_progress = epoch as f32 / epochs.max(1) as f32;
             let sched_floor = if deq_progress < 0.25 {
                 8
@@ -2061,6 +2063,20 @@ impl Trainer {
                 self.adaptive_adj_iters = adj_usize as u32;
             }
 
+            // Skip chunks: advance file position past already-trained data (first epoch only).
+            // Each chunk advances by `stride` tokens (stride = ctx_len/2).
+            let skip_offset = if skip_chunks > 0 && epoch == 0 {
+                let skip_bytes = ((skip_chunks * stride * 4) as u64).min(file_size as u64);
+                println!(
+                    "    [skip] Skipping {skip_chunks} chunks ({} tokens, {:.2} MB)",
+                    skip_bytes / 4,
+                    skip_bytes as f64 / 1_048_576.0
+                );
+                skip_bytes
+            } else {
+                0u64
+            };
+
             // Prefetch next chunk on a background thread to overlap disk I/O with GPU work.
             let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
             let path_owned = path.to_string();
@@ -2072,6 +2088,12 @@ impl Trainer {
                         return;
                     }
                 };
+                if skip_offset > 0 {
+                    if f.seek(SeekFrom::Start(skip_offset)).is_err() {
+                        let _ = tx.send((Vec::new(), 0));
+                        return;
+                    }
+                }
                 loop {
                     let mut buf = vec![0u8; chunk_bytes];
                     let n = match f.read(&mut buf) {
@@ -2089,16 +2111,16 @@ impl Trainer {
                 }
             });
             let mut epoch_loss = 0.0f32;
-            let mut num_chunks = 0usize;
+            let mut num_chunks = if skip_chunks > 0 && epoch == 0 { skip_chunks } else { 0 };
             let mut total_tokens = 0usize;
-            // Buffer de tokens no consumidos del chunk anterior (para ventana solapada).
+            // Buffer of unconsumed tokens from the previous chunk (for overlapping window).
             let mut carry: Vec<u32> = Vec::with_capacity(stride);
             // Pre-allocate token window to avoid per-chunk heap allocations.
             let mut tokens: Vec<u32> = Vec::with_capacity(chunk_tokens + stride);
             let mut last_save_time = std::time::Instant::now();
 
             loop {
-                // Prepend carry del chunk anterior + leer nuevos bytes (prefetch thread).
+                // Prepend carry from previous chunk + read new bytes (prefetch thread).
                 let (read_buf, n) = match rx.recv() {
                     Ok(v) => v,
                     Err(_) => (Vec::new(), 0),
@@ -2107,7 +2129,7 @@ impl Trainer {
                     break;
                 }
 
-                // Reset de estado estricto en límites de documento (opcional según eos_token)
+                // Strict state reset at document boundaries (optional depending on eos_token)
                 if eos_token != 0 && !carry.is_empty() && carry[0] == eos_token {
                     self.reset_state();
                 }
@@ -2125,10 +2147,10 @@ impl Trainer {
                     break;
                 }
 
-                // Detectar EOS: dividir el chunk en sub-secuencias de documento.
+                // Detect EOS: split the chunk into document sub-sequences.
                 let mut seg_start = 0;
                 while seg_start < tokens.len().saturating_sub(1) {
-                    // Encontrar el siguiente EOS dentro de este chunk.
+                    // Find the next EOS within this chunk.
                     let seg_end = tokens[seg_start..]
                         .iter()
                         .position(|&t| t == eos_token)
@@ -2228,7 +2250,7 @@ impl Trainer {
                         }
                     }
 
-                    // Saltar el token EOS y continuar en la siguiente sub-secuencia.
+                    // Skip the EOS token and continue to the next sub-sequence.
                     seg_start = if seg_end < tokens.len() {
                         seg_end + 1
                     } else {
@@ -2236,7 +2258,7 @@ impl Trainer {
                     };
                 }
 
-                // Carry: solapar los últimos min(stride, tokens.len()) tokens para contexto.
+                // Carry: overlap the last min(stride, tokens.len()) tokens for context.
                 let overlap_start = tokens.len().saturating_sub(stride.min(tokens.len()));
                 carry.clear();
                 carry.extend_from_slice(&tokens[overlap_start..]);
@@ -2268,11 +2290,11 @@ impl Trainer {
                     break; // EOF
                 }
 
-                // Mini-log cada 10 chunks para ver progreso en tiempo real
+                // Mini-log every 10 chunks to show real-time progress
                 if num_chunks % 10 == 0 && num_chunks > 0 {
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps = total_tokens as f32 / elapsed.max(1e-9);
-                    // Métrica principal: promedio acumulado real de train (no cache GPU).
+                    // Main metric: real accumulated training average (not GPU cache).
                     let current_loss = epoch_loss / num_chunks as f32;
 
                     println!(
@@ -2280,19 +2302,19 @@ impl Trainer {
                         num_chunks, current_loss, tps, elapsed
                     );
 
-                    // Auto-save intra-epoch: solo por tiempo (cada 30 min).
-                    // El guardado por `save_every` ya se aplica por epoch al final del loop.
+                    // Intra-epoch auto-save: time-based only (every 30 min).
+                    // The `save_every` checkpoint is already applied per epoch at the end of the loop.
                     let time_save = last_save_time.elapsed().as_secs() > 1800;
                     if time_save && !checkpoint_path.is_empty() {
                         println!(
-                            "    \x1b[93m[auto-save]\x1b[0m Guardando progreso (chunk {})...",
+                            "    \x1b[93m[auto-save]\x1b[0m Saving progress (chunk {})...",
                             num_chunks
                         );
                         if let Err(e) = self.save_checkpoint(checkpoint_path) {
-                            eprintln!("    \x1b[31m[error]\x1b[0m No se pudo guardar: {}", e);
+                            eprintln!("    \x1b[31m[error]\x1b[0m Failed to save: {}", e);
                         } else {
                             println!(
-                                "    \x1b[32m[success]\x1b[0m Checkpoint '{}' actualizado.",
+                                "    \x1b[32m[success]\x1b[0m Checkpoint '{}' updated.",
                                 checkpoint_path
                             );
                             last_save_time = std::time::Instant::now();
@@ -2305,7 +2327,7 @@ impl Trainer {
             if let Some(gpu) = self.gpu_deq.as_ref() {
                 gpu.tps_epoch_end();
             }
-            // Vaciar cola GPU al final de cada epoch.
+            // Flush GPU queue at the end of each epoch.
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
                 // Validation/end-of-run boundary. We intentionally synchronize before final metrics.
@@ -2324,11 +2346,11 @@ impl Trainer {
                 #[cfg(feature = "wgpu")]
                 if self.cfg_debug_sample_every != 0 {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
-                        // Optimizamos: Solo leemos el debug_buffer (pequeño) en lugar de pesos masivos (36MB)
+                        // Optimization: Only read the debug_buffer (small) instead of massive weights (36MB)
                         let debug = gpu.read_debug_buffer();
                         let nz_h = debug[9];
-                        // El wq_sum lo omitimos durante el loop para máxima velocidad,
-                        // se puede consultar al final del epoch o en sync.
+                        // We skip wq_sum during the loop for maximum speed,
+                        // it can be queried at the end of the epoch or on sync.
                         gpu_stats = format!(" nz_h={:.4}", nz_h);
                     }
                 }
@@ -2362,12 +2384,12 @@ impl Trainer {
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {
                 if let Err(e) = self.save_checkpoint(checkpoint_path) {
                     eprintln!(
-                        "[checkpoint] Error guardando en '{}': {}",
+                        "[checkpoint] Error saving to '{}': {}",
                         checkpoint_path, e
                     );
                 } else {
                     eprintln!(
-                        "[checkpoint] Guardado en '{}' (epoch {})",
+                        "[checkpoint] Saved to '{}' (epoch {})",
                         checkpoint_path,
                         epoch + 1
                     );
@@ -2378,26 +2400,26 @@ impl Trainer {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Checkpointing: pesos + estado del optimizador
+    // Checkpointing: weights + optimizer state
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Guarda el modelo completo más el estado del optimizador.
-    /// Formato: <path>.aidn (pesos) + <path>.opt (momentos Adam).
+    /// Saves the full model plus optimizer state.
+    /// Format: <path>.aidn (weights) + <path>.opt (Adam moments).
     pub fn save_checkpoint(&mut self, base_path: &str) -> std::io::Result<()> {
-        // Pesos del modelo
+        // Model weights
         self.save_full(&format!("{base_path}.aidn"))?;
 
-        // Sincronizar momentos GPU → CPU Adam antes de guardar
+        // Sync GPU moments to CPU Adam before saving
         #[cfg(feature = "wgpu")]
         self.sync_gpu_moments_to_cpu();
 
-        // Estado del optimizador (con momentos ya poblados)
+        // Optimizer state (with moments already populated)
         self.optimizer
             .save_state(&format!("{base_path}.opt"))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    /// Carga un checkpoint completo (pesos + estado del optimizador).
+    /// Loads a full checkpoint (weights + optimizer state).
     pub fn load_checkpoint(base_path: &str) -> std::io::Result<Self> {
         let mut trainer = Self::load_full(&format!("{base_path}.aidn"))?;
         let opt_path = format!("{base_path}.opt");
@@ -2406,14 +2428,14 @@ impl Trainer {
                 .optimizer
                 .load_state(&opt_path)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            // Restaurar momentos Adam en GPU si está disponible
+            // Restore Adam moments on GPU if available
             #[cfg(feature = "wgpu")]
             trainer.sync_cpu_moments_to_gpu();
         }
         Ok(trainer)
     }
 
-    /// Descarga los momentos Adam desde GPU → CPU Adam struct para poder guardarlos.
+    /// Downloads Adam moments from GPU to CPU Adam struct for saving.
     #[cfg(feature = "wgpu")]
     fn sync_gpu_moments_to_cpu(&mut self) {
         use nalgebra::{DMatrix, DVector};
@@ -2422,7 +2444,7 @@ impl Trainer {
             None => return,
         };
 
-        println!("[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...");
+        println!("[GPU-CHECK] Starting VRAM checksum before saving...");
         // Checkpoint checksum path: CPU is about to read GPU moments synchronously.
         gpu.device.poll(wgpu::Maintain::Wait);
 
@@ -2433,9 +2455,9 @@ impl Trainer {
                 let sum_mw: f32 = m_w.iter().map(|x| x.abs()).sum();
                 let sum_vw: f32 = v_w.iter().map(|x| x.abs()).sum();
 
-                // VRAM Checksum: Si los momentos son exactamente cero, algo falló en el mapeo
+                // VRAM Checksum: If moments are exactly zero, something failed in the mapping
                 if sum_mw == 0.0 && sum_vw == 0.0 && self.optimizer.step_count() > 10 {
-                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Checksum de VRAM falló (Momentos LM=0). Abortando para proteger checkpoint.");
+                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (LM moments=0). Aborting to protect checkpoint.");
                 }
 
                 println!(
@@ -2461,7 +2483,7 @@ impl Trainer {
             if let Ok((m_emb, v_emb)) = gpu_emb.read_moments(&gpu.device, &gpu.queue) {
                 let sum_me: f32 = m_emb.iter().map(|x| x.abs()).sum();
                 if sum_me == 0.0 && self.optimizer.step_count() > 10 {
-                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Checksum de VRAM falló (Momentos EMB=0). Abortando.");
+                    panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m VRAM checksum failed (EMB moments=0). Aborting.");
                 }
                 println!("    Embedding Moments Checksum: m={:.4}", sum_me);
 
@@ -2475,7 +2497,7 @@ impl Trainer {
         }
     }
 
-    /// Sube los momentos Adam CPU → GPU después de cargar un checkpoint.
+    /// Uploads Adam moments from CPU to GPU after loading a checkpoint.
     #[cfg(feature = "wgpu")]
     pub fn sync_cpu_moments_to_gpu(&mut self) {
         let gpu = match self.gpu_deq.as_ref() {
@@ -2514,7 +2536,7 @@ impl Trainer {
         }
     }
 
-    /// Guarda el modelo completo (Config + Reasoning + LmHead + Tokenizer) en un solo .aidn
+    /// Saves the full model (Config + Reasoning + LmHead + Tokenizer) into a single .aidn
     pub fn save_full(&mut self, path: &str) -> std::io::Result<()> {
         use aideen_core::model::AidenModel;
 
@@ -2523,17 +2545,17 @@ impl Trainer {
 
         let mut model = AidenModel::new(self.config.clone());
 
-        // Empacar pesos de Reasoning
+        // Pack Reasoning weights
         for (k, v) in self.reasoning.export_weights() {
             model.set_weight(&k, v);
         }
 
-        // Empacar pesos de LmHead
+        // Pack LmHead weights
         for (k, v) in self.lm_head.export_weights() {
             model.set_weight(&k, v);
         }
 
-        // Empacar embeddings del Tokenizer
+        // Pack Tokenizer embeddings
         model.set_weight(
             "tokenizer.embeddings",
             self.tokenizer.embeddings.as_slice().to_vec(),
@@ -2550,7 +2572,7 @@ impl Trainer {
             self.tokenizer.vocab_size().to_string(),
         );
 
-        // Persistir estado del Stability Oracle (v13.2)
+        // Persist Stability Oracle state (v13.2)
         model.metadata.insert(
             "adaptive_max_iters".to_string(),
             self.adaptive_max_iters.to_string(),
@@ -2580,14 +2602,14 @@ impl Trainer {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    /// Carga el modelo completo (Config + Reasoning + LmHead + Tokenizer) desde un .aidn
+    /// Loads the full model (Config + Reasoning + LmHead + Tokenizer) from a .aidn
     pub fn load_full(path: &str) -> std::io::Result<Self> {
         use aideen_core::model::AidenModel;
 
         let model = AidenModel::load(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Reconstruir Tokenizer
+        // Reconstruct Tokenizer
         let emb_data = model.get_weight("tokenizer.embeddings").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "tokenizer.embeddings not found")
         })?;
@@ -2604,8 +2626,8 @@ impl Trainer {
 
         let mut tokenizer = Tokenizer::new_empty(vocab_size, model.config.clone());
 
-        // Restaurar el HF tokenizer (BPE) si está disponible en rutas estándar.
-        // Sin esto, encode() usa el fallback char-level vacío y devuelve [].
+        // Restore the HF tokenizer (BPE) if available at standard paths.
+        // Without this, encode() uses the empty char-level fallback and returns [].
         let tok_paths = [
             "aideen-backbone/tokenizer.json",
             "tokenizer.json",
@@ -2631,23 +2653,23 @@ impl Trainer {
             .as_mut_slice()
             .copy_from_slice(emb_data);
 
-        // Reconstruir Trainer
-        let mut trainer = Trainer::from_tokenizer(tokenizer, 0.001); // LR por defecto
+        // Reconstruct Trainer
+        let mut trainer = Trainer::from_tokenizer(tokenizer, 0.001); // default LR
         trainer.config = model.config.clone();
 
-        // Importar pesos en Reasoning
+        // Import weights into Reasoning
         trainer
             .reasoning
             .import_weights(&model.weights)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Importar pesos en LmHead
+        // Import weights into LmHead
         trainer
             .lm_head
             .import_weights(&model.weights)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Restaurar estado del Stability Oracle (v13.2)
+        // Restore Stability Oracle state (v13.2)
         if let Some(v) = model
             .metadata
             .get("adaptive_max_iters")
@@ -2705,7 +2727,7 @@ impl Trainer {
     #[cfg(feature = "wgpu")]
     pub fn sync_inference_weights(&mut self) {
         if let Some(gpu) = self.gpu_deq.as_ref() {
-            // Sincronizar DEQ Core solo si los pesos fueron subidos/actualizados en GPU.
+            // Sync DEQ Core only if weights were uploaded/updated on GPU.
             if self.gpu_weights_uploaded {
                 if let Ok((wq, wk, wv, wo, win, wx, wout, alog, nscale)) = gpu.read_weights() {
                 let to_mat = |vec: Vec<f32>| {
@@ -2788,7 +2810,7 @@ impl Trainer {
             }
         }
 
-        // Sincronizar Embeddings
+        // Sync Embeddings
         if let Some(gpu_emb) = self.gpu_emb.as_ref() {
             if let Some(gpu) = self.gpu_deq.as_ref() {
                 if self.gpu_emb_weights_uploaded {
@@ -2833,9 +2855,9 @@ impl Trainer {
         }
     }
 
-    /// Configura explícitamente el backend de inferencia.
-    /// - `prefer_gpu=true`: intenta activar GPU; si no hay, queda en CPU.
-    /// - `prefer_gpu=false`: fuerza CPU.
+    /// Explicitly configures the inference backend.
+    /// - `prefer_gpu=true`: tries to activate GPU; falls back to CPU if unavailable.
+    /// - `prefer_gpu=false`: forces CPU.
     #[cfg(feature = "wgpu")]
     pub fn configure_inference_backend(&mut self, prefer_gpu: bool) -> bool {
         if !prefer_gpu {
@@ -2852,7 +2874,7 @@ impl Trainer {
         }
     }
 
-    /// En builds sin `wgpu`, siempre usa CPU.
+    /// In builds without `wgpu`, always uses CPU.
     #[cfg(not(feature = "wgpu"))]
     pub fn configure_inference_backend(&mut self, _prefer_gpu: bool) -> bool {
         self.reasoning.clear_backend();
