@@ -1,31 +1,31 @@
-/// Critic v0: Bandit Softmax con reputación por experto.
+/// Critic v0: Softmax Bandit with per-expert reputation.
 ///
-/// # Diseño
+/// # Design
 ///
-/// MVP deliberadamente simple: tracker de «reputación» *online* por nodo.
-/// Usa un estimador Q(arm) tipo UCB-1 suavizado por softmax para seleccionar
-/// el próximo experto, actualizado tras cada respuesta de la red.
+/// Deliberately simple MVP: *online* reputation tracker per node.
+/// Uses a UCB-1 Q(arm) estimator smoothed by softmax to select the
+/// next expert, updated after each network response.
 ///
-/// ## Por qué no gradient-based ahora
-/// * Requiere H* completo + sample buffer → complejidad Fase 7+.
-/// * Bandit/UCB es estocásticamente correcto para el MVP (demo-ready).
-/// * Compatible con el Critic completo: misma interfaz, lógica más rica.
+/// ## Why not gradient-based now
+/// * Requires full H* + sample buffer → Phase 7+ complexity.
+/// * Bandit/UCB is stochastically correct for the MVP (demo-ready).
+/// * Compatible with the full Critic: same interface, richer logic.
 ///
-/// ## Invariantes
-/// * `Critic::select()` es puro y determinista dado el estado actual.
-/// * `Critic::update()` es el único punto de mutación.
-/// * No hay I/O, sin allocación excepto en `select()` para el vec de probs.
+/// ## Invariants
+/// * `Critic::select()` is pure and deterministic given the current state.
+/// * `Critic::update()` is the only mutation point.
+/// * No I/O, no allocation except in `select()` for the probs vec.
 ///
-/// # Uso
+/// # Usage
 /// ```no_run
 /// use aideen_node::critic::{Critic, CriticConfig};
 /// let mut critic = Critic::new(CriticConfig::default());
 /// let arms = &[[1u8; 32], [2u8; 32]];
 ///
-/// // Selección probabilística
+/// // Probabilistic selection
 /// let chosen = critic.select(arms).unwrap();
 ///
-/// // Actualización tras recibir respuesta del experto
+/// // Update after receiving expert response
 /// critic.update(&arms[chosen], 0.85); // q_total = 0.85
 /// ```
 use std::collections::HashMap;
@@ -34,17 +34,17 @@ use crate::peers::NodeId;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-/// Parámetros del Critic bandit.
+/// Critic bandit parameters.
 #[derive(Debug, Clone)]
 pub struct CriticConfig {
-    /// Temperatura softmax. Más alto → exploración; más bajo → explotación.
-    /// Rango típico [0.1, 2.0].
+    /// Softmax temperature. Higher → exploration; lower → exploitation.
+    /// Typical range [0.1, 2.0].
     pub temperature: f32,
-    /// Bonus de confianza UCB (exploración). C = 0 deshabilita UCB.
+    /// UCB confidence bonus (exploration). C = 0 disables UCB.
     pub ucb_c: f32,
-    /// Valor inicial de Q para expertos nunca vistos (optimismo inicial).
+    /// Initial Q value for never-seen experts (initial optimism).
     pub q_init: f32,
-    /// Tasa de aprendizaje incremental (exponential moving average).
+    /// Incremental learning rate (exponential moving average).
     pub lr: f32,
 }
 
@@ -53,7 +53,7 @@ impl Default for CriticConfig {
         Self {
             temperature: 0.5,
             ucb_c: 0.5,
-            q_init: 0.6, // Arrancamos con optimismo moderado
+            q_init: 0.6, // Start with moderate optimism
             lr: 0.1,
         }
     }
@@ -61,25 +61,25 @@ impl Default for CriticConfig {
 
 // ── Arm state ─────────────────────────────────────────────────────────────────
 
-/// Estado interno de un brazo (un experto/nodo).
+/// Internal state of an arm (one expert/node).
 #[derive(Debug, Clone)]
 struct ArmState {
-    /// Q(arm): media exponencial de q_total recibidos.
+    /// Q(arm): exponential moving average of received q_total values.
     q_est: f32,
-    /// Número de veces que este arm fue seleccionado.
+    /// Number of times this arm was selected.
     n: u64,
 }
 
 // ── Critic ────────────────────────────────────────────────────────────────────
 
-/// Critic v0: Softmax bandit con bonus UCB.
+/// Critic v0: Softmax bandit with UCB bonus.
 ///
-/// Thead-unsafe (uso exclusivo por NodeRunner en su hilo).
-/// Para producción: encapsular en `Arc<Mutex<Critic>>` en el runner.
+/// Thread-unsafe (exclusive use by NodeRunner in its thread).
+/// For production: wrap in `Arc<Mutex<Critic>>` in the runner.
 pub struct Critic {
     cfg: CriticConfig,
     arms: HashMap<NodeId, ArmState>,
-    /// Paso global (total de updates). Necesario para UCB.
+    /// Global step (total updates). Required for UCB.
     t: u64,
 }
 
@@ -92,16 +92,16 @@ impl Critic {
         }
     }
 
-    /// Devuelve el índice del experto seleccionado de la lista `candidates`.
+    /// Returns the index of the selected expert from the `candidates` list.
     ///
-    /// Si la lista está vacía, devuelve None.
-    /// Si hay un solo candidato, lo devuelve sin muestreo (fast path).
+    /// If the list is empty, returns None.
+    /// If there is only one candidate, returns it without sampling (fast path).
     pub fn select(&self, candidates: &[NodeId]) -> Option<usize> {
         match candidates.len() {
             0 => None,
             1 => Some(0),
             n => {
-                // Calcular UCB scores
+                // Compute UCB scores
                 let logT = ((self.t.max(1)) as f32).ln();
                 let scores: Vec<f32> = candidates
                     .iter()
@@ -127,8 +127,8 @@ impl Critic {
                 let sum: f32 = exps.iter().sum();
                 let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
 
-                // Muestreo determinista basado en tiempo para MVP (sin PRNG externo)
-                // En producción: usar rand::thread_rng().
+                // Deterministic time-based sampling for MVP (no external PRNG)
+                // For production: use rand::thread_rng().
                 let uniform = pseudo_uniform(self.t, candidates.len());
                 let mut cumulative = 0.0f32;
                 for (i, &p) in probs.iter().enumerate() {
@@ -142,10 +142,10 @@ impl Critic {
         }
     }
 
-    /// Actualiza la reputación de un experto tras recibir su respuesta.
+    /// Updates an expert's reputation after receiving its response.
     ///
-    /// `node_id`: el experto que respondió.
-    /// `q_received`: calidad observada (q_total del ExpertResult).
+    /// `node_id`: the expert that responded.
+    /// `q_received`: observed quality (q_total from ExpertResult).
     pub fn update(&mut self, node_id: &NodeId, q_received: f32) {
         self.t += 1;
         let lr = self.cfg.lr;
@@ -159,13 +159,13 @@ impl Critic {
         arm.q_est = arm.q_est + lr * (q_received - arm.q_est);
     }
 
-    /// Reputación actual de un experto (None si nunca se ha visto).
+    /// Current reputation of an expert (None if never seen).
     pub fn reputation(&self, node_id: &NodeId) -> Option<f32> {
         self.arms.get(node_id).map(|a| a.q_est)
     }
 
-    /// Top-k expertos ordenados por reputación descendente.
-    /// Útil para diagnóstico y logs.
+    /// Top-k experts sorted by descending reputation.
+    /// Useful for diagnostics and logs.
     pub fn top_k(&self, k: usize) -> Vec<(NodeId, f32)> {
         let mut ranked: Vec<(NodeId, f32)> =
             self.arms.iter().map(|(id, a)| (*id, a.q_est)).collect();
@@ -175,10 +175,10 @@ impl Critic {
     }
 }
 
-// ── Helpers privados ──────────────────────────────────────────────────────────
+// ── Private helpers ──────────────────────────────────────────────────────────
 
-/// Generador pseudo-aleatorio en [0, 1) basado en t y n.
-/// No es criptográficamente seguro, solo para MVP sin dependencia rand.
+/// Pseudo-random generator in [0, 1) based on t and n.
+/// Not cryptographically secure, only for MVP without rand dependency.
 fn pseudo_uniform(t: u64, n: usize) -> f32 {
     // Xorshift64 single step
     let mut x = t.wrapping_add(6364136223846793005u64);
@@ -186,10 +186,10 @@ fn pseudo_uniform(t: u64, n: usize) -> f32 {
     x ^= x << 25;
     x ^= x >> 27;
     let bits = x.wrapping_mul(2685821657736338717u64);
-    // Convertir a [0, 1)
+    // Convert to [0, 1)
     let frac = (bits >> 11) as f32 / (1u64 << 53) as f32;
-    // Ajustar a [0, n) y volver a [0, 1) relativo a n (para softmax cumulative)
-    // En realidad para select usamos directamente frac como uniforme [0,1)
+    // Adjust to [0, n) and back to [0, 1) relative to n (for softmax cumulative)
+    // In practice for select we use frac directly as uniform [0,1)
     let _ = n; // n se usa en el caller para bounds
     frac
 }
@@ -236,7 +236,7 @@ mod tests {
 
         let top = critic.top_k(2);
         assert_eq!(top.len(), 2);
-        assert_eq!(top[0].0, [1u8; 32], "id=1 debe ser primero (q=0.9)");
-        assert!(top[0].1 > top[1].1, "top_k debe estar ordenado desc");
+        assert_eq!(top[0].0, [1u8; 32], "id=1 must be first (q=0.9)");
+        assert!(top[0].1 > top[1].1, "top_k must be sorted desc");
     }
 }

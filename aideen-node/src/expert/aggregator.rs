@@ -3,9 +3,9 @@ use aideen_core::protocol::NetMsg;
 pub struct Aggregator;
 
 impl Aggregator {
-    /// Combina deltas ponderados de ExpertResults.
-    /// `alphas` deben estar ya normalizados (Σα=1).
-    /// `delta_cap_global`: clamp final sobre el delta combinado (None = sin límite).
+    /// Combines weighted deltas from ExpertResults.
+    /// `alphas` must already be normalised (Σα=1).
+    /// `delta_cap_global`: final clamp on the combined delta (None = no limit).
     pub fn combine(
         alphas: &[f32],
         results: &[NetMsg],

@@ -5,7 +5,7 @@ use aideen_node::agent::FsAgentStore;
 
 // ── Helper ────────────────────────────────────────────────────────────────
 
-/// Directorio temporal único por test (basado en nanos para evitar colisiones).
+/// Unique temporary directory per test (based on nanos to avoid collisions).
 fn tmp_dir() -> std::path::PathBuf {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -42,7 +42,7 @@ fn test_fs_prefs_roundtrip() {
 
 // ── Test 2 ────────────────────────────────────────────────────────────────
 
-/// append 5 eventos → recent(3) devuelve 3 en orden cronológico inverso.
+/// append 5 events → recent(3) returns 3 in reverse chronological order.
 #[test]
 fn test_fs_event_append_and_recent() {
     let base = tmp_dir().to_string_lossy().to_string();
@@ -53,21 +53,18 @@ fn test_fs_event_append_and_recent() {
     }
 
     let recent = store.recent_events(3);
-    assert_eq!(recent.len(), 3, "debe devolver exactamente 3 eventos");
+    assert_eq!(recent.len(), 3, "must return exactly 3 events");
 
-    // Orden inverso: el más reciente (ts=4) debe ser primero
+    // Reverse order: most recent (ts=4) must be first
     if let AgentEvent::TickAttractor { unix_ts, .. } = &recent[0] {
-        assert_eq!(
-            *unix_ts, 4,
-            "el primer evento debe ser el más reciente (ts=4)"
-        );
+        assert_eq!(*unix_ts, 4, "first event must be the most recent (ts=4)");
     } else {
-        panic!("se esperaba TickAttractor");
+        panic!("expected TickAttractor");
     }
     if let AgentEvent::TickAttractor { unix_ts, .. } = &recent[2] {
         assert_eq!(*unix_ts, 2, "el tercer evento debe tener ts=2");
     } else {
-        panic!("se esperaba TickAttractor");
+        panic!("expected TickAttractor");
     }
 }
 

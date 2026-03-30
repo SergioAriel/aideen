@@ -112,7 +112,7 @@ impl UpdateManager {
         expert.apply_signed_update(update, &pk, &mut self.guard)?;
 
         // Emitir evento de telemetría.
-        // update_hash() está basado en signing_bytes() (ver aideen-core/src/protocol.rs:91-96).
+        // update_hash() is based on signing_bytes() (see aideen-core/src/protocol.rs:91-96).
         let update_hash = update.update_hash();
         let _ = self.agent_store.append_event(AgentEvent::UpdateApplied {
             version: update.version,

@@ -18,7 +18,7 @@ fn test_config() -> ArchitectureConfig {
 
 // ── Test 1 ────────────────────────────────────────────────────────────────
 
-/// query sobre índice vacío → vec![]
+/// query on empty index → vec![]
 #[test]
 fn test_query_empty_before_inserts() {
     let mem = AttractorMemory::new(2);
@@ -28,14 +28,14 @@ fn test_query_empty_before_inserts() {
 
 // ── Test 2 ────────────────────────────────────────────────────────────────
 
-/// Vec A similar al query; Vec B ortogonal → A rankea primero por cosine.
+/// Vec A similar to the query; Vec B orthogonal → A ranks first by cosine.
 #[test]
 fn test_cosine_ordering_similar_before_orthogonal() {
     let mut mem = AttractorMemory::new(2);
 
-    // A = muy similar a (1,0)
+    // A = very similar to (1,0)
     let a = vec2(0.99, 0.01);
-    // B = ortogonal a (1,0)
+    // B = orthogonal to (1,0)
     let b = vec2(0.0, 1.0);
 
     mem.write(b.clone());
@@ -70,7 +70,7 @@ fn test_insert_k_clamps_to_n() {
 
 // ── Test 4 ────────────────────────────────────────────────────────────────
 
-/// Dimensión incorrecta en write → panic con mensaje claro.
+/// Wrong dimension in write → panic with clear message.
 #[test]
 #[should_panic(expected = "dim mismatch en write")]
 fn test_dim_mismatch_panics_on_write() {
@@ -80,8 +80,8 @@ fn test_dim_mismatch_panics_on_write() {
 
 // ── Test 5 ────────────────────────────────────────────────────────────────
 
-/// NullMemory + AideenNode-style warm-start: query devuelve vec![], fallback sin panic.
-/// Valida que el patrón de warm-start del loop DEQ es seguro con NullMemory.
+/// NullMemory + AideenNode-style warm-start: query returns vec![], fallback without panic.
+/// Validates that the DEQ loop warm-start pattern is safe with NullMemory.
 #[test]
 fn test_warm_start_falls_back_with_null_memory() {
     let mut mem = NullMemory;

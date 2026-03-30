@@ -10,42 +10,42 @@ pub struct ExpertClient {
 }
 
 impl ExpertClient {
-    /// Construye desde lista de pares (node_id, canal).
-    /// BTreeMap garantiza orden natural por NodeId — determinista sin sort extra.
+    /// Builds from a list of (node_id, channel) pairs.
+    /// BTreeMap guarantees natural order by NodeId — deterministic without extra sort.
     pub fn new(peers: Vec<(NodeId, Box<dyn NetChannel>)>) -> Self {
         Self {
             peers: peers.into_iter().collect(),
         }
     }
 
-    /// Reemplaza todos los canales en caliente.
+    /// Hot-swaps all channels.
     pub fn replace_peers(&mut self, peers: Vec<(NodeId, Box<dyn NetChannel>)>) {
         self.peers = peers.into_iter().collect();
     }
 
-    /// NodeIds en orden determinista (BTreeMap natural).
+    /// NodeIds in deterministic order (BTreeMap natural).
     pub fn sorted_peer_ids(&self) -> Vec<NodeId> {
         self.peers.keys().copied().collect()
     }
 
-    /// Devuelve true si el NodeId ya tiene canal activo.
+    /// Returns true if the NodeId already has an active channel.
     pub fn has_peer(&self, id: &NodeId) -> bool {
         self.peers.contains_key(id)
     }
 
-    /// Inserta o reemplaza canal para un NodeId.
+    /// Inserts or replaces channel for a NodeId.
     pub fn upsert_peer(&mut self, id: NodeId, ch: Box<dyn NetChannel>) {
         self.peers.insert(id, ch);
     }
 
-    /// Elimina peers cuyo NodeId NO está en `keep`. O(n) — HashSet lookup O(1).
+    /// Removes peers whose NodeId is NOT in `keep`. O(n) — HashSet lookup O(1).
     pub fn retain_only(&mut self, keep: &HashSet<NodeId>) {
         self.peers.retain(|id, _| keep.contains(id));
     }
 
-    /// Envía `task` a los peers seleccionados y recoge resultados.
-    /// `selected`: `(node_id, alpha)` ya traducidos de índices en `ExpertPipeline`.
-    /// MVP: secuencial. Producción: `std::thread::scope` para paralelismo real (1 RTT).
+    /// Sends `task` to selected peers and collects results.
+    /// `selected`: `(node_id, alpha)` already translated from indices in `ExpertPipeline`.
+    /// MVP: sequential. Production: `std::thread::scope` for real parallelism (1 RTT).
     pub fn query(
         &mut self,
         task: NetMsg,

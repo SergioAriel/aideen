@@ -136,7 +136,7 @@ fn make_peer(id: NodeId) -> PeerEntry {
     }
 }
 
-// ── Test 1: no redial si peer ya está en ExpertClient ─────────────────────────
+// ── Test 1: no redial if peer is already in ExpertClient ──────────────────────
 
 #[test]
 fn test_reconcile_does_not_redial_existing_peer() {
@@ -149,26 +149,26 @@ fn test_reconcile_does_not_redial_existing_peer() {
 
     let mut client = ExpertClient::new(vec![]);
 
-    // Primera reconcile → debe dialear
+    // First reconcile → must dial
     runner.reconcile_expert_client("ai", &mut client);
     assert_eq!(
         dial_calls.load(Ordering::SeqCst),
         1,
-        "primer reconcile debe dialear"
+        "first reconcile must dial"
     );
     assert_eq!(runner.last_reconcile_stats.dial_attempts, 1);
     assert_eq!(runner.last_reconcile_stats.dial_success, 1);
 
-    // Segunda reconcile → peer ya en client → sin dial extra
+    // Second reconcile → peer already in client → no extra dial
     runner.reconcile_expert_client("ai", &mut client);
     assert_eq!(
         dial_calls.load(Ordering::SeqCst),
         1,
-        "reconcile con peer activo no debe redialear"
+        "reconcile with active peer must not redial"
     );
     assert_eq!(
         runner.last_reconcile_stats.dial_attempts, 0,
-        "segundo reconcile: 0 attempts"
+        "second reconcile: 0 attempts"
     );
 }
 
@@ -185,7 +185,7 @@ fn test_reconcile_skips_when_breaker_open() {
     });
     runner.set_peer_snapshot(1, vec![make_peer(peer_id)]);
 
-    // Pre-abrir breaker con TTL largo
+    // Pre-open breaker with long TTL
     runner.peer_failures.entry(peer_id).or_default().open_until =
         Some(Instant::now() + Duration::from_secs(60));
 
@@ -199,7 +199,7 @@ fn test_reconcile_skips_when_breaker_open() {
     );
     assert_eq!(
         runner.last_reconcile_stats.breaker_skips, 1,
-        "debe contar 1 breaker skip"
+        "must count 1 breaker skip"
     );
     assert_eq!(runner.last_reconcile_stats.dial_attempts, 0);
 }

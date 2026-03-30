@@ -1,9 +1,9 @@
-/// Selecciona peers y pesos α (normalizados, Σα=1) para consulta de expertos.
+/// Selects peers and weights α (normalised, Σα=1) for expert queries.
 pub trait Router: Send {
     fn select(&self, h_k: &[f32], n_peers: usize) -> Vec<(usize, f32)>;
 }
 
-/// Pesos uniformes sobre los primeros K peers.
+/// Uniform weights over the first K peers.
 pub struct UniformRouter {
     pub k: usize,
 }

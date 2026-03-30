@@ -15,7 +15,7 @@ use nalgebra::DVector;
 
 // ── Mock Reasoning ───────────────────────────────────────────────────────────
 
-/// Converge rápido: δ_paso ≈ 1e-7 * sqrt(dim) — sirve para early-stop tests.
+/// Converges fast: δ_step ≈ 1e-7 * sqrt(dim) — suitable for early-stop tests.
 struct StableMockReasoning(ArchitectureConfig);
 impl Reasoning for StableMockReasoning {
     fn config(&self) -> &ArchitectureConfig {
@@ -39,7 +39,7 @@ impl Reasoning for StableMockReasoning {
     }
 }
 
-/// Diverge linealmente: h += 10.0 por paso — sirve para clamp tests.
+/// Diverges linearly: h += 10.0 per step — suitable for clamp tests.
 struct UnstableMockReasoning(ArchitectureConfig);
 impl Reasoning for UnstableMockReasoning {
     fn config(&self) -> &ArchitectureConfig {
@@ -80,7 +80,7 @@ impl ComputeBackend for TestBackend {
     }
 }
 
-/// Reasoning para el nodo consultante. Converge en 1 paso.
+/// Reasoning for the querying node. Converges in 1 step.
 struct NodeReasoning(ArchitectureConfig);
 impl Reasoning for NodeReasoning {
     fn config(&self) -> &ArchitectureConfig {

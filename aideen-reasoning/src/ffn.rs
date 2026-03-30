@@ -2,7 +2,7 @@ use aideen_core::reasoning::Reasoning;
 use aideen_core::state::{ArchitectureConfig, HSlots};
 use nalgebra::DVector;
 
-/// Implementación concreta de un modelo experto FFN
+/// Concrete implementation of an expert FFN model
 pub struct ExpertFFN {
     pub config: ArchitectureConfig,
     pub w1: nalgebra::DMatrix<f32>,

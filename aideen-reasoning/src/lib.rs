@@ -1,8 +1,8 @@
 //! aideen-reasoning
 //! ─────────────────────────────────────────────
-//! El Intelecto (Modelos R).
-//! Este crate propone deltas (Δ) pero NO decide.
-//! Es entrenable e intercambiable.
+//! The Intellect (R Models).
+//! This crate proposes deltas (Δ) but does NOT decide.
+//! It is trainable and interchangeable.
 
 pub mod attention;
 pub mod deq;

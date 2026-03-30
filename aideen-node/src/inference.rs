@@ -1,13 +1,13 @@
-/// Módulo de inferencia: pipeline completo query → H* → RoutingDecision.
+/// Inference module: full pipeline query → H* → RoutingDecision.
 ///
-/// Este es el "corazón ejecutivo" del nodo Aideen:
-/// 1. Codifica la query como vector de estado S
-/// 2. Ejecuta el loop DEQ hasta convergencia (o max_iters)
-/// 3. Calcula métricas semánticas sobre H*
-/// 4. Decide el routing (LocalOnly / ExpertHop / Discovery)
+/// This is the "executive core" of the Aideen node:
+/// 1. Encodes the query as state vector S
+/// 2. Runs the DEQ loop until convergence (or max_iters)
+/// 3. Computes semantic metrics on H*
+/// 4. Decides routing (LocalOnly / ExpertHop / Discovery)
 ///
-/// No genera texto — eso es tarea del decoder (Fase 6).
-/// No envía nada por red — eso lo hace el caller con el RoutingDecision.
+/// Does not generate text — that is the decoder's job (Phase 6).
+/// Does not send anything over the network — the caller does that with the RoutingDecision.
 use aideen_core::{
     compute::ComputeBackend,
     quality::{
@@ -20,54 +20,54 @@ use nalgebra::DVector;
 
 use crate::expert::ExpertPipeline;
 
-// ── Resultado de la inferencia ────────────────────────────────────────────────
+// ── Inference result ─────────────────────────────────────────────────────────
 
-/// Resultado completo de un ciclo de inferencia Aideen.
+/// Complete result of an Aideen inference cycle.
 ///
-/// Contiene el estado de razonamiento convergido (H*), las métricas
-/// que caracterizan su calidad, y la decisión de routing recomendada.
+/// Contains the converged reasoning state (H*), the metrics
+/// characterising its quality, and the recommended routing decision.
 #[derive(Debug, Clone)]
 pub struct InferenceResult {
-    /// Estado de razonamiento convergido (K×D_R).
+    /// Converged reasoning state (K×D_R).
     pub h_star: HSlots,
-    /// Métricas de la inferencia.
+    /// Inference metrics.
     pub metrics: InferenceMetrics,
-    /// Qué hacer a continuación (LocalOnly / ExpertHop / Discovery).
+    /// What to do next (LocalOnly / ExpertHop / Discovery).
     pub routing: aideen_core::quality::RoutingDecision,
-    /// Señal semántica usada para tomar la decisión de routing.
+    /// Semantic signal used to make the routing decision.
     pub signal: SemanticSignal,
 }
 
-/// Métricas de un ciclo de inferencia.
+/// Metrics for an inference cycle.
 #[derive(Debug, Clone)]
 pub struct InferenceMetrics {
-    /// Estabilidad residual del DEQ (campo `stability` de QualityMetrics).
+    /// DEQ residual stability (`stability` field from QualityMetrics).
     pub stability: f32,
-    /// Diversidad entre slots de H* [0, 1].
+    /// Diversity across H* slots [0, 1].
     pub slot_diversity: f32,
-    /// Energía media de los slots (norma L2 promedio).
+    /// Mean slot energy (average L2 norm).
     pub slot_energy: f32,
-    /// Número de iteraciones DEQ ejecutadas.
+    /// Number of DEQ iterations executed.
     pub iters: usize,
-    /// true si el DEQ alcanzo el criterio de convergencia.
+    /// true if the DEQ reached the convergence criterion.
     pub converged: bool,
 }
 
-// ── Encoder de query ──────────────────────────────────────────────────────────
+// ── Query encoder ────────────────────────────────────────────────────────────
 
-/// Codifica una query de texto como vector de estado S de dimensión `dim`.
+/// Encodes a text query as a state vector S of dimension `dim`.
 ///
-/// Implementación MVP: hash FNV-1a de cada palabra → acumula en slots de `dim`.
-/// Normalización final: tanh por componente → rango (-1, 1].
+/// MVP implementation: FNV-1a hash per word → accumulates into `dim` slots.
+/// Final normalisation: per-component tanh → range (-1, 1].
 ///
-/// Esta es una implementación stub intencional para que el pipeline funcione
-/// end-to-end antes de integrar un tokenizador real (Fase 6).
+/// This is an intentional stub implementation so the pipeline works
+/// end-to-end before integrating a real tokeniser (Phase 6).
 pub fn encode_query(query: &str, dim: usize) -> DVector<f32> {
     let mut feats = vec![0.0f32; dim];
     for word in query.split_whitespace() {
         let h = fnv1a(word.as_bytes());
         feats[h % dim] += 1.0;
-        // También registra bigramas de caracteres para más granularidad
+        // Also register character bigrams for finer granularity
         let bytes = word.as_bytes();
         for pair in bytes.windows(2) {
             let h2 = fnv1a(pair);
@@ -86,25 +86,25 @@ fn fnv1a(bytes: &[u8]) -> usize {
     h as usize
 }
 
-// ── Loop de inferencia principal ──────────────────────────────────────────────
+// ── Main inference loop ──────────────────────────────────────────────────────
 
-/// Configuración del loop de inferencia.
+/// Configuration for the inference loop.
 pub struct InferenceConfig {
-    /// Máximo de iteraciones DEQ.
+    /// Maximum DEQ iterations.
     pub max_iters: usize,
-    /// Umbral de convergencia: ||H_{k+1} - H_k||_flat < epsilon → converge.
+    /// Convergence threshold: ||H_{k+1} - H_k||_flat < epsilon → converge.
     pub epsilon: f32,
-    /// Factor de damping α para integración de estado.
+    /// Damping factor α for state integration.
     pub alpha: f32,
-    /// Puntuación de feedback histórico [0, 1] (0.5 = neutral).
+    /// Historical feedback score [0, 1] (0.5 = neutral).
     pub feedback_score: f32,
-    /// Cada cuántas iteraciones DEQ consultar los ExpertDEQ nodes.
-    /// 0 = desactivado (sin ExpertDEQs — modo local puro).
-    /// Recomendado: entre 3 y 8 (consultar a mitad de convergencia).
+    /// How often (in DEQ iterations) to query ExpertDEQ nodes.
+    /// 0 = disabled (no ExpertDEQs — pure local mode).
+    /// Recommended: between 3 and 8 (query at mid-convergence).
     pub k_expert_interval: usize,
-    /// Peso β con el que se mezcla el delta experto en H*.
+    /// Weight β used to blend the expert delta into H*.
     /// H*[k] += β × expert_delta[k]
-    /// Recomendado: 0.3–0.6 (no dejar que los experts dominen).
+    /// Recommended: 0.3–0.6 (don't let experts dominate).
     pub expert_beta: f32,
 }
 
@@ -115,31 +115,31 @@ impl Default for InferenceConfig {
             epsilon: 1e-4,
             alpha: 0.5,
             feedback_score: 0.5,
-            k_expert_interval: 6, // consultar experts cada 6 iters
-            expert_beta: 0.4,     // peso moderado del delta experto
+            k_expert_interval: 6, // query experts every 6 iters
+            expert_beta: 0.4,     // moderate expert delta weight
         }
     }
 }
 
-/// Ejecuta el pipeline completo de inferencia para una query de texto.
+/// Runs the full inference pipeline for a text query.
 ///
 /// Pipeline:
 /// ```text
 /// query → encode_query(D_R) → State S →
 ///   DEQ loop:
 ///     H_{k+1} = reasoning.step(H_k, S)
-///     cada K iters → ExpertPipeline.run(H_k) → inject delta
+///     every K iters → ExpertPipeline.run(H_k) → inject delta
 ///   until converge →
 ///   H* → compute_q + diversity + energy →
 ///   SemanticSignal → decide_routing → InferenceResult
 /// ```
 ///
-/// # Parámetros
-/// - `query`: texto libre de entrada
-/// - `reasoning`: implementación del DEQ a usar
-/// - `backend`: backend de cómputo (CPU o WGPU)
-/// - `experts`: pipeline de ExpertDEQ nodes (None = modo local puro)
-/// - `cfg`: parámetros del loop
+/// # Parameters
+/// - `query`: free-form input text
+/// - `reasoning`: DEQ implementation to use
+/// - `backend`: compute backend (CPU or WGPU)
+/// - `experts`: ExpertDEQ node pipeline (None = pure local mode)
+/// - `cfg`: loop parameters
 pub fn run<R, B>(
     query: &str,
     reasoning: &mut R,
@@ -153,15 +153,15 @@ where
 {
     let config = reasoning.config();
     let d_r = config.d_r;
-    // 1. Codificar query como estado S
+    // 1. Encode query as state S
     let s = encode_query(query, d_r);
 
-    // 2. Inicializar H desde S
+    // 2. Initialise H from S
     let mut h: HSlots = reasoning.init(&s);
     let mut h_prev = h.clone();
     let mut delta_norms: Vec<f32> = Vec::with_capacity(cfg.max_iters);
 
-    // 3. Loop DEQ con K-checkpoint para ExpertDEQ nodes
+    // 3. DEQ loop with K-checkpoint for ExpertDEQ nodes
     let mut iters = 0usize;
     let mut converged = false;
     let k_interval = cfg.k_expert_interval;
@@ -170,18 +170,18 @@ where
         iters = iter + 1;
         let h_next = reasoning.step(&h, &s, Some(backend as &mut dyn ComputeBackend));
 
-        // ── K-checkpoint: consultar ExpertDEQ nodes ──────────────────────────
-        // Se ejecuta cada k_interval iteraciones (no en iter=0 para dar tiempo
-        // al DEQ de obtener una representación inicial).
+        // ── K-checkpoint: query ExpertDEQ nodes ─────────────────────────────
+        // Runs every k_interval iterations (not at iter=0 to give the DEQ
+        // time to build an initial representation).
         let h_next = if k_interval > 0 && iter > 0 && iter % k_interval == 0 {
             if let Some(ref mut pipeline) = experts {
-                // Usamos slot 0 como representante para la query al expert
+                // Use slot 0 as representative for the expert query
                 let h_k_vec = h_next.slot(0);
                 let h_k_slice: &[f32] = h_k_vec.as_slice();
 
                 match pipeline.run(h_k_slice) {
                     Ok(result) => {
-                        // Inyectar delta en todos los slots con peso expert_beta
+                        // Inject delta into all slots with expert_beta weight
                         let mut h_enriched = h_next.clone();
                         let config = reasoning.config();
                         for slot_idx in 0..config.h_slots {
@@ -196,7 +196,7 @@ where
                         }
                         h_enriched
                     }
-                    Err(_) => h_next, // Si el expert falla, continuar sin enrichment
+                    Err(_) => h_next, // If the expert fails, continue without enrichment
                 }
             } else {
                 h_next
@@ -206,7 +206,7 @@ where
         };
         // ── fin K-checkpoint ─────────────────────────────────────────────────
 
-        // Convergencia sobre el flat completo
+        // Convergence over the full flat vector
         let flat_next = h_next.to_flat();
         let flat_curr = h.to_flat();
         let delta_norm = flat_next
@@ -226,8 +226,8 @@ where
         }
     }
 
-    // 4. Calcular métricas de calidad
-    let h_r = h.slot(0); // representante canónico para compute_q
+    // 4. Compute quality metrics
+    let h_r = h.slot(0); // canonical representative for compute_q
     let h_prev_r = h_prev.slot(0);
     let delta_s_r = &h_r - &s;
 
@@ -240,12 +240,12 @@ where
 
     let quality = compute_q(&h_r, &h_prev_r, &delta_s_r, oscillation_var);
 
-    // Solo devuelve resultado si el DEQ alcanzó un estado de calidad mínima
+    // Only return a result if the DEQ reached minimum quality
     if quality.q_total < aideen_core::quality::Q_MIN_WRITE {
         return None;
     }
 
-    // 5. Métricas semánticas
+    // 5. Semantic metrics
     let slot_diversity = compute_slot_diversity(&h);
     let slot_energy = compute_slot_energy(&h);
 
@@ -257,7 +257,7 @@ where
         converged,
     };
 
-    // 6. Señal semántica — Q_semantic = 0.5·q_conv + 0.3·diversity + 0.2·feedback
+    // 6. Semantic signal — Q_semantic = 0.5·q_conv + 0.3·diversity + 0.2·feedback
     let signal = SemanticSignal::new(quality.q_total, slot_diversity, cfg.feedback_score);
 
     // 7. Routing
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(q.len(), d_r);
         assert!(
             q.iter().any(|&x| x.abs() > 1e-6),
-            "encode no debe ser todo cero"
+            "encode must not be all zeros"
         );
     }
 
@@ -327,7 +327,7 @@ mod tests {
             &cfg,
         );
 
-        // Si alguno devuelve un resultado, h* debe depender del input
+        // If both return a result, h* must depend on the input
         if let (Some(a), Some(b)) = (r1, r2) {
             let flat_a = a.h_star.to_flat();
             let flat_b = b.h_star.to_flat();
@@ -336,9 +336,9 @@ mod tests {
                 .zip(flat_b.iter())
                 .map(|(x, y)| (x - y).abs())
                 .sum();
-            assert!(diff > 1e-6, "h* para queries distintas debe ser diferente");
+            assert!(diff > 1e-6, "h* for different queries must differ");
         }
-        // Si el DEQ no convergió con estos params, el test pasa vacío (no es un fallo del pipeline)
+        // If the DEQ did not converge with these params, the test passes empty (not a pipeline failure)
     }
 
     #[test]
@@ -348,7 +348,7 @@ mod tests {
         let mut backend = NullBackend;
         let cfg = InferenceConfig::default();
 
-        // Solo chequeamos que el resultado tiene los campos correctos si hay convergencia
+        // We only check that the result has the correct fields if there is convergence
         let _result = run(
             "test query para aideen",
             &mut reasoning,
@@ -356,6 +356,6 @@ mod tests {
             None,
             &cfg,
         );
-        // Si no converge con pesos aleatorios: ok, eso se resuelve en entrenamiento
+        // If it doesn't converge with random weights: ok, that is resolved during training
     }
 }

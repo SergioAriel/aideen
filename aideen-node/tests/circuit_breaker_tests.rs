@@ -4,12 +4,12 @@ use std::time::{Duration, Instant};
 
 use aideen_node::peers::connector::FailureState;
 
-/// Verifica que el backoff con jitter cae dentro de la banda ±30% del base esperado.
-/// Banda ±30% (más amplia que el ±20% de jitter real) para absorber overhead de test.
+/// Verifies that backoff with jitter falls within the ±30% band of the expected base.
+/// ±30% band (wider than the real ±20% jitter) to absorb test overhead.
 #[test]
 fn test_breaker_backoff_increases_and_within_jitter_band() {
     let node_id = [0xAAu8; 32];
-    // base_secs esperados para fail_count 1..=7: 1, 2, 4, 8, 16, 32, 60 (cap)
+    // expected base_secs for fail_count 1..=7: 1, 2, 4, 8, 16, 32, 60 (cap)
     let expected_bases = [1u64, 2, 4, 8, 16, 32, 60];
 
     for (i, &base) in expected_bases.iter().enumerate() {

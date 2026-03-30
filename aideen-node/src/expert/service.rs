@@ -4,28 +4,28 @@ use aideen_core::reasoning::Reasoning;
 use aideen_core::state::HSlots;
 use nalgebra::DVector;
 
-/// Servicio de inferencia de experto local.
+/// Local expert inference service.
 ///
-/// Recibe un `ExpertTask` (s_r aplanado = K×D_R floats),
-/// reconstruye HSlots, ejecuta su mini-DEQ y devuelve el delta aplanado.
+/// Receives an `ExpertTask` (flattened s_r = K×D_R floats),
+/// reconstructs HSlots, runs its mini-DEQ and returns the flattened delta.
 pub struct ExpertService<R: Reasoning> {
     pub reasoning: R,
-    /// Pasos máximos de DEQ (antiguo k_steps).
+    /// Maximum DEQ steps (formerly k_steps).
     pub k_max: usize,
-    /// Early-stop: norma de diferencia entre flats < eps_step → cortar.
+    /// Early-stop: flat difference norm < eps_step → cut.
     pub eps_step: f32,
     /// Clamp: ||Δ_total|| > delta_cap → reescalar a delta_cap.
     pub delta_cap: f32,
 }
 
 /// stop codes (ExpertResult.stop):
-/// 0 = eps_step gate (convergió antes de k_max)
-/// 1 = k_max gate (agotó pasos sin converger)
-/// 2 = delta_cap gate (delta clampeado por ser demasiado grande)
+/// 0 = eps_step gate (converged before k_max)
+/// 1 = k_max gate (exhausted steps without converging)
+/// 2 = delta_cap gate (delta clamped for being too large)
 
 impl<R: Reasoning> ExpertService<R> {
-    /// Procesa un NetMsg::ExpertTask.
-    /// Preserva Δ = f_i^k(H_k) − H_k arrancando desde H0, no desde init().
+    /// Processes a NetMsg::ExpertTask.
+    /// Preserves Δ = f_i^k(H_k) − H_k starting from H0, not from init().
     pub fn process(&self, msg: &NetMsg) -> Result<NetMsg, String> {
         let (task_id, target_id, s_r) = match msg {
             NetMsg::ExpertTask {
@@ -37,21 +37,21 @@ impl<R: Reasoning> ExpertService<R> {
             _ => return Err("ExpertService: expected ExpertTask".into()),
         };
 
-        // Reconstruir H0 desde s_r aplanado
+        // Reconstruct H0 from flattened s_r
         let config = self.reasoning.config();
         let h0 = if s_r.len() == config.h_slots * config.d_r {
             HSlots::from_flat(s_r, config)
         } else {
-            // Fallback: broadcast del primer D_R si el tamaño no coincide
+            // Fallback: broadcast the first D_R if the size doesn't match
             let s = DVector::from_vec(s_r.clone());
             let d_r = config.d_r;
             HSlots::from_broadcast(&s.rows(0, s.len().min(d_r)).into_owned(), config)
         };
 
-        // s es la proyección del slot 0 como contexto para el step
+        // s is the projection of slot 0 as context for the step
         let s_ctx = DVector::from_vec(h0.slot(0).as_slice().to_vec());
 
-        // Arrancar desde h0 (preserva Δ = f^k(H_k) - H_k)
+        // Start from h0 (preserves Δ = f^k(H_k) - H_k)
         let mut h = h0.clone();
         let mut iters = 0u32;
         let mut stop: u8 = 1; // default: k_max gate
@@ -61,7 +61,7 @@ impl<R: Reasoning> ExpertService<R> {
                 .reasoning
                 .step(&h, &s_ctx, None::<&mut dyn ComputeBackend>);
 
-            // Convergencia sobre flats
+            // Convergence over flats
             let flat_next = h_next.to_flat();
             let flat_curr = h.to_flat();
             let step_norm = flat_next
@@ -79,7 +79,7 @@ impl<R: Reasoning> ExpertService<R> {
             }
         }
 
-        // Calcular delta total: H_final - H0
+        // Compute total delta: H_final - H0
         let flat_final = h.to_flat();
         let flat_init = h0.to_flat();
         let mut diff: Vec<f32> = flat_final
@@ -88,10 +88,10 @@ impl<R: Reasoning> ExpertService<R> {
             .map(|(a, b)| a - b)
             .collect();
 
-        // Norma del delta
+        // Delta norm
         let norm = diff.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        // Clamp total: si el delta es demasiado grande, reescalar
+        // Total clamp: if the delta is too large, rescale
         if norm > self.delta_cap {
             let scale = self.delta_cap / norm;
             diff.iter_mut().for_each(|x| *x *= scale);

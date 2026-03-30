@@ -105,15 +105,15 @@ fn test_quic_channel_factory_dial_loopback() {
     use aideen_core::protocol::NetMsg;
     use aideen_node::network::channel_factory::{ChannelFactory, QuicChannelFactory};
 
-    // ── Construir cert auto-firmado (mismo patrón que pair_local) ─────────────
+    // ── Build self-signed cert (same pattern as pair_local) ────────────────────
     let cert = generate_simple_self_signed(vec!["aideen-peer".to_string()]).unwrap();
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let priv_key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
 
-    // Fingerprint esperado: sha256(cert_der)
+    // Expected fingerprint: sha256(cert_der)
     let expected_fp: [u8; 32] = Sha256::digest(cert_der.as_ref()).into();
 
-    // ── Levantar servidor QUIC echo en hilo separado ──────────────────────────
+    // ── Start QUIC echo server in a separate thread ───────────────────────────
     let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(0);
 
     let cert_der_srv = cert_der.clone();

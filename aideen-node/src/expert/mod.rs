@@ -12,50 +12,50 @@ use aideen_core::protocol::NetMsg;
 
 use crate::peers::types::NodeId;
 
-/// Resultado de una consulta al pipeline de expertos.
+/// Result of a query to the expert pipeline.
 ///
-/// Contiene el delta combinado listo para inyectar con `apply_expert_result()`,
-/// más estadísticas del batch para telemetría y damping.
+/// Contains the combined delta ready to inject with `apply_expert_result()`,
+/// plus batch statistics for telemetry and damping.
 pub struct RunResult {
-    /// Delta combinado (pre-β), listo para inject_delta_r_scaled.
+    /// Combined delta (pre-β), ready for inject_delta_r_scaled.
     pub delta: Vec<f32>,
-    /// Calidad media ponderada de peers no descartados.
+    /// Weighted mean quality of non-dropped peers.
     pub q_mean: f32,
     /// ||delta||₂ post-aggregation pre-β.
     pub delta_norm: f32,
-    /// Peers descartados como outliers en el batch.
+    /// Peers dropped as outliers in the batch.
     pub drops_count: u32,
 }
 
-/// Pipeline de consulta de expertos P2P.
+/// P2P expert query pipeline.
 ///
-/// Orquesta: Router → ExpertClient → outlier filter → Aggregator.
-/// Llamar antes de tick() para warm-start del DEQ local con conocimiento externo.
+/// Orchestrates: Router → ExpertClient → outlier filter → Aggregator.
+/// Call before tick() for warm-start of the local DEQ with external knowledge.
 pub struct ExpertPipeline {
     pub router: Box<dyn Router>,
     pub client: ExpertClient,
     pub bundle_version: u64,
-    /// Clamp global aplicado al delta combinado (None = sin límite).
+    /// Global clamp applied to the combined delta (None = no limit).
     pub delta_cap_global: Option<f32>,
-    /// None = desactivado.
-    /// Some(f) = descarta peers con ||Δ_i|| > f × mediana del batch.
-    /// Solo actúa si k_éxitos ≥ 2 Y f > 1.0.
+    /// None = disabled.
+    /// Some(f) = drops peers with ||Δ_i|| > f × batch median.
+    /// Only acts if k_successes ≥ 2 AND f > 1.0.
     pub outlier_factor: Option<f32>,
 }
 
 impl ExpertPipeline {
-    /// Consulta peers seleccionados en paralelo (MVP: secuencial) y agrega deltas.
+    /// Queries selected peers in parallel (MVP: sequential) and aggregates deltas.
     /// `h_k_slice`: slice del subespacio S_R del estado actual (len = D_R = 1024).
-    /// Retorna RunResult listo para `apply_expert_result`.
+    /// Returns RunResult ready for `apply_expert_result`.
     pub fn run(&mut self, h_k_slice: &[f32]) -> Result<RunResult, String> {
-        // Orden determinista via BTreeMap natural
+        // Deterministic order via BTreeMap natural ordering
         let peer_ids: Vec<NodeId> = self.client.sorted_peer_ids();
         let n = peer_ids.len();
         if n == 0 {
             return Err("ExpertPipeline: no peers".into());
         }
 
-        // Router devuelve índices sobre peer_ids; los traducimos a NodeIds
+        // Router returns indices over peer_ids; we translate them to NodeIds
         let selected_indices = self.router.select(h_k_slice, n);
         if selected_indices.is_empty() {
             return Err("ExpertPipeline: no peers selected".into());
@@ -76,7 +76,7 @@ impl ExpertPipeline {
 
         let raw = self.client.query(task, &selected);
 
-        // Filtrar éxitos — alphas y results quedan alineados 1:1
+        // Filter successes — alphas and results stay aligned 1:1
         let (alphas, results): (Vec<f32>, Vec<NetMsg>) = raw
             .into_iter()
             .filter_map(|(a, r)| r.ok().map(|m| (a, m)))
@@ -86,7 +86,7 @@ impl ExpertPipeline {
             return Err("ExpertPipeline: all peers failed".into());
         }
 
-        // Renormalización base (Σ=1)
+        // Base renormalisation (Σ=1)
         let total: f32 = alphas.iter().sum();
         let mut norm_alphas: Vec<f32> = alphas.iter().map(|a| a / total).collect();
 
@@ -131,7 +131,7 @@ impl ExpertPipeline {
                     }
                     let remaining: f32 = norm_alphas.iter().sum();
                     if remaining == 0.0 {
-                        return Err("ExpertPipeline: todos los peers son outliers".into());
+                        return Err("ExpertPipeline: all peers are outliers".into());
                     }
                     norm_alphas.iter_mut().for_each(|a| *a /= remaining);
                 }

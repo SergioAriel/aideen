@@ -2,8 +2,8 @@
 
 use aideen_core::doc_memory::{ChunkId, DocHit, DocId, DocMemory, DocMeta};
 
-/// Backend OPFS para DocMemory.
-/// Stub compilable — shape correcto, implementación real en sprint siguiente.
+/// OPFS backend for DocMemory.
+/// Compilable stub — correct shape, real implementation in the next sprint.
 pub struct OpfsDocMemory;
 
 impl OpfsDocMemory {

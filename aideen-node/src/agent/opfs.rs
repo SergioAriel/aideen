@@ -10,18 +10,18 @@ use web_sys::{
     FileSystemGetDirectoryOptions, FileSystemGetFileOptions, FileSystemWritableFileStream,
 };
 
-/// Cuántos eventos recientes mantenemos en el ring buffer en memoria.
+/// How many recent events we keep in the in-memory ring buffer.
 const RECENT_CAP: usize = 256;
 
-/// Backend WASM para Origin Private File System (OPFS).
+/// WASM backend for Origin Private File System (OPFS).
 ///
-/// Layout idéntico a FsAgentStore (mismo framing, misma serde):
+/// Layout identical to FsAgentStore (same framing, same serde):
 ///   <agent_id>/prefs.bin   — bincode(HashMap<String, String>)
 ///   <agent_id>/events.log  — [u32 LE len][bincode(AgentEvent)]*
 ///
-/// Las escrituras son async fire-and-forget: la caché se actualiza
-/// sincrónicamente y spawn_local persiste en OPFS en background.
-/// Usa la API async de OPFS (createWritable) — funciona en Window y Worker.
+/// Writes are async fire-and-forget: cache is updated synchronously
+/// and spawn_local persists to OPFS in background.
+/// Uses the async OPFS API (createWritable) — works in Window and Worker.
 pub struct OpfsAgentStore {
     agent_id: String,
     prefs: HashMap<String, String>,
@@ -30,7 +30,7 @@ pub struct OpfsAgentStore {
 
 impl OpfsAgentStore {
     /// Abre o crea el store bajo `<agent_id>/` en OPFS.
-    /// Carga prefs y los últimos eventos desde disco.
+    /// Loads prefs and the latest events from disk.
     pub async fn open(agent_id: &str) -> Result<Self, String> {
         let dir = agent_dir(agent_id).await?;
 
@@ -68,7 +68,7 @@ impl AgentStore for OpfsAgentStore {
     }
 
     fn append_event(&mut self, event: AgentEvent) -> Result<(), String> {
-        // Actualizar ring buffer en memoria
+        // Update in-memory ring buffer
         if self.recent.len() >= RECENT_CAP {
             self.recent.pop_front();
         }
@@ -137,7 +137,7 @@ async fn read_bytes(dir: &FileSystemDirectoryHandle, name: &str) -> Result<Vec<u
     Ok(Uint8Array::new(&ab).to_vec())
 }
 
-/// Sobreescribe `name` con `bytes` completo (para prefs.bin).
+/// Overwrites `name` with the complete `bytes` (for prefs.bin).
 async fn write_full(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
     let dir = agent_dir(agent_id).await?;
 
@@ -172,7 +172,7 @@ async fn write_full(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), St
     Ok(())
 }
 
-/// Agrega `bytes` al final de `name` (para events.log).
+/// Appends `bytes` to the end of `name` (for events.log).
 async fn append_bytes(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
     let dir = agent_dir(agent_id).await?;
 
@@ -226,7 +226,7 @@ async fn append_bytes(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), 
     Ok(())
 }
 
-/// Parsea events.log y devuelve los últimos RECENT_CAP eventos en orden FIFO.
+/// Parses events.log and returns the last RECENT_CAP events in FIFO order.
 fn parse_events(bytes: &[u8]) -> VecDeque<AgentEvent> {
     let mut events = VecDeque::new();
     let mut cursor = 0usize;

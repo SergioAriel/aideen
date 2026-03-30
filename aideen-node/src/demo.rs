@@ -1,19 +1,19 @@
-//! # Aideen AI MVP — Demo End-to-End
+//! # Aideen AI MVP — End-to-End Demo
 //!
-//! Demuestra tres modos de operación del loop de inferencia:
+//! Demonstrates three inference loop operation modes:
 //!
-//! ## Modo 1: Local-Only
-//! DEQ local converge sin consultar expertos externos.
+//! ## Mode 1: Local-Only
+//! Local DEQ converges without querying external experts.
 //!
-//! ## Modo 2: Expert-Hop (in-process)
-//! El nodo consulta un experto en el mismo proceso a través de
-//! `InProcessChannel`. El Critic actualiza reputación tras cada respuesta.
+//! ## Mode 2: Expert-Hop (in-process)
+//! The node queries an expert in the same process via
+//! `InProcessChannel`. The Critic updates reputation after each response.
 //!
-//! ## Modo 3: Full Pipeline (DEQ → H* → MambaDecoder → texto)
-//! Ejecuta el pipeline completo:
+//! ## Mode 3: Full Pipeline (DEQ → H* → MambaDecoder → text)
+//! Runs the full pipeline:
 //!   query → encoder → DEQ (MambaSlotReasoning) → H* → MambaDecoder → tokens
 //!
-//! ## Ejecución
+//! ## Running
 //! ```
 //! cargo run --bin demo -- [local|expert|full|both]
 //! ```
@@ -35,7 +35,7 @@ use aideen_node::{
 };
 use nalgebra::DVector;
 
-// ── Mocks compactos ───────────────────────────────────────────────────────────
+// ── Compact mocks ────────────────────────────────────────────────────────────
 
 struct DemoBackend;
 impl ComputeBackend for DemoBackend {
@@ -52,7 +52,7 @@ impl ComputeBackend for DemoBackend {
     }
 }
 
-// Reasoning estable: decay muy leve → converge rápido (para demo local/expert)
+// Stable reasoning: very mild decay → converges fast (for local/expert demo)
 struct StableReasoning {
     config: ArchitectureConfig,
 }
@@ -86,14 +86,14 @@ impl Reasoning for StableReasoning {
     }
 }
 
-// ── Vocabulario mínimo para demo ──────────────────────────────────────────────
+// ── Minimal vocabulary for demo ───────────────────────────────────────────────
 
-/// Tokenizador trivial: cada caracter ASCII → token ID.
+/// Trivial tokeniser: each ASCII character → token ID.
 fn tokenize(text: &str, vocab_size: usize) -> Vec<u32> {
     text.bytes().map(|b| b as u32 % vocab_size as u32).collect()
 }
 
-/// Detokenizador trivial: token ID → caracter.
+/// Trivial detokeniser: token ID → character.
 fn detokenize(tokens: &[u32]) -> String {
     tokens
         .iter()
@@ -128,8 +128,8 @@ fn run_local_mode(queries: &[&str]) {
 
     for (i, query) in queries.iter().enumerate() {
         let t0 = Instant::now();
-        // Nota: run_local_mode usa StableReasoning que no necesita tokens,
-        // pero pasamos el query como string por compatibilidad con la firma de inference_run.
+        // Note: run_local_mode uses StableReasoning which doesn't need tokens,
+        // but we pass the query as a string for compatibility with the inference_run signature.
         let result = inference_run(query, &mut reasoning, &mut backend, None, &cfg);
         let elapsed_ms = t0.elapsed().as_millis();
 
@@ -144,7 +144,9 @@ fn run_local_mode(queries: &[&str]) {
                 println!("  routing:       {:?}", r.routing);
                 println!("  Q_semantic:    {:.4}", r.signal.q_semantic);
             }
-            None => println!("  ⚠ DEQ no convergió con Q_min (normal en MVP sin entrenamiento)"),
+            None => {
+                println!("  ⚠ DEQ did not converge with Q_min (normal in MVP without training)")
+            }
         }
         println!("  elapsed:       {}ms\n", elapsed_ms);
     }
@@ -223,7 +225,7 @@ fn run_expert_mode(queries: &[&str]) {
                 r.h_star
             }
             None => {
-                println!("  [Local] DEQ no convergió — usando H* cero para expert-hop");
+                println!("  [Local] DEQ did not converge — using zero H* for expert-hop");
                 HSlots::zeros(&config)
             }
         };
@@ -254,7 +256,7 @@ fn run_expert_mode(queries: &[&str]) {
         );
     }
 
-    println!("Top-1 experto por reputación: {:?}", critic.top_k(1));
+    println!("Top-1 expert by reputation: {:?}", critic.top_k(1));
 }
 
 // ── MODO 3: Full Pipeline (DEQ → H* → MambaDecoder → texto) ──────────────────
@@ -263,15 +265,15 @@ fn run_full_mode(queries: &[&str]) {
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║   MODO 3: Full Pipeline  DEQ → H* → MambaDecoder   ║");
     println!("╚══════════════════════════════════════════════════════╝");
-    println!("Nota: pesos random — los tokens son sin sentido semántico.");
-    println!("      El objetivo es validar que el PIPELINE FUNCIONA.\n");
+    println!("Note: random weights — tokens have no semantic meaning.");
+    println!("      The goal is to validate that the PIPELINE WORKS.\n");
 
-    // MambaSlotReasoning como f del DEQ (cross-slot attn + Mamba SSM)
+    // MambaSlotReasoning as f of the DEQ (cross-slot attn + Mamba SSM)
     let config = ArchitectureConfig::default();
     let mut reasoning = MambaSlotReasoning::new(config.clone());
     let mut backend = DemoBackend;
 
-    // Vocabulario pequeño para demo (ASCII printable)
+    // Small vocabulary for demo (ASCII printable)
     let vocab_size = 128usize;
     let mut dec_config = config.clone();
     dec_config.vocab_size = vocab_size;
@@ -279,7 +281,7 @@ fn run_full_mode(queries: &[&str]) {
 
     let cfg = InferenceConfig {
         max_iters: 30,
-        epsilon: 1e-3, // más tolerante para convergencia con pesos random
+        epsilon: 1e-3, // more tolerant for convergence with random weights
         ..Default::default()
     };
 
@@ -301,7 +303,7 @@ fn run_full_mode(queries: &[&str]) {
                 r.h_star.clone()
             }
             None => {
-                println!("  [DEQ]     no convergió — usando H* parcial");
+                println!("  [DEQ]     did not converge — using partial H*");
                 HSlots::zeros(&config)
             }
         };
@@ -328,9 +330,9 @@ fn run_full_mode(queries: &[&str]) {
 
 fn main() {
     let queries = [
-        "¿Qué es un sistema de razonamiento distribuido?",
-        "Explica cómo funciona el aprendizaje por refuerzo",
-        "¿Cuál es la diferencia entre inferencia y entrenamiento?",
+        "What is a distributed reasoning system?",
+        "Explain how reinforcement learning works",
+        "What is the difference between inference and training?",
     ];
 
     let args: Vec<String> = std::env::args().collect();
@@ -339,7 +341,7 @@ fn main() {
     println!("═══════════════════════════════════════════════════════");
     println!("           AIDEEN AI MVP — Demo End-to-End              ");
     println!("═══════════════════════════════════════════════════════");
-    println!("Modo: {mode}  |  Queries: {}", queries.len());
+    println!("Mode: {mode}  |  Queries: {}", queries.len());
 
     match mode {
         "local" => run_local_mode(&queries),
@@ -352,5 +354,5 @@ fn main() {
         }
     }
 
-    println!("\n✓ Demo completado.");
+    println!("\n✓ Demo completed.");
 }

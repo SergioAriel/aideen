@@ -51,7 +51,7 @@ pub struct FsDocMemory {
 
 impl FsDocMemory {
     /// Abre o crea el store en `<base_dir>/<agent_id>/docs/`.
-    /// Reconstruye el índice global desde disco al arrancar.
+    /// Reconstructs the global index from disk at startup.
     pub fn open(base_dir: &str, agent_id: &str) -> Result<Self, String> {
         let dir = PathBuf::from(base_dir).join(agent_id).join("docs");
         std::fs::create_dir_all(dir.join("raw")).map_err(|e| e.to_string())?;
@@ -80,7 +80,7 @@ impl FsDocMemory {
         Ok(slf)
     }
 
-    /// Builder: configura tamaño de chunk y solapamiento.
+    /// Builder: configures chunk size and overlap.
     pub fn with_chunking(mut self, chunk_size: usize, overlap: usize) -> Self {
         self.chunk_size = chunk_size.max(512);
         self.overlap = overlap.min(self.chunk_size / 2);
@@ -131,8 +131,8 @@ impl FsDocMemory {
 
     // ── Chunking ──────────────────────────────────────────────────────────────
 
-    /// Divide `bytes` en chunks con solapamiento.
-    /// Devuelve: Vec<(chunk_id, byte_start, byte_end_exclusive, chunk_bytes)>
+    /// Splits `bytes` into chunks with overlap.
+    /// Returns: Vec<(chunk_id, byte_start, byte_end_exclusive, chunk_bytes)>
     fn split_into_chunks(&self, bytes: &[u8]) -> Vec<(ChunkId, u64, u64, Vec<u8>)> {
         if bytes.is_empty() {
             return vec![];
@@ -293,7 +293,7 @@ impl DocMemory for FsDocMemory {
             }
         }
 
-        // 5) Actualizar manifest + flush
+        // 5) Update manifest + flush
         self.manifest.push(DocRecord {
             doc_id,
             meta,
@@ -321,7 +321,7 @@ impl DocMemory for FsDocMemory {
             return vec![];
         }
 
-        // Acumular score TF por (doc_id, chunk_id)
+        // Accumulate TF score per (doc_id, chunk_id)
         let mut scores: HashMap<(DocId, ChunkId), f32> = HashMap::new();
         for tok in toks {
             if let Some(posts) = self.inverted.get(&tok) {

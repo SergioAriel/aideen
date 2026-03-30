@@ -1,13 +1,13 @@
-/// QuicChannel: implementa NetChannel sobre quinn QUIC.
+/// QuicChannel: implements NetChannel over quinn QUIC.
 ///
-/// Framing canónico: u32 LE (longitud) + bincode(NetMsg).
-/// Internamente usa tokio::sync::mpsc para bridge sync↔async.
+/// Canonical framing: u32 LE (length) + bincode(NetMsg).
+/// Internally uses tokio::sync::mpsc for sync↔async bridging.
 ///
-/// Arquitectura:
-/// - Runtime global persistente (OnceLock) para no perder las tareas.
-/// - pair_local() conecta, señaliza readiness, y spawn las tareas de I/O.
-/// - dial() abre conexión real a "host:port" (o "quic://host:port"), captura fingerprint.
-/// - open_uni en salida / accept_uni en entrada: cualquier lado puede escribir primero.
+/// Architecture:
+/// - Persistent global runtime (OnceLock) to avoid losing tasks.
+/// - pair_local() connects, signals readiness, and spawns I/O tasks.
+/// - dial() opens a real connection to "host:port" (or "quic://host:port"), captures fingerprint.
+/// - open_uni for outbound / accept_uni for inbound: either side can write first.
 use std::sync::{Arc, OnceLock};
 
 use aideen_core::protocol::NetMsg;
@@ -61,8 +61,8 @@ async fn read_framed(recv: &mut quinn::RecvStream) -> Result<NetMsg, String> {
 
 // ── Runtime global ────────────────────────────────────────────────────────
 
-/// Runtime tokio compartido — vive hasta el final del proceso.
-/// Necesario para que las tareas QUIC sobrevivan a pair_local().
+/// Shared tokio runtime — lives until the end of the process.
+/// Necessary so that QUIC tasks survive pair_local().
 static QUIC_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn quic_rt() -> &'static tokio::runtime::Runtime {
@@ -78,9 +78,9 @@ fn quic_rt() -> &'static tokio::runtime::Runtime {
 // ── Test helpers ──────────────────────────────────────────────────────────
 
 impl QuicChannel {
-    /// Crea un par (client, server) conectado sobre QUIC local con puertos efímeros.
-    /// Genera certificado auto-firmado. Solo para tests.
-    /// Bloquea hasta que la conexión QUIC está establecida.
+    /// Creates a (client, server) pair connected over local QUIC with ephemeral ports.
+    /// Generates a self-signed certificate. For tests only.
+    /// Blocks until the QUIC connection is established.
     pub fn pair_local() -> (Self, Self) {
         use std::net::SocketAddr;
         use std::sync::Arc;
@@ -92,13 +92,13 @@ impl QuicChannel {
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         let priv_key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
 
-        // Canales sync↔async
+        // Sync↔async channels
         let (c_app_tx, c_net_rx) = tokio::sync::mpsc::channel::<NetMsg>(64);
         let (c_net_tx, c_app_rx) = tokio::sync::mpsc::channel::<NetMsg>(64);
         let (s_app_tx, s_net_rx) = tokio::sync::mpsc::channel::<NetMsg>(64);
         let (s_net_tx, s_app_rx) = tokio::sync::mpsc::channel::<NetMsg>(64);
 
-        // Señal de readiness (sincrona: ready cuando conexión establecida)
+        // Readiness signal (synchronous: ready when connection established)
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
 
         let cert_der_srv = cert_der.clone();
@@ -142,16 +142,16 @@ impl QuicChannel {
                 }
             );
 
-            // ── Señalizar readiness DESPUÉS de la conexión ───────────────
-            // Cada lado abre SU PROPIO stream de salida (open_uni) y acepta
-            // el del otro (accept_uni). Así cualquiera puede escribir primero
-            // sin bloquear al otro en accept.
+            // ── Signal readiness AFTER connection ─────────────────────────
+            // Each side opens ITS OWN outbound stream (open_uni) and accepts
+            // the other's (accept_uni). This way either can write first
+            // without blocking the other on accept.
             let _ = ready_tx.send(());
 
             // ── I/O loops: 2 uni streams independientes ──────────────────
             //
-            //   C→S: cliente abre uni stream → servidor acepta
-            //   S→C: servidor abre uni stream → cliente acepta
+            //   C→S: client opens uni stream → server accepts
+            //   S→C: server opens uni stream → client accepts
             //
             // Cada write loop abre su stream lazily cuando llega el 1er msg.
             // Cada read loop acepta el stream del peer cuando éste escribe.
@@ -226,7 +226,7 @@ impl QuicChannel {
 // ── FingerprintCapture ────────────────────────────────────────────────────────
 
 /// Verifier TLS custom: acepta cualquier cert y captura su fingerprint SHA-256.
-/// La validación TOFU/pinning ocurre después del handshake en TrustStore.
+/// TOFU/pinning validation occurs after the handshake in TrustStore.
 /// verify_tls12/13_signature → assertion() — seguridad es post-handshake.
 #[derive(Debug)]
 struct FingerprintCapture {
@@ -282,7 +282,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCapture {
 
 impl QuicChannel {
     /// Conecta a un endpoint real ("host:port" o "quic://host:port"), captura fingerprint.
-    /// Bloquea hasta que el QUIC handshake completa.
+    /// Blocks until the QUIC handshake completes.
     pub fn dial(endpoint: &str) -> Result<(Self, [u8; 32]), String> {
         // Ajuste #1: soportar "quic://host:port" y "host:port"
         let endpoint = endpoint.strip_prefix("quic://").unwrap_or(endpoint);
@@ -292,7 +292,7 @@ impl QuicChannel {
             fingerprint: fp_cell.clone(),
         });
 
-        // Construir ClientConfig con verifier custom (requires dangerous_configuration feature)
+        // Build ClientConfig with custom verifier (requires dangerous_configuration feature)
         let rustls_cli = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)

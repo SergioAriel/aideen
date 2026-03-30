@@ -209,7 +209,7 @@ async fn handle_session(
                 return Ok(());
             }
 
-            // ── Discovery (solo si ya delegado) ─────────────────────────
+            // ── Discovery (only if already delegated) ─────────────────────
             (
                 SessionState::Delegated { node_id },
                 NetMsg::Discovery {

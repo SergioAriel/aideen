@@ -9,7 +9,7 @@ pub trait SelectionPolicy: Send {
     ) -> Vec<&'a ArtifactMeta>;
 }
 
-/// Política por defecto: filtra artefactos cuyo QuantLevel está soportado por el nodo.
+/// Default policy: filters artifacts whose QuantLevel is supported by the node.
 pub struct CompatPolicy;
 
 impl SelectionPolicy for CompatPolicy {

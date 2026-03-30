@@ -6,10 +6,10 @@ use crate::peers::types::NodeId;
 const BACKOFF_BASE_SECS: u64 = 1;
 const BACKOFF_CAP_SECS: u64 = 60;
 
-/// Estado de fallos de un peer — implementa circuit breaker con backoff exponencial.
+/// Peer failure state — implements circuit breaker with exponential backoff.
 ///
 /// Backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (cap).
-/// Scope 5M: jitter, persistencia entre reinicios.
+/// Scope 5M: jitter, persistence between restarts.
 #[derive(Default)]
 pub struct FailureState {
     pub fail_count: u32,
@@ -25,8 +25,8 @@ impl FailureState {
         }
     }
 
-    /// Registra un fallo y abre el breaker con backoff exponencial + jitter ±20% per-peer.
-    /// Secuencia base: 1s, 2s, 4s, 8s, 16s, 32s, 60s (cap). Jitter: sha2(node_id ‖ fail_count ‖ ts/10).
+    /// Records a failure and opens the breaker with exponential backoff + ±20% per-peer jitter.
+    /// Base sequence: 1s, 2s, 4s, 8s, 16s, 32s, 60s (cap). Jitter: sha2(node_id ‖ fail_count ‖ ts/10).
     pub fn record_failure(&mut self, node_id: &NodeId) {
         self.fail_count += 1;
         let base = BACKOFF_BASE_SECS
@@ -37,18 +37,18 @@ impl FailureState {
         self.open_until = Some(Instant::now() + Duration::from_millis(total_ms));
     }
 
-    /// Registra un éxito y cierra el breaker.
+    /// Records a success and closes the breaker.
     pub fn record_success(&mut self) {
         self.fail_count = 0;
         self.open_until = None;
     }
 }
 
-/// Mapa de breakers por NodeId — vive en NodeRunner.
+/// Map of breakers per NodeId — lives in NodeRunner.
 pub type PeerFailures = HashMap<NodeId, FailureState>;
 
-/// Jitter ±20% determinista por (node_id, fail_count, time_bucket de 10s).
-/// Devuelve milisegundos a sumar al base (puede ser negativo).
+/// Deterministic ±20% jitter by (node_id, fail_count, 10s time_bucket).
+/// Returns milliseconds to add to the base (can be negative).
 fn jitter_millis(node_id: &[u8; 32], fail_count: u32, base_secs: u64) -> i64 {
     use sha2::{Digest, Sha256};
     let ts_bucket = std::time::SystemTime::now()

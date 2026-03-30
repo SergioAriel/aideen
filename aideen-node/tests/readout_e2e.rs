@@ -1,7 +1,7 @@
-/// E2E: Readout canónico sobre h* del ciclo DEQ.
+/// E2E: Canonical readout over h* from the DEQ cycle.
 ///
-/// Invariantes verificados:
-///   1. tick() con convergencia instantánea → h_star = Some(h*)
+/// Verified invariants:
+///   1. tick() with instant convergence → h_star = Some(h*)
 ///   2. LinearReadout::identity devuelve exactamente h*
 ///   3. LinearReadout::new(W, b) devuelve W·h* + b exacto
 ///   4. Cuando Ethics viola → h_star = None (gating)
@@ -14,10 +14,10 @@ use nalgebra::{DMatrix, DVector};
 
 // ── Constantes del test ────────────────────────────────────────────────────
 
-/// Valor fijo al que converge el MockReasoning
+/// Fixed value to which MockReasoning converges
 const H_VAL: f32 = 0.3;
 
-// ── Mocks mínimos ──────────────────────────────────────────────────────────
+// ── Minimal mocks ─────────────────────────────────────────────────────────
 
 struct MockBackend;
 impl aideen_core::compute::ComputeBackend for MockBackend {
@@ -34,7 +34,7 @@ impl aideen_core::compute::ComputeBackend for MockBackend {
     }
 }
 
-/// Reasoning que converge instantáneamente a `[H_VAL; D_R]` en todos los slots.
+/// Reasoning that converges instantly to `[H_VAL; D_R]` in all slots.
 struct FixedPointReasoning(ArchitectureConfig);
 impl aideen_core::reasoning::Reasoning for FixedPointReasoning {
     fn config(&self) -> &ArchitectureConfig {
@@ -53,7 +53,7 @@ impl aideen_core::reasoning::Reasoning for FixedPointReasoning {
     }
 }
 
-/// Control que para en la primera iteración (iter=0).
+/// Control that stops on the first iteration (iter=0).
 struct ImmediateStop;
 impl aideen_core::control::Control for ImmediateStop {
     fn max_iters(&self) -> usize {
@@ -64,7 +64,7 @@ impl aideen_core::control::Control for ImmediateStop {
     }
     fn decide(&self, _iter: usize, _dn: f32, _e: f32) -> aideen_core::control::ControlDecision {
         aideen_core::control::ControlDecision {
-            stop: true, // siempre para en iter=0
+            stop: true, // always stops at iter=0
             beta: 1.0,
             write_memory: false,
             allow_learning: true,
@@ -153,7 +153,7 @@ fn test_readout_identity_on_attractor() {
     assert_dvec_approx(&output, &h_star, 1e-6);
 }
 
-/// Readout proyección 2D: W·h* + b exacto.
+/// Readout 2D projection: exact W·h* + b.
 #[test]
 fn test_readout_projection_on_attractor() {
     let config = ArchitectureConfig::default();
@@ -195,7 +195,7 @@ fn test_readout_projection_on_attractor() {
     );
 }
 
-/// Gating ético: si Ethics viola, h_star debe ser None.
+/// Ethical gating: if Ethics violates, h_star must be None.
 #[test]
 fn test_h_star_absent_on_ethics_violation() {
     let config = ArchitectureConfig::default();

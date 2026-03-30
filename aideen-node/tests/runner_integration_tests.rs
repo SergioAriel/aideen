@@ -55,7 +55,7 @@ impl Reasoning for MockReasoning {
     }
 }
 
-/// Reasoning sensible al estado: blende slots con la región S_sim (donde
+/// State-sensitive Reasoning: blends slots with the S_sim region (where
 /// `set_context()` escribe los features documentales). Converge en 1 paso.
 struct ContextSensitiveReasoning {
     config: ArchitectureConfig,
@@ -79,7 +79,7 @@ impl Reasoning for ContextSensitiveReasoning {
         }
         let mut next = HSlots::zeros(&self.config);
         for k in 0..self.config.h_slots {
-            // Converge inmediatamente en 1 iteración para no depender de H_SLOTS ni epsilon
+            // Converges immediately in 1 iteration to avoid depending on H_SLOTS or epsilon
             next.set_slot(k, &sim_padded);
         }
         next
@@ -275,13 +275,13 @@ fn add_doc_search_locate_survive_restart() {
 
     let doc_mem2 = FsDocMemory::open(base.to_str().unwrap(), agent).unwrap();
     let hits2 = doc_mem2.search("aideen", 5);
-    assert!(!hits2.is_empty(), "documento debe sobrevivir al restart");
+    assert!(!hits2.is_empty(), "document must survive restart");
     assert_eq!(hits2[0].doc_id, doc_id);
 }
 
 // ── Test 3 ─────────────────────────────────────────────────────────────────────
 
-/// build_context_features es determinista y produce vector no-nulo con hits reales.
+/// build_context_features is deterministic and produces a non-null vector with real hits.
 #[test]
 fn doc_context_changes_state() {
     use aideen_node::{agent::FsAgentStore, doc_memory::FsDocMemory};
@@ -298,7 +298,7 @@ fn doc_context_changes_state() {
         .unwrap();
 
     let hits = runner.search_docs("aideen", 5);
-    assert!(!hits.is_empty(), "el doc debe aparecer en el índice");
+    assert!(!hits.is_empty(), "the doc must appear in the index");
 
     let feats1 = build_context_features(
         &RuntimeContext {
@@ -319,17 +319,17 @@ fn doc_context_changes_state() {
 
     assert_eq!(
         feats1, feats2,
-        "build_context_features debe ser determinista"
+        "build_context_features must be deterministic"
     );
     assert!(
         feats1.norm() > 0.0,
-        "features con hits reales deben ser no-nulas"
+        "features with real hits must be non-null"
     );
 }
 
 // ── Test 4 ─────────────────────────────────────────────────────────────────────
 
-/// Dos queries distintas producen h* distintos cuando Reasoning es sensible a S_sim.
+/// Two different queries produce different h* when Reasoning is sensitive to S_sim.
 #[test]
 fn context_affects_attractor() {
     use aideen_node::{agent::FsAgentStore, doc_memory::FsDocMemory};
@@ -442,7 +442,7 @@ fn discovery_emitted_when_delegated() {
 
 // ── Test 6 ─────────────────────────────────────────────────────────────────────
 
-/// Sin delegación, tick_with_query no emite Discovery aunque allow_learning=true.
+/// Without delegation, tick_with_query does not emit Discovery even if allow_learning=true.
 #[test]
 fn discovery_not_emitted_without_delegation() {
     use aideen_node::{agent::FsAgentStore, doc_memory::FsDocMemory};

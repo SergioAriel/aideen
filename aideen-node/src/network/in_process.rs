@@ -1,7 +1,7 @@
-/// Canal in-process para tests E2E sin I/O real.
+/// In-process channel for E2E tests without real I/O.
 ///
-/// Simula una conexión QUIC bidireccional usando canales sincrónicos de std.
-/// Ambos extremos se crean con `InProcessChannel::pair()`.
+/// Simulates a bidirectional QUIC connection using std synchronous channels.
+/// Both ends are created with `InProcessChannel::pair()`.
 use std::sync::mpsc;
 
 use aideen_core::protocol::NetMsg;
@@ -14,8 +14,8 @@ pub struct InProcessChannel {
 }
 
 impl InProcessChannel {
-    /// Crea un par de canales conectados: (client, server).
-    /// Lo que un extremo envía lo recibe el otro.
+    /// Creates a pair of connected channels: (client, server).
+    /// What one end sends, the other receives.
     pub fn pair() -> (Self, Self) {
         let (tx_a, rx_b) = mpsc::sync_channel(64);
         let (tx_b, rx_a) = mpsc::sync_channel(64);

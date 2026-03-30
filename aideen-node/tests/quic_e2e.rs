@@ -7,9 +7,9 @@ use aideen_node::network::quic_channel::QuicChannel;
 use aideen_node::network::NetChannel;
 use aideen_node::system::node::{AideenNode, LearningSignal};
 use aideen_node::update::UpdateManager;
-/// E2E: Pipeline de red canónico AIDEEN sobre QUIC real (quinn).
+/// E2E: AIDEEN canonical network pipeline over real QUIC (quinn).
 ///
-/// Mismos tres invariantes que net_pipeline_e2e, pero el canal es
+/// Same three invariants as net_pipeline_e2e, but the channel is
 /// QuicChannel::pair_local() con framing u32 LE + bincode.
 ///
 ///   1. HANDSHAKE  — Hello → Delegation → Ack

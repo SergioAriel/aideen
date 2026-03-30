@@ -1,12 +1,12 @@
-// Red P2P / Transporte
-// Regla: NO puede importar `system`
+// P2P Network / Transport
+// Rule: MUST NOT import `system`
 
 use aideen_core::protocol::NetMsg;
 
-/// Canal de mensajes NetMsg — wire-format canónico de AIDEEN.
+/// NetMsg message channel — AIDEEN canonical wire-format.
 ///
-/// Toda comunicación de protocolo (handshake, discovery, updates, expert tasks)
-/// usa este canal. tick() no toca este canal — los mensajes se emiten afuera del loop DEQ.
+/// All protocol communication (handshake, discovery, updates, expert tasks)
+/// uses this channel. tick() does not touch this channel — messages are emitted outside the DEQ loop.
 pub trait NetChannel {
     fn send(&mut self, msg: NetMsg) -> Result<(), String>;
     fn recv(&mut self) -> Result<NetMsg, String>;

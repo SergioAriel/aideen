@@ -336,7 +336,7 @@ fn test_pipeline_with_registry_wiring() {
         }
     });
 
-    // Construir ExpertClient desde los domain_ids del registry
+    // Build ExpertClient from the registry's domain_ids
     let peers: Vec<(NodeId, Box<dyn NetChannel>)> = domain_ids
         .into_iter()
         .zip(std::iter::once(Box::new(client_ch) as Box<dyn NetChannel>))

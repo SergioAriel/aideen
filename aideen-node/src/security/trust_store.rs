@@ -2,17 +2,17 @@ use std::collections::HashMap;
 
 use crate::peers::types::NodeId;
 
-/// Decisión de confianza devuelta por `verify_or_tofu`.
+/// Trust decision returned by `verify_or_tofu`.
 pub enum TrustDecision {
-    /// Fingerprint coincide con el registrado — peer conocido.
+    /// Fingerprint matches the stored one — known peer.
     Trusted,
-    /// Primera vez que se ve este peer — fingerprint guardado (TOFU).
+    /// First time seeing this peer — fingerprint stored (TOFU).
     TofuStored,
 }
 
-/// Almacén de fingerprints TLS. Implementa TOFU y pinning en una sola primitiva.
+/// TLS fingerprint store. Implements TOFU and pinning in a single primitive.
 ///
-/// Scope 5M: persistencia en FS/OPFS.
+/// Scope 5M: persistence on FS/OPFS.
 pub struct TrustStore {
     known: HashMap<NodeId, [u8; 32]>,
 }
@@ -24,18 +24,18 @@ impl TrustStore {
         }
     }
 
-    /// TOFU + pinning en una sola llamada.
+    /// TOFU + pinning in a single call.
     ///
-    /// - `pinned_fp = Some(x)` → exige `observed == x` antes de cualquier otra comprobación.
-    /// - Si el peer ya está registrado → exige que `observed` coincida con el almacenado.
-    /// - Primera vez → almacena y retorna `TofuStored`.
+    /// - `pinned_fp = Some(x)` → requires `observed == x` before any other check.
+    /// - If the peer is already registered → requires `observed` to match the stored one.
+    /// - First time → stores and returns `TofuStored`.
     pub fn verify_or_tofu(
         &mut self,
         node_id: NodeId,
         observed_fp: [u8; 32],
         pinned_fp: Option<[u8; 32]>,
     ) -> Result<TrustDecision, String> {
-        // 1. Pinning explícito (más restrictivo: falla aunque TOFU sea primera vez)
+        // 1. Explicit pinning (most restrictive: fails even if TOFU is first time)
         if let Some(pinned) = pinned_fp {
             if observed_fp != pinned {
                 return Err(format!(
@@ -59,13 +59,13 @@ impl TrustStore {
         }
     }
 
-    /// Consulta el fingerprint almacenado para un peer.
+    /// Queries the stored fingerprint for a peer.
     pub fn get(&self, node_id: &NodeId) -> Option<&[u8; 32]> {
         self.known.get(node_id)
     }
 
-    /// Carga TrustStore desde disco. Si el fichero no existe, devuelve `TrustStore::new()`.
-    /// Scope 5N: migración a OPFS para browser.
+    /// Loads TrustStore from disk. If the file does not exist, returns `TrustStore::new()`.
+    /// Scope 5N: migration to OPFS for browser.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         if !path.exists() {
@@ -77,7 +77,7 @@ impl TrustStore {
         Ok(Self { known })
     }
 
-    /// Persiste a disco con escritura atómica (write tmp + rename).
+    /// Persists to disk with atomic write (write tmp + rename).
     /// No crea directorios padre — el caller es responsable de que existan.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn flush(&self, path: &std::path::Path) -> Result<(), String> {

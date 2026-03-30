@@ -1,14 +1,14 @@
 use aideen_core::memory::Memory;
 use nalgebra::DVector;
 
-/// Memoria geométrica de atractores h*.
+/// Geometric attractor memory for h*.
 ///
-/// KNN exacto por cosine similarity — WASM-safe, sin deps externos.
+/// Exact KNN by cosine similarity — WASM-safe, no external deps.
 ///
-/// Guarda `store_raw` (h* original para warm-start) y `store_normed`
-/// (h* normalizado para similitud estable). Duplica memoria a 2x,
-/// aceptable para < 10k atractores. Si escala: migrar a normalización
-/// on-query o comprimir `store_normed` a Vec<f32>.
+/// Stores `store_raw` (original h* for warm-start) and `store_normed`
+/// (normalised h* for stable similarity). Doubles memory to 2x,
+/// acceptable for < 10k attractors. If scaling: migrate to on-query
+/// normalisation or compress `store_normed` to Vec<f32>.
 pub struct AttractorMemory {
     store_raw: Vec<DVector<f32>>,
     store_normed: Vec<DVector<f32>>,
@@ -41,8 +41,8 @@ impl AttractorMemory {
         }
     }
 
-    /// Cosine similarity entre dos vectores normalizados.
-    /// Devuelve NEG_INFINITY si el resultado no es finito (anti-NaN).
+    /// Cosine similarity between two normalised vectors.
+    /// Returns NEG_INFINITY if the result is not finite (anti-NaN).
     fn cosine(a: &DVector<f32>, b: &DVector<f32>) -> f32 {
         let s = a.dot(b);
         if s.is_finite() {

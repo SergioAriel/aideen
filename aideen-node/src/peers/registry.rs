@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::peers::types::{NodeId, PeerDelta, PeerEntry};
 
-/// Directorio indexado de peers. O(1) lookup/update, O(k) query por dominio.
+/// Indexed peer directory. O(1) lookup/update, O(k) query by domain.
 ///
-/// Invariantes:
-/// - `by_domain[d]` nunca contiene sets vacíos (limpieza en remove).
-/// - Todos los domains en `by_domain` están en lowercase.
-/// - `by_domain` y `by_id` son consistentes: un NodeId en `by_id` ↔ aparece en sus domains.
+/// Invariants:
+/// - `by_domain[d]` never contains empty sets (cleanup on remove).
+/// - All domains in `by_domain` are lowercase.
+/// - `by_domain` and `by_id` are consistent: a NodeId in `by_id` ↔ appears in its domains.
 pub struct PeerRegistry {
     epoch: u64,
     by_id: HashMap<NodeId, PeerEntry>,
@@ -23,7 +23,7 @@ impl PeerRegistry {
         }
     }
 
-    /// Bootstrap: reemplaza todo. Fija epoch sin validación (arranque).
+    /// Bootstrap: replaces everything. Sets epoch without validation (startup).
     pub fn set_snapshot(&mut self, epoch: u64, peers: Vec<PeerEntry>) {
         self.epoch = epoch;
         self.by_id.clear();
@@ -51,7 +51,7 @@ impl PeerRegistry {
         Ok(())
     }
 
-    /// NodeIds de peers que sirven `domain` (lowercase automático), orden determinista.
+    /// NodeIds of peers serving `domain` (automatic lowercase), deterministic order.
     pub fn node_ids_for_domain(&self, domain: &str) -> Vec<NodeId> {
         let domain = domain.to_lowercase();
         let mut ids: Vec<NodeId> = self

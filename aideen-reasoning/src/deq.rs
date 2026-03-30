@@ -2,7 +2,7 @@ use aideen_core::reasoning::Reasoning;
 use aideen_core::state::HSlots;
 use nalgebra::DVector;
 
-/// Deep Equilibrium Model (DEQ) genérico
+/// Generic Deep Equilibrium Model (DEQ)
 pub struct GeneralDEQ<R: Reasoning> {
     pub inner_model: R,
 }

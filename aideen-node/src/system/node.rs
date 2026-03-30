@@ -9,27 +9,27 @@ use aideen_core::{
     state::HSlots,
 };
 
-/// Nodo AIDEEN: orquesta el ciclo completo sin conocer implementaciones concretas.
-/// La red es externa al loop DEQ — los mensajes se emiten desde afuera de tick().
+/// AIDEEN Node: orchestrates the full cycle without knowing concrete implementations.
+/// The network is external to the DEQ loop — messages are emitted from outside tick().
 pub struct AideenNode<R, C, E, M, B> {
     // Estado cognitivo global [S_M | S_R | S_C | S_E | S_sim]
     pub state: DVector<f32>,
 
-    // Contratos cognitivos (core)
+    // Cognitive contracts (core)
     pub reasoning: R,
     pub control: C,
     pub ethics: E,
     pub memory: M,
 
-    // Infraestructura de cómputo
+    // Compute infrastructure
     pub backend: B,
 
-    // Parámetros de integración
+    // Integration parameters
     pub alpha: f32,
     pub epsilon: f32,
 }
 
-/// Razón por la cual se detuvo el tick.
+/// Reason why the tick stopped.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StopReason {
     Control,
@@ -39,7 +39,7 @@ pub enum StopReason {
     ReachedAttractor,
 }
 
-/// Métricas de un tick para visualización y control.
+/// Tick metrics for visualisation and control.
 #[derive(Debug, Clone)]
 pub struct TickMetrics {
     pub energy_r: f32,
@@ -51,13 +51,13 @@ pub struct TickMetrics {
     pub is_attractor: bool,
     pub allow_learning: bool,
     pub quality: QualityMetrics,
-    /// Punto fijo cognitivo (K×D_R slots). Solo presente cuando is_attractor == true.
+    /// Cognitive fixed point (K×D_R slots). Only present when is_attractor == true.
     pub h_star: Option<HSlots>,
 }
 
-/// Señal de salida del Tick para el laboratorio (PRIVADO/EXTERNO).
-/// Struct interno — nunca viaja por red directamente.
-/// Para emitir a la red usar `to_discovery_msg()`.
+/// Tick output signal for the laboratory (PRIVATE/EXTERNAL).
+/// Internal struct — never travels over the network directly.
+/// To emit to the network use `to_discovery_msg()`.
 #[derive(Debug, Clone)]
 pub struct LearningSignal {
     pub allow_learning: bool,
@@ -67,8 +67,8 @@ pub struct LearningSignal {
 }
 
 impl LearningSignal {
-    /// Convierte la señal interna al wire-format canónico para el AiArchitect.
-    /// Solo hashes viajan — h* completo permanece local.
+    /// Converts the internal signal to the canonical wire-format for the AiArchitect.
+    /// Only hashes travel — full h* remains local.
     pub fn to_discovery_msg(
         &self,
         node_id: [u8; 32],
@@ -128,15 +128,15 @@ where
     M: Memory,
     B: aideen_core::compute::ComputeBackend,
 {
-    /// Definición Constitucional de Atractor (AIDEEN):
+    /// Constitutional Attractor Definition (AIDEEN):
     /// h* es atractor <=> ||h_{t+1} - h_t|| < epsilon AND Q(h*) >= Q_MIN_WRITE
     pub fn is_attractor_state(&self, delta_norm: f32, q: f32) -> bool {
         delta_norm < self.epsilon && q >= Q_MIN_WRITE
     }
 
-    /// Escribe el vector de contexto en el subespacio S_sim (no integrable).
-    /// Llamar antes de tick() para inyectar contexto documental externo.
-    /// `ctx` debe tener longitud D_SIM; si es más corto, el resto queda a 0.
+    /// Writes the context vector into the S_sim subspace (not integrable).
+    /// Call before tick() to inject external document context.
+    /// `ctx` must have length D_SIM; if shorter, the rest stays at 0.
     pub fn set_context(&mut self, ctx: &DVector<f32>) {
         let config = self.reasoning.config();
         let d_reasoning = config.d_reasoning();
@@ -149,9 +149,9 @@ where
         }
     }
 
-    /// Inyecta un delta sobre el subespacio de razonamiento S_R.
+    /// Injects a delta into the reasoning subspace S_R.
     /// state[OFF_R .. OFF_R+D_R] += delta
-    /// Llamar antes de tick() para warm-start con contribución de expertos.
+    /// Call before tick() for warm-start with expert contributions.
     pub fn inject_delta_r(&mut self, delta: &[f32]) {
         let config = self.reasoning.config();
         let off_r = config.off_r();
@@ -163,7 +163,7 @@ where
         }
     }
 
-    /// Igual que inject_delta_r pero aplica β in-place, sin allocar un Vec extra.
+    /// Same as inject_delta_r but applies β in-place, without allocating an extra Vec.
     /// state[OFF_R .. OFF_R+D_R] += beta * delta
     pub fn inject_delta_r_scaled(&mut self, delta: &[f32], beta: f32) {
         let config = self.reasoning.config();
@@ -180,19 +180,19 @@ where
         }
     }
 
-    /// Un tick completo del nodo AIDEEN. Devuelve métricas si hubo integración.
+    /// A full tick of the AIDEEN node. Returns metrics if integration occurred.
     pub fn tick(&mut self) -> Option<TickMetrics> {
         let s0 = self.state.clone();
 
-        // ── 1. Inicializar razonamiento ─────────────────────
-        // Warm-start: si hay atractores similares en memoria, usamos el más
-        // cercano como h_0; de lo contrario caemos al init() normal del Reasoning.
-        // Inicializar H como HSlots desde el estado global S0
+        // ── 1. Initialise reasoning ───────────────────────
+        // Warm-start: if there are similar attractors in memory, we use the closest
+        // as h_0; otherwise we fall back to the Reasoning's normal init().
+        // Initialise H as HSlots from the global state S0
         let h_init: HSlots = self.reasoning.init(&s0);
-        // warm-start: si hay atractores similares en memoria usamos slot(0) del más cercano
+        // warm-start: if similar attractors exist in memory use slot(0) of the closest
         let mem_hint = self.memory.query(&h_init.slot(0), 1);
         let mut h: HSlots = if let Some(hint_vec) = mem_hint.into_iter().next() {
-            // Reconstruir HSlots desde el DVector de memoria (broadcast al slot 0, resto desde init)
+            // Reconstruct HSlots from the memory DVector (broadcast to slot 0, rest from init)
             let mut warm = h_init.clone();
             warm.set_slot(0, &hint_vec);
             warm
@@ -202,11 +202,11 @@ where
         let mut h_prev: HSlots = h.clone();
         let mut delta_norms: Vec<f32> = Vec::new();
 
-        // ── 2. Loop DEQ gobernado por Control ────────────────
+        // ── 2. DEQ loop governed by Control ──────────────────
         for iter in 0..self.control.max_iters() {
             let h_next = self.reasoning.step(&h, &s0, Some(&mut self.backend));
 
-            // Convergencia: norma de la diferencia entre los flats de H_k+1 y H_k
+            // Convergence: norm of the difference between the flats of H_k+1 and H_k
             let flat_next = h_next.to_flat();
             let flat_curr = h.to_flat();
             let delta_norm = flat_next
@@ -225,15 +225,15 @@ where
             h = h_next;
 
             if decision.stop {
-                // Usamos slot(0) como representante canónico de H* para compute_q
-                // (compute_q trabaja con DVector; la riqueza de slots se mide por SemanticSignal)
+                // Use slot(0) as canonical representative of H* for compute_q
+                // (compute_q works with DVector; slot richness is measured by SemanticSignal)
                 let h_r_owned = h.slot(0);
                 let h_prev_r_owned = h_prev.slot(0);
                 let config = self.reasoning.config();
                 let s_r0 = s0.rows(config.off_r(), config.d_r).into_owned();
                 let delta_s_r_owned = &h_r_owned - &s_r0;
 
-                // Varianza de oscilación
+                // Oscillation variance
                 let oscillation_var = if delta_norms.len() > 1 {
                     let mean = delta_norms.iter().sum::<f32>() / delta_norms.len() as f32;
                     delta_norms.iter().map(|n| (n - mean).powi(2)).sum::<f32>()
@@ -267,7 +267,7 @@ where
                     });
                 }
 
-                // Integración estable: aplicamos delta H*[slot0] sobre el subespacio S_R (D_R dims).
+                // Stable integration: apply delta H*[slot0] over the S_R subspace (D_R dims).
                 // delta_i = h_flat[i] - s0[i]  →  c = tanh(α·β·delta)  →  proposed[i] += c
                 let h_flat = h.to_flat();
                 let mut proposed = self.state.clone();
@@ -303,7 +303,7 @@ where
                 let write_memory = decision.write_memory && (quality.q_total >= Q_MIN_WRITE);
 
                 if write_memory {
-                    // Guardamos el slot 0 de H* como representante en memoria
+                    // Store slot 0 of H* as representative in memory
                     self.memory.write(h.slot(0));
                 }
 

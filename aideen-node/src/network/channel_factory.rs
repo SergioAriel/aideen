@@ -1,18 +1,18 @@
 use crate::network::NetChannel;
 use crate::peers::types::PeerEntry;
 
-/// Resultado de un dial exitoso: canal listo + fingerprint SHA-256 del cert leaf del peer.
+/// Result of a successful dial: ready channel + SHA-256 fingerprint of the peer's leaf cert.
 pub struct DialResult {
     pub channel: Box<dyn NetChannel>,
     pub fingerprint: [u8; 32],
 }
 
-/// Fábrica de canales desde un PeerEntry. Implementado por QuicChannelFactory (y mocks en tests).
+/// Channel factory from a PeerEntry. Implemented by QuicChannelFactory (and mocks in tests).
 pub trait ChannelFactory: Send + Sync {
     fn dial(&self, peer: &PeerEntry) -> Result<DialResult, String>;
 }
 
-/// Implementación real: dial QUIC con fingerprint capture.
+/// Real implementation: QUIC dial with fingerprint capture.
 pub struct QuicChannelFactory;
 
 impl ChannelFactory for QuicChannelFactory {
@@ -26,7 +26,7 @@ impl ChannelFactory for QuicChannelFactory {
     }
 }
 
-/// Factory que siempre retorna error — default en NodeRunner::new() para tests sin dial real.
+/// Factory that always returns an error — default in NodeRunner::new() for tests without real dial.
 pub struct NullChannelFactory;
 
 impl ChannelFactory for NullChannelFactory {

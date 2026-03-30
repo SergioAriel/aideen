@@ -103,8 +103,8 @@ fn build_runner() -> NodeRunner<MockR, MockC, MockE, MockM, MockB> {
     )
 }
 
-/// Servidor que responde directamente con ExpertResult de delta fijo (bypasa ExpertService).
-/// Esto garantiza deltas controlados independientemente del Reasoning.
+/// Server that responds directly with a fixed-delta ExpertResult (bypasses ExpertService).
+/// This guarantees controlled deltas independently of Reasoning.
 fn spawn_fixed_delta_server(delta_fill: f32, config: ArchitectureConfig) -> Box<dyn NetChannel> {
     let (client_ch, mut server_ch) = InProcessChannel::pair();
     std::thread::spawn(move || loop {
@@ -170,11 +170,11 @@ fn test_outlier_hard_drop_two_peers() {
     let norm: f32 = result.delta.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         norm < 200.0,
-        "norma del delta combinado debe ser << 2262; got {norm}"
+        "combined delta norm must be << 2262; got {norm}"
     );
 }
 
-// ── Test 2: outlier desactivado cuando factor=None ────────────────────────────
+// ── Test 2: outlier disabled when factor=None ─────────────────────────────────
 
 #[test]
 fn test_outlier_disabled_when_factor_none() {
@@ -307,10 +307,10 @@ fn test_beta_reduces_with_low_quality() {
 #[test]
 fn test_stats_acc_expert_flush() {
     let mut acc = RouterStatsAccumulator::new(2);
-    // Necesitamos 2 ticks para flush_every=2
+    // Need 2 ticks for flush_every=2
     acc.record(0.8, Some("expert_a"));
     acc.record(0.9, Some("expert_a"));
-    // Registrar 2 consultas expert con (delta_norm, drops, beta)
+    // Record 2 expert queries with (delta_norm, drops, beta)
     acc.record_expert(5.0, 1, 0.8);
     acc.record_expert(3.0, 0, 0.9);
 

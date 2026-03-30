@@ -7,13 +7,13 @@ use aideen_node::network::in_process::InProcessChannel;
 use aideen_node::network::NetChannel;
 use aideen_node::system::node::{AideenNode, LearningSignal};
 use aideen_node::update::UpdateManager;
-/// E2E: Pipeline de red canónico AIDEEN.
+/// E2E: AIDEEN canonical network pipeline.
 ///
-/// Tres invariantes verificados sin I/O real (canal in-process):
+/// Three invariants verified without real I/O (in-process channel):
 ///
 ///   1. HANDSHAKE  — Hello → Delegation → Ack
 ///   2. DISCOVERY  — tick() allow_learning=true → to_discovery_msg() → servidor recibe Discovery
-///   3. UPDATE LOOP — servidor envía SignedUpdate → cliente aplica → Ack
+///   3. UPDATE LOOP — server sends SignedUpdate → client applies → Ack
 use ed25519_dalek::{Signer, SigningKey};
 use nalgebra::DVector;
 use rand::rngs::OsRng;

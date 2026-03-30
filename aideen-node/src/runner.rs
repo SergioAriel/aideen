@@ -26,8 +26,8 @@ use crate::system::node::{AideenNode, StopReason, TickMetrics};
 
 // ── ReconcileStats ────────────────────────────────────────────────────────────
 
-/// Contadores de diagnóstico del último ciclo de reconcile.
-/// Solo para métricas locales — no viaja por red.
+/// Diagnostic counters for the last reconcile cycle.
+/// Local metrics only — not sent over the network.
 #[derive(Default, Debug, Clone)]
 pub struct ReconcileStats {
     pub dial_attempts: u32,
@@ -40,9 +40,9 @@ pub struct ReconcileStats {
 
 // ── RouterStatsAccumulator ────────────────────────────────────────────────────
 
-/// Acumula métricas de routing por ventana de N ticks.
-/// El caller llama `flush()` periódicamente y envía el resultado por QUIC
-/// (mismo patrón que `discovery` en `tick_with_query`).
+/// Accumulates routing metrics per window of N ticks.
+/// The caller calls `flush()` periodically and sends the result over QUIC
+/// (same pattern as `discovery` in `tick_with_query`).
 pub struct RouterStatsAccumulator {
     flush_every: u32,
     ticks: u32,
@@ -67,7 +67,7 @@ impl RouterStatsAccumulator {
         }
     }
 
-    /// Registra una muestra de calidad y el experto consultado (opcional).
+    /// Records a quality sample and the queried expert (optional).
     pub fn record(&mut self, q: f32, target_id: Option<&str>) {
         self.q_samples.push(q);
         self.ticks += 1;
@@ -76,15 +76,15 @@ impl RouterStatsAccumulator {
         }
     }
 
-    /// Registra estadísticas de una consulta al pipeline de expertos.
+    /// Records statistics from a query to the expert pipeline.
     pub fn record_expert(&mut self, delta_norm: f32, drops: u32, beta: f32) {
         self.delta_norms.push(delta_norm);
         self.drops_total += drops;
         self.beta_samples.push(beta);
     }
 
-    /// Devuelve `NetMsg::RouterStats` si se alcanzó `flush_every` ticks, y resetea.
-    /// Devuelve `None` si aún no se ha acumulado suficiente.
+    /// Returns `NetMsg::RouterStats` if `flush_every` ticks have been reached, and resets.
+    /// Returns `None` if not enough data has been accumulated yet.
     pub fn flush(&mut self, node_id: [u8; 32]) -> Option<NetMsg> {
         if self.ticks < self.flush_every || self.q_samples.is_empty() {
             return None;
@@ -98,7 +98,7 @@ impl RouterStatsAccumulator {
             .cloned()
             .fold(f32::NEG_INFINITY, f32::max);
         let mut expert_hits: Vec<(String, u32)> = self.expert_hits.drain().collect();
-        expert_hits.sort_by(|a, b| a.0.cmp(&b.0)); // orden determinista para tests
+        expert_hits.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic order for tests
         let window_ticks = self.ticks;
         self.ticks = 0;
         self.q_samples.clear();
@@ -131,11 +131,11 @@ impl RouterStatsAccumulator {
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
 
-/// Resultado de un tick con inyección de contexto documental.
+/// Result of a tick with document context injection.
 ///
-/// `discovery` solo está presente cuando `metrics.allow_learning == true`
-/// Y el runner tiene `delegated == true` (Zero-Trust gate).
-/// El caller es responsable de enviar `discovery` por el canal QUIC.
+/// `discovery` is only present when `metrics.allow_learning == true`
+/// AND the runner has `delegated == true` (Zero-Trust gate).
+/// The caller is responsible for sending `discovery` over the QUIC channel.
 pub struct TickOutcome {
     pub metrics: TickMetrics,
     pub discovery: Option<NetMsg>,
@@ -143,17 +143,17 @@ pub struct TickOutcome {
 
 // ── NodeRunner ────────────────────────────────────────────────────────────────
 
-/// Punto de entrada de alto nivel para un nodo AIDEEN.
+/// High-level entry point for an AIDEEN node.
 ///
-/// Envuelve `AideenNode<R,C,E,M,B>` y añade:
-/// - Emisión automática de `AgentEvent::TickAttractor` al alcanzar h*.
-/// - API de memoria documental (add/search/locate).
-/// - Inyección de contexto documental en S_sim antes de tick.
-/// - Construcción de `NetMsg::Discovery` cuando `allow_learning && delegated`.
+/// Wraps `AideenNode<R,C,E,M,B>` and adds:
+/// - Automatic emission of `AgentEvent::TickAttractor` when h* is reached.
+/// - Document memory API (add/search/locate).
+/// - Document context injection into S_sim before tick.
+/// - Construction of `NetMsg::Discovery` when `allow_learning && delegated`.
 ///
-/// `node_id`, `bundle_version` y `target_id` son identidad estable del nodo
-/// y se fijan en construcción. `set_delegated()` lo actualiza el caller
-/// cuando `UpdateManager` instale una `KeyDelegation` válida.
+/// `node_id`, `bundle_version` and `target_id` are the node's stable identity
+/// and are fixed at construction. `set_delegated()` is updated by the caller
+/// when `UpdateManager` installs a valid `KeyDelegation`.
 pub struct NodeRunner<R, C, E, M, B> {
     pub node: AideenNode<R, C, E, M, B>,
     pub agent_store: Box<dyn AgentStore + Send>,
@@ -161,26 +161,26 @@ pub struct NodeRunner<R, C, E, M, B> {
     pub node_id: [u8; 32],
     pub bundle_version: u64,
     pub target_id: String,
-    /// Capacidades detectadas del dispositivo en construcción.
+    /// Device capabilities detected at construction.
     pub caps: NodeCapabilities,
-    /// Acumulador de métricas de routing. Llamar `flush()` cada N ticks.
+    /// Routing metrics accumulator. Call `flush()` every N ticks.
     pub stats_acc: RouterStatsAccumulator,
-    /// Directorio indexado de peers (PeerRegistry con by_id + by_domain).
+    /// Indexed peer directory (PeerRegistry with by_id + by_domain).
     pub peer_registry: PeerRegistry,
     // β damping params (Stability Pack):
-    /// Factor de damping base. β = clamp(β0 * q_mean / (1 + delta_norm), β_min, β_max).
+    /// Base damping factor. β = clamp(β0 * q_mean / (1 + delta_norm), β_min, β_max).
     pub beta0: f32,
     pub beta_min: f32,
     pub beta_max: f32,
     // 5L — dial + seguridad:
-    /// Fábrica de canales QUIC. Default: NullChannelFactory (sin dial real).
+    /// QUIC channel factory. Default: NullChannelFactory (no real dial).
     pub channel_factory: Arc<dyn ChannelFactory>,
     /// TOFU + pinning de fingerprints TLS por peer.
     pub trust_store: TrustStore,
-    /// Circuit breakers por NodeId — backoff exponencial ante fallos de dial.
+    /// Circuit breakers per NodeId — exponential backoff on dial failures.
     pub peer_failures: PeerFailures,
     // 5M — telemetría operativa:
-    /// Contadores del último ciclo de reconcile. Solo para diagnóstico local.
+    /// Counters from the last reconcile cycle. Local diagnostics only.
     pub last_reconcile_stats: ReconcileStats,
     delegated: bool, // gate Zero-Trust: Delegation instalada
 }
@@ -193,8 +193,8 @@ where
     M: Memory,
     B: ComputeBackend,
 {
-    /// Constructor canónico. `delegated` arranca en `false`; usar
-    /// `set_delegated(true)` al recibir una `KeyDelegation` válida.
+    /// Canonical constructor. `delegated` starts at `false`; use
+    /// `set_delegated(true)` upon receiving a valid `KeyDelegation`.
     pub fn new(
         node: AideenNode<R, C, E, M, B>,
         agent_store: Box<dyn AgentStore + Send>,
@@ -224,37 +224,37 @@ where
         }
     }
 
-    /// Activa/desactiva el gate Zero-Trust de Discovery.
-    /// Llamar con `true` cuando `UpdateManager` instale una `KeyDelegation` válida.
+    /// Enables/disables the Zero-Trust Discovery gate.
+    /// Call with `true` when `UpdateManager` installs a valid `KeyDelegation`.
     pub fn set_delegated(&mut self, v: bool) {
         self.delegated = v;
     }
 
     // ── PeerRegistry API ──────────────────────────────────────────────────────
 
-    /// Bootstrap completo del directorio: reemplaza todo el estado con `peers`.
+    /// Full directory bootstrap: replaces all state with `peers`.
     pub fn set_peer_snapshot(&mut self, epoch: u64, peers: Vec<PeerEntry>) {
         self.peer_registry.set_snapshot(epoch, peers);
     }
 
-    /// Aplica un delta incremental. Rechaza si `delta.epoch <= current epoch`.
+    /// Applies an incremental delta. Rejects if `delta.epoch <= current epoch`.
     pub fn apply_peer_delta(&mut self, delta: PeerDelta) -> Result<(), String> {
         self.peer_registry.apply_delta(delta)
     }
 
-    /// NodeIds de peers que sirven `domain`, orden determinista (sorted).
+    /// NodeIds of peers serving `domain`, deterministic order (sorted).
     pub fn peer_ids_for_domain(&self, domain: &str) -> Vec<NodeId> {
         self.peer_registry.node_ids_for_domain(domain)
     }
 
     // ── 5L: dial + reconcile ──────────────────────────────────────────────────
 
-    /// Sincroniza `client` con `PeerRegistry` para el `domain` dado.
+    /// Synchronises `client` with `PeerRegistry` for the given `domain`.
     ///
-    /// - Elimina peers obsoletos del cliente (retain_only).
-    /// - Intenta dialear peers nuevos, respetando circuit breakers.
-    /// - Aplica TOFU/pinning en TrustStore antes de añadir el canal.
-    /// - Actualiza `last_reconcile_stats` con contadores del ciclo.
+    /// - Removes stale peers from the client (retain_only).
+    /// - Attempts to dial new peers, respecting circuit breakers.
+    /// - Applies TOFU/pinning in TrustStore before adding the channel.
+    /// - Updates `last_reconcile_stats` with cycle counters.
     pub fn reconcile_expert_client(
         &mut self,
         domain: &str,
@@ -319,9 +319,9 @@ where
 
     // ── Expert result injection ───────────────────────────────────────────────
 
-    /// Aplica damping β al RunResult del pipeline e inyecta en el espacio R del nodo.
+    /// Applies damping β to the pipeline RunResult and injects into the node's R space.
     /// β = clamp(β0 * q_mean / (1.0 + delta_norm), β_min, β_max).
-    /// Sin allocación intermedia (inject_delta_r_scaled). Devuelve β aplicado.
+    /// No intermediate allocation (inject_delta_r_scaled). Returns the applied β.
     pub fn apply_expert_result(&mut self, result: &crate::expert::RunResult) -> f32 {
         let raw = self.beta0 * result.q_mean / (1.0 + result.delta_norm);
         let beta = raw.clamp(self.beta_min, self.beta_max);
@@ -333,8 +333,8 @@ where
 
     // ── Tick base ─────────────────────────────────────────────────────────────
 
-    /// Ejecuta un tick cognitivo sin inyección de contexto.
-    /// Si se alcanza un atractor, emite `AgentEvent::TickAttractor`.
+    /// Runs a cognitive tick without context injection.
+    /// If an attractor is reached, emits `AgentEvent::TickAttractor`.
     pub fn tick(&mut self) -> Option<TickMetrics> {
         let metrics = self.node.tick()?;
 
@@ -364,12 +364,12 @@ where
 
     // ── DocMemory API ─────────────────────────────────────────────────────────
 
-    /// Inserta un documento en la memoria documental.
+    /// Inserts a document into the document memory.
     pub fn add_document(&mut self, meta: DocMeta, bytes: Vec<u8>) -> Result<DocId, String> {
         self.doc_memory.add_document(meta, bytes)
     }
 
-    /// Búsqueda lexical en la memoria documental. Devuelve top-k hits.
+    /// Lexical search in the document memory. Returns top-k hits.
     pub fn search_docs(&self, query: &str, k: usize) -> Vec<DocHit> {
         self.doc_memory.search(query, k)
     }
@@ -381,7 +381,7 @@ where
 
     // ── AgentStore API ────────────────────────────────────────────────────────
 
-    /// Últimos `limit` eventos del agente (orden cronológico inverso).
+    /// Last `limit` agent events (reverse chronological order).
     pub fn recent_events(&self, limit: usize) -> Vec<AgentEvent> {
         self.agent_store.recent_events(limit)
     }
@@ -429,16 +429,16 @@ where
 
     // ── Tick con contexto + Discovery ─────────────────────────────────────────
 
-    /// Tick con inyección de contexto documental.
+    /// Tick with document context injection.
     ///
-    /// 1. Busca `query` en `doc_memory` → features → `node.set_context()`
-    /// 2. Llama a `tick()` (emite `TickAttractor` si aplica)
-    /// 3. Si `metrics.allow_learning && delegated`:
-    ///    - Construye `NetMsg::Discovery` (hashes, sin h* raw)
-    ///    - Emite `AgentEvent::DiscoveryEmitted` en agent_store
-    ///    - Devuelve `discovery` en `TickOutcome`
+    /// 1. Searches `query` in `doc_memory` → features → `node.set_context()`
+    /// 2. Calls `tick()` (emits `TickAttractor` if applicable)
+    /// 3. If `metrics.allow_learning && delegated`:
+    ///    - Builds `NetMsg::Discovery` (hashes, no raw h*)
+    ///    - Emits `AgentEvent::DiscoveryEmitted` in agent_store
+    ///    - Returns `discovery` in `TickOutcome`
     ///
-    /// El caller decide cuándo/si enviar `discovery` por el canal QUIC.
+    /// The caller decides when/if to send `discovery` over the QUIC channel.
     pub fn tick_with_query(&mut self, query: &str, k: usize) -> Option<TickOutcome> {
         // 1. Context injection
         let hits = self.doc_memory.search(query, k);
@@ -548,24 +548,24 @@ fn unix_now() -> u64 {
 
 // ── Context injection ─────────────────────────────────────────────────────────
 
-/// Contexto de runtime agregado antes de cada tick.
+/// Runtime context aggregated before each tick.
 ///
-/// Empaqueta hits de búsqueda documental, preferencias del agente y
-/// eventos recientes. `build_context_features()` lo proyecta a un
-/// vector de dimensión D_SIM para inyectar en S_sim.
+/// Packages document search hits, agent preferences and
+/// recent events. `build_context_features()` projects it into a
+/// vector of dimension D_SIM for injection into S_sim.
 pub struct RuntimeContext {
     pub docs: Vec<DocHit>,
     pub prefs: HashMap<String, String>,
     pub recent_events: Vec<AgentEvent>,
 }
 
-/// Proyecta un `RuntimeContext` en un vector de features de dimensión `dim`.
+/// Projects a `RuntimeContext` into a feature vector of dimension `dim`.
 ///
-/// Algoritmo: slot-hashing determinista para cada fuente:
-/// - DocHits: hash(doc_id, chunk_id) → slot, acumula score
-/// - Prefs:   FNV-1a(key) → slot, acumula 1.0
-/// - Events:  discriminante de tipo → slot, acumula 1.0
-/// Normalización final: tanh por componente → rango (-1, 1].
+/// Algorithm: deterministic slot-hashing for each source:
+/// - DocHits: hash(doc_id, chunk_id) → slot, accumulates score
+/// - Prefs:   FNV-1a(key) → slot, accumulates 1.0
+/// - Events:  type discriminant → slot, accumulates 1.0
+/// Final normalisation: per-component tanh → range (-1, 1].
 pub fn build_context_features(ctx: &RuntimeContext, dim: usize) -> DVector<f32> {
     let mut feats = vec![0.0f32; dim];
 

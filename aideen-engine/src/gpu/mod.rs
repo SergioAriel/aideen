@@ -136,8 +136,8 @@ impl ComputeBackend for WgpuBackend {
         input: &TensorId,
         out_dim: usize,
     ) -> Result<DVector<f32>, String> {
-        let w_buf = self.buffers.get(&weights.0).ok_or("Pesos no encontrados")?;
-        let i_buf = self.buffers.get(&input.0).ok_or("Input no encontrado")?;
+        let w_buf = self.buffers.get(&weights.0).ok_or("Weights not found")?;
+        let i_buf = self.buffers.get(&input.0).ok_or("Input not found")?;
 
         // Asumiendo w_buf size = in_dim * out_dim * 4 bytes
         let in_dim = (w_buf.size() as usize / 4) / out_dim;

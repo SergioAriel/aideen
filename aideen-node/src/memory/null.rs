@@ -1,8 +1,8 @@
 use aideen_core::memory::Memory;
 use nalgebra::DVector;
 
-/// Implementación de producción "sin memoria".
-/// Operaciones no-op. Permite usar AideenNode sin memoria activada.
+/// Production "no memory" implementation.
+/// No-op operations. Allows using AideenNode without active memory.
 pub struct NullMemory;
 
 impl Memory for NullMemory {
