@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 Juan Marchetto & Sergio Solis
+
 //! AIDEEN training binary.
 //!
 //! # Architecture notes for future LLMs reading this
@@ -57,6 +60,7 @@ fn main() {
     let mut freeze_emb = false;
     let mut freeze_lm = false;
     let mut skip_chunks: usize = 0;
+    let mut val_ratio: f64 = 0.0;
 
     let mut i = 1;
     while i < args.len() {
@@ -96,6 +100,12 @@ fn main() {
                     skip_chunks = v.parse().unwrap_or(0);
                 }
             }
+            "--val-ratio" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    val_ratio = v.parse().unwrap_or(0.0);
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -116,6 +126,7 @@ fn main() {
         freeze_emb,
         freeze_lm,
         skip_chunks,
+        val_ratio,
     );
 }
 
@@ -131,6 +142,7 @@ fn run_large_file(
     freeze_emb: bool,
     freeze_lm: bool,
     skip_chunks: usize,
+    val_ratio: f64,
 ) {
     println!("  Mode: large file → {txt_path}");
     if skip_chunks > 0 {
@@ -290,6 +302,7 @@ fn run_large_file(
             save_every,
             checkpoint_base,
             skip_chunks,
+            val_ratio,
         )
         .expect("Error during train_on_file");
 
