@@ -1,6 +1,10 @@
 [package]
 name = "aideen-training"
 version = "0.1.0"
+description = "Training pipeline, optimizer, checkpointing"
+license = "MIT"
+repository = "https://github.com/SergioAriel/aideen"
+authors = ["Sergio Ariel Solis <solis.sergioariel@gmail.com>", "Juan Patricio Marchetto <juanpatriciomarchetto@gmail.com>"]
 edition = "2021"
 
 [features]
@@ -36,7 +40,7 @@ rand           = "0.8.5"
 tokenizers     = "0.21"
 ed25519-dalek  = { version = "2", features = ["rand_core"] }
 
-# Optional GPU deps — sólo con --features wgpu
+# Optional GPU deps — only with --features wgpu
 aideen-block = { path = "../aideen-block", optional = true }
 pollster     = { version = "0.3", optional = true }
 wgpu         = { version = "23", optional = true }

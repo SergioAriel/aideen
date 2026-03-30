@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "aideen-core",         # 1. Contratos Públicos (Sellado)
-    "aideen-reasoning",    # 2. Cerebro Entrenable
-    "aideen-node",         # 3. GPU Runtime y P2P
-    "aideen-backbone",     # 4. Arquitectura del Modelo
-    "aideen-training-lab", # 5. Laboratorio Privado
-    "aideen-engine",       # 6. Motor Computacional GPU
-    "aideen-coordinator",  # 7. Coordinador Criptográfico
+    "aideen-core",         # 1. Public Contracts (Sealed)
+    "aideen-reasoning",    # 2. Trainable Reasoning Engine
+    "aideen-node",         # 3. GPU Runtime and P2P
+    "aideen-backbone",     # 4. Model Architecture
+    "aideen-training-lab", # 5. Private Training Lab
+    "aideen-engine",       # 6. GPU Compute Engine
+    "aideen-coordinator",  # 7. Cryptographic Coordinator
     "aideen-critic",       # 8. Critic — Learning Plane
-    "aideen-block",        # 9. Bloque Mamba+Attn+MoE (DEQ f-block + Decoder)
-    "aideen-bench",        # 10. Benchmark: DEQ+SSM vs Transformer iso-parámetro
+    "aideen-block",        # 9. Mamba+Attn+MoE Block (DEQ f-block + Decoder)
+    "aideen-bench",        # 10. Benchmark: DEQ+SSM vs Transformer iso-parameter
 ]
 resolver = "2"

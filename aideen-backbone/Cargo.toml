@@ -1,6 +1,10 @@
 [package]
 name = "aideen-backbone"
 version = "0.1.0"
+description = "Model architecture (DEQ + Mamba composition), tokenizer, generation"
+license = "MIT"
+repository = "https://github.com/SergioAriel/aideen"
+authors = ["Sergio Ariel Solis <solis.sergioariel@gmail.com>", "Juan Patricio Marchetto <juanpatriciomarchetto@gmail.com>"]
 edition = "2021"
 
 [features]

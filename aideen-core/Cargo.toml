@@ -1,6 +1,10 @@
 [package]
 name = "aideen-core"
 version = "0.1.0"
+description = "Public contracts, cryptographic types, sealed protocol constants"
+license = "MIT"
+repository = "https://github.com/SergioAriel/aideen"
+authors = ["Sergio Ariel Solis <solis.sergioariel@gmail.com>", "Juan Patricio Marchetto <juanpatriciomarchetto@gmail.com>"]
 edition = "2021"
 
 [dependencies]

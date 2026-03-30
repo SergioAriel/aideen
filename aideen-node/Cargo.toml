@@ -1,6 +1,10 @@
 [package]
 name = "aideen-node"
 version = "0.1.0"
+description = "P2P network node (QUIC, WebTransport)"
+license = "MIT"
+repository = "https://github.com/SergioAriel/aideen"
+authors = ["Sergio Ariel Solis <solis.sergioariel@gmail.com>", "Juan Patricio Marchetto <juanpatriciomarchetto@gmail.com>"]
 edition = "2021"
 
 [[bin]]
@@ -8,14 +12,14 @@ name = "demo"
 path = "src/demo.rs"
 required-features = []
 
-# Deps WASM-safe (compilan en ambos targets)
+# WASM-safe deps (compile on both targets)
 [dependencies]
 aideen-core = { path = "../aideen-core" }
 bincode   = "1.3.3"
 nalgebra  = "0.32"
 sha2      = "0.10.9"
 
-# Deps nativas (tokio, QUIC, backbone: no compilan en wasm32-unknown-unknown)
+# Native deps (tokio, QUIC, backbone: do not compile on wasm32-unknown-unknown)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 aideen-reasoning = { path = "../aideen-reasoning" }
 aideen-backbone  = { path = "../aideen-backbone" }
@@ -28,7 +32,7 @@ quinn  = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen  = "0.13"
 
-# Deps WASM (OPFS + JS interop: solo en browser)
+# WASM deps (OPFS + JS interop: browser only)
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen         = "0.2"
 wasm-bindgen-futures = "0.4"
