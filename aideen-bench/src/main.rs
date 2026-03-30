@@ -168,11 +168,11 @@ fn build_aideen(vocab_size: usize, vocab: Vec<char>, seed: u64, backend: Backend
     cfg.d_r = D_R_AIDEEN;
     cfg.vocab_size = vocab_size;
     cfg.ctx_len = CTX_LEN;
-    cfg.max_deq_iters = 6;
-    cfg.adj_iters = 4;
+    cfg.max_deq_iters = 16; // match training defaults (was 6, too low to converge from random)
+    cfg.adj_iters = 6;
     cfg.train_deq = true;
     cfg.deq_grad_scale = 0.01;
-    cfg.renorm_every_steps = 50;
+    cfg.renorm_every_steps = 4; // match training defaults (was 50, spectral norm applied too infrequently)
 
     let mut tok = Tokenizer::new_empty(vocab_size, cfg.clone());
     tok.vocab = vocab;

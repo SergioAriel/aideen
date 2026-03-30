@@ -33,7 +33,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 **v0.1 — Stable training pipeline:**
 - GPU training on AMD Radeon 780M (integrated GPU, 2 GB VRAM, Vulkan)
 - Model: d_r=512, h_slots=8, vocab_size=50,257 (BPE), ~213 MB checkpoint
-- Validation loss: 5.96 → 2.95 (50.5% reduction) over 7,310 chunks (25.2% of corpus)
+- Validation loss: 5.96 → 4.66 ± 0.35 sustained avg (best sustained 3.99) over 7,310 chunks (25.2% of corpus)
 - Throughput: 11 tokens/second, 0% unconverged Picard iterations
 - 27+ hours of stable continuous GPU training with automatic checkpointing
 
@@ -44,9 +44,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 - 7,290 chunks processed in 16 hours from scratch
 
 **Benchmark (DEQ vs Transformer):**
-- AIDEEN DEQ: val_loss 4.17 ± 0.00 vs Transformer (Candle): 2.98 ± 0.02
-- 100K tokens, 3 seeds, paired t-test p=0.0001
-- DEQ requires more data exposure to stabilize (inherent to fixed-point iteration)
+- Initial run (100K tokens, 3 seeds, p=0.0001): AIDEEN 4.17 vs Transformer 2.98
+- Note: initial benchmark used suboptimal DEQ hyperparameters (max_iters=6, renorm_every=50) causing 100% unconverged iterations. Corrected benchmark (max_iters=16, renorm_every=4, matching training pipeline) pending
+- DEQ convergence verified in full training pipeline: 0% unconverged at 5.9 avg iterations
 
 **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens) tokenized for larger-scale training
 
