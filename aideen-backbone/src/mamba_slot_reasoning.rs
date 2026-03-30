@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
-/// MambaSlotReasoning -- the actual `f` block of the DEQ.
+/// MambaSlotReasoning — the actual `f` block of the DEQ.
 pub struct MambaSlotReasoning {
     pub config: ArchitectureConfig,
 
@@ -72,7 +72,7 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) slot_anchor: DMatrix<f32>,
 
-    // ── Mamba SSM por slot ───────────────────────────────────────────────────
+    // ── Mamba SSM per slot ────────────────────────────────────────────────────
     #[cfg(feature = "lab")]
     pub a_log: DMatrix<f32>, // [h_slots × d_r] row-major, per-slot decay
     #[cfg(not(feature = "lab"))]
@@ -113,7 +113,7 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) b_forget: DVector<f32>,
 
-    // ── LayerNorm por slot ───────────────────────────────────────────────────
+    // ── LayerNorm per slot ────────────────────────────────────────────────────
     #[cfg(feature = "lab")]
     pub norm_scale: DVector<f32>,
     #[cfg(not(feature = "lab"))]
@@ -148,16 +148,6 @@ impl MambaSlotReasoning {
         xavier_range: f32,
     ) -> DMatrix<f32> {
         DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-xavier_range..xavier_range))
-    }
-
-    #[allow(dead_code)]
-    fn identity_like_mat_with_rng<R: Rng + ?Sized>(
-        rng: &mut R,
-        d_r: usize,
-        noise: f32,
-    ) -> DMatrix<f32> {
-        let jitter = DMatrix::from_fn(d_r, d_r, |_, _| rng.gen_range(-noise..noise));
-        DMatrix::identity(d_r, d_r) + jitter
     }
 
     fn scaled_identity_like_mat_with_rng<R: Rng + ?Sized>(
@@ -222,11 +212,11 @@ impl MambaSlotReasoning {
             rng.gen_range(-0.01_f32..0.01_f32)
         });
 
-        // DEQ requiere σ(J_f) < 1 desde la inicialización.
-        // El Jacobiano compuesto de atención (W_o · softmax · W_v · W_q) puede superar 1
-        // con Xavier estándar. Renormalizamos las matrices de atención a σ ≤ 0.10
-        // para garantizar σ(J_attn) << 1 antes del primer token de entrenamiento.
-        // residual_alpha=0.0 es necesario — incluso alpha=0.2 lleva contr→1.
+        // DEQ requires σ(J_f) < 1 from initialization.
+        // The composite attention Jacobian (W_o · softmax · W_v · W_q) can exceed 1
+        // with standard Xavier. We renormalize the attention matrices to σ ≤ 0.10
+        // to guarantee σ(J_attn) << 1 before the first training token.
+        // residual_alpha=0.0 is necessary — even alpha=0.2 pushes contr→1.
         let deq_threshold = 0.10_f32;
         let win_threshold = 0.30_f32;
         let n_iter = 20;
@@ -250,7 +240,7 @@ impl MambaSlotReasoning {
             centered * 2.5e-3f32 + rng.gen_range(-5.0e-4f32..5.0e-4f32)
         });
         let hist_gate_logit = DVector::from_fn(h_slots, |slot, _| {
-            // Gate inicial: alpha_target ≈ 0.10 con piso 0.07 y techo 0.20.
+            // Initial gate: alpha_target ≈ 0.10 with floor 0.07 and ceiling 0.20.
             // sigma(g) = (alpha - alpha_min)/(alpha_max - alpha_min) = 0.23077 -> g ≈ -1.204.
             let base = -1.204_f32;
             let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
@@ -328,7 +318,6 @@ impl MambaSlotReasoning {
         }
         let seed = hasher.finish();
         let mut out = Vec::with_capacity(h_slots * base.len());
-        let _attn_t = 0.10_f32;
         let win_t = 0.30_f32;
         let n_iter = 20;
         // Disable per-slot jitter to remove seed-dependent W_in variance during diagnosis.
@@ -374,6 +363,37 @@ impl MambaSlotReasoning {
         v
     }
 
+    /// GPU flat layout for W_o: [h_slots × d_r×d_r matrices].
+    /// Each slot matrix is the shared w_o plus a deterministic per-slot jitter.
+    /// Shader accesses slot s: W_o[s*d*d + j*d + d_out].
+    pub fn w_o_gpu_flat(&self) -> Vec<f32> {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        let attn_t = 0.10_f32;
+        let n_iter = 20;
+        let jitter_scale = std::env::var("AIDEEN_DEQ_WO_JITTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.05);
+        let mut v = Vec::with_capacity(h * d * d);
+        for s in 0..h {
+            let mut mat = self.w_o.clone();
+            for r in 0..d {
+                for c in 0..d {
+                    // Slightly smaller jitter than W_q/W_k to keep output stable.
+                    let i = r * d + c;
+                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin()
+                        * jitter_scale;
+                    mat[(r, c)] += jitter;
+                }
+            }
+            spectral_norm::normalize_if_needed(&mut mat, attn_t, n_iter);
+            v.extend_from_slice(mat.as_slice());
+        }
+        v
+    }
+
     /// GPU flat layout for W_q: [h_slots × d_r×d_r matrices | h_slots×d_r q_bias (row-major)].
     /// Each slot matrix is the shared w_q plus a deterministic per-slot jitter for symmetry breaking.
     /// Shader accesses slot s matrix: W_q[s*d*d + j*d + d_out].
@@ -411,9 +431,9 @@ impl MambaSlotReasoning {
     }
 
     pub fn renormalize_weights(&mut self) {
-        // Umbral 0.10 para matrices de atención — necesario para mantener σ(J_attn) < 1
-        // durante el entrenamiento (no solo en la inicialización).
-        // w_x y w_out (Mamba externo) usan umbral 0.70 — no afectan la contractividad del DEQ.
+        // Threshold 0.10 for attention matrices — required to keep σ(J_attn) < 1
+        // during training (not just at initialization).
+        // w_x and w_out (outer Mamba) use threshold 0.70 — they do not affect DEQ contractivity.
         let attn_t = 0.10_f32;
         let win_t = 0.30_f32;
         let mamba_t = 0.70_f32;
@@ -974,7 +994,7 @@ mod tests {
         assert_ne!(
             h_a.to_flat(),
             h_b.to_flat(),
-            "step must be sensitive to input s"
+            "step debe ser sensible al input s"
         );
     }
 
@@ -988,7 +1008,7 @@ mod tests {
             h = r.step(&h, &s, None);
         }
         let energy: f32 = h.to_flat().iter().map(|x| x * x).sum();
-        assert!(energy.is_finite(), "Energy must not explode: {energy}");
-        assert!(energy < 1e6, "Energy too high: {energy}");
+        assert!(energy.is_finite(), "Energy no debe explotar: {energy}");
+        assert!(energy < 1e6, "Energy demasiado alta: {energy}");
     }
 }
