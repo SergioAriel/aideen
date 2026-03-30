@@ -142,26 +142,26 @@ fn deq_forward_main(
             }
         }
 
+        if (ENABLE_SLOT_QKV_PROBE) {
+            for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
+                var q = 0.0;
+                var k = 0.0;
+                var v = 0.0;
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let h_val = H_curr[h_base + slot_off + j];
+                    let w_idx = j * d_model + d_out;
+                    q = q + AllWeights[w_idx] * h_val;
+                    k = k + AllWeights[aw_wk_base(d_model, h_slots) + w_idx] * h_val;
+                    v = v + AllWeights[aw_wv_base(d_model, h_slots) + w_idx] * h_val;
+                }
+                Scratch[q_base + slot_off + d_out] = q;
+                Scratch[k_base + slot_off + d_out] = k;
+                Scratch[v_base + slot_off + d_out] = v;
+            }
+        }
         var iter = 0u;
         var converged = false;
         while (iter < iter_limit && !converged) {
-            if (ENABLE_SLOT_QKV_PROBE) {
-                for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
-                    var q = 0.0;
-                    var k = 0.0;
-                    var v = 0.0;
-                    for (var j = 0u; j < d_model; j = j + 1u) {
-                        let h_val = H_curr[h_base + slot_off + j];
-                        let w_idx = j * d_model + d_out;
-                        q = q + AllWeights[w_idx] * h_val;
-                        k = k + AllWeights[aw_wk_base(d_model, h_slots) + w_idx] * h_val;
-                        v = v + AllWeights[aw_wv_base(d_model, h_slots) + w_idx] * h_val;
-                    }
-                    Scratch[q_base + slot_off + d_out] = q;
-                    Scratch[k_base + slot_off + d_out] = k;
-                    Scratch[v_base + slot_off + d_out] = v;
-                }
-            }
             if (ENABLE_SLOT_ATTN_MINIMAL) {
                 if (tid < h_slots) {
                     let k_off = tid * d_model;
