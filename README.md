@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SergioAriel/aideen/actions/workflows/ci.yml/badge.svg)](https://github.com/SergioAriel/aideen/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-35k_LOC-orange)
-![WGSL](https://img.shields.io/badge/WGSL-25_shaders-blue)
+![WGSL](https://img.shields.io/badge/WGSL-24_shaders-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Mamba-style selective state memory (SSM)** instead of stacked transformer layers — achieving comparable quality with significantly fewer parameters.
@@ -22,18 +22,33 @@ Key components:
 - **Multi-slot attention** (h_slots parallel reasoning heads with per-slot Q/K/V/W_in)
 - **Mamba SSM** with selective state (input-dependent decay), forget gate, and dynamic history gating
 - **Picard adjoint** backward pass via implicit differentiation (O(1) memory)
-- **25 WGSL GPU compute shaders** for training and inference
+- **24 WGSL GPU compute shaders** for training and inference
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 
 ## Current Status (March 2026)
 
-- **GPU training pipeline:** Fully operational on AMD Radeon 780M (integrated GPU, 2 GB VRAM, Vulkan)
-- **Model configuration:** d_r=512, h_slots=8, vocab_size=50,257 (BPE tokenizer)
-- **Training results:** Validation loss reduced from 5.97 (random init) to 4.08 over 2,860 gradient steps on a 3.76M token corpus (Rust Book + arXiv ML papers + SmolTalk)
-- **Stability:** 12+ hours continuous GPU training at 11.8 tokens/second with automatic checkpointing
-- **Picard convergence:** 100% of tokens converge within 5-6 iterations (cap 20), contractivity < 0.85
-- **Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens, English + Spanish) tokenized and prepared for larger-scale training
+**Two development versions validated on consumer hardware:**
+
+**v0.1 — Stable training pipeline:**
+- GPU training on AMD Radeon 780M (integrated GPU, 2 GB VRAM, Vulkan)
+- Model: d_r=512, h_slots=8, vocab_size=50,257 (BPE), ~213 MB checkpoint
+- Validation loss: 5.96 → 2.95 (50.5% reduction) over 7,310 chunks (25.2% of corpus)
+- Throughput: 11 tokens/second, 0% unconverged Picard iterations
+- 27+ hours of stable continuous GPU training with automatic checkpointing
+
+**v0.2 — GPU-optimized pipeline (2.9× throughput):**
+- 32 tokens/second (2.9× improvement over v0.1)
+- Batched command encoders, Anderson acceleration, ping-pong adjoint, tiled matmul
+- Per-slot W_o architecture improvement
+- 7,290 chunks processed in 16 hours from scratch
+
+**Benchmark (DEQ vs Transformer):**
+- AIDEEN DEQ: val_loss 4.17 ± 0.00 vs Transformer (Candle): 2.98 ± 0.02
+- 100K tokens, 3 seeds, paired t-test p=0.0001
+- DEQ requires more data exposure to stabilize (inherent to fixed-point iteration)
+
+**Data ready:** 10 GB multilingual Wikipedia corpus (4.28B tokens) tokenized for larger-scale training
 
 For the key architectural insight (why Mamba runs outside the DEQ loop), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -68,14 +83,14 @@ cargo test --workspace --exclude aideen-block --exclude aideen-engine --exclude 
 # Train on a text file (requires GPU via wgpu)
 cargo run --release -p aideen-training --features aideen-training/wgpu --bin train -- --file corpus.txt --epochs 5
 
-# Resume from checkpoint
-cargo run --release -p aideen-training --features aideen-training/wgpu --bin train -- --file corpus.txt --resume model_large --epochs 1
+# Resume from checkpoint (--skip-chunks to skip already-trained chunks)
+cargo run --release -p aideen-training --features aideen-training/wgpu --bin train -- --file corpus.txt --resume model_large --skip-chunks 7310 --epochs 1
 
 # Interactive chat with a trained model
 cargo run --release -p aideen-training --features aideen-training/wgpu --bin chat -- --model model_large
 
 # Run DEQ vs Transformer benchmarks (CPU, no GPU needed)
-cargo run --release -p aideen-bench
+cargo run --release -p aideen-bench --bin arch_bench
 ```
 
 ### Environment Variables
