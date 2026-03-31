@@ -693,9 +693,13 @@ impl Trainer {
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
                 }
-                // TEST-ONLY: force one spectral renorm before the first step.
-                // Disabled by default; set AIDEEN_DEQ_FORCE_RENORM=1 in tests only.
-                if !self.force_renorm_done && Self::env_flag("AIDEEN_DEQ_FORCE_RENORM") {
+                // Dynamic slot-attention re-enters the DEQ Jacobian; ensure the GPU buffers
+                // start from the strict spectral regime before the first training step.
+                let dynamic_slot_attn =
+                    Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED");
+                if !self.force_renorm_done
+                    && (Self::env_flag("AIDEEN_DEQ_FORCE_RENORM") || dynamic_slot_attn)
+                {
                     let _ = gpu.renormalize_spectral();
                     self.force_renorm_done = true;
                 }

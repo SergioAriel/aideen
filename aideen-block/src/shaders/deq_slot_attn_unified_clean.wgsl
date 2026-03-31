@@ -155,98 +155,98 @@ fn deq_slot_attn_unified_main(
             workgroupBarrier();
         }
 
-        for (var idx = tid; idx < h_slots * head_dim; idx = idx + WG_SIZE) {
-            let ks = idx / head_dim;
-            let hd = idx % head_dim;
-            let ks_off = ks * d_model;
-            let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
-            let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
-            let wk_bias_base = wk_bias_root + ks_off;
-            var k = AllWeights[wk_bias_base + hd];
-            var v = 0.0;
-            var q = 0.0;
-            if (ks == slot_idx) {
-                q = AllWeights[wq_bias_base + hd];
-            }
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let h_val = H_curr[h_base + ks_off + j];
-                k = k + AllWeights[wk_mat_base + j * d_model + hd] * h_val;
-                v = v + AllWeights[wv_mat_base + j * d_model + hd] * h_val;
-                if (ks == slot_idx) {
-                    q = q + AllWeights[wq_mat_base + j * d_model + hd] * h_val;
-                }
-            }
-            k_cache[idx] = k;
-            v_cache[idx] = v;
-            if (ks == slot_idx) {
-                q_self[hd] = q;
-            }
-        }
-        workgroupBarrier();
-
-        if (tid < h_slots) {
-            let ks = tid;
-            var score = 0.0;
-            let ks_head = ks * head_dim;
-            for (var d = 0u; d < head_dim; d = d + 1u) {
-                score = score + q_self[d] * k_cache[ks_head + d];
-            }
-            slot_attn_weights[ks] = score * inverseSqrt(max(1.0, f32(head_dim)));
-        }
-        workgroupBarrier();
-        if (tid == 0u) {
-            var max_s = -1e30;
-            for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                max_s = max(max_s, slot_attn_weights[ks]);
-            }
-            var sum_exp = 0.0;
-            for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                let w = exp(slot_attn_weights[ks] - max_s);
-                slot_attn_weights[ks] = w;
-                sum_exp = sum_exp + w;
-            }
-            sum_exp = max(sum_exp, 1e-12);
-            for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                slot_attn_weights[ks] = slot_attn_weights[ks] / sum_exp;
-            }
-        }
-        workgroupBarrier();
-
-        for (var h = tid; h < head_dim; h = h + WG_SIZE) {
-            var mix = 0.0;
-            for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                mix = mix + slot_attn_weights[ks] * v_cache[ks * head_dim + h];
-            }
-            head_mix[h] = mix;
-        }
-        workgroupBarrier();
-
-        if (d_model == WG_SIZE * 2u) {
-            let d0 = tid;
-            let d1 = tid + WG_SIZE;
-            var attn0 = 0.0;
-            var attn1 = 0.0;
-            for (var h = 0u; h < head_dim; h = h + 1u) {
-                let mix = head_mix[h];
-                attn0 = attn0 + AllWeights[wo_mat_base + h * d_model + d0] * mix;
-                attn1 = attn1 + AllWeights[wo_mat_base + h * d_model + d1] * mix;
-            }
-            Scratch[attn_base + d0] = attn0;
-            Scratch[attn_base + d1] = attn1;
-        } else {
-            for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                var attn = 0.0;
-                for (var h = 0u; h < head_dim; h = h + 1u) {
-                    attn = attn + AllWeights[wo_mat_base + h * d_model + d] * head_mix[h];
-                }
-                Scratch[attn_base + d] = attn;
-            }
-        }
-        workgroupBarrier();
-
         var iter = 0u;
         var converged = false;
         while (iter < iter_limit && !converged) {
+            for (var idx = tid; idx < h_slots * head_dim; idx = idx + WG_SIZE) {
+                let ks = idx / head_dim;
+                let hd = idx % head_dim;
+                let ks_off = ks * d_model;
+                let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
+                let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
+                let wk_bias_base = wk_bias_root + ks_off;
+                var k = AllWeights[wk_bias_base + hd];
+                var v = 0.0;
+                var q = 0.0;
+                if (ks == slot_idx) {
+                    q = AllWeights[wq_bias_base + hd];
+                }
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let h_val = H_curr[h_base + ks_off + j];
+                    k = k + AllWeights[wk_mat_base + j * d_model + hd] * h_val;
+                    v = v + AllWeights[wv_mat_base + j * d_model + hd] * h_val;
+                    if (ks == slot_idx) {
+                        q = q + AllWeights[wq_mat_base + j * d_model + hd] * h_val;
+                    }
+                }
+                k_cache[idx] = k;
+                v_cache[idx] = v;
+                if (ks == slot_idx) {
+                    q_self[hd] = q;
+                }
+            }
+            workgroupBarrier();
+
+            if (tid < h_slots) {
+                let ks = tid;
+                var score = 0.0;
+                let ks_head = ks * head_dim;
+                for (var d = 0u; d < head_dim; d = d + 1u) {
+                    score = score + q_self[d] * k_cache[ks_head + d];
+                }
+                slot_attn_weights[ks] = score * inverseSqrt(max(1.0, f32(head_dim)));
+            }
+            workgroupBarrier();
+            if (tid == 0u) {
+                var max_s = -1e30;
+                for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                    max_s = max(max_s, slot_attn_weights[ks]);
+                }
+                var sum_exp = 0.0;
+                for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                    let w = exp(slot_attn_weights[ks] - max_s);
+                    slot_attn_weights[ks] = w;
+                    sum_exp = sum_exp + w;
+                }
+                sum_exp = max(sum_exp, 1e-12);
+                for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                    slot_attn_weights[ks] = slot_attn_weights[ks] / sum_exp;
+                }
+            }
+            workgroupBarrier();
+
+            for (var h = tid; h < head_dim; h = h + WG_SIZE) {
+                var mix = 0.0;
+                for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+                    mix = mix + slot_attn_weights[ks] * v_cache[ks * head_dim + h];
+                }
+                head_mix[h] = mix;
+            }
+            workgroupBarrier();
+
+            if (d_model == WG_SIZE * 2u) {
+                let d0 = tid;
+                let d1 = tid + WG_SIZE;
+                var attn0 = 0.0;
+                var attn1 = 0.0;
+                for (var h = 0u; h < head_dim; h = h + 1u) {
+                    let mix = head_mix[h];
+                    attn0 = attn0 + AllWeights[wo_mat_base + h * d_model + d0] * mix;
+                    attn1 = attn1 + AllWeights[wo_mat_base + h * d_model + d1] * mix;
+                }
+                Scratch[attn_base + d0] = attn0;
+                Scratch[attn_base + d1] = attn1;
+            } else {
+                for (var d = tid; d < d_model; d = d + WG_SIZE) {
+                    var attn = 0.0;
+                    for (var h = 0u; h < head_dim; h = h + 1u) {
+                        attn = attn + AllWeights[wo_mat_base + h * d_model + d] * head_mix[h];
+                    }
+                    Scratch[attn_base + d] = attn;
+                }
+            }
+            workgroupBarrier();
+
             var local_sumsq = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 let pre = Scratch[signal_base + d]
