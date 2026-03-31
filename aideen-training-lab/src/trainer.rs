@@ -151,6 +151,57 @@ impl Trainer {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
     }
 
+    fn fixed_history_reference_mode() -> bool {
+        Self::env_flag("AIDEEN_DEQ_FIXED_HISTORY_REFERENCE")
+    }
+
+    fn solve_query_with_fixed_history(
+        &self,
+        query: &nalgebra::DVector<f32>,
+        m_prev: Option<&HSlots>,
+        max_iters: usize,
+    ) -> HSlots {
+        let hist_ctx = self.reasoning.fixed_hist_ctx(m_prev, query);
+        let mut h = self.reasoning.init(query);
+        for _ in 0..max_iters.max(1) {
+            h = self
+                .reasoning
+                .step_with_fixed_hist_ctx(&h, query, &hist_ctx, None);
+        }
+        h
+    }
+
+    fn temporal_update_from_h(&self, m_prev: Option<&HSlots>, h_star: &HSlots) -> HSlots {
+        let zero_state;
+        let prev = if let Some(m_prev) = m_prev {
+            m_prev
+        } else {
+            zero_state = HSlots::zeros(&self.config);
+            &zero_state
+        };
+        self.reasoning.temporal_step(prev, h_star)
+    }
+
+    fn prime_fixed_history_state(&self, tokens: &[u32]) -> Option<HSlots> {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut m_prev: Option<HSlots> = None;
+        for i in 0..tokens.len() {
+            let ctx_start = i.saturating_sub(self.config.ctx_len.saturating_sub(1));
+            let context = &tokens[ctx_start..=i];
+            let query = self.tokenizer.embed_context(context, self.config.ctx_len);
+            let h_star = self.solve_query_with_fixed_history(
+                &query,
+                m_prev.as_ref(),
+                self.config.max_deq_iters,
+            );
+            m_prev = Some(self.temporal_update_from_h(m_prev.as_ref(), &h_star));
+        }
+        m_prev
+    }
+
     fn gib(bytes: f64) -> f64 {
         bytes / (1024.0 * 1024.0 * 1024.0)
     }
@@ -1938,13 +1989,19 @@ impl Trainer {
             return String::new();
         }
         let prompt_len = tokens.len();
+        let use_fixed_history_ref = Self::fixed_history_reference_mode();
+        let mut ref_m_prev = if use_fixed_history_ref {
+            self.prime_fixed_history_state(&tokens)
+        } else {
+            None
+        };
 
         for _ in 0..max_tokens {
             let ctx_start = tokens.len().saturating_sub(self.config.ctx_len);
             let context = &tokens[ctx_start..];
 
             #[cfg(feature = "wgpu")]
-            if self.gpu_deq.is_some() {
+            if self.gpu_deq.is_some() && !use_fixed_history_ref {
                 let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
                 if self.gpu_emb.is_none() {
                     let safe_ctx = self.config.ctx_len.max(1024);
@@ -2021,10 +2078,21 @@ impl Trainer {
 
             // Fallback CPU
             let query = self.tokenizer.embed_context(context, self.config.ctx_len);
-            let mut h = self.reasoning.init(&query);
-            for _ in 0..10 {
-                h = self.reasoning.step(&h, &query, None);
-            }
+            let h = if use_fixed_history_ref {
+                let h_star = self.solve_query_with_fixed_history(
+                    &query,
+                    ref_m_prev.as_ref(),
+                    self.config.max_deq_iters,
+                );
+                ref_m_prev = Some(self.temporal_update_from_h(ref_m_prev.as_ref(), &h_star));
+                h_star
+            } else {
+                let mut h = self.reasoning.init(&query);
+                for _ in 0..10 {
+                    h = self.reasoning.step(&h, &query, None);
+                }
+                h
+            };
             let logits = self.lm_head.forward(&h);
             tokens.push(LmHead::sample(
                 &logits,
@@ -2034,6 +2102,9 @@ impl Trainer {
                 repetition_penalty,
                 context,
             ));
+        }
+        if use_fixed_history_ref {
+            self.m_prev = ref_m_prev;
         }
         self.tokenizer.decode(&tokens[prompt_len..])
     }
@@ -2064,13 +2135,19 @@ impl Trainer {
         }
         let prompt_len = tokens.len();
         let mut decoded_len = 0usize;
+        let use_fixed_history_ref = Self::fixed_history_reference_mode();
+        let mut ref_m_prev = if use_fixed_history_ref {
+            self.prime_fixed_history_state(&tokens)
+        } else {
+            None
+        };
 
         for _ in 0..max_tokens {
             let ctx_start = tokens.len().saturating_sub(self.config.ctx_len);
             let context = &tokens[ctx_start..];
 
             #[cfg(feature = "wgpu")]
-            if self.gpu_deq.is_some() {
+            if self.gpu_deq.is_some() && !use_fixed_history_ref {
                 let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
                 if self.gpu_emb.is_none() {
                     let safe_ctx = self.config.ctx_len.max(1024);
@@ -2154,10 +2231,21 @@ impl Trainer {
 
             // Fallback CPU
             let query = self.tokenizer.embed_context(context, self.config.ctx_len);
-            let mut h = self.reasoning.init(&query);
-            for _ in 0..10 {
-                h = self.reasoning.step(&h, &query, None);
-            }
+            let h = if use_fixed_history_ref {
+                let h_star = self.solve_query_with_fixed_history(
+                    &query,
+                    ref_m_prev.as_ref(),
+                    self.config.max_deq_iters,
+                );
+                ref_m_prev = Some(self.temporal_update_from_h(ref_m_prev.as_ref(), &h_star));
+                h_star
+            } else {
+                let mut h = self.reasoning.init(&query);
+                for _ in 0..10 {
+                    h = self.reasoning.step(&h, &query, None);
+                }
+                h
+            };
             let logits = self.lm_head.forward(&h);
             let next_token = LmHead::sample(
                 &logits,
@@ -2174,6 +2262,9 @@ impl Trainer {
                 on_token(&current[decoded_len..]);
                 decoded_len = current.len();
             }
+        }
+        if use_fixed_history_ref {
+            self.m_prev = ref_m_prev;
         }
 
         self.tokenizer.decode(&tokens[prompt_len..])
@@ -2194,16 +2285,29 @@ impl Trainer {
 
         let mut total_loss = 0.0f32;
         let mut count = 0usize;
+        let use_fixed_history_ref = Self::fixed_history_reference_mode();
+        let mut m_prev: Option<HSlots> = None;
 
         for (i, &target) in targets.iter().enumerate() {
             let ctx_start = i.saturating_sub(self.config.ctx_len.saturating_sub(1));
             let context = &inputs[ctx_start..=i];
 
             let query = self.tokenizer.embed_context(context, self.config.ctx_len);
-            let mut h = self.reasoning.init(&query);
-            for _ in 0..self.config.max_deq_iters.max(1) {
-                h = self.reasoning.step(&h, &query, None);
-            }
+            let h = if use_fixed_history_ref {
+                let h_star = self.solve_query_with_fixed_history(
+                    &query,
+                    m_prev.as_ref(),
+                    self.config.max_deq_iters,
+                );
+                m_prev = Some(self.temporal_update_from_h(m_prev.as_ref(), &h_star));
+                h_star
+            } else {
+                let mut h = self.reasoning.init(&query);
+                for _ in 0..self.config.max_deq_iters.max(1) {
+                    h = self.reasoning.step(&h, &query, None);
+                }
+                h
+            };
             let logits = self.lm_head.forward(&h);
 
             // Cross-entropy: -log(softmax[target])

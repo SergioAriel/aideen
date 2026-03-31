@@ -849,6 +849,98 @@ impl MambaSlotReasoning {
         v.zip_map(&self.norm_scale, |x, s| s * x / rms)
     }
 
+    fn project_input_signal(&self, s: &DVector<f32>) -> DVector<f32> {
+        let d_r = self.config.d_r;
+        let s_r = if s.len() >= d_r {
+            s.rows(0, d_r).into_owned()
+        } else {
+            let mut v = DVector::zeros(d_r);
+            v.rows_mut(0, s.len()).copy_from(&s.rows(0, s.len()));
+            v
+        };
+        &self.w_in * &s_r
+    }
+
+    fn hist_alpha_min_target() -> f32 {
+        0.070
+    }
+
+    fn hist_alpha_max() -> f32 {
+        0.20
+    }
+
+    fn hist_gate_alpha(&self, slot: usize) -> f32 {
+        let sigma = 1.0 / (1.0 + (-self.hist_gate_logit[slot]).exp());
+        Self::hist_alpha_min_target()
+            + (Self::hist_alpha_max() - Self::hist_alpha_min_target()) * sigma
+    }
+
+    /// Builds the historical context injected into the DEQ as a token-fixed signal.
+    ///
+    /// This intentionally depends on the previous temporal carrier `m_prev` and the current
+    /// token injection scale, but not on the current Picard iterate `h`. That preserves the
+    /// invariant we want for stability: history participates in the fixed point as a frozen
+    /// context instead of re-entering the Jacobian at every iteration.
+    pub fn fixed_hist_ctx(&self, m_prev: Option<&HSlots>, s: &DVector<f32>) -> HSlots {
+        let Some(m_prev) = m_prev else {
+            return HSlots::zeros(&self.config);
+        };
+
+        let d_r = self.config.d_r;
+        let h_slots = self.config.h_slots;
+        let input_signal = self.project_input_signal(s);
+        let inj_rms = (input_signal.map(|x| x * x).mean() + 1e-6).sqrt();
+        let mut out = HSlots::zeros(&self.config);
+
+        for k in 0..h_slots {
+            let prev_m = m_prev.slot(k);
+            let prev_rms = (prev_m.map(|x| x * x).mean() + 1e-6).sqrt();
+            let prev_unit = &prev_m / prev_rms;
+            let slot_scale = self.hist_slot_scale.row(k).transpose().into_owned();
+
+            let mut u = &self.w_hist_shared * &prev_m;
+            for dim in 0..d_r {
+                u[dim] += slot_scale[dim] * prev_unit[dim];
+            }
+
+            let u_rms = (u.map(|x| x * x).mean() + 1e-6).sqrt();
+            let scale = if u_rms > 1e-6 {
+                (inj_rms / u_rms).min(1.0)
+            } else {
+                1.0
+            };
+            let alpha = self.hist_gate_alpha(k);
+            out.set_slot(k, &(u * (alpha * scale)));
+        }
+
+        out
+    }
+
+    pub fn step_with_fixed_hist_ctx(
+        &self,
+        h: &HSlots,
+        s: &DVector<f32>,
+        hist_ctx: &HSlots,
+        _exec: Option<&mut dyn ComputeBackend>,
+    ) -> HSlots {
+        let h_slots = self.config.h_slots;
+        let h_attn = self.cross_slot_attn(h);
+        let input_signal = self.project_input_signal(s);
+
+        let mut next = HSlots::zeros(&self.config);
+        for k in 0..h_slots {
+            let h_slot = h.slot(k);
+            let attn_k = h_attn.slot(k);
+            let hist_k = hist_ctx.slot(k);
+            let slot_bias = self.slot_anchor.row(k).transpose().into_owned();
+            let combined = attn_k + &input_signal + hist_k;
+            let f_h = self.rms_norm(&(combined + slot_bias));
+            let damped = spectral_norm::damped_update(&h_slot, &f_h, self.damping);
+            next.set_slot(k, &damped);
+        }
+        next
+    }
+
     fn cross_slot_attn(&self, h: &HSlots) -> HSlots {
         let d_r = self.config.d_r;
         let h_slots = self.config.h_slots;
@@ -903,34 +995,8 @@ impl Reasoning for MambaSlotReasoning {
     }
 
     fn step(&self, h: &HSlots, s: &DVector<f32>, _exec: Option<&mut dyn ComputeBackend>) -> HSlots {
-        let d_r = self.config.d_r;
-        let h_slots = self.config.h_slots;
-
-        let h_attn = self.cross_slot_attn(h);
-
-        let s_r = if s.len() >= d_r {
-            s.rows(0, d_r).into_owned()
-        } else {
-            let mut v = DVector::zeros(d_r);
-            v.rows_mut(0, s.len()).copy_from(&s.rows(0, s.len()));
-            v
-        };
-        let input_signal = &self.w_in * &s_r;
-
-        let mut next = HSlots::zeros(&self.config);
-        for k in 0..h_slots {
-            let h_slot = h.slot(k);
-            let attn_k = h_attn.slot(k);
-
-            // v14: En el loop DEQ, solo combinamos atención e inyección de contexto.
-            // La conexión residual interna ha sido purgada para forzar p(J)<1.
-            let combined = attn_k + &input_signal;
-            let slot_bias = self.slot_anchor.row(k).transpose().into_owned();
-            let f_h = self.rms_norm(&(combined + slot_bias));
-            let damped = spectral_norm::damped_update(&h_slot, &f_h, self.damping);
-            next.set_slot(k, &damped);
-        }
-        next
+        let hist_ctx = HSlots::zeros(&self.config);
+        self.step_with_fixed_hist_ctx(h, s, &hist_ctx, _exec)
     }
 
     fn temporal_step(&self, m_prev: &HSlots, h_star: &HSlots) -> HSlots {
@@ -1009,5 +1075,36 @@ mod tests {
         let energy: f32 = h.to_flat().iter().map(|x| x * x).sum();
         assert!(energy.is_finite(), "Energy no debe explotar: {energy}");
         assert!(energy < 1e6, "Energy demasiado alta: {energy}");
+    }
+
+    #[test]
+    fn fixed_hist_ctx_is_zero_without_memory() {
+        let config = ArchitectureConfig::default();
+        let r = MambaSlotReasoning::new(config.clone());
+        let s = make_query(1.0, config.d_r);
+        let hist = r.fixed_hist_ctx(None, &s);
+        assert!(
+            hist.to_flat().iter().all(|v| v.abs() < 1e-8),
+            "Sin m_prev el hist_ctx debe ser exactamente nulo"
+        );
+    }
+
+    #[test]
+    fn zero_fixed_hist_ctx_matches_plain_step() {
+        let config = ArchitectureConfig::default();
+        let r = MambaSlotReasoning::new(config.clone());
+        let s = make_query(1.0, config.d_r);
+        let h0 = r.init(&s);
+        let zero_hist = HSlots::zeros(&config);
+
+        let plain = r.step(&h0, &s, None);
+        let with_hist = r.step_with_fixed_hist_ctx(&h0, &s, &zero_hist, None);
+
+        for (a, b) in plain.to_flat().iter().zip(with_hist.to_flat().iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "step_with_fixed_hist_ctx(0) debe coincidir con step: {a} vs {b}"
+            );
+        }
     }
 }
