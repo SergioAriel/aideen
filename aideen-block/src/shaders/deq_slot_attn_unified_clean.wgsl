@@ -74,31 +74,79 @@ fn compute_slot_attn(
     wo_mat_base: u32,
     attn_base: u32,
 ) {
-    for (var idx = tid; idx < h_slots * head_dim; idx = idx + WG_SIZE) {
-        let ks = idx / head_dim;
-        let hd = idx % head_dim;
-        let ks_off = ks * d_model;
-        let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
-        let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
-        let wk_bias_base = wk_bias_root + ks_off;
-        var k = AllWeights[wk_bias_base + hd];
-        var v = 0.0;
-        var q = 0.0;
-        if (ks == slot_idx) {
-            q = AllWeights[wq_bias_base + hd];
-        }
-        for (var j = 0u; j < d_model; j = j + 1u) {
-            let h_val = H_curr[h_base + ks_off + j];
-            k = k + AllWeights[wk_mat_base + j * d_model + hd] * h_val;
-            v = v + AllWeights[wv_mat_base + j * d_model + hd] * h_val;
+    if (head_dim == 32u) {
+        let half_head = head_dim / 2u;
+        let active_lanes = h_slots * half_head;
+        if (tid < active_lanes) {
+            let ks = tid / half_head;
+            let hd0 = tid % half_head;
+            let hd1 = hd0 + half_head;
+            let ks_off = ks * d_model;
+            let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
+            let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
+            let wk_bias_base = wk_bias_root + ks_off;
+            var k0 = AllWeights[wk_bias_base + hd0];
+            var k1 = AllWeights[wk_bias_base + hd1];
+            var v0 = 0.0;
+            var v1 = 0.0;
+            var q0 = 0.0;
+            var q1 = 0.0;
             if (ks == slot_idx) {
-                q = q + AllWeights[wq_mat_base + j * d_model + hd] * h_val;
+                q0 = AllWeights[wq_bias_base + hd0];
+                q1 = AllWeights[wq_bias_base + hd1];
+            }
+            for (var j = 0u; j < d_model; j = j + 1u) {
+                let h_val = H_curr[h_base + ks_off + j];
+                let wk_row = wk_mat_base + j * d_model;
+                let wv_row = wv_mat_base + j * d_model;
+                k0 = k0 + AllWeights[wk_row + hd0] * h_val;
+                k1 = k1 + AllWeights[wk_row + hd1] * h_val;
+                v0 = v0 + AllWeights[wv_row + hd0] * h_val;
+                v1 = v1 + AllWeights[wv_row + hd1] * h_val;
+                if (ks == slot_idx) {
+                    let wq_row = wq_mat_base + j * d_model;
+                    q0 = q0 + AllWeights[wq_row + hd0] * h_val;
+                    q1 = q1 + AllWeights[wq_row + hd1] * h_val;
+                }
+            }
+            let idx0 = ks * head_dim + hd0;
+            let idx1 = idx0 + half_head;
+            k_cache[idx0] = k0;
+            k_cache[idx1] = k1;
+            v_cache[idx0] = v0;
+            v_cache[idx1] = v1;
+            if (ks == slot_idx) {
+                q_self[hd0] = q0;
+                q_self[hd1] = q1;
             }
         }
-        k_cache[idx] = k;
-        v_cache[idx] = v;
-        if (ks == slot_idx) {
-            q_self[hd] = q;
+    } else {
+        for (var idx = tid; idx < h_slots * head_dim; idx = idx + WG_SIZE) {
+            let ks = idx / head_dim;
+            let hd = idx % head_dim;
+            let ks_off = ks * d_model;
+            let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
+            let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
+            let wk_bias_base = wk_bias_root + ks_off;
+            var k = AllWeights[wk_bias_base + hd];
+            var v = 0.0;
+            var q = 0.0;
+            if (ks == slot_idx) {
+                q = AllWeights[wq_bias_base + hd];
+            }
+            for (var j = 0u; j < d_model; j = j + 1u) {
+                let h_val = H_curr[h_base + ks_off + j];
+                k = k + AllWeights[wk_mat_base + j * d_model + hd] * h_val;
+                v = v + AllWeights[wv_mat_base + j * d_model + hd] * h_val;
+                if (ks == slot_idx) {
+                    q = q + AllWeights[wq_mat_base + j * d_model + hd] * h_val;
+                }
+            }
+            k_cache[idx] = k;
+            v_cache[idx] = v;
+            if (ks == slot_idx) {
+                q_self[hd] = q;
+            }
         }
     }
     workgroupBarrier();

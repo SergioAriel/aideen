@@ -191,6 +191,10 @@ impl Trainer {
         let t = seq_len as f64;
         let iters = max_iters as f64;
         let f32_bytes = std::mem::size_of::<f32>() as f64;
+        let slot_attn_unified =
+            Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
+                && Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED");
+        let dynamic_qkv = Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV");
 
         if Self::clean_deq_mode_active() {
             let win_bytes = b * t * (h * d * d * f32_bytes);
@@ -198,8 +202,13 @@ impl Trainer {
         }
 
         // Lower bounds derived from the hot dense matrices touched in deq_forward.wgsl.
-        let qkv_bytes = b * t * iters * (3.0 * h * d * d * f32_bytes);
-        let wo_bytes = b * t * iters * (h * d * d * f32_bytes);
+        let attn_iters = if slot_attn_unified && !dynamic_qkv {
+            1.0
+        } else {
+            iters
+        };
+        let qkv_bytes = b * t * attn_iters * (3.0 * h * d * d * f32_bytes);
+        let wo_bytes = b * t * attn_iters * (h * d * d * f32_bytes);
         let win_bytes = b * t * (h * d * d * f32_bytes);
         let hist_lower_bound = b * t * ((d * d + h * d * d + d * d) * f32_bytes);
 
