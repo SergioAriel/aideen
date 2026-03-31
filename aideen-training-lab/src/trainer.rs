@@ -188,10 +188,8 @@ impl Trainer {
         }
 
         let mut m_prev: Option<HSlots> = None;
-        for i in 0..tokens.len() {
-            let ctx_start = i.saturating_sub(self.config.ctx_len.saturating_sub(1));
-            let context = &tokens[ctx_start..=i];
-            let query = self.tokenizer.embed_context(context, self.config.ctx_len);
+        for &token in tokens {
+            let query = self.tokenizer.embed(token);
             let h_star = self.solve_query_with_fixed_history(
                 &query,
                 m_prev.as_ref(),
@@ -200,6 +198,101 @@ impl Trainer {
             m_prev = Some(self.temporal_update_from_h(m_prev.as_ref(), &h_star));
         }
         m_prev
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn upload_reasoning_weights_with_slot_anchor(
+        &self,
+        gpu: &GpuDeqBackend,
+        slot_anchor_rm: &[f32],
+    ) {
+        let (
+            w_hist_shared_rm,
+            hist_slot_scale_rm,
+            hist_slot_bias_rm,
+            hist_gate_logit,
+            _slot_anchor_base_rm,
+            w_delta_rm,
+            b_delta,
+            w_gate_hist_rm,
+            w_forget_rm,
+            b_forget_rm,
+        ) = self.reasoning.history_params_gpu_layout();
+        gpu.upload_weights(
+            &gpu.queue,
+            &self.reasoning.w_q_gpu_flat(),
+            &self.reasoning.w_k_gpu_flat(),
+            &self.reasoning.w_v_gpu_flat(),
+            &self.reasoning.w_o_gpu_flat(),
+            &self.reasoning.w_in_gpu_flat(),
+            self.reasoning.w_x.as_slice(),
+            self.reasoning.w_out.as_slice(),
+            &self.reasoning.a_log_gpu_flat(),
+            self.reasoning.norm_scale.as_slice(),
+            w_hist_shared_rm.as_slice(),
+            hist_slot_scale_rm.as_slice(),
+            hist_slot_bias_rm.as_slice(),
+            hist_gate_logit.as_slice(),
+            slot_anchor_rm,
+            w_delta_rm.as_slice(),
+            b_delta.as_slice(),
+            w_gate_hist_rm.as_slice(),
+            w_forget_rm.as_slice(),
+            b_forget_rm.as_slice(),
+        );
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn gpu_solve_token_with_fixed_history(
+        &self,
+        gpu: &GpuDeqBackend,
+        token: u32,
+        m_prev: Option<&HSlots>,
+    ) -> Result<(nalgebra::DVector<f32>, HSlots, HSlots), &'static str> {
+        let query = self.tokenizer.embed(token);
+        let hist_ctx = self.reasoning.fixed_hist_ctx(m_prev, &query);
+        let (
+            _w_hist_shared_rm,
+            _hist_slot_scale_rm,
+            _hist_slot_bias_rm,
+            _hist_gate_logit,
+            slot_anchor_rm,
+            _w_delta_rm,
+            _b_delta,
+            _w_gate_hist_rm,
+            _w_forget_rm,
+            _b_forget_rm,
+        ) = self.reasoning.history_params_gpu_layout();
+        let hist_flat = hist_ctx.to_flat();
+        let mut slot_anchor_eff = slot_anchor_rm;
+        for (dst, add) in slot_anchor_eff.iter_mut().zip(hist_flat.iter()) {
+            *dst += *add;
+        }
+
+        self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_eff.as_slice());
+        let s_sequence = self.tokenizer.embed_sequence(&[token]);
+        let (h_pooled, h_star_flat, _) = gpu.run_forward_deq_pooled_with_state(
+            1,
+            1,
+            self.config.max_deq_iters as u32,
+            self.config.deq_epsilon,
+            self.reasoning.damping,
+            &s_sequence,
+            &self.reasoning.w_q_gpu_flat(),
+            &self.reasoning.w_k_gpu_flat(),
+            &self.reasoning.w_v_gpu_flat(),
+            &self.reasoning.w_o_gpu_flat(),
+            &self.reasoning.w_in_gpu_flat(),
+            self.reasoning.w_x.as_slice(),
+            self.reasoning.w_out.as_slice(),
+            &self.reasoning.a_log_gpu_flat(),
+            self.reasoning.norm_scale.as_slice(),
+            false,
+        )?;
+
+        let h_star = HSlots::from_flat(&h_star_flat, &self.config);
+        let m_next = self.temporal_update_from_h(m_prev, &h_star);
+        Ok((nalgebra::DVector::from_vec(h_pooled), h_star, m_next))
     }
 
     fn gib(bytes: f64) -> f64 {
@@ -2001,7 +2094,34 @@ impl Trainer {
             let context = &tokens[ctx_start..];
 
             #[cfg(feature = "wgpu")]
-            if self.gpu_deq.is_some() && !use_fixed_history_ref {
+            if self.gpu_deq.is_some() && use_fixed_history_ref {
+                let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
+                let current_token = *context.last().unwrap_or(&0);
+                if let Ok((h_pooled, _h_star, m_next)) = self.gpu_solve_token_with_fixed_history(
+                    &gpu,
+                    current_token,
+                    ref_m_prev.as_ref(),
+                ) {
+                    ref_m_prev = Some(m_next);
+                    self.sync_lm_head_from_gpu_if_needed();
+                    let d_r = self.config.d_r;
+                    let last_h = h_pooled.as_slice().chunks(d_r).last().unwrap();
+                    let h_pooled = nalgebra::DVector::from_column_slice(last_h);
+                    let logits = &self.lm_head.w * h_pooled + &self.lm_head.b;
+                    let next_token = LmHead::sample(
+                        &logits,
+                        temperature,
+                        top_p,
+                        top_k,
+                        repetition_penalty,
+                        context,
+                    );
+                    tokens.push(next_token);
+                    self.gpu_deq = Some(gpu);
+                    continue;
+                }
+                self.gpu_deq = Some(gpu);
+            } else if self.gpu_deq.is_some() && !use_fixed_history_ref {
                 let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
                 if self.gpu_emb.is_none() {
                     let safe_ctx = self.config.ctx_len.max(1024);
@@ -2077,7 +2197,11 @@ impl Trainer {
             }
 
             // Fallback CPU
-            let query = self.tokenizer.embed_context(context, self.config.ctx_len);
+            let query = if use_fixed_history_ref {
+                self.tokenizer.embed(*context.last().unwrap_or(&0))
+            } else {
+                self.tokenizer.embed_context(context, self.config.ctx_len)
+            };
             let h = if use_fixed_history_ref {
                 let h_star = self.solve_query_with_fixed_history(
                     &query,
@@ -2105,6 +2229,13 @@ impl Trainer {
         }
         if use_fixed_history_ref {
             self.m_prev = ref_m_prev;
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = self.gpu_deq.as_ref() {
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _) =
+                    self.reasoning.history_params_gpu_layout();
+                self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
+                self.gpu_weights_uploaded = true;
+            }
         }
         self.tokenizer.decode(&tokens[prompt_len..])
     }
@@ -2147,7 +2278,40 @@ impl Trainer {
             let context = &tokens[ctx_start..];
 
             #[cfg(feature = "wgpu")]
-            if self.gpu_deq.is_some() && !use_fixed_history_ref {
+            if self.gpu_deq.is_some() && use_fixed_history_ref {
+                let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
+                let current_token = *context.last().unwrap_or(&0);
+                if let Ok((h_pooled, _h_star, m_next)) = self.gpu_solve_token_with_fixed_history(
+                    &gpu,
+                    current_token,
+                    ref_m_prev.as_ref(),
+                ) {
+                    ref_m_prev = Some(m_next);
+                    self.sync_lm_head_from_gpu_if_needed();
+                    let d_r = self.config.d_r;
+                    let last_h = h_pooled.as_slice().chunks(d_r).last().unwrap();
+                    let h_pooled = nalgebra::DVector::from_column_slice(last_h);
+                    let logits = &self.lm_head.w * h_pooled + &self.lm_head.b;
+                    let next_token = LmHead::sample(
+                        &logits,
+                        temperature,
+                        top_p,
+                        top_k,
+                        repetition_penalty,
+                        context,
+                    );
+                    tokens.push(next_token);
+                    self.gpu_deq = Some(gpu);
+
+                    let current = self.tokenizer.decode(&tokens[prompt_len..]);
+                    if current.len() > decoded_len {
+                        on_token(&current[decoded_len..]);
+                        decoded_len = current.len();
+                    }
+                    continue;
+                }
+                self.gpu_deq = Some(gpu);
+            } else if self.gpu_deq.is_some() && !use_fixed_history_ref {
                 let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
                 if self.gpu_emb.is_none() {
                     let safe_ctx = self.config.ctx_len.max(1024);
@@ -2230,7 +2394,11 @@ impl Trainer {
             }
 
             // Fallback CPU
-            let query = self.tokenizer.embed_context(context, self.config.ctx_len);
+            let query = if use_fixed_history_ref {
+                self.tokenizer.embed(*context.last().unwrap_or(&0))
+            } else {
+                self.tokenizer.embed_context(context, self.config.ctx_len)
+            };
             let h = if use_fixed_history_ref {
                 let h_star = self.solve_query_with_fixed_history(
                     &query,
@@ -2265,6 +2433,13 @@ impl Trainer {
         }
         if use_fixed_history_ref {
             self.m_prev = ref_m_prev;
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = self.gpu_deq.as_ref() {
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _) =
+                    self.reasoning.history_params_gpu_layout();
+                self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
+                self.gpu_weights_uploaded = true;
+            }
         }
 
         self.tokenizer.decode(&tokens[prompt_len..])
@@ -2292,7 +2467,11 @@ impl Trainer {
             let ctx_start = i.saturating_sub(self.config.ctx_len.saturating_sub(1));
             let context = &inputs[ctx_start..=i];
 
-            let query = self.tokenizer.embed_context(context, self.config.ctx_len);
+            let query = if use_fixed_history_ref {
+                self.tokenizer.embed(*context.last().unwrap_or(&0))
+            } else {
+                self.tokenizer.embed_context(context, self.config.ctx_len)
+            };
             let h = if use_fixed_history_ref {
                 let h_star = self.solve_query_with_fixed_history(
                     &query,
@@ -3244,5 +3423,29 @@ mod tests {
         }
         let loss_15 = trainer.train_step(ctx, target, false);
         assert!(loss_15 < loss_0);
+    }
+
+    #[test]
+    fn eval_loss_reports_fixed_history_reference_delta() {
+        let (trainer, mut tokens) = make_trainer();
+        let extra = trainer
+            .tokenizer
+            .encode(" la memoria temporal estabiliza el contexto token a token");
+        tokens.extend_from_slice(&extra);
+
+        std::env::remove_var("AIDEEN_DEQ_FIXED_HISTORY_REFERENCE");
+        let plain = trainer.eval_loss(&tokens);
+        std::env::set_var("AIDEEN_DEQ_FIXED_HISTORY_REFERENCE", "1");
+        let fixed = trainer.eval_loss(&tokens);
+        std::env::remove_var("AIDEEN_DEQ_FIXED_HISTORY_REFERENCE");
+
+        eprintln!(
+            "[fixed-history-eval] plain={:.6} fixed={:.6} delta={:.6}",
+            plain,
+            fixed,
+            fixed - plain
+        );
+        assert!(plain.is_finite());
+        assert!(fixed.is_finite());
     }
 }
