@@ -159,6 +159,11 @@ impl Trainer {
         if Self::env_flag("AIDEEN_DEQ_ONLY") {
             return true;
         }
+        if Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
+            || Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED")
+        {
+            return false;
+        }
         if std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
             || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
             || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()

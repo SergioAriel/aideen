@@ -246,6 +246,13 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|v| v.clamp(8, 32))
             .unwrap_or(32);
+        let slot_attn_dynamic_qkv = std::env::var("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let slot_attn_minimal_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_MINIMAL")
             .ok()
             .map(|v| {
@@ -427,6 +434,10 @@ impl RustDeqBridge {
                 slot_attn_constants.insert(
                     "SLOT_ATTN_HEAD_DIM".to_string(),
                     slot_attn_head_dim as f64,
+                );
+                slot_attn_constants.insert(
+                    "SLOT_ATTN_DYNAMIC_QKV".to_string(),
+                    if slot_attn_dynamic_qkv { 1.0 } else { 0.0 },
                 );
                 let signal_init_pipeline = device.create_compute_pipeline(
                     &wgpu::ComputePipelineDescriptor {
