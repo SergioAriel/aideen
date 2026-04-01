@@ -227,10 +227,12 @@ impl MambaSlotReasoning {
         spectral_norm::normalize_if_needed(&mut w_in, win_threshold, n_iter);
 
         let hist_slot_scale = DMatrix::from_fn(h_slots, d_r, |slot, _| {
-            // Keep multiplicative history adaptation off at initialization. A non-zero
-            // diagonal scale would create an implicit bypass from M_{t-1} into the DEQ.
-            let _ = slot;
-            0.0
+            // Exact zero left the multiplicative history branch effectively dormant in
+            // practice: checkpoints kept hist_slot_scale≈0 and history contributed almost
+            // nothing even when the rest of the temporal path was alive. A tiny slot-specific
+            // seed preserves the "near-off" invariant while restoring a learnable signal path.
+            let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+            centered * 5.0e-5f32 + rng.gen_range(-1.0e-4f32..1.0e-4f32)
         });
         let hist_slot_bias = DMatrix::from_fn(h_slots, d_r, |slot, _| {
             // Break slot permutation symmetry structurally. Without a slot-specific additive

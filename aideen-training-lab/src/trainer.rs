@@ -2739,6 +2739,7 @@ impl Trainer {
                                     }
                                     num_chunks += 1;
                                     total_tokens += batch_train_buf.len();
+                                    interval_tokens += batch_train_buf.len();
                                     batch_train_buf.clear();
                                     batch_tgt_buf.clear();
                                     #[cfg(feature = "wgpu")]
@@ -2781,6 +2782,7 @@ impl Trainer {
                                 }
                                 num_chunks += 1;
                                 total_tokens += batch_train_buf.len();
+                                interval_tokens += batch_train_buf.len();
                                 batch_train_buf.clear();
                                 batch_tgt_buf.clear();
                                 #[cfg(feature = "wgpu")]
