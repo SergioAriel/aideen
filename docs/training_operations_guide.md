@@ -121,6 +121,68 @@ Este perfil está optimizado para **correr**, no para explicar por qué aprende 
 
 ---
 
+## Corpus recomendado para pruebas serias
+
+No usar `corpus_combined.txt` directamente como corpus principal de pretraining.
+
+La auditoría mostró que ese archivo quedó dominado por bloques:
+
+- `USER:`
+- `ASSISTANT:`
+- `SYSTEM:`
+
+Eso sirve para una etapa de instruct/chat, pero no para el pretraining base del
+modelo.
+
+### Generar corpora limpios y separados
+
+```bash
+cd /Users/sergiosolis/Programacion/AIDEEN
+python3 prepare_training_corpora.py
+```
+
+Esto genera en `/Users/sergiosolis/Programacion/aideen`:
+
+- `corpus_pretrain_minimal.txt`
+- `corpus_chat_instruct.txt`
+
+### Qué contiene cada uno
+
+- `corpus_pretrain_minimal.txt`
+  - Rust Book
+  - FineWeb limpio extraído del corpus combinado
+  - documentación local del proyecto:
+    - `README.md`
+    - `ARCHITECTURE.md`
+    - `PLAN.md`
+    - `ARCHITECTURE_DECISIONS.md`
+    - `docs/distributed_training_users.md`
+
+- `corpus_chat_instruct.txt`
+  - el bloque conversacional `USER:/ASSISTANT:/SYSTEM:` separado para una etapa
+    futura de finetune/chat
+
+### Smoke test recomendado
+
+```bash
+cd /Users/sergiosolis/Programacion/AIDEEN
+AIDEEN_LADDER_BASE=model_clean_probe \
+AIDEEN_CORPUS_FILE=/Users/sergiosolis/Programacion/aideen/corpus_pretrain_minimal.txt \
+AIDEEN_TINY_EPOCHS=1 \
+AIDEEN_CORPUS_EPOCHS=1 \
+AIDEEN_MAX_CHUNKS=40 \
+AIDEEN_MAX_CHUNKS_CORPUS=40 \
+./train_learning_ladder.sh both
+```
+
+Este run no busca calidad final. Busca validar que:
+
+1. el modelo aprenda una distribución más coherente;
+2. no reaparezcan tokens degenerados tipo `ASS/USER/IST/ANT`;
+3. la historia siga viva sin que el corpus la tape.
+
+---
+
 ## 2. Training con reporting visible
 
 Cuando el objetivo es evaluar calidad/aprendizaje y no solo throughput, usar el perfil

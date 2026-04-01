@@ -11,6 +11,8 @@
 
 # Training corpus files (large — users download separately)
 corpus_combined.txt
+corpus_pretrain_minimal.txt
+corpus_chat_instruct.txt
 corpus_fineweb_50m.txt
 corpus_italian_wiki.txt
 val_fineweb.txt
@@ -23,6 +25,7 @@ training_logs/
 run_*.log
 *.log.bak
 model_large*
+model_*
 model.*
 
 # Python

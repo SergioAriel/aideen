@@ -6,6 +6,7 @@ cd "$ROOT"
 
 MODE="${1:-both}"
 BASE="${AIDEEN_LADDER_BASE:-model_ladder}"
+CORPUS_FILE="${AIDEEN_CORPUS_FILE:-$ROOT/corpus_combined.txt}"
 
 TINY_BASE="${BASE}_tiny"
 CORPUS_BASE="${BASE}_corpus"
@@ -54,7 +55,7 @@ run_corpus() {
     AIDEEN_PROGRESS_EVERY="${AIDEEN_PROGRESS_EVERY_CORPUS:-20}" \
     AIDEEN_MAX_CHUNKS="${AIDEEN_MAX_CHUNKS_CORPUS:-18446744073709551615}" \
     cargo run --release --features wgpu -p aideen-training --bin train -- \
-      --file "$ROOT/corpus_combined.txt" \
+      --file "${CORPUS_FILE}" \
       --resume "${TINY_BASE}" \
       --epochs "${AIDEEN_CORPUS_EPOCHS:-1}" \
       --log-every 1 \
