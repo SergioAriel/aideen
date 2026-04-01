@@ -129,6 +129,7 @@ pub struct Trainer {
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
     cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
     cfg_val_every: usize,          // AIDEEN_VAL_EVERY
+    cfg_progress_every: usize,     // AIDEEN_PROGRESS_EVERY
     cfg_wv_debug: bool,            // AIDEEN_DEQ_WV_DEBUG
     cfg_ssm_debug: bool,           // AIDEEN_SSM_DEBUG
     cfg_max_chunks: usize,         // AIDEEN_MAX_CHUNKS
@@ -140,6 +141,8 @@ pub struct Trainer {
     cfg_dynamic_qkv: bool,         // AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV
     cfg_lm_force_cpu_dldh: bool,   // AIDEEN_LM_FORCE_CPU_DLDH
     cfg_lm_dldh_parity: bool,      // AIDEEN_LM_DLDH_PARITY
+    cfg_clean_deq_mode: bool,      // derived from DEQ env at construction
+    cfg_log_emb_stats: bool,       // AIDEEN_LOG_EMB_STATS
 }
 
 impl Trainer {
@@ -345,7 +348,7 @@ impl Trainer {
         let slot_attn_unified = self.cfg_slot_attn_unified;
         let dynamic_qkv = self.cfg_dynamic_qkv;
 
-        if Self::clean_deq_mode_active() {
+        if self.cfg_clean_deq_mode {
             let win_bytes = b * t * (h * d * d * f32_bytes);
             return (0.0, 0.0, win_bytes, 0.0);
         }
@@ -560,6 +563,10 @@ impl Trainer {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20),
+            cfg_progress_every: std::env::var("AIDEEN_PROGRESS_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(10),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -576,6 +583,8 @@ impl Trainer {
             cfg_dynamic_qkv: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV"),
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
+            cfg_clean_deq_mode: Self::clean_deq_mode_active(),
+            cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -658,6 +667,10 @@ impl Trainer {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20),
+            cfg_progress_every: std::env::var("AIDEEN_PROGRESS_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(10),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -674,6 +687,8 @@ impl Trainer {
             cfg_dynamic_qkv: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV"),
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
+            cfg_clean_deq_mode: Self::clean_deq_mode_active(),
+            cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -1954,7 +1969,7 @@ impl Trainer {
                 let end = (i + step).min(train_tokens.len());
                 let batch_ctx = &train_tokens[i..end];
                 let batch_tgt = &targets[i..end];
-                if epoch % log_every == 0 && i == 0 {
+                if self.cfg_log_emb_stats && epoch % log_every == 0 && i == 0 {
                     use std::collections::HashSet;
                     let uniq: HashSet<u32> = batch_ctx.iter().copied().collect();
                     eprintln!(
@@ -1998,7 +2013,10 @@ impl Trainer {
                     }
                 }
 
-                if num_chunks % 10 == 0 && num_chunks != last_progress_chunk_logged {
+                if self.cfg_progress_every != 0
+                    && num_chunks % self.cfg_progress_every == 0
+                    && num_chunks != last_progress_chunk_logged
+                {
                     let interval_elapsed = interval_start.elapsed().as_secs_f32();
                     let instant_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
 
@@ -2845,7 +2863,8 @@ impl Trainer {
                 }
 
                 // Mini-log cada 10 chunks para ver progreso en tiempo real
-                if num_chunks % 10 == 0
+                if self.cfg_progress_every != 0
+                    && num_chunks % self.cfg_progress_every == 0
                     && num_chunks > 0
                     && num_chunks != last_progress_chunk_logged
                 {
