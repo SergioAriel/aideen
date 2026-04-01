@@ -718,6 +718,10 @@ impl Trainer {
         if reset_state {
             self.reset_state();
         }
+        // IMPORTANT:
+        // AIDEEN_DEQ_FIXED_HISTORY_REFERENCE is an eval/inference reference path only.
+        // Training must stay on the fused GPU path so history experiments do not silently
+        // change the execution regime we use for performance and quality comparisons.
 
         #[cfg(feature = "wgpu")]
         {
@@ -780,6 +784,9 @@ impl Trainer {
         if reset_state {
             self.reset_state();
         }
+        // Keep fixed-history out of the hot training path. The reference mode is useful to
+        // validate semantics in eval/generation, but training comparisons must remain fused
+        // so we isolate the value of history from the cost of a different execution engine.
 
         // hist_gated is default — always enforce min_iters for stable history injection.
         {
@@ -3405,7 +3412,7 @@ mod tests {
         let config = ArchitectureConfig::default();
         let tok = Tokenizer::from_text(text, config);
         let tokens = tok.encode(text);
-        let mut trainer = Trainer::from_tokenizer(tok, 0.01);
+        let mut trainer = Trainer::from_tokenizer_seeded(tok, 0.01, 42);
         trainer.config.max_deq_iters = 20;
         trainer.config.adj_iters = 5;
         (trainer, tokens)
@@ -3448,4 +3455,5 @@ mod tests {
         assert!(plain.is_finite());
         assert!(fixed.is_finite());
     }
+
 }
