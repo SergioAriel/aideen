@@ -402,6 +402,25 @@ env \
     --save-every 0
 ```
 
+### Escalera de aprendizaje `tiny -> corpus`
+
+```bash
+cd /Users/sergiosolis/Programacion/AIDEEN
+./train_learning_ladder.sh both
+```
+
+Qué hace:
+- stage 1: entrena corto sobre `tinyshakespeare` y guarda `${BASE}_tiny`
+- stage 2: reanuda desde `${BASE}_tiny` sobre `corpus_combined.txt` y guarda `${BASE}_corpus`
+- al final de cada stage corre `report_checkpoint.sh`
+
+Variables útiles:
+- `AIDEEN_LADDER_BASE=model_ladder`
+- `AIDEEN_TINY_EPOCHS=1`
+- `AIDEEN_CORPUS_EPOCHS=1`
+- `AIDEEN_MAX_CHUNKS=40` para acotar el stage tiny
+- `AIDEEN_MAX_CHUNKS_CORPUS=40` para smoke test corto del stage corpus
+
 ### Training con reporting
 
 ```bash
@@ -435,6 +454,13 @@ cargo run --release --features wgpu -p aideen-training --bin infer -- \
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN
 ./report_checkpoint.sh model_large
+```
+
+### Resume estable
+
+```bash
+cd /Users/sergiosolis/Programacion/AIDEEN
+AIDEEN_RESUME_BASE=model_large AIDEEN_CHECKPOINT_BASE=model_large_resume ./resume_training.sh 3
 ```
 
 ---
