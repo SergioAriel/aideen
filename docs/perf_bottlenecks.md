@@ -108,6 +108,25 @@ Cada una requiere un perfil distinto. No comparar números entre perfiles.
 - No decidir por TPS de un perfil usando números de otro perfil
 - No promover defaults por “compila y no crashea”; deben pasar el perfil correspondiente
 
+### 2026-03-31 — Fused path stabilized, observability moved off hot path
+**Contexto**: trainer fused con history estable, sin que `fixed-history` contamine training, y con readbacks/progress/validación fuera del camino crítico por default.
+
+**Cambios estructurales**
+- `fixed-history` queda solo como referencia semántica para `eval/generate`
+- `train_on_tokens` / `train_on_file` ya no fuerzan loss readbacks dentro del step fused
+- progreso y validación no bloquean por default (`VAL_EVERY=0`, `PROGRESS_EVERY=0`)
+- `ctx_len` default del binario de train sube a `512`
+
+**Resultados recientes**
+- perfil estable, `batch=4`, `ctx=512`, `B19=1`, history default:
+  - `tps_epoch = 4123.0`
+- techo comparativo, `batch=8`, `ctx=512`, `B19=1`, `AIDEEN_DEQ_HIST_GATED=0`:
+  - `tps_epoch = 5129.0`
+
+**Lectura**
+- el colapso a `~800 TPS` no era un límite del modelo; venía de mezclar perfiles y del carril token-a-token de referencia
+- el hot path fused ya volvió a una banda sana y escalable
+
 ---
 
 ## Status Legend
