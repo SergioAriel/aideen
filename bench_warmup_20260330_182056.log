@@ -1,0 +1,126 @@
+   Compiling aideen-core v0.1.0 (/home/marche/sustainability/aideen/aideen-core)
+   Compiling aideen-backbone v0.1.0 (/home/marche/sustainability/aideen/aideen-backbone)
+   Compiling aideen-training v0.1.0 (/home/marche/sustainability/aideen/aideen-training-lab)
+   Compiling aideen-bench v0.1.0 (/home/marche/sustainability/aideen/aideen-bench)
+warning: fields `name` and `params` are never read
+   --> aideen-bench/src/main.rs:144:5
+    |
+143 | struct ModelRun {
+    |        -------- fields in this struct
+144 |     name: &'static str,
+    |     ^^^^
+145 |     params: usize,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `encode` and `decode` are never used
+  --> aideen-bench/src/dataset.rs:26:12
+   |
+16 | impl Dataset {
+   | ------------ methods in this implementation
+...
+26 |     pub fn encode(&self, text: &str) -> Vec<u32> {
+   |            ^^^^^^
+...
+32 |     pub fn decode(&self, tokens: &[u32]) -> String {
+   |            ^^^^^^
+
+warning: `aideen-bench` (bin "arch_bench") generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 14.69s
+     Running `target/release/arch_bench`
+
+╔══════════════════════════════════════════════════════════════╗
+║  AIDEEN vs Transformer — Benchmark (Multi-Seed)             ║
+║  EXP 1: Iso-Data | EXP 2: Iso-Time | EXP 3: Inference      ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Protocol guarantees:
+  ✓ eval_*() is pure &self — does not mutate weights, optimizer, or state
+  ✓ Both models see the same batches in the same order
+  ✓ tokens_seen counted exactly (tokens_in.len() per step)
+  ✓ training wall_clock accumulated WITHOUT counting eval time
+  ✓ Same tokenizer and train/val split for both models
+
+  Config: iso_data_budget=100000 updates | iso_time=120s eval_every=20000 val_tokens=16384 seeds=[42] | backends: aideen=gpu transformer=cpu
+  [WARN] Mixed backend comparison (gpu vs cpu). For symmetric benchmark use CPUvsCPU.
+
+① Loading dataset...
+  Dataset: local cache (1115394 chars)
+  Vocab: 65 chars | Train: 1003854 tokens | Val: 111540 tokens
+
+  AIDEEN     : 283K params  (D_R=192, backend=gpu)
+  Transformer: 297K params  (d=128, 2-layer GPT, ctx=128)
+  Difference : 4.4%  (target iso-params <5.0%)
+
+
+══════════ Seed 1 / 1 (42) ══════════
+[GpuDeqBackend] Adapter: AMD Radeon 780M Graphics (RADV PHOENIX)
+  [WARM-UP] DEQ spectral conditioning: 1000 steps (not counted in comparison)
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.1996, max=0.1998, abs_mean=0.032072
+    W_k:  min=-0.1999, max=0.1998, abs_mean=0.032070
+    W_v:  min=-0.0365, max=0.0365, abs_mean=0.019085
+    W_o:  min=-0.0064, max=0.0064, abs_mean=0.003207
+    W_in: min=-0.0195, max=0.0195, abs_mean=0.009719
+[GPU-LM] Syncing LM Head weights... (abs_sum=22.5167)
+    [WARM-UP] step 0: contractivity=1.000, avg_iters=1.0
+    [WARM-UP] step 200: contractivity=1.000, avg_iters=1.0
+    [WARM-UP] step 400: contractivity=1.000, avg_iters=1.0
+    [WARM-UP] step 600: contractivity=1.000, avg_iters=1.0
+    [WARM-UP] step 800: contractivity=1.000, avg_iters=1.0
+  [WARM-UP] Complete. DEQ pre-conditioned for benchmark.
+
+      tokens │   AI-val    AI-train   AI t/s  │   TF-val    TF-train   TF t/s  │ win
+  ────────────────────────────────────────────────────────────────────────────────
+         20K │     4.1726     0.0000      189 │     3.4472     3.9101     2066 │ TF →
+         40K │     4.1726     0.0000      190 │     3.1718     3.2765     2315 │ TF →
+         60K │     4.1726     0.0000      189 │     3.0526     3.0728     2360 │ TF →
+         80K │     4.1726     0.0000      183 │     2.9898     2.9847     2239 │ TF →
+  ────────────────────────────────────────────────────────────────────────────────
+  best_val   │     4.1726                                │     2.9898                                │
+  t_training │       8.9m                                │      45.9s                                │
+  tok_seen   │       100K                                │       100K                                │
+[GpuDeqBackend] Adapter: AMD Radeon 780M Graphics (RADV PHOENIX)
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.2000, max=0.1992, abs_mean=0.032061
+    W_k:  min=-0.1998, max=0.1996, abs_mean=0.032066
+    W_v:  min=-0.0363, max=0.0363, abs_mean=0.019070
+    W_o:  min=-0.0064, max=0.0064, abs_mean=0.003215
+    W_in: min=-0.0193, max=0.0193, abs_mean=0.009727
+[GPU-LM] Syncing LM Head weights... (abs_sum=22.5167)
+
+     wall(s) │   AI-val    AI-train   AI t/s  │   TF-val    TF-train   TF t/s  │ win
+  ────────────────────────────────────────────────────────────────────────────────
+         117 │     4.1720     0.0000      189 │     3.3909     3.8024     1920 │ TF →
+  ────────────────────────────────────────────────────────────────────────────────
+  best_val   │     4.1720                                │     3.3909                                │
+  t_training │       1.8m                                │      10.5s                                │
+  tok_seen   │        20K                                │        20K                                │
+
+╔══════════════════════════════════════════════════════════════╗
+║  EXP 3: Inference — teacher-forcing NLL + throughput        ║
+╚══════════════════════════════════════════════════════════════╝
+  • forward-only (&self): no sampling, no backprop, no tick
+  • Same chunks from the val set (target_tokens=16384, stride=CTX_LEN+1)
+
+           Model │      NLL │    tok/sec │   ms/token │    #params
+  ──────────────────────────────────────────────────────────────
+          AIDEEN │   4.1726 │        342 │      2.924 │       283K
+     Transformer │   2.9535 │       9040 │      0.111 │       297K
+
+  Speedup inferencia Transformer/AIDEEN : 26.4×
+  NLL: Transformer wins by 1.2191 nats (29.2% better)
+
+╔══════════════════════════════════════════════════════════════╗
+║  Aggregated summary (mean ± std, multi-seed)                 ║
+╚══════════════════════════════════════════════════════════════╝
+EXP1 Iso-Data best_val:   AIDEEN 4.1726 ± 0.0000 | TF 2.9898 ± 0.0000
+EXP2 Iso-Time best_val:   AIDEEN 4.1720 ± 0.0000 | TF 3.3909 ± 0.0000
+EXP2 tokens seen:         AIDEEN 20096 ± 0 | TF 20096 ± 0
+EXP1 updates:             AIDEEN 781 ± 0 | TF 781 ± 0
+EXP3 Inference NLL:       AIDEEN 4.1726 ± 0.0000 | TF 2.9535 ± 0.0000
+EXP1 paired t-test: insufficient n or zero variance.
+EXP2 paired t-test: insufficient n or zero variance.
+EXP3 paired t-test: insufficient n or zero variance.
+Seeds CSV: aideen-bench/results/arch_bench_1774907443.csv

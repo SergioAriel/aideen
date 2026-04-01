@@ -1,0 +1,103 @@
+warning: unused import: `Hash`
+  --> aideen-backbone/src/mamba_slot_reasoning.rs:13:17
+   |
+13 | use std::hash::{Hash, Hasher};
+   |                 ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `attn_t`
+   --> aideen-backbone/src/mamba_slot_reasoning.rs:330:13
+    |
+330 |         let attn_t = 0.10_f32;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_attn_t`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `fused_update_hist_bias_pipeline`, `fused_update_hist_xprep_pipeline`, and `fused_update_hist_hrhs_pipeline` are never read
+  --> aideen-backbone/src/gpu_deq.rs:62:5
+   |
+35 | pub struct GpuDeqBackend {
+   |            ------------- fields in this struct
+...
+62 |     fused_update_hist_bias_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+66 |     fused_update_hist_xprep_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+67 |     fused_update_hist_hrhs_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `picard_damping_from_env` is never used
+    --> aideen-backbone/src/gpu_deq.rs:1711:8
+     |
+  99 | impl GpuDeqBackend {
+     | ------------------ associated function in this implementation
+...
+1711 |     fn picard_damping_from_env() -> f32 {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `dl_dh_rms_red_buf`, `ternary_pipeline`, and `s_h_rms_buf` are never read
+  --> aideen-backbone/src/gpu_lm_head.rs:29:5
+   |
+21 | pub struct GpuLmHeadTrainer {
+   |            ---------------- fields in this struct
+...
+29 |     dl_dh_rms_red_buf: wgpu::Buffer,
+   |     ^^^^^^^^^^^^^^^^^
+...
+51 |     ternary_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^
+52 |     s_h_rms_buf: wgpu::Buffer,
+   |     ^^^^^^^^^^^
+
+warning: associated function `identity_like_mat_with_rng` is never used
+   --> aideen-backbone/src/mamba_slot_reasoning.rs:153:8
+    |
+132 | impl MambaSlotReasoning {
+    | ----------------------- associated function in this implementation
+...
+153 |     fn identity_like_mat_with_rng<R: Rng + ?Sized>(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aideen-backbone` (lib) generated 6 warnings (run `cargo fix --lib -p aideen-backbone` to apply 2 suggestions)
+warning: unused variable: `gpu_emb`
+   --> aideen-training-lab/src/trainer.rs:485:26
+    |
+485 |                 let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+    |                          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gpu_emb`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `env_f32_default` is never used
+   --> aideen-training-lab/src/trainer.rs:132:8
+    |
+117 | impl Trainer {
+    | ------------ associated function in this implementation
+...
+132 |     fn env_f32_default(name: &str, default: f32) -> f32 {
+    |        ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aideen-training` (lib) generated 2 warnings (run `cargo fix --lib -p aideen-training` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.92s
+     Running `target/release/train --file corpus_combined.txt --resume model_large --epochs 1 --log-every 1 --save-every 1`
+  Modo: archivo grande → corpus_combined.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Tokenizando corpus_combined.txt → corpus_combined.txt.tokens.bin ...
+  15393720 chars → 3759267 tokens, vocab=50257 → 14.34 MB
+  Resumiendo desde checkpoint: model_large
+[GpuDeqBackend] Adapter: AMD Radeon 780M Graphics (RADV PHOENIX)
+  Backend: GPU (Metal) ✅ [Auto-managed]
+
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.1986, max=0.1989, abs_mean=0.044608
+    W_k:  min=-0.1988, max=0.1989, abs_mean=0.044604
+    W_v:  min=-0.0503, max=0.0503, abs_mean=0.022151
+    W_o:  min=-0.0039, max=0.0039, abs_mean=0.001938
+    W_in: min=-0.0119, max=0.0119, abs_mean=0.005926
+[GPU-LM] Sincronizando pesos del LM Head... (abs_sum=113481.9688)
+radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a soft recovery.

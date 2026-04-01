@@ -173,17 +173,18 @@ impl RustDeqBridge {
     fn clean_scratch_stride(
         d_model: u32,
         h_slots: u32,
-        enable_slot_qkv_probe: bool,
-        enable_slot_attn_real_staged: bool,
+        _enable_slot_qkv_probe: bool,
+        _enable_slot_attn_real_staged: bool,
     ) -> u32 {
-        let signal = d_model * h_slots;
-        if enable_slot_attn_real_staged {
-            signal * 5
-        } else if enable_slot_qkv_probe {
-            signal * 4
-        } else {
-            signal
-        }
+        // Full layout matching fused_deq_update.wgsl:
+        //   [0..4*h*d]   q/k/v/attn_out
+        //   [4*h*d..5*h*d] mamba (M_t)
+        //   [5*h*d..6*h*d] signal (inj_t)
+        //   [6*h*d..7*h*d] minner
+        //   [7*h*d..8*h*d] hist_ctx (c_{t,k})
+        //   [8*h*d..8*h*d+h²] attn weights
+        //   [+h] scalars
+        d_model * (h_slots * 8) + h_slots * h_slots + h_slots
     }
 
     fn pooled_elements(
