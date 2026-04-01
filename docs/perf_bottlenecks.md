@@ -120,6 +120,8 @@ Cada una requiere un perfil distinto. No comparar números entre perfiles.
 **Resultados recientes**
 - perfil estable, `batch=4`, `ctx=512`, `B19=1`, history default:
   - `tps_epoch = 4123.0`
+- perfil estable, `batch=8`, `ctx=512`, `B19=1`, history default:
+  - `tps_epoch = 5197.8`
 - techo comparativo, `batch=8`, `ctx=512`, `B19=1`, `AIDEEN_DEQ_HIST_GATED=0`:
   - `tps_epoch = 5129.0`
 
@@ -278,6 +280,14 @@ in 4 iterations. Profile: does loss change if `adj_iters=4` vs `6`?
 `adj_iters=4` vs `6` on stress_test (seed 11, 10 iters).
 TPS 7.4 (adj=4) vs 6.7 (adj=6), loss/contr essentially unchanged in short run.
 Marked as candidate only; keep default at 6 until longer-run quality is verified.
+
+**Revalidación (2026-03-31, fused train real, tinyshakespeare, batch=8, ctx=512, B19=1)**:
+- `AIDEEN_ADJ_ITERS_OVERRIDE=4` dio `tps_epoch = 2225.6`
+- baseline del mismo perfil sin override: `tps_epoch = 5197.8`
+
+Conclusión actual:
+- en el régimen fused real de training, bajar `adj_iters` a `4` **no** es una mejora segura
+- queda descartado como default por ahora
 
 ### 🟡 B11 — Second `read_debug_buffer` call in `train_on_tokens`
 **Problem**: `trainer.rs:1047` — inside `train_on_tokens` diagnostic block, `gpu.read_debug_buffer()`

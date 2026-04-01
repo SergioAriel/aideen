@@ -31,6 +31,7 @@ cargo run --release --features wgpu -p aideen-training --bin train -- \
 
 **Resultados recientes**
 - `ctx=512`, `batch=4`, `B19=1`, history default: `tps_epoch = 4123.0`
+- `ctx=512`, `batch=8`, `B19=1`, history default: `tps_epoch = 5197.8`
 - mismo perfil con `AIDEEN_DEQ_HIST_GATED=0`: medir aparte si se busca techo absoluto
 
 ## Perfil techo (comparativo, no default del modelo)
