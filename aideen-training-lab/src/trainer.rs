@@ -128,6 +128,7 @@ pub struct Trainer {
     cfg_tps_sync_every: usize, // AIDEEN_TPS_SYNC_EVERY
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
     cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
+    cfg_val_every: usize,          // AIDEEN_VAL_EVERY
     cfg_wv_debug: bool,            // AIDEEN_DEQ_WV_DEBUG
     cfg_ssm_debug: bool,           // AIDEEN_SSM_DEBUG
     cfg_max_chunks: usize,         // AIDEEN_MAX_CHUNKS
@@ -555,6 +556,10 @@ impl Trainer {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or_else(Self::default_hist_min_iters)
                 .max(1),
+            cfg_val_every: std::env::var("AIDEEN_VAL_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(20),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -649,6 +654,10 @@ impl Trainer {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or_else(Self::default_hist_min_iters)
                 .max(1),
+            cfg_val_every: std::env::var("AIDEEN_VAL_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(20),
             cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
             cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
             cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
@@ -1936,6 +1945,7 @@ impl Trainer {
             let mut num_chunks = 0;
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
+            let mut last_progress_chunk_logged = 0usize;
             let ctx_len = self.config.ctx_len.max(1);
             let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
             let step = ctx_len * batch_size;
@@ -1988,7 +1998,7 @@ impl Trainer {
                     }
                 }
 
-                if num_chunks % 10 == 0 {
+                if num_chunks % 10 == 0 && num_chunks != last_progress_chunk_logged {
                     let interval_elapsed = interval_start.elapsed().as_secs_f32();
                     let instant_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
 
@@ -2019,6 +2029,7 @@ impl Trainer {
                     // Reset interval timers
                     interval_start = std::time::Instant::now();
                     interval_tokens = 0;
+                    last_progress_chunk_logged = num_chunks;
                 }
             }
 
@@ -2651,6 +2662,7 @@ impl Trainer {
             let mut epoch_loss = 0.0f32;
             let mut num_chunks = 0usize;
             let mut total_tokens = 0usize;
+            let mut last_progress_chunk_logged = 0usize;
             // Buffer de tokens no consumidos del chunk anterior (para ventana solapada).
             let mut carry: Vec<u32> = Vec::with_capacity(stride);
             // Pre-allocate token window to avoid per-chunk heap allocations.
@@ -2712,7 +2724,9 @@ impl Trainer {
                                 let remaining = max_batch_tokens.saturating_sub(batch_train_buf.len());
                                 if remaining == 0 {
                                     // Flush full batch before consuming more.
-                                    let is_val = num_chunks % 20 == 0;
+                                    let is_val = self.cfg_val_every != 0
+                                        && num_chunks > 0
+                                        && num_chunks % self.cfg_val_every == 0;
                                     if is_val {
                                         self.eval_mode = true;
                                     }
@@ -2756,7 +2770,9 @@ impl Trainer {
                                 || (eos_token != 0 && seg_start > 0); // flush on document boundary
 
                             if flush && !batch_train_buf.is_empty() {
-                                let is_val = num_chunks % 20 == 0;
+                                let is_val = self.cfg_val_every != 0
+                                    && num_chunks > 0
+                                    && num_chunks % self.cfg_val_every == 0;
                                 if is_val {
                                     self.eval_mode = true;
                                 }
@@ -2829,7 +2845,10 @@ impl Trainer {
                 }
 
                 // Mini-log cada 10 chunks para ver progreso en tiempo real
-                if num_chunks % 10 == 0 && num_chunks > 0 {
+                if num_chunks % 10 == 0
+                    && num_chunks > 0
+                    && num_chunks != last_progress_chunk_logged
+                {
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps = total_tokens as f32 / elapsed.max(1e-9);
                     // Métrica principal: promedio acumulado real de train (no cache GPU).
@@ -2839,6 +2858,7 @@ impl Trainer {
                         "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps_avg={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
                         num_chunks, current_loss, tps, elapsed
                     );
+                    last_progress_chunk_logged = num_chunks;
 
                     // Auto-save intra-epoch: solo por tiempo (cada 30 min).
                     // El guardado por `save_every` ya se aplica por epoch al final del loop.
