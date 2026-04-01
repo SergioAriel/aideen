@@ -1232,7 +1232,8 @@ impl GpuDeqBackend {
         let mut anderson_hist_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(4);
         for seg in 0..4 {
             let slots_in_seg = if seg < segment_count {
-                slots_per_segment
+                let already_alloc = seg * slots_per_segment;
+                (anderson_m_alloc as usize).saturating_sub(already_alloc).min(slots_per_segment)
             } else {
                 1
             };
