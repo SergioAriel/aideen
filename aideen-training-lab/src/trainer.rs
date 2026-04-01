@@ -324,22 +324,18 @@ impl Trainer {
     }
 
     fn clean_deq_mode_active() -> bool {
+        // Clean DEQ mode only when explicitly requested via AIDEEN_DEQ_ONLY=1
+        // or AIDEEN_DEQ_RESIDUAL_ALPHA set to <= -1.5.
+        // Default is hist_gated mode (residual_alpha = -0.5) with per-token history.
         if Self::env_flag("AIDEEN_DEQ_ONLY") {
             return true;
         }
-        if Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
-            || Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED")
-        {
-            return false;
+        if let Ok(alpha_str) = std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA") {
+            if let Ok(alpha) = alpha_str.trim().parse::<f32>() {
+                return alpha <= -1.5;
+            }
         }
-        if std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok()
-        {
-            return false;
-        }
-        true
+        false
     }
 
     fn default_hist_min_iters() -> u32 {

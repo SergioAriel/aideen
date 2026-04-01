@@ -332,15 +332,13 @@ impl GpuDeqBackend {
             return -0.25;
         }
 
-        // hist_gated (-0.5) is the default mode. Override only if another mode is set.
+        // hist_gated (-0.5) is the default mode with per-token history integration.
+        // Set AIDEEN_DEQ_RESIDUAL_ALPHA to override, or -2.0 for clean DEQ (no history).
         let alpha = std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or_else(|| {
-                // Default now is the clean DEQ core: no slot-attention, no history in the solve.
-                -2.0
-            });
+            .map(|v| v.clamp(-2.0, 1.0))
+            .unwrap_or(-0.5);
         alpha
     }
 

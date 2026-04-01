@@ -403,7 +403,7 @@ fn deq_forward_main(
 
         // ── Step 5: Temporal update M_t = SSM(M_{t-1}, h*) ──
         if (hist_enabled) {
-            // RMS of h*
+            // 5a: RMS of h*
             var local_h_sq = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 let h_val = H_curr[h_base + slot_off + d];
@@ -417,12 +417,11 @@ fn deq_forward_main(
             }
             let h_rms = sqrt(shared_vals[0] * inv_d_model + 1e-6);
 
+            // 5b: Compute m_inner = a * M_{t-1} + (1-a) * x_proj, store in mamba_base temporarily
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 let h_unit = H_curr[h_base + slot_off + d] / h_rms;
-                // x_proj = h_unit + wx_max * tanh(W_x[d,d]) * h_unit
                 let wx = 0.5 * tanh(AllWeights[aw_wx_base(d_model, h_slots) + d * d_model + d]);
                 let x_proj = h_unit + wx * h_unit;
-                // SSM: a = sigmoid(-A_log), M_t = a * M_{t-1} + (1-a) * x_proj
                 let a_log = AllWeights[aw_alog_base(d_model, h_slots) + slot_idx * d_model + d];
                 let a = 1.0 / (1.0 + exp(a_log));
                 var prev_m = 0.0;
@@ -430,16 +429,24 @@ fn deq_forward_main(
                     let prev_mamba = fw_token_mamba_base(t_abs - 1u, d_model, h_slots) + slot_off;
                     prev_m = Scratch[prev_mamba + d];
                 }
-                let m_inner = a * prev_m + (1.0 - a) * x_proj;
-                // Residual carrier: M_t = m_inner + W_out * m_inner
-                var m_out = m_inner;
+                Scratch[mamba_base + d] = a * prev_m + (1.0 - a) * x_proj;
+            }
+            workgroupBarrier();
+
+            // 5c: Residual carrier M_t = m_inner + W_out * m_inner (full matmul)
+            // Use hist_ctx region as temp for the matmul result
+            for (var d = tid; d < d_model; d = d + WG_SIZE) {
+                var wout_sum = 0.0;
                 for (var j = 0u; j < d_model; j = j + 1u) {
-                    // Use only diagonal for efficiency (matches CPU temporal_step)
-                    if (j == d) {
-                        m_out = m_out + AllWeights[aw_wout_base(d_model, h_slots) + d * d_model + j] * m_inner;
-                    }
+                    wout_sum = wout_sum + AllWeights[aw_wout_base(d_model, h_slots) + d * d_model + j] * Scratch[mamba_base + j];
                 }
-                Scratch[mamba_base + d] = m_out;
+                // Store m_inner + W_out*m_inner in hist_ctx temp, then copy back
+                Scratch[hctx_base + d] = Scratch[mamba_base + d] + wout_sum;
+            }
+            workgroupBarrier();
+            // Copy final M_t back to mamba_base
+            for (var d = tid; d < d_model; d = d + WG_SIZE) {
+                Scratch[mamba_base + d] = Scratch[hctx_base + d];
             }
             workgroupBarrier();
         }
