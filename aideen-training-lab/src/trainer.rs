@@ -134,6 +134,11 @@ pub struct Trainer {
     cfg_adj_iters_override: Option<u32>, // AIDEEN_ADJ_ITERS_OVERRIDE
     cfg_system_cost_audit: bool,   // AIDEEN_SYSTEM_COST_AUDIT
     cfg_system_cost_wait: bool,    // AIDEEN_SYSTEM_COST_WAIT
+    cfg_force_renorm: bool,        // AIDEEN_DEQ_FORCE_RENORM
+    cfg_slot_attn_unified: bool,   // AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED
+    cfg_dynamic_qkv: bool,         // AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV
+    cfg_lm_force_cpu_dldh: bool,   // AIDEEN_LM_FORCE_CPU_DLDH
+    cfg_lm_dldh_parity: bool,      // AIDEEN_LM_DLDH_PARITY
 }
 
 impl Trainer {
@@ -323,6 +328,7 @@ impl Trainer {
     }
 
     fn estimate_forward_bandwidth_bytes(
+        &self,
         batch_size: u32,
         seq_len: u32,
         max_iters: u32,
@@ -335,10 +341,8 @@ impl Trainer {
         let t = seq_len as f64;
         let iters = max_iters as f64;
         let f32_bytes = std::mem::size_of::<f32>() as f64;
-        let slot_attn_unified =
-            Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
-                && Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED");
-        let dynamic_qkv = Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV");
+        let slot_attn_unified = self.cfg_slot_attn_unified;
+        let dynamic_qkv = self.cfg_dynamic_qkv;
 
         if Self::clean_deq_mode_active() {
             let win_bytes = b * t * (h * d * d * f32_bytes);
@@ -562,6 +566,11 @@ impl Trainer {
                 .and_then(|v| v.trim().parse::<u32>().ok()),
             cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
             cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
+            cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
+            cfg_slot_attn_unified: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED"),
+            cfg_dynamic_qkv: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV"),
+            cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
+            cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -651,6 +660,11 @@ impl Trainer {
                 .and_then(|v| v.trim().parse::<u32>().ok()),
             cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
             cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
+            cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
+            cfg_slot_attn_unified: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED"),
+            cfg_dynamic_qkv: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV"),
+            cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
+            cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -860,10 +874,8 @@ impl Trainer {
                 }
                 // Dynamic slot-attention re-enters the DEQ Jacobian; ensure the GPU buffers
                 // start from the strict spectral regime before the first training step.
-                let dynamic_slot_attn =
-                    Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED");
                 if !self.force_renorm_done
-                    && (Self::env_flag("AIDEEN_DEQ_FORCE_RENORM") || dynamic_slot_attn)
+                    && (self.cfg_force_renorm || self.cfg_slot_attn_unified)
                 {
                     let _ = gpu.renormalize_spectral();
                     self.force_renorm_done = true;
@@ -941,34 +953,39 @@ impl Trainer {
         // Sync CPU lm_head only when frozen/debug paths need it — not on every training step.
         #[cfg(feature = "wgpu")]
         if self.frozen_lm
-            || Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH")
-            || Self::env_flag("AIDEEN_LM_DLDH_PARITY")
+            || self.cfg_lm_force_cpu_dldh
+            || self.cfg_lm_dldh_parity
         {
             self.sync_lm_head_from_gpu_if_needed();
         }
+
+        let num_tokens = targets.len();
+        let fwd_batch_size = self.cfg_fwd_batch_size;
+        let per_seq_len = if fwd_batch_size == 0 {
+            0
+        } else {
+            (num_tokens as u32) / fwd_batch_size
+        };
+        let audit_forward_bytes = self.estimate_forward_bandwidth_bytes(
+            fwd_batch_size,
+            per_seq_len,
+            self.adaptive_max_iters,
+            self.config.d_r,
+            self.config.h_slots,
+        );
 
         if let (Some(gpu), Some(gpu_lm), Some(gpu_emb)) =
             (gpu_ctx, self.gpu_lm.as_mut(), self.gpu_emb.as_ref())
         {
             self.optimizer.tick();
-            let num_tokens = targets.len();
             if num_tokens == 0 {
                 return 0.0;
             }
             let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
             // 1. Prepare DEQ input on GPU
-            let fwd_batch_size = self.cfg_fwd_batch_size;
             // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
-            let per_seq_len = (num_tokens as u32) / fwd_batch_size;
             let single_query_mode = query.len() == self.config.d_r && num_tokens == 1;
-            let audit_forward_bytes = Self::estimate_forward_bandwidth_bytes(
-                fwd_batch_size,
-                per_seq_len,
-                self.adaptive_max_iters,
-                self.config.d_r,
-                self.config.h_slots,
-            );
             if single_query_mode {
                 // train_step path: match CPU semantics by feeding the pooled query vector.
                 let q_bytes = bytemuck::cast_slice(query.as_slice());
@@ -1238,8 +1255,8 @@ impl Trainer {
                     }
                     let h_star_flat = h_star.to_flat();
 
-                    let force_cpu_lm_dldh = Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH");
-                    let parity_check = Self::env_flag("AIDEEN_LM_DLDH_PARITY");
+                    let force_cpu_lm_dldh = self.cfg_lm_force_cpu_dldh;
+                    let parity_check = self.cfg_lm_dldh_parity;
                     let mut dl_dh_cpu_opt: Option<nalgebra::DVector<f32>> = None;
                     let mut dl_dh_cpu_parity_opt: Option<nalgebra::DVector<f32>> = None;
 
