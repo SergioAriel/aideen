@@ -226,7 +226,10 @@ fn run_large_file(
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(0.0001);
-    let checkpoint_base = "model_large";
+    let checkpoint_base = env::var("AIDEEN_CHECKPOINT_BASE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "model_large".to_string());
 
     let train_seed = env_u64("AIDEEN_TRAIN_SEED");
     let mut trainer = if let Some(ref base) = resume_path {
@@ -278,7 +281,7 @@ fn run_large_file(
             log_every,
             eos_token,
             save_every,
-            checkpoint_base,
+            &checkpoint_base,
         )
         .expect("Error durante train_on_file");
 
@@ -289,7 +292,7 @@ fn run_large_file(
         println!("  [Skip] save/generate desactivado (save_every=0)");
         return;
     }
-    save_and_generate(&mut trainer, checkpoint_base);
+    save_and_generate(&mut trainer, &checkpoint_base);
 }
 
 fn find_tokenizer_path() -> Option<String> {

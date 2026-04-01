@@ -26,6 +26,8 @@ análisis y mejora. Pero sí fija una base operativa estable para:
 - El progreso ahora diferencia:
   - `tps_win`: throughput de ventana
   - `tps_run`: throughput acumulado del run
+- Cuando `AIDEEN_PROGRESS_EVERY>0`, esos TPS ya miden trabajo GPU completado.
+  El trainer sincroniza en cada corte de progreso para evitar números inflados por comandos en cola.
 - Si no hay una loss confiable visible, el trainer muestra `loss=n/a` en vez de `0.0000`.
 - La inferencia rápida ya tiene un bin dedicado:
   - `aideen-training-lab/src/bin/infer.rs`
@@ -65,6 +67,7 @@ Este es el comando base recomendado para un run real sobre el corpus grande.
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN && \
 env \
+  AIDEEN_CHECKPOINT_BASE=model_large \
   AIDEEN_BATCH_SIZE=8 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_LM_FUSED_B19=1 \
@@ -98,6 +101,9 @@ env \
   - no validar durante training throughput
 - `AIDEEN_PROGRESS_EVERY=20`
   - da visibilidad sin demasiado ruido
+- `AIDEEN_CHECKPOINT_BASE=model_large`
+  - base del checkpoint que se usaría si activás guardado
+  - útil para corridas comparativas sin pisar un checkpoint previo
 
 ### Cuándo usarlo
 
@@ -125,6 +131,7 @@ de reporting.
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN && \
 env \
+  AIDEEN_CHECKPOINT_BASE=model_report \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_LM_FUSED_B19=1 \
@@ -154,6 +161,7 @@ env \
 - `tps_win`
 - `tps_run`
 - `tps_epoch` al final
+- checkpoint separado si activás `--save-every > 0`
 
 ---
 
@@ -260,6 +268,10 @@ Si usás:
 el proceso puede estar vivo pero no imprimir nada útil por bastante tiempo.
 
 En ese caso parece colgado, pero no necesariamente lo está.
+
+Si querés ver progreso y TPS honestos durante el run:
+- dejar `AIDEEN_PROGRESS_EVERY>0`
+- usar el perfil de reporting o uno equivalente
 
 ---
 
@@ -374,6 +386,7 @@ Sí, varias cosas deberían poder evitarse después.
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN && \
 env \
+  AIDEEN_CHECKPOINT_BASE=model_large \
   AIDEEN_BATCH_SIZE=8 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_LM_FUSED_B19=1 \

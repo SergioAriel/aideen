@@ -2013,6 +2013,13 @@ impl Trainer {
                     && num_chunks % self.cfg_progress_every == 0
                     && num_chunks != last_progress_chunk_logged
                 {
+                    #[cfg(feature = "wgpu")]
+                    if let Some(gpu) = self.gpu_deq.as_ref() {
+                        // Reporting mode must measure completed GPU work, not merely queued commands.
+                        // Waiting here keeps throughput benchmarks unaffected when progress is disabled,
+                        // while making visible TPS/loss trustworthy whenever the caller asks for progress.
+                        gpu.device.poll(wgpu::Maintain::Wait);
+                    }
                     let interval_elapsed = interval_start.elapsed().as_secs_f32();
                     let window_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
                     let epoch_elapsed = t_start.elapsed().as_secs_f32();
@@ -2841,6 +2848,12 @@ impl Trainer {
                     && num_chunks > 0
                     && num_chunks != last_progress_chunk_logged
                 {
+                    #[cfg(feature = "wgpu")]
+                    if let Some(gpu) = self.gpu_deq.as_ref() {
+                        // Same rationale as the in-memory loop above: visible progress should reflect
+                        // finished GPU work, not commands still queued in Metal.
+                        gpu.device.poll(wgpu::Maintain::Wait);
+                    }
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps_run = total_tokens as f32 / elapsed.max(1e-9);
                     let tps_win = interval_tokens as f32 / interval_start.elapsed().as_secs_f32().max(1e-9);
