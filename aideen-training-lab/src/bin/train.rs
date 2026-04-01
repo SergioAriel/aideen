@@ -170,7 +170,9 @@ fn run_large_file(
     tok.config.ctx_len = std::env::var("AIDEEN_CTX_LEN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(256);
+        // Training throughput is strongly launch-bound at 256. 512 stays stable on M1 Pro
+        // and gives the GPU more useful work per dispatch; callers can still override it.
+        .unwrap_or(512);
     tok.config.train_deq = true;
 
     let vocab_size = tok.vocab_size();

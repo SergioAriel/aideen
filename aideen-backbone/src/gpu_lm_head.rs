@@ -618,7 +618,7 @@ impl GpuLmHeadTrainer {
                     let vl = v.trim().to_ascii_lowercase();
                     vl == "1" || vl == "true" || vl == "yes"
                 })
-                .unwrap_or(false),
+                .unwrap_or(true),
             cfg_lm_debug: std::env::var("AIDEEN_LM_DEBUG")
                 .ok()
                 .map(|v| {

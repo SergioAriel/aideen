@@ -108,6 +108,27 @@ Cada una requiere un perfil distinto. No comparar números entre perfiles.
 - No decidir por TPS de un perfil usando números de otro perfil
 - No promover defaults por “compila y no crashea”; deben pasar el perfil correspondiente
 
+### 2026-03-31 — Fused path stabilized, observability moved off hot path
+**Contexto**: trainer fused con history estable, sin que `fixed-history` contamine training, y con readbacks/progress/validación fuera del camino crítico por default.
+
+**Cambios estructurales**
+- `fixed-history` queda solo como referencia semántica para `eval/generate`
+- `train_on_tokens` / `train_on_file` ya no fuerzan loss readbacks dentro del step fused
+- progreso y validación no bloquean por default (`VAL_EVERY=0`, `PROGRESS_EVERY=0`)
+- `ctx_len` default del binario de train sube a `512`
+
+**Resultados recientes**
+- perfil estable, `batch=4`, `ctx=512`, `B19=1`, history default:
+  - `tps_epoch = 4123.0`
+- perfil estable, `batch=8`, `ctx=512`, `B19=1`, history default:
+  - `tps_epoch = 5197.8`
+- techo comparativo, `batch=8`, `ctx=512`, `B19=1`, `AIDEEN_DEQ_HIST_GATED=0`:
+  - `tps_epoch = 5129.0`
+
+**Lectura**
+- el colapso a `~800 TPS` no era un límite del modelo; venía de mezclar perfiles y del carril token-a-token de referencia
+- el hot path fused ya volvió a una banda sana y escalable
+
 ---
 
 ## Status Legend
@@ -259,6 +280,14 @@ in 4 iterations. Profile: does loss change if `adj_iters=4` vs `6`?
 `adj_iters=4` vs `6` on stress_test (seed 11, 10 iters).
 TPS 7.4 (adj=4) vs 6.7 (adj=6), loss/contr essentially unchanged in short run.
 Marked as candidate only; keep default at 6 until longer-run quality is verified.
+
+**Revalidación (2026-03-31, fused train real, tinyshakespeare, batch=8, ctx=512, B19=1)**:
+- `AIDEEN_ADJ_ITERS_OVERRIDE=4` dio `tps_epoch = 2225.6`
+- baseline del mismo perfil sin override: `tps_epoch = 5197.8`
+
+Conclusión actual:
+- en el régimen fused real de training, bajar `adj_iters` a `4` **no** es una mejora segura
+- queda descartado como default por ahora
 
 ### 🟡 B11 — Second `read_debug_buffer` call in `train_on_tokens`
 **Problem**: `trainer.rs:1047` — inside `train_on_tokens` diagnostic block, `gpu.read_debug_buffer()`
