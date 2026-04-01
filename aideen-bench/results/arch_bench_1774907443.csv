@@ -1,0 +1,2 @@
+seed,aideen_backend,transformer_backend,transformer_impl,iso_data_unit,exp1_ai_best,exp1_tf_best,exp1_ai_tps,exp1_tf_tps,exp2_ai_best,exp2_tf_best,exp2_ai_tokens,exp2_tf_tokens,exp1_ai_updates,exp1_tf_updates,exp2_ai_updates,exp2_tf_updates,inf_ai_nll,inf_tf_nll,inf_ai_tps,inf_tf_tps
+42,gpu,cpu,candle_gpt,updates,4.172582,2.989770,188.157,2179.681,4.171962,3.390917,20096,20096,781,781,157,157,4.172582,2.953478,339.325,8880.327

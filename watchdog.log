@@ -1,0 +1,3 @@
+[2026-03-25 23:42:08] === Watchdog started (interval=3600s, max_restarts=3) ===
+[2026-03-26 00:42:08] Training appears FINISHED. Watchdog exiting.
+[2026-03-26 00:42:08] === Watchdog exiting (restarts used: 0/3) ===

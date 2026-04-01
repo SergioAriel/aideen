@@ -1,0 +1,250 @@
+warning: unused import: `Hash`
+  --> aideen-backbone/src/mamba_slot_reasoning.rs:13:17
+   |
+13 | use std::hash::{Hash, Hasher};
+   |                 ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `attn_t`
+   --> aideen-backbone/src/mamba_slot_reasoning.rs:330:13
+    |
+330 |         let attn_t = 0.10_f32;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_attn_t`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `fused_update_hist_bias_pipeline`, `fused_update_hist_xprep_pipeline`, and `fused_update_hist_hrhs_pipeline` are never read
+  --> aideen-backbone/src/gpu_deq.rs:62:5
+   |
+35 | pub struct GpuDeqBackend {
+   |            ------------- fields in this struct
+...
+62 |     fused_update_hist_bias_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+66 |     fused_update_hist_xprep_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+67 |     fused_update_hist_hrhs_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `picard_damping_from_env` is never used
+    --> aideen-backbone/src/gpu_deq.rs:1711:8
+     |
+  99 | impl GpuDeqBackend {
+     | ------------------ associated function in this implementation
+...
+1711 |     fn picard_damping_from_env() -> f32 {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `dl_dh_rms_red_buf`, `ternary_pipeline`, and `s_h_rms_buf` are never read
+  --> aideen-backbone/src/gpu_lm_head.rs:29:5
+   |
+21 | pub struct GpuLmHeadTrainer {
+   |            ---------------- fields in this struct
+...
+29 |     dl_dh_rms_red_buf: wgpu::Buffer,
+   |     ^^^^^^^^^^^^^^^^^
+...
+51 |     ternary_pipeline: wgpu::ComputePipeline,
+   |     ^^^^^^^^^^^^^^^^
+52 |     s_h_rms_buf: wgpu::Buffer,
+   |     ^^^^^^^^^^^
+
+warning: associated function `identity_like_mat_with_rng` is never used
+   --> aideen-backbone/src/mamba_slot_reasoning.rs:153:8
+    |
+132 | impl MambaSlotReasoning {
+    | ----------------------- associated function in this implementation
+...
+153 |     fn identity_like_mat_with_rng<R: Rng + ?Sized>(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aideen-backbone` (lib) generated 6 warnings (run `cargo fix --lib -p aideen-backbone` to apply 2 suggestions)
+warning: unused variable: `gpu_emb`
+   --> aideen-training-lab/src/trainer.rs:485:26
+    |
+485 |                 let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+    |                          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gpu_emb`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `env_f32_default` is never used
+   --> aideen-training-lab/src/trainer.rs:132:8
+    |
+117 | impl Trainer {
+    | ------------ associated function in this implementation
+...
+132 |     fn env_f32_default(name: &str, default: f32) -> f32 {
+    |        ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aideen-training` (lib) generated 2 warnings (run `cargo fix --lib -p aideen-training` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.91s
+     Running `target/release/train --file corpus_combined.txt --resume model_large --epochs 1 --log-every 1 --save-every 1`
+  Modo: archivo grande → corpus_combined.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Tokenizando corpus_combined.txt → corpus_combined.txt.tokens.bin ...
+  15393720 chars → 3759267 tokens, vocab=50257 → 14.34 MB
+  Resumiendo desde checkpoint: model_large
+[GpuDeqBackend] Adapter: AMD Radeon 780M Graphics (RADV PHOENIX)
+  Backend: GPU (Metal) ✅ [Auto-managed]
+
+[GPU-VERIFY] Post-upload:
+    W_q:  min=-0.1986, max=0.1989, abs_mean=0.044608
+    W_k:  min=-0.1988, max=0.1989, abs_mean=0.044604
+    W_v:  min=-0.0503, max=0.0503, abs_mean=0.022151
+    W_o:  min=-0.0039, max=0.0039, abs_mean=0.001938
+    W_in: min=-0.0119, max=0.0119, abs_mean=0.005926
+[GPU-LM] Sincronizando pesos del LM Head... (abs_sum=113481.9688)
+    [93m[VAL] chunk     0  val_loss=5.9620[0m
+    [90m[GPU-DEBUG] Step 70: hit=  0/125 (  0.0%) contr=0.878 maxΔ=9.931e-4 rs_cg=0.0e0 iters=6.2 cap=20 damp=0.85 mode=NORMAL conv=OK tps=0.0 max_h=4.544167 inj_rms=3.097e-3 hist_rms=7.710e-4 hist/inj=2.484e-1 mamba_rms=9.903e-1 q/k/v=1.374e0/1.376e0/3.278e-3 mix/attn=1.726e-3/1.004e-3 attn_max=0.266 attn_ent=1.625 comb_rms=3.098e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.095e-1/8.831e-11/1.566e-1/1.566e-1 gate grad/step/before/after=4.793e-6/4.793e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk    10  [92mloss=4.7810[0m  [96mtps=    12.6[0m  [90mtime=162.9s[0m
+    [90m[GPU-DEBUG] Step 80: hit=  0/125 (  0.0%) contr=0.878 maxΔ=9.931e-4 rs_cg=0.0e0 iters=6.2 cap=20 damp=0.85 mode=NORMAL conv=OK tps=12.2 max_h=4.544167 inj_rms=3.097e-3 hist_rms=7.710e-4 hist/inj=2.484e-1 mamba_rms=9.903e-1 q/k/v=1.374e0/1.376e0/3.278e-3 mix/attn=1.726e-3/1.004e-3 attn_max=0.266 attn_ent=1.625 comb_rms=3.098e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=3.295e0/1.292e-9/1.566e-1/1.566e-1 gate grad/step/before/after=5.093e-6/5.093e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk    20  val_loss=6.0652[0m
+    [90m[GPU-DEBUG] Step 90: hit=  0/47 (  0.0%) contr=1.499 maxΔ=9.978e-4 rs_cg=0.0e0 iters=6.1 cap=22 damp=0.60 mode=EMERG conv=OK tps=11.5 max_h=4.422025 inj_rms=2.994e-3 hist_rms=7.392e-4 hist/inj=2.457e-1 mamba_rms=9.861e-1 q/k/v=1.364e0/1.367e0/3.183e-3 mix/attn=1.441e-3/1.002e-3 attn_max=0.273 attn_ent=1.585 comb_rms=2.995e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.521e-2/5.480e-11/1.566e-1/1.566e-1 gate grad/step/before/after=3.304e-6/3.304e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk    30  [92mloss=5.3303[0m  [96mtps=    12.0[0m  [90mtime=491.5s[0m
+    [90m[GPU-DEBUG] Step  0: hit=  0/55 (  0.0%) contr=0.881 maxΔ=9.878e-4 rs_cg=0.0e0 iters=10.0 cap=22 damp=0.60 mode=EMERG conv=OK tps=11.1 max_h=4.567823 inj_rms=3.067e-3 hist_rms=7.666e-4 hist/inj=2.500e-1 mamba_rms=9.940e-1 q/k/v=1.533e0/1.536e0/3.249e-3 mix/attn=1.590e-3/1.002e-3 attn_max=0.262 attn_ent=1.617 comb_rms=3.067e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.665e-2/5.226e-12/1.566e-1/1.566e-1 gate grad/step/before/after=-8.036e-7/-4.018e-14/-1.274e0/-1.274e0 lr=5.000e-6 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk    40  [92mloss=5.4558[0m  [96mtps=    11.9[0m  [90mtime=685.5s[0m
+    [93m[VAL] chunk    40  val_loss=5.9153[0m
+    [90m[GPU-DEBUG] Step 10: hit=  0/5 (  0.0%) contr=0.532 maxΔ=9.813e-4 rs_cg=0.0e0 iters=9.4 cap=22 damp=0.85 mode=NORMAL conv=OK tps=10.9 max_h=4.101311 inj_rms=2.727e-3 hist_rms=6.817e-4 hist/inj=2.500e-1 mamba_rms=9.991e-1 q/k/v=9.021e-1/9.009e-1/2.920e-3 mix/attn=1.532e-3/1.002e-3 attn_max=0.290 attn_ent=1.430 comb_rms=2.728e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-2.121e-2/-5.763e-12/1.566e-1/1.566e-1 gate grad/step/before/after=-4.576e-7/-2.288e-14/-1.274e0/-1.274e0 lr=5.000e-6 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.134e0 v=1.869e-3 a=3.407e-5 t01 h=9.922e-1 v=2.090e-3 a=5.030e-5 t02 h=1.000e-6 v=2.237e-3 a=7.424e-5 t03 h=1.000e-6 v=2.969e-3 a=3.585e-5 t04 h=1.000e-6 v=4.468e-3 a=5.839e-5[0m
+    [95m[progress][0m chunk    50  [92mloss=5.4429[0m  [96mtps=    11.7[0m  [90mtime=762.6s[0m
+    [90m[GPU-DEBUG] Step 20: hit=  0/142 (  0.0%) contr=0.798 maxΔ=9.902e-4 rs_cg=0.0e0 iters=6.2 cap=22 damp=0.85 mode=NORMAL conv=OK tps=10.8 max_h=4.634239 inj_rms=3.205e-3 hist_rms=7.937e-4 hist/inj=2.484e-1 mamba_rms=9.873e-1 q/k/v=1.406e0/1.409e0/3.385e-3 mix/attn=1.674e-3/1.003e-3 attn_max=0.272 attn_ent=1.618 comb_rms=3.206e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-1.145e0/-4.489e-10/1.566e-1/1.566e-1 gate grad/step/before/after=1.828e-6/1.828e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk    60  [92mloss=5.5022[0m  [96mtps=    11.8[0m  [90mtime=955.3s[0m
+    [93m[VAL] chunk    60  val_loss=5.7597[0m
+    [90m[GPU-DEBUG] Step 30: hit=  0/142 (  0.0%) contr=0.798 maxΔ=9.902e-4 rs_cg=0.0e0 iters=6.2 cap=22 damp=0.85 mode=NORMAL conv=OK tps=11.6 max_h=4.634239 inj_rms=3.205e-3 hist_rms=7.937e-4 hist/inj=2.484e-1 mamba_rms=9.873e-1 q/k/v=1.406e0/1.409e0/3.385e-3 mix/attn=1.674e-3/1.003e-3 attn_max=0.272 attn_ent=1.618 comb_rms=3.206e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=3.096e-1/1.214e-10/1.566e-1/1.566e-1 gate grad/step/before/after=-1.194e-7/-1.194e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk    70  [92mloss=5.4522[0m  [96mtps=    12.0[0m  [90mtime=1154.3s[0m
+    [90m[GPU-DEBUG] Step 40: hit=  0/115 (  0.0%) contr=0.883 maxΔ=9.817e-4 rs_cg=0.0e0 iters=6.4 cap=22 damp=0.85 mode=NORMAL conv=OK tps=12.0 max_h=4.445971 inj_rms=3.306e-3 hist_rms=8.265e-4 hist/inj=2.500e-1 mamba_rms=9.919e-1 q/k/v=1.448e0/1.450e0/3.477e-3 mix/attn=1.690e-3/1.003e-3 attn_max=0.259 attn_ent=1.648 comb_rms=3.306e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=3.834e-2/3.363e-11/1.566e-1/1.566e-1 gate grad/step/before/after=2.023e-6/2.023e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk    80  val_loss=5.9472[0m
+    [90m[GPU-DEBUG] Step 50: hit=  0/150 (  0.0%) contr=0.945 maxΔ=9.958e-4 rs_cg=0.0e0 iters=6.2 cap=22 damp=0.85 mode=NORMAL conv=OK tps=11.3 max_h=4.624085 inj_rms=3.209e-3 hist_rms=7.962e-4 hist/inj=2.485e-1 mamba_rms=9.932e-1 q/k/v=1.470e0/1.472e0/3.385e-3 mix/attn=1.694e-3/1.003e-3 attn_max=0.264 attn_ent=1.637 comb_rms=3.210e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.213e-1/8.677e-11/1.566e-1/1.566e-1 gate grad/step/before/after=-1.219e-6/-1.219e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk    90  [92mloss=5.4522[0m  [96mtps=    11.9[0m  [90mtime=1438.2s[0m
+    [90m[GPU-DEBUG] Step 60: hit=  0/141 (  0.0%) contr=0.692 maxΔ=9.948e-4 rs_cg=0.0e0 iters=6.2 cap=22 damp=0.85 mode=NORMAL conv=OK tps=11.9 max_h=4.543077 inj_rms=3.094e-3 hist_rms=7.660e-4 hist/inj=2.484e-1 mamba_rms=9.940e-1 q/k/v=1.378e0/1.381e0/3.277e-3 mix/attn=1.632e-3/1.003e-3 attn_max=0.280 attn_ent=1.597 comb_rms=3.095e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.208e-1/4.738e-11/1.566e-1/1.566e-1 gate grad/step/before/after=8.064e-7/8.064e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk   100  val_loss=5.8669[0m
+    [90m[GPU-DEBUG] Step 70: hit=  0/167 (  0.0%) contr=0.871 maxΔ=9.951e-4 rs_cg=0.0e0 iters=6.3 cap=22 damp=0.85 mode=NORMAL conv=OK tps=9.6 max_h=4.552873 inj_rms=2.966e-3 hist_rms=7.350e-4 hist/inj=2.486e-1 mamba_rms=9.863e-1 q/k/v=1.321e0/1.323e0/3.158e-3 mix/attn=1.622e-3/1.003e-3 attn_max=0.282 attn_ent=1.601 comb_rms=2.967e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.439e-2/8.672e-12/1.566e-1/1.566e-1 gate grad/step/before/after=-2.845e-6/-2.845e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   110  [92mloss=5.4550[0m  [96mtps=    11.8[0m  [90mtime=1644.3s[0m
+    [90m[GPU-DEBUG] Step 80: hit=  0/155 (  0.0%) contr=0.840 maxΔ=9.923e-4 rs_cg=0.0e0 iters=6.3 cap=22 damp=0.85 mode=NORMAL conv=OK tps=11.0 max_h=4.633464 inj_rms=2.915e-3 hist_rms=7.217e-4 hist/inj=2.485e-1 mamba_rms=9.874e-1 q/k/v=1.354e0/1.358e0/3.108e-3 mix/attn=1.639e-3/1.003e-3 attn_max=0.277 attn_ent=1.587 comb_rms=2.915e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.159e-1/7.527e-11/1.566e-1/1.566e-1 gate grad/step/before/after=3.470e-6/3.470e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk   120  val_loss=5.7350[0m
+    [90m[GPU-DEBUG] Step 90: hit=  0/15 (  0.0%) contr=0.588 maxΔ=9.708e-4 rs_cg=0.0e0 iters=6.0 cap=22 damp=0.85 mode=NORMAL conv=OK tps=8.4 max_h=4.070570 inj_rms=2.985e-3 hist_rms=6.742e-4 hist/inj=2.347e-1 mamba_rms=9.650e-1 q/k/v=1.235e0/1.237e0/3.183e-3 mix/attn=1.896e-3/1.006e-3 attn_max=0.293 attn_ent=1.607 comb_rms=2.985e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.096e-2/7.830e-11/1.566e-1/1.566e-1 gate grad/step/before/after=5.981e-6/5.981e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=9.757e-1 v=4.717e-3 a=1.025e-4 t01 h=8.967e-1 v=1.950e-3 a=4.811e-5 t02 h=1.000e-6 v=1.846e-3 a=2.785e-5 t03 h=1.000e-6 v=1.869e-3 a=9.468e-5 t04 h=1.000e-6 v=1.482e-3 a=7.158e-5 t05 h=1.000e-6 v=6.718e-3 a=1.664e-4 t06 h=1.000e-6 v=4.717e-3 a=1.056e-4 t07 h=1.000e-6 v=1.574e-3 a=2.764e-5 t08 h=1.000e-6 v=4.717e-3 a=1.124e-4 t09 h=1.000e-6 v=1.870e-3 a=4.333e-5 t10 h=1.000e-6 v=1.980e-3 a=4.485e-5 t11 h=1.000e-6 v=2.615e-3 a=2.715e-5 t12 h=1.000e-6 v=2.064e-3 a=4.672e-5 t13 h=1.000e-6 v=4.717e-3 a=6.948e-5 t14 h=1.000e-6 v=1.935e-3 a=3.693e-5[0m
+    [90m[GPU-DEBUG] Step  0: hit=  0/177 (  0.0%) contr=0.886 maxΔ=9.810e-4 rs_cg=0.0e0 iters=6.2 cap=22 damp=0.85 mode=NORMAL conv=OK tps=11.3 max_h=4.513690 inj_rms=3.124e-3 hist_rms=7.749e-4 hist/inj=2.487e-1 mamba_rms=9.929e-1 q/k/v=1.344e0/1.346e0/3.306e-3 mix/attn=1.668e-3/1.003e-3 attn_max=0.266 attn_ent=1.608 comb_rms=3.125e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=5.095e-2/1.998e-11/1.566e-1/1.566e-1 gate grad/step/before/after=-4.024e-7/-4.024e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   140  [92mloss=5.4509[0m  [96mtps=    11.8[0m  [90mtime=1955.7s[0m
+    [93m[auto-save][0m Guardando progreso (chunk 140)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=4430.7480, v=1.375568e0
+    Embedding Moments Checksum: m=3.2842
+    [32m[success][0m Checkpoint 'model_large' actualizado.
+    [93m[VAL] chunk   140  val_loss=5.5390[0m
+    [90m[GPU-DEBUG] Step 10: hit=  0/177 (  0.0%) contr=0.886 maxΔ=9.810e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=11.5 max_h=4.513690 inj_rms=3.124e-3 hist_rms=7.749e-4 hist/inj=2.487e-1 mamba_rms=9.929e-1 q/k/v=1.344e0/1.346e0/3.306e-3 mix/attn=1.668e-3/1.003e-3 attn_max=0.266 attn_ent=1.608 comb_rms=3.125e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=4.134e0/1.621e-9/1.566e-1/1.566e-1 gate grad/step/before/after=3.579e-6/3.579e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   150  [92mloss=5.4192[0m  [96mtps=    11.8[0m  [90mtime=2156.5s[0m
+    [90m[GPU-DEBUG] Step 20: hit=  0/177 (  0.0%) contr=0.886 maxΔ=9.810e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=12.2 max_h=4.513690 inj_rms=3.124e-3 hist_rms=7.749e-4 hist/inj=2.487e-1 mamba_rms=9.929e-1 q/k/v=1.344e0/1.346e0/3.306e-3 mix/attn=1.668e-3/1.003e-3 attn_max=0.266 attn_ent=1.608 comb_rms=3.125e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.644e1/1.037e-8/1.566e-1/1.566e-1 gate grad/step/before/after=5.797e-6/5.797e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   160  [92mloss=5.4217[0m  [96mtps=    11.9[0m  [90mtime=2365.8s[0m
+    [93m[VAL] chunk   160  val_loss=5.3808[0m
+    [90m[GPU-DEBUG] Step 30: hit=  0/177 (  0.0%) contr=0.886 maxΔ=9.810e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=11.6 max_h=4.513690 inj_rms=3.124e-3 hist_rms=7.749e-4 hist/inj=2.487e-1 mamba_rms=9.929e-1 q/k/v=1.344e0/1.346e0/3.306e-3 mix/attn=1.668e-3/1.003e-3 attn_max=0.266 attn_ent=1.608 comb_rms=3.125e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-9.286e0/-3.642e-9/1.566e-1/1.566e-1 gate grad/step/before/after=4.997e-7/4.997e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   170  [92mloss=5.3906[0m  [96mtps=    12.0[0m  [90mtime=2565.1s[0m
+    [90m[GPU-DEBUG] Step 40: hit=  0/177 (  0.0%) contr=0.886 maxΔ=9.810e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=12.2 max_h=4.513690 inj_rms=3.124e-3 hist_rms=7.749e-4 hist/inj=2.487e-1 mamba_rms=9.929e-1 q/k/v=1.344e0/1.346e0/3.306e-3 mix/attn=1.668e-3/1.003e-3 attn_max=0.266 attn_ent=1.608 comb_rms=3.125e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=3.759e1/1.474e-8/1.566e-1/1.566e-1 gate grad/step/before/after=1.885e-6/1.885e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   180  [92mloss=5.3965[0m  [96mtps=    12.0[0m  [90mtime=2774.5s[0m
+    [93m[VAL] chunk   180  val_loss=5.4624[0m
+    [90m[GPU-DEBUG] Step 50: hit=  0/178 (  0.0%) contr=0.847 maxΔ=9.949e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=11.1 max_h=4.680542 inj_rms=3.070e-3 hist_rms=7.615e-4 hist/inj=2.487e-1 mamba_rms=9.965e-1 q/k/v=1.304e0/1.307e0/3.253e-3 mix/attn=1.666e-3/1.003e-3 attn_max=0.279 attn_ent=1.587 comb_rms=3.071e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.427e-1/8.060e-11/1.566e-1/1.566e-1 gate grad/step/before/after=2.295e-7/2.295e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   190  [92mloss=5.3722[0m  [96mtps=    12.0[0m  [90mtime=2940.3s[0m
+    [90m[GPU-DEBUG] Step 60: hit=  0/178 (  0.0%) contr=0.847 maxΔ=9.949e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=12.2 max_h=4.680542 inj_rms=3.070e-3 hist_rms=7.615e-4 hist/inj=2.487e-1 mamba_rms=9.965e-1 q/k/v=1.304e0/1.307e0/3.253e-3 mix/attn=1.666e-3/1.003e-3 attn_max=0.279 attn_ent=1.587 comb_rms=3.071e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=8.776e-1/3.441e-10/1.566e-1/1.566e-1 gate grad/step/before/after=6.486e-6/6.486e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   200  [92mloss=5.3747[0m  [96mtps=    12.0[0m  [90mtime=3150.2s[0m
+    [93m[VAL] chunk   200  val_loss=5.4327[0m
+    [90m[GPU-DEBUG] Step 70: hit=  0/89 (  0.0%) contr=0.842 maxΔ=9.831e-4 rs_cg=0.0e0 iters=6.2 cap=21 damp=0.85 mode=NORMAL conv=OK tps=11.3 max_h=4.504029 inj_rms=3.317e-3 hist_rms=8.188e-4 hist/inj=2.475e-1 mamba_rms=9.887e-1 q/k/v=1.539e0/1.541e0/3.489e-3 mix/attn=1.637e-3/1.003e-3 attn_max=0.262 attn_ent=1.649 comb_rms=3.317e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-4.852e-2/-5.513e-11/1.566e-1/1.566e-1 gate grad/step/before/after=8.949e-6/8.949e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-DEBUG] Step 80: hit=  0/151 (  0.0%) contr=0.894 maxΔ=9.900e-4 rs_cg=0.0e0 iters=6.3 cap=21 damp=0.85 mode=NORMAL conv=OK tps=9.9 max_h=4.554372 inj_rms=3.216e-3 hist_rms=7.979e-4 hist/inj=2.485e-1 mamba_rms=9.985e-1 q/k/v=1.550e0/1.553e0/3.389e-3 mix/attn=1.614e-3/1.003e-3 attn_max=0.266 attn_ent=1.629 comb_rms=3.217e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.052e-1/7.010e-11/1.566e-1/1.566e-1 gate grad/step/before/after=5.013e-6/5.013e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk   220  val_loss=5.2832[0m
+    [90m[GPU-DEBUG] Step 90: hit=  0/23 (  0.0%) contr=0.542 maxΔ=9.972e-4 rs_cg=0.0e0 iters=6.4 cap=21 damp=0.85 mode=NORMAL conv=OK tps=9.3 max_h=4.300672 inj_rms=3.084e-3 hist_rms=7.711e-4 hist/inj=2.500e-1 mamba_rms=9.867e-1 q/k/v=1.241e0/1.243e0/3.267e-3 mix/attn=1.537e-3/1.002e-3 attn_max=0.267 attn_ent=1.605 comb_rms=3.085e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=4.213e-2/1.915e-10/1.566e-1/1.566e-1 gate grad/step/before/after=1.251e-5/1.251e-12/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   230  [92mloss=5.3371[0m  [96mtps=    11.9[0m  [90mtime=3444.0s[0m
+    [90m[GPU-DEBUG] Step  0: hit=  0/25 (  0.0%) contr=0.768 maxΔ=8.895e-4 rs_cg=0.0e0 iters=6.1 cap=21 damp=0.85 mode=NORMAL conv=OK tps=10.3 max_h=4.531453 inj_rms=3.336e-3 hist_rms=8.340e-4 hist/inj=2.500e-1 mamba_rms=1.014e0 q/k/v=1.743e0/1.747e0/3.496e-3 mix/attn=1.713e-3/1.003e-3 attn_max=0.263 attn_ent=1.665 comb_rms=3.335e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.006e-2/8.359e-11/1.566e-1/1.566e-1 gate grad/step/before/after=3.345e-6/3.345e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk   240  val_loss=5.1946[0m
+    [90m[GPU-DEBUG] Step 10: hit=  0/161 (  0.0%) contr=0.848 maxΔ=9.851e-4 rs_cg=0.0e0 iters=6.2 cap=20 damp=0.85 mode=NORMAL conv=OK tps=11.3 max_h=4.647257 inj_rms=3.155e-3 hist_rms=7.886e-4 hist/inj=2.500e-1 mamba_rms=1.001e0 q/k/v=1.583e0/1.586e0/3.330e-3 mix/attn=1.623e-3/1.003e-3 attn_max=0.269 attn_ent=1.627 comb_rms=3.154e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.352e-1/8.452e-11/1.566e-1/1.566e-1 gate grad/step/before/after=5.677e-6/5.677e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-DEBUG] Step 20: hit=  0/137 (  0.0%) contr=0.935 maxΔ=9.875e-4 rs_cg=0.0e0 iters=6.1 cap=20 damp=0.85 mode=NORMAL conv=OK tps=10.4 max_h=4.545730 inj_rms=3.403e-3 hist_rms=8.439e-4 hist/inj=2.484e-1 mamba_rms=1.005e0 q/k/v=1.684e0/1.688e0/3.564e-3 mix/attn=1.692e-3/1.003e-3 attn_max=0.263 attn_ent=1.643 comb_rms=3.402e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.654e-2/1.216e-11/1.566e-1/1.566e-1 gate grad/step/before/after=3.050e-7/3.050e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [93m[VAL] chunk   260  val_loss=5.4643[0m
+    [90m[GPU-DEBUG] Step 30: hit=  0/108 (  0.0%) contr=0.839 maxΔ=9.713e-4 rs_cg=0.0e0 iters=6.0 cap=20 damp=0.85 mode=NORMAL conv=OK tps=9.9 max_h=4.546135 inj_rms=3.099e-3 hist_rms=7.712e-4 hist/inj=2.482e-1 mamba_rms=9.956e-1 q/k/v=1.377e0/1.379e0/3.280e-3 mix/attn=1.652e-3/1.003e-3 attn_max=0.267 attn_ent=1.628 comb_rms=3.099e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-4.720e-2/-4.411e-11/1.566e-1/1.566e-1 gate grad/step/before/after=-2.679e-7/-2.679e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   270  [92mloss=5.2957[0m  [96mtps=    11.9[0m  [90mtime=3920.8s[0m
+    [93m[auto-save][0m Guardando progreso (chunk 270)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=7090.6963, v=2.261895e0
+    Embedding Moments Checksum: m=4.8377
+    [32m[success][0m Checkpoint 'model_large' actualizado.
+    [90m[GPU-DEBUG] Step 40: hit=  0/184 (  0.0%) contr=0.840 maxΔ=9.839e-4 rs_cg=0.0e0 iters=6.1 cap=20 damp=0.85 mode=NORMAL conv=OK tps=11.0 max_h=4.615920 inj_rms=3.349e-3 hist_rms=8.337e-4 hist/inj=2.488e-1 mamba_rms=1.002e0 q/k/v=1.679e0/1.682e0/3.513e-3 mix/attn=1.658e-3/1.003e-3 attn_max=0.265 attn_ent=1.640 comb_rms=3.349e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-7.737e-2/-4.228e-11/1.566e-1/1.566e-1 gate grad/step/before/after=-5.222e-7/-5.222e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   280  [92mloss=5.2990[0m  [96mtps=    11.8[0m  [90mtime=4098.0s[0m
+    [93m[VAL] chunk   280  val_loss=5.4199[0m
+    [90m[GPU-DEBUG] Step 50: hit=  0/184 (  0.0%) contr=0.840 maxΔ=9.839e-4 rs_cg=0.0e0 iters=6.1 cap=20 damp=0.85 mode=NORMAL conv=OK tps=11.6 max_h=4.615920 inj_rms=3.349e-3 hist_rms=8.337e-4 hist/inj=2.488e-1 mamba_rms=1.002e0 q/k/v=1.679e0/1.682e0/3.513e-3 mix/attn=1.658e-3/1.003e-3 attn_max=0.265 attn_ent=1.640 comb_rms=3.349e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-2.443e0/-9.579e-10/1.566e-1/1.566e-1 gate grad/step/before/after=3.325e-6/3.325e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   290  [92mloss=5.2816[0m  [96mtps=    11.9[0m  [90mtime=4296.9s[0m
+    [90m[GPU-DEBUG] Step 60: hit=  0/184 (  0.0%) contr=0.840 maxΔ=9.839e-4 rs_cg=0.0e0 iters=6.1 cap=20 damp=0.85 mode=NORMAL conv=OK tps=12.2 max_h=4.615920 inj_rms=3.349e-3 hist_rms=8.337e-4 hist/inj=2.488e-1 mamba_rms=1.002e0 q/k/v=1.679e0/1.682e0/3.513e-3 mix/attn=1.658e-3/1.003e-3 attn_max=0.265 attn_ent=1.640 comb_rms=3.349e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-1.334e1/-5.230e-9/1.566e-1/1.566e-1 gate grad/step/before/after=1.332e-4/1.332e-11/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   300  [92mloss=5.2851[0m  [96mtps=    11.9[0m  [90mtime=4507.0s[0m
+    [93m[VAL] chunk   300  val_loss=5.4417[0m
+    [90m[GPU-DEBUG] Step 70: hit=  0/7 (  0.0%) contr=0.379 maxΔ=6.552e-4 rs_cg=0.0e0 iters=5.9 cap=20 damp=0.85 mode=NORMAL conv=OK tps=11.1 max_h=4.024219 inj_rms=3.836e-3 hist_rms=8.044e-4 hist/inj=2.173e-1 mamba_rms=9.913e-1 q/k/v=9.621e-1/9.641e-1/3.978e-3 mix/attn=2.687e-3/1.009e-3 attn_max=0.287 attn_ent=1.604 comb_rms=3.831e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-5.428e-3/-9.047e-11/1.566e-1/1.566e-1 gate grad/step/before/after=1.953e-5/1.953e-12/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.083e0 v=4.727e-3 a=1.032e-4 t01 h=9.935e-1 v=2.881e-3 a=1.358e-4 t02 h=1.000e-6 v=4.421e-3 a=1.821e-4 t03 h=1.000e-6 v=2.572e-3 a=8.163e-5 t04 h=1.000e-6 v=4.538e-3 a=1.523e-4 t05 h=1.000e-6 v=5.652e-3 a=1.917e-4 t06 h=1.000e-6 v=2.057e-3 a=3.033e-5[0m
+    [90m[GPU-DEBUG] Step 80: hit=  0/7 (  0.0%) contr=0.406 maxΔ=8.483e-4 rs_cg=0.0e0 iters=5.9 cap=20 damp=0.85 mode=NORMAL conv=OK tps=7.5 max_h=4.027699 inj_rms=3.839e-3 hist_rms=8.052e-4 hist/inj=2.173e-1 mamba_rms=9.914e-1 q/k/v=9.666e-1/9.689e-1/3.981e-3 mix/attn=2.626e-3/1.009e-3 attn_max=0.285 attn_ent=1.608 comb_rms=3.834e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-4.125e-3/-6.875e-11/1.566e-1/1.566e-1 gate grad/step/before/after=1.566e-5/1.566e-12/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.083e0 v=4.727e-3 a=1.032e-4 t01 h=9.937e-1 v=2.887e-3 a=1.242e-4 t02 h=1.000e-6 v=4.424e-3 a=1.899e-4 t03 h=1.000e-6 v=2.573e-3 a=8.152e-5 t04 h=1.000e-6 v=4.545e-3 a=1.449e-4 t05 h=1.000e-6 v=5.656e-3 a=1.913e-4 t06 h=1.000e-6 v=2.059e-3 a=3.087e-5[0m
+    [93m[VAL] chunk   320  val_loss=5.4097[0m
+    [90m[GPU-DEBUG] Step 90: hit=  0/118 (  0.0%) contr=0.962 maxΔ=9.906e-4 rs_cg=0.0e0 iters=6.3 cap=20 damp=0.85 mode=NORMAL conv=OK tps=9.5 max_h=4.648972 inj_rms=3.309e-3 hist_rms=8.181e-4 hist/inj=2.481e-1 mamba_rms=1.001e0 q/k/v=1.519e0/1.522e0/3.477e-3 mix/attn=1.601e-3/1.003e-3 attn_max=0.271 attn_ent=1.627 comb_rms=3.309e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.398e-1/1.195e-10/1.566e-1/1.566e-1 gate grad/step/before/after=-3.024e-6/-3.024e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-DEBUG] Step  0: hit=  0/7 (  0.0%) contr=0.511 maxΔ=9.006e-4 rs_cg=0.0e0 iters=5.6 cap=20 damp=0.85 mode=NORMAL conv=OK tps=10.7 max_h=3.830936 inj_rms=3.902e-3 hist_rms=8.208e-4 hist/inj=2.173e-1 mamba_rms=9.924e-1 q/k/v=1.048e0/1.051e0/4.040e-3 mix/attn=2.095e-3/1.005e-3 attn_max=0.300 attn_ent=1.547 comb_rms=3.896e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-1.822e-2/-3.036e-10/1.566e-1/1.566e-1 gate grad/step/before/after=4.462e-6/4.462e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.111e0 v=4.728e-3 a=1.032e-4 t01 h=1.005e0 v=2.903e-3 a=1.046e-4 t02 h=1.000e-6 v=4.435e-3 a=2.036e-4 t03 h=1.000e-6 v=2.199e-3 a=1.521e-5 t04 h=1.000e-6 v=4.563e-3 a=7.363e-5 t05 h=1.000e-6 v=5.669e-3 a=1.936e-4 t06 h=1.000e-6 v=2.814e-3 a=5.498e-5[0m
+    [93m[VAL] chunk   340  val_loss=5.4211[0m
+    [90m[GPU-DEBUG] Step 10: hit=  0/7 (  0.0%) contr=0.503 maxΔ=6.596e-4 rs_cg=0.0e0 iters=5.9 cap=20 damp=0.85 mode=NORMAL conv=OK tps=7.8 max_h=4.044621 inj_rms=3.907e-3 hist_rms=8.223e-4 hist/inj=2.173e-1 mamba_rms=9.902e-1 q/k/v=9.841e-1/9.875e-1/4.046e-3 mix/attn=2.365e-3/1.007e-3 attn_max=0.288 attn_ent=1.596 comb_rms=3.903e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.102e-2/3.504e-10/1.566e-1/1.566e-1 gate grad/step/before/after=6.877e-7/6.877e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.114e0 v=4.729e-3 a=1.031e-4 t01 h=1.007e0 v=2.913e-3 a=9.952e-5 t02 h=1.000e-6 v=4.442e-3 a=2.089e-4 t03 h=1.000e-6 v=2.199e-3 a=3.805e-5 t04 h=1.000e-6 v=4.573e-3 a=1.363e-4 t05 h=1.000e-6 v=5.676e-3 a=1.885e-4 t06 h=1.000e-6 v=2.821e-3 a=6.281e-5[0m
+    [90m[GPU-DEBUG] Step 20: hit=  0/7 (  0.0%) contr=0.476 maxΔ=8.176e-4 rs_cg=0.0e0 iters=5.9 cap=20 damp=0.85 mode=NORMAL conv=OK tps=8.3 max_h=4.174449 inj_rms=3.919e-3 hist_rms=8.251e-4 hist/inj=2.173e-1 mamba_rms=9.864e-1 q/k/v=1.106e0/1.109e0/4.056e-3 mix/attn=2.501e-3/1.008e-3 attn_max=0.286 attn_ent=1.604 comb_rms=3.914e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=3.324e-2/5.540e-10/1.566e-1/1.566e-1 gate grad/step/before/after=1.306e-5/1.306e-12/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.116e0 v=4.729e-3 a=1.030e-4 t01 h=1.007e0 v=2.919e-3 a=9.766e-5 t02 h=1.000e-6 v=4.451e-3 a=2.131e-4 t03 h=1.000e-6 v=2.224e-3 a=4.955e-5 t04 h=1.000e-6 v=4.585e-3 a=1.583e-4 t05 h=1.000e-6 v=5.687e-3 a=1.910e-4 t06 h=1.000e-6 v=2.835e-3 a=6.814e-5[0m
+    [93m[VAL] chunk   360  val_loss=4.9856[0m
+    [90m[GPU-DEBUG] Step 30: hit=  0/7 (  0.0%) contr=0.327 maxΔ=6.634e-4 rs_cg=0.0e0 iters=5.9 cap=20 damp=0.85 mode=NORMAL conv=OK tps=9.6 max_h=4.006445 inj_rms=3.982e-3 hist_rms=8.410e-4 hist/inj=2.173e-1 mamba_rms=9.932e-1 q/k/v=9.811e-1/9.849e-1/4.115e-3 mix/attn=2.499e-3/1.007e-3 attn_max=0.284 attn_ent=1.605 comb_rms=3.978e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=2.838e-2/4.730e-10/1.566e-1/1.566e-1 gate grad/step/before/after=-2.396e-6/-2.396e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.113e0 v=4.730e-3 a=1.030e-4 t01 h=1.007e0 v=2.925e-3 a=9.719e-5 t02 h=1.000e-6 v=4.461e-3 a=2.162e-4 t03 h=1.000e-6 v=2.617e-3 a=6.937e-5 t04 h=1.000e-6 v=4.598e-3 a=1.308e-4 t05 h=1.000e-6 v=5.697e-3 a=1.859e-4 t06 h=1.000e-6 v=2.849e-3 a=7.721e-5[0m
+    [90m[GPU-DEBUG] Step 40: hit=  0/7 (  0.0%) contr=0.299 maxΔ=9.377e-4 rs_cg=0.0e0 iters=5.6 cap=20 damp=0.85 mode=NORMAL conv=OK tps=6.8 max_h=3.842958 inj_rms=3.820e-3 hist_rms=8.002e-4 hist/inj=2.173e-1 mamba_rms=9.920e-1 q/k/v=1.074e0/1.077e0/3.965e-3 mix/attn=2.130e-3/1.005e-3 attn_max=0.302 attn_ent=1.552 comb_rms=3.814e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=-8.765e-3/-1.461e-10/1.566e-1/1.566e-1 gate grad/step/before/after=1.238e-5/1.238e-12/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [90m[GPU-TOKENS] t00 h=1.084e0 v=4.730e-3 a=1.029e-4 t01 h=9.954e-1 v=2.933e-3 a=9.812e-5 t02 h=1.000e-6 v=4.473e-3 a=2.187e-4 t03 h=1.000e-6 v=2.204e-3 a=1.564e-5 t04 h=1.000e-6 v=4.612e-3 a=1.079e-4 t05 h=1.000e-6 v=5.708e-3 a=1.933e-4 t06 h=1.000e-6 v=2.077e-3 a=3.564e-5[0m
+    [93m[VAL] chunk   380  val_loss=4.8857[0m
+    [90m[GPU-DEBUG] Step 50: hit=  0/197 (  0.0%) contr=1.120 maxΔ=9.991e-4 rs_cg=0.0e0 iters=6.2 cap=20 damp=0.85 mode=NORMAL conv=OK tps=10.7 max_h=4.708317 inj_rms=3.181e-3 hist_rms=7.896e-4 hist/inj=2.488e-1 mamba_rms=9.960e-1 q/k/v=1.372e0/1.375e0/3.356e-3 mix/attn=1.670e-3/1.003e-3 attn_max=0.276 attn_ent=1.590 comb_rms=3.181e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=5.382e-1/2.110e-10/1.566e-1/1.566e-1 gate grad/step/before/after=-6.047e-7/-6.047e-14/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   390  [92mloss=5.2263[0m  [96mtps=    11.8[0m  [90mtime=4869.8s[0m
+    [90m[GPU-DEBUG] Step 60: hit=  0/204 (  0.0%) contr=0.942 maxΔ=9.965e-4 rs_cg=0.0e0 iters=6.1 cap=20 damp=0.85 mode=NORMAL conv=OK tps=11.4 max_h=4.669962 inj_rms=3.293e-3 hist_rms=8.191e-4 hist/inj=2.489e-1 mamba_rms=1.005e0 q/k/v=1.593e0/1.597e0/3.460e-3 mix/attn=1.640e-3/1.003e-3 attn_max=0.264 attn_ent=1.637 comb_rms=3.293e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=9.704e-2/4.780e-11/1.566e-1/1.566e-1 gate grad/step/before/after=1.132e-6/1.132e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   400  [92mloss=5.2274[0m  [96mtps=    11.8[0m  [90mtime=5007.4s[0m
+    [93m[VAL] chunk   400  val_loss=5.4958[0m
+    [90m[GPU-DEBUG] Step 70: hit=  0/61 (  0.0%) contr=0.796 maxΔ=9.884e-4 rs_cg=0.0e0 iters=6.1 cap=20 damp=0.85 mode=NORMAL conv=OK tps=10.5 max_h=4.601123 inj_rms=3.195e-3 hist_rms=7.834e-4 hist/inj=2.463e-1 mamba_rms=9.840e-1 q/k/v=1.549e0/1.551e0/3.371e-3 mix/attn=1.657e-3/1.003e-3 attn_max=0.257 attn_ent=1.647 comb_rms=3.195e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=1.722e-1/2.871e-10/1.566e-1/1.566e-1 gate grad/step/before/after=3.300e-6/3.300e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+    [95m[progress][0m chunk   410  [92mloss=5.2169[0m  [96mtps=    11.8[0m  [90mtime=5119.3s[0m
+    [90m[GPU-DEBUG] Step 80: hit=  0/190 (  0.0%) contr=1.033 maxΔ=9.973e-4 rs_cg=0.0e0 iters=6.2 cap=20 damp=0.85 mode=NORMAL conv=OK tps=11.9 max_h=4.909572 inj_rms=3.139e-3 hist_rms=7.798e-4 hist/inj=2.488e-1 mamba_rms=9.916e-1 q/k/v=1.398e0/1.401e0/3.318e-3 mix/attn=1.667e-3/1.003e-3 attn_max=0.272 attn_ent=1.605 comb_rms=3.139e-3 hist=[1.566e-1,-8.543e-3,-7.673e-3] anchor=[-7.238e-4,-7.233e-4] floors=[0.000e0,0.000e0] flags=[1,0,0,0,0] shared=OK total=4096[0m
+    [90m[GPU-HIST] W_hist grad/step/before/after=5.181e-2/2.032e-11/1.566e-1/1.566e-1 gate grad/step/before/after=1.273e-6/1.273e-13/-1.274e0/-1.274e0 lr=1.000e-5 gscale=1.000e-2 wd=1.000e-2[0m
+radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a soft recovery.
