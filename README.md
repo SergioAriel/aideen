@@ -69,7 +69,7 @@ cargo run --release --features wgpu -p aideen-training --bin chat -- --model mod
 |----------|---------|-------------|
 | `AIDEEN_CTX_LEN` | 256 | Context window length (tokens) |
 | `AIDEEN_BATCH_SIZE` | 1 | Sequences per gradient step |
-| `AIDEEN_DEQ_HIST_GATED` | 1 | Enable history-gated mode |
+| `AIDEEN_DEQ_MODE` | `hist_gated` | DEQ solve mode: `hist_gated`, `no_mamba`, `init_mamba`, `fixed_mamba`, `deq_only` |
 
 ## Project History
 

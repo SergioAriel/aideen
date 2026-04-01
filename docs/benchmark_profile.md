@@ -32,7 +32,7 @@ cargo run --release --features wgpu -p aideen-training --bin train -- \
 **Resultados recientes**
 - `ctx=512`, `batch=4`, `B19=1`, history default: `tps_epoch = 4123.0`
 - `ctx=512`, `batch=8`, `B19=1`, history default: `tps_epoch = 5197.8`
-- mismo perfil con `AIDEEN_DEQ_HIST_GATED=0`: medir aparte si se busca techo absoluto
+- mismo perfil con `AIDEEN_DEQ_MODE=no_mamba`: medir aparte si se busca techo absoluto
 
 ## Perfil techo (comparativo, no default del modelo)
 Objetivo: buscar el máximo throughput disponible del sistema, aceptando desactivar history.
@@ -41,7 +41,7 @@ Objetivo: buscar el máximo throughput disponible del sistema, aceptando desacti
 ```
 cd /Users/sergiosolis/Programacion/AIDEEN && \
 AIDEEN_BATCH_SIZE=8 AIDEEN_DEBUG_SAMPLE=0 AIDEEN_LM_FUSED_B19=1 \
-AIDEEN_DEQ_HIST_GATED=0 AIDEEN_LOSS_READBACK_EVERY=0 AIDEEN_TPS_SYNC_EVERY=0 \
+AIDEEN_DEQ_MODE=no_mamba AIDEEN_LOSS_READBACK_EVERY=0 AIDEEN_TPS_SYNC_EVERY=0 \
 AIDEEN_VAL_EVERY=0 AIDEEN_PROGRESS_EVERY=0 AIDEEN_MAX_CHUNKS=20 \
 cargo run --release --features wgpu -p aideen-training --bin train -- \
   --file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt \

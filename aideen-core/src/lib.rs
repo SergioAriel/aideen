@@ -12,6 +12,7 @@ pub mod block_backend;
 pub mod capabilities;
 pub mod compute;
 pub mod control;
+pub mod deq_mode;
 pub mod doc_memory;
 pub mod ethics;
 pub mod integrator;

@@ -11,6 +11,7 @@
 //!   ⑧ renormalize_weights() (spectral norm)
 
 use aideen_core::{
+    deq_mode::DeqSolveMode,
     reasoning::Reasoning,
     state::{ArchitectureConfig, HSlots},
 };
@@ -342,14 +343,7 @@ impl Trainer {
         {
             return false;
         }
-        if std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok()
-        {
-            return false;
-        }
-        true
+        DeqSolveMode::from_env().is_clean_core()
     }
 
     fn default_hist_min_iters() -> u32 {

@@ -26,7 +26,7 @@ cargo build --release --bin stress_test --features wgpu 2>&1 | tail -3
 for DR in 512; do
     echo ""
     echo "--- d_r=$DR ---"
-    AIDEEN_DEQ_HIST_GATED=1 \
+    AIDEEN_DEQ_MODE=hist_gated \
     AIDEEN_STRESS_DR=$DR \
     AIDEEN_STRESS_ITERS=$ITERS \
     AIDEEN_STRESS_SEED=$SEED \

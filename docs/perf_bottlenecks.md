@@ -122,7 +122,7 @@ Cada una requiere un perfil distinto. No comparar números entre perfiles.
   - `tps_epoch = 4123.0`
 - perfil estable, `batch=8`, `ctx=512`, `B19=1`, history default:
   - `tps_epoch = 5197.8`
-- techo comparativo, `batch=8`, `ctx=512`, `B19=1`, `AIDEEN_DEQ_HIST_GATED=0`:
+- techo comparativo, `batch=8`, `ctx=512`, `B19=1`, `AIDEEN_DEQ_MODE=no_mamba`:
   - `tps_epoch = 5129.0`
 
 **Lectura**

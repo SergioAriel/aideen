@@ -71,7 +71,7 @@ env \
   AIDEEN_BATCH_SIZE=8 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_LM_FUSED_B19=1 \
-  AIDEEN_DEQ_HIST_GATED=1 \
+  AIDEEN_DEQ_MODE=hist_gated \
   AIDEEN_LOSS_READBACK_EVERY=0 \
   AIDEEN_TPS_SYNC_EVERY=0 \
   AIDEEN_VAL_EVERY=0 \
@@ -91,8 +91,9 @@ env \
   - mejor ocupación que `256` en este régimen
 - `AIDEEN_LM_FUSED_B19=1`
   - usar path fused rápido del LM
-- `AIDEEN_DEQ_HIST_GATED=1`
-  - mantener history activa en el sistema real
+- `AIDEEN_DEQ_MODE=hist_gated`
+  - history entra al solve como contexto fijo/gated del token
+  - es el modo serio actual para training
 - `AIDEEN_LOSS_READBACK_EVERY=0`
   - no bloquear training por loss readbacks intra-step
 - `AIDEEN_TPS_SYNC_EVERY=0`
@@ -197,7 +198,7 @@ env \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_LM_FUSED_B19=1 \
-  AIDEEN_DEQ_HIST_GATED=1 \
+  AIDEEN_DEQ_MODE=hist_gated \
   AIDEEN_LOSS_READBACK_EVERY=20 \
   AIDEEN_TPS_SYNC_EVERY=20 \
   AIDEEN_VAL_EVERY=200 \
@@ -452,7 +453,7 @@ env \
   AIDEEN_BATCH_SIZE=8 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_LM_FUSED_B19=1 \
-  AIDEEN_DEQ_HIST_GATED=1 \
+  AIDEEN_DEQ_MODE=hist_gated \
   AIDEEN_LOSS_READBACK_EVERY=0 \
   AIDEEN_TPS_SYNC_EVERY=0 \
   AIDEEN_VAL_EVERY=0 \

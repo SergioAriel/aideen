@@ -3,6 +3,7 @@ use aideen_block::deq_bridge::{
     aw_wk_byte_off, aw_wo_byte_off, aw_wout_byte_off, aw_wv_byte_off, aw_wx_byte_off,
     DeqComputeShape, RustDeqBridge,
 };
+use aideen_core::deq_mode::DeqSolveMode;
 use aideen_core::state::ArchitectureConfig;
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
@@ -129,7 +130,7 @@ pub struct GpuDeqBackend {
     // --- Hot-path cached env vars (parsed once at construction, not per training step) ---
     // Avoids ~52 syscalls/step from std::env::var calls in apply_fused_deq_update and adjoint.
     pub cached_residual_alpha: f32,
-    cfg_hist_gated: bool,
+    cfg_deq_mode: DeqSolveMode,
     cfg_hist_selective: bool,
     cfg_slot_anchor_zero: bool,
     cfg_rms_floor: f32,
@@ -312,36 +313,8 @@ impl GpuDeqBackend {
             .and_then(|v| v.trim().parse::<u32>().ok())
     }
 
-    fn residual_alpha_from_env() -> f32 {
-        // Stage modes via sentinel passed to WGSL:
-        //  -2.0 => DEQ-only (no attention, no mamba)
-        //  -1.0 => attention ON, mamba OFF
-        //  -0.75 => attention ON, mamba history only as h0 init
-        //  -0.5 => attention ON, gated per-slot historical context
-        //  -0.25 => attention ON, fixed mamba bias per token
-        if std::env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1") {
-            return -2.0;
-        }
-        if std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1") {
-            return -1.0;
-        }
-        if std::env::var("AIDEEN_DEQ_INIT_MAMBA").ok().as_deref() == Some("1") {
-            return -0.75;
-        }
-        if std::env::var("AIDEEN_DEQ_FIXED_MAMBA").ok().as_deref() == Some("1") {
-            return -0.25;
-        }
-
-        // hist_gated (-0.5) is the default mode. Override only if another mode is set.
-        let alpha = std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or_else(|| {
-                // Default now is the clean DEQ core: no slot-attention, no history in the solve.
-                -2.0
-            });
-        alpha
+    fn deq_mode_from_env() -> DeqSolveMode {
+        DeqSolveMode::from_env()
     }
 
     /// Inicializa la conexión con Apple Metal / Vulkan y compila los Shaders WGSL del DEQ
@@ -1722,8 +1695,8 @@ impl GpuDeqBackend {
             }],
         });
         // Parse all hot-path env vars once at construction.
-        let cached_residual_alpha = Self::residual_alpha_from_env();
-        let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
+        let cfg_deq_mode = Self::deq_mode_from_env();
+        let cached_residual_alpha = cfg_deq_mode.residual_alpha();
         let cfg_hist_selective = Self::hist_selective_from_env();
         let bool_flag = |s: &str| -> Option<bool> {
             std::env::var(s).ok().map(|v| {
@@ -1860,7 +1833,7 @@ impl GpuDeqBackend {
             anderson_store_pipeline,
             anderson_mix_pipeline,
             cached_residual_alpha,
-            cfg_hist_gated,
+            cfg_deq_mode,
             cfg_hist_selective,
             cfg_slot_anchor_zero,
             cfg_rms_floor,
@@ -3172,9 +3145,8 @@ impl GpuDeqBackend {
         );
         // Use cached config flags — no env::var syscalls in hot path.
         let profile_fused = self.cfg_fused_profile;
-        // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
-        let deq_only = self.cached_residual_alpha <= -1.5;
-        let hist_gated = self.cfg_hist_gated && !deq_only;
+        let deq_only = self.cfg_deq_mode.is_clean_core();
+        let hist_gated = self.cfg_deq_mode.history_is_gated();
         let hist_selective = self.cfg_hist_selective;
         let hist_internal_probe = self.cfg_hist_internal_probe;
         if profile_fused {
