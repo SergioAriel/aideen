@@ -20,6 +20,34 @@ const DEFAULT_TOP_K: usize = 40;
 const DEFAULT_REP_PENALTY: f32 = 1.1;
 const DEFAULT_PROMPT: &str = "La memoria temporal permite";
 
+fn rms(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let mean_sq = xs.iter().map(|x| x * x).sum::<f32>() / xs.len() as f32;
+    mean_sq.sqrt()
+}
+
+fn mean(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f32>() / xs.len() as f32
+}
+
+fn min_max(xs: &[f32]) -> (f32, f32) {
+    if xs.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for &x in xs {
+        mn = mn.min(x);
+        mx = mx.max(x);
+    }
+    (mn, mx)
+}
+
 fn read_prompt_from_stdin() -> io::Result<String> {
     let mut buf = String::new();
     io::stdin().read_to_string(&mut buf)?;
@@ -45,6 +73,7 @@ fn main() {
     let mut top_k = DEFAULT_TOP_K;
     let mut rep_penalty = DEFAULT_REP_PENALTY;
     let mut stream = false;
+    let mut stats = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -99,6 +128,7 @@ fn main() {
                 }
             }
             "--stream" => stream = true,
+            "--stats" => stats = true,
             _ => {}
         }
         i += 1;
@@ -140,6 +170,81 @@ fn main() {
         })
     };
     let load_elapsed = load_start.elapsed().as_secs_f32();
+
+    if stats {
+        let emb = trainer.tokenizer.embeddings.as_slice();
+        let lm_w = trainer.lm_head.w.as_slice();
+        let lm_b = trainer.lm_head.b.as_slice();
+        let lm_g = trainer.lm_head.g.as_slice();
+        let (
+            w_hist_shared,
+            hist_slot_scale,
+            hist_slot_bias,
+            hist_gate_logit,
+            slot_anchor,
+            _w_delta,
+            _b_delta,
+            _w_gate_hist,
+            _w_forget,
+            _b_forget,
+        ) = trainer.reasoning.history_params_gpu_layout();
+        let (gate_min, gate_max) = min_max(&hist_gate_logit);
+        let (slot_anchor_min, slot_anchor_max) = min_max(&slot_anchor);
+        println!("--- STATS ---");
+        println!(
+            "  embeddings  : rms={:.5} mean={:.5} n={}",
+            rms(emb),
+            mean(emb),
+            emb.len()
+        );
+        println!(
+            "  lm_w        : rms={:.5} mean={:.5} n={}",
+            rms(lm_w),
+            mean(lm_w),
+            lm_w.len()
+        );
+        println!(
+            "  lm_b        : rms={:.5} mean={:.5} n={}",
+            rms(lm_b),
+            mean(lm_b),
+            lm_b.len()
+        );
+        println!(
+            "  lm_g        : rms={:.5} mean={:.5} min={:.5} max={:.5}",
+            rms(lm_g),
+            mean(lm_g),
+            min_max(lm_g).0,
+            min_max(lm_g).1
+        );
+        println!(
+            "  hist_shared : rms={:.5} mean={:.5}",
+            rms(&w_hist_shared),
+            mean(&w_hist_shared)
+        );
+        println!(
+            "  hist_scale  : rms={:.5} mean={:.5}",
+            rms(&hist_slot_scale),
+            mean(&hist_slot_scale)
+        );
+        println!(
+            "  hist_bias   : rms={:.5} mean={:.5}",
+            rms(&hist_slot_bias),
+            mean(&hist_slot_bias)
+        );
+        println!(
+            "  hist_gate   : mean={:.5} min={:.5} max={:.5}",
+            mean(&hist_gate_logit),
+            gate_min,
+            gate_max
+        );
+        println!(
+            "  slot_anchor : rms={:.5} mean={:.5} min={:.5} max={:.5}",
+            rms(&slot_anchor),
+            mean(&slot_anchor),
+            slot_anchor_min,
+            slot_anchor_max
+        );
+    }
 
     let prompt_tokens = trainer.tokenizer.encode(&prompt);
     println!("  prompt tokens: {}", prompt_tokens.len());

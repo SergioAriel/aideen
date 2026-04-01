@@ -146,6 +146,16 @@ pub struct Trainer {
 }
 
 impl Trainer {
+    fn visible_loss_text(&self, fallback: Option<f32>) -> String {
+        if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
+            format!("{:.4}", self.last_gpu_loss)
+        } else if let Some(v) = fallback.filter(|v| v.is_finite() && *v > 0.0) {
+            format!("{:.4}", v)
+        } else {
+            "n/a".to_string()
+        }
+    }
+
     fn env_flag(name: &str) -> bool {
         std::env::var(name)
             .ok()
@@ -1944,6 +1954,7 @@ impl Trainer {
             let mut num_chunks = 0;
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
+            let mut total_tokens = 0usize;
             let mut last_progress_chunk_logged = 0usize;
             let ctx_len = self.config.ctx_len.max(1);
             let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
@@ -1987,6 +1998,7 @@ impl Trainer {
                 }
                 num_chunks += 1;
                 interval_tokens += batch_ctx.len();
+                total_tokens += batch_ctx.len();
                 #[cfg(feature = "wgpu")]
                 if self.cfg_tps_sync_every != 0
                     && num_chunks % self.cfg_tps_sync_every == 0 {
@@ -2002,21 +2014,14 @@ impl Trainer {
                     && num_chunks != last_progress_chunk_logged
                 {
                     let interval_elapsed = interval_start.elapsed().as_secs_f32();
-                    let instant_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
-
-                    #[cfg(feature = "wgpu")]
-                    let current_loss_disp = if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0
-                    {
-                        self.last_gpu_loss
-                    } else {
-                        epoch_loss / num_chunks as f32
-                    };
-                    #[cfg(not(feature = "wgpu"))]
-                    let current_loss_disp = epoch_loss / num_chunks as f32;
+                    let window_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
+                    let epoch_elapsed = t_start.elapsed().as_secs_f32();
+                    let epoch_tps = total_tokens as f32 / epoch_elapsed.max(1e-9);
+                    let current_loss_disp = self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
 
                     println!(
-                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps_avg={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
-                        num_chunks, current_loss_disp, instant_tps, t_start.elapsed().as_secs_f32()
+                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
+                        num_chunks, current_loss_disp, window_tps, epoch_tps, epoch_elapsed
                     );
 
                     // Reset interval timers
@@ -2060,14 +2065,7 @@ impl Trainer {
 
             if epoch % log_every == 0 {
                 // GPU already idle (poll above) — read_cached_loss is near-instant here
-                #[cfg(feature = "wgpu")]
-                let display_loss = if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
-                    self.last_gpu_loss
-                } else {
-                    total_loss
-                };
-                #[cfg(not(feature = "wgpu"))]
-                let display_loss = total_loss;
+                let display_loss = self.visible_loss_text(Some(total_loss));
                 let mut gpu_suffix = String::new();
                 #[cfg(feature = "wgpu")]
                 if let Some(gpu) = self.gpu_deq.as_ref() {
@@ -2077,7 +2075,7 @@ impl Trainer {
                     }
                 }
                 println!(
-                    "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps={:>8.1}  time={:.2}s{}",
+                    "  epoch {epoch:>4}/{epochs}  loss={}  lr={:.6}  tps={:>8.1}  time={:.2}s{}",
                     display_loss, current_lr, tps, elapsed, gpu_suffix
                 );
             }
@@ -2653,6 +2651,8 @@ impl Trainer {
             let mut epoch_loss = 0.0f32;
             let mut num_chunks = 0usize;
             let mut total_tokens = 0usize;
+            let mut interval_start = std::time::Instant::now();
+            let mut interval_tokens = 0usize;
             let mut last_progress_chunk_logged = 0usize;
             // Buffer de tokens no consumidos del chunk anterior (para ventana solapada).
             let mut carry: Vec<u32> = Vec::with_capacity(stride);
@@ -2840,15 +2840,17 @@ impl Trainer {
                     && num_chunks != last_progress_chunk_logged
                 {
                     let elapsed = t_start.elapsed().as_secs_f32();
-                    let tps = total_tokens as f32 / elapsed.max(1e-9);
-                    // Métrica principal: promedio acumulado real de train (no cache GPU).
-                    let current_loss = epoch_loss / num_chunks as f32;
+                    let tps_run = total_tokens as f32 / elapsed.max(1e-9);
+                    let tps_win = interval_tokens as f32 / interval_start.elapsed().as_secs_f32().max(1e-9);
+                    let current_loss = self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
 
                     println!(
-                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={:.4}\x1b[0m  \x1b[96mtps_avg={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
-                        num_chunks, current_loss, tps, elapsed
+                        "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
+                        num_chunks, current_loss, tps_win, tps_run, elapsed
                     );
                     last_progress_chunk_logged = num_chunks;
+                    interval_start = std::time::Instant::now();
+                    interval_tokens = 0;
 
                     // Auto-save intra-epoch: solo por tiempo (cada 30 min).
                     // El guardado por `save_every` ya se aplica por epoch al final del loop.
@@ -2912,21 +2914,14 @@ impl Trainer {
                     }
                 }
 
-                #[cfg(feature = "wgpu")]
-                let display_loss = if num_chunks > 0 {
-                    epoch_loss / num_chunks as f32
+                let display_loss = self.visible_loss_text(if num_chunks > 0 {
+                    Some(epoch_loss / num_chunks as f32)
                 } else {
-                    0.0
-                };
-                #[cfg(not(feature = "wgpu"))]
-                let display_loss = if num_chunks > 0 {
-                    epoch_loss / num_chunks as f32
-                } else {
-                    0.0
-                };
+                    None
+                });
 
                 println!(
-                    "  epoch {epoch:>4}/{epochs}  loss={:.4}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
+                    "  epoch {epoch:>4}/{epochs}  loss={}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
                     display_loss, current_lr, tps, elapsed, total_tokens, gpu_stats
                 );
             }
