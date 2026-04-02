@@ -3203,6 +3203,12 @@ impl GpuDeqBackend {
         let d = self.config.d_r as u32;
         let n = batch_size * seq_len * self.config.h_slots as u32;
         let hs = self.config.h_slots as u32;
+        // Compute safe 2D dispatch grid for kernels dispatched with `n` workgroups in X.
+        // grid_stride_x is written into the uniform so shaders reconstruct the linear entry:
+        //   entry = wid.y * params.grid_stride_x + wid.x
+        let (n_x, n_y, _, n_stride) = dispatch_1d(n);
+        let tbptt_n = batch_size * hs;
+        let (tbptt_x, tbptt_y, _, _tbptt_stride) = dispatch_1d(tbptt_n);
         // T1-A: Batch all compute stages into a single command encoder for the normal
         // (non-profile, non-probe) training path, eliminating ~20 queue.submit() calls/step.
         if !profile_fused && !hist_internal_probe {
@@ -3219,6 +3225,14 @@ impl GpuDeqBackend {
             // because stage2/stage3 fully overwrite them before any read.
             enc.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
             enc.clear_buffer(&self.fused_hist_delta_buf, 0, None);
+            // Write uniform with grid_stride_x = n_x so n-indexed kernels can reconstruct
+            // the linear entry from a 2D dispatch: entry = wid.y * grid_stride_x + wid.x.
+            let params_with_stride = UpdateUniforms { grid_stride_x: n_stride, ..params };
+            self.queue.write_buffer(
+                &self.fused_update_params_buf,
+                0,
+                bytemuck::bytes_of(&params_with_stride),
+            );
             // add_pass!: append one compute pass (one pipeline) to `enc`.
             // Macro expansion is inline so `enc` / `self` are captured correctly
             // without closure-capture lifetime issues.
@@ -3253,7 +3267,7 @@ impl GpuDeqBackend {
                 let train_hist_alog = self.cfg_hist_train_alog;
                 let train_hist_delta = self.cfg_hist_train_delta;
                 let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
-                add_pass!(&self.fused_update_hist_prep_pipeline, n, 1);
+                add_pass!(&self.fused_update_hist_prep_pipeline, n_x, n_y);
                 add_pass!(&self.fused_update_hist_gate_pipeline, hs.div_ceil(64), 1);
                 add_pass!(
                     &self.fused_update_hist_mat_pipeline,
@@ -3271,7 +3285,7 @@ impl GpuDeqBackend {
                     hs.div_ceil(16)
                 );
                 if train_hist_temporal {
-                    add_pass!(&self.fused_update_hist_tbptt_pipeline, batch_size * hs, 1);
+                    add_pass!(&self.fused_update_hist_tbptt_pipeline, tbptt_x, tbptt_y);
                     add_pass!(
                         &self.fused_update_hist_forget_pipeline,
                         d.div_ceil(16),
@@ -3311,7 +3325,7 @@ impl GpuDeqBackend {
                     (batch_size * seq_len).div_ceil(16),
                     hs
                 );
-                add_pass!(&self.fused_update_stage1b_pipeline, n, 1);
+                add_pass!(&self.fused_update_stage1b_pipeline, n_x, n_y);
                 add_pass!(
                     &self.fused_update_stage2_pipeline,
                     hs.div_ceil(16),

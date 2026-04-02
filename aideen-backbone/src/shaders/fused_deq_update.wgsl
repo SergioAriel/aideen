@@ -286,7 +286,9 @@ fn fused_attn_stage1b_main(
     @builtin(workgroup_id) wid: vec3<u32>
 ) {
     let lane = lid.x;
-    let entry = wid.x;
+    // 2D dispatch reconstruction: entry = wid.y * grid_stride_x + wid.x.
+    // When n <= 65535, gid.y == 0 and grid_stride_x == n, so entry == wid.x.
+    let entry = wid.y * params.grid_stride_x + wid.x;
     let d = params.d_model;
     let h_slots = params.h_slots;
     let n_entries = params.batch_size * params.seq_len * h_slots;
@@ -764,7 +766,8 @@ fn fused_hist_stage_prep_main(
     @builtin(workgroup_id) wid: vec3<u32>
 ) {
     let lane = lid.x;
-    let entry = wid.x;
+    // 2D dispatch reconstruction: entry = wid.y * grid_stride_x + wid.x.
+    let entry = wid.y * params.grid_stride_x + wid.x;
     let d = params.d_model;
     let h_slots = params.h_slots;
     let n_entries = params.batch_size * params.seq_len * h_slots;
@@ -1262,7 +1265,9 @@ fn fused_hist_stage_tbptt_main(
     @builtin(workgroup_id) wid: vec3<u32>
 ) {
     let lane = lid.x;
-    let wg_idx = wid.x;
+    // hist_tbptt dispatches batch_size * h_slots workgroups.
+    // Use 2D grid reconstruction for safety when this product exceeds 65535.
+    let wg_idx = wid.y * params.grid_stride_x + wid.x;
     let d = params.d_model;
     let h_slots = params.h_slots;
     let batch_idx = wg_idx / h_slots;
