@@ -124,24 +124,25 @@ fn deq_forward_main(
             }
         }
         workgroupBarrier();
-        if (global_t == 0u) {
-            var local_sumsq = 0.0;
-            for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                let sig = Scratch[signal_base + d];
-                local_sumsq = local_sumsq + sig * sig;
+        // Experiment: H_curr remains the iterative state inside the current token solve,
+        // but it is no longer carried across tokens. Every token now initializes H_curr
+        // from its own signal.
+        var local_sumsq = 0.0;
+        for (var d = tid; d < d_model; d = d + WG_SIZE) {
+            let sig = Scratch[signal_base + d];
+            local_sumsq = local_sumsq + sig * sig;
+        }
+        shared_vals[tid] = local_sumsq;
+        workgroupBarrier();
+        for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+            if (tid < stride) {
+                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
             }
-            shared_vals[tid] = local_sumsq;
             workgroupBarrier();
-            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
-                if (tid < stride) {
-                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
-                }
-                workgroupBarrier();
-            }
-            let sig_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-            for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                H_curr[h_base + slot_off + d] = Scratch[signal_base + d] / max(sig_rms, 1e-6);
-            }
+        }
+        let sig_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+        for (var d = tid; d < d_model; d = d + WG_SIZE) {
+            H_curr[h_base + slot_off + d] = Scratch[signal_base + d] / max(sig_rms, 1e-6);
         }
 
         if (ENABLE_SLOT_QKV_PROBE) {

@@ -110,29 +110,30 @@ fn deq_forward_main(
             Scratch[signal_base + d_out] = inj;
         }
 
-        if (global_t == 0u) {
-            var local_sumsq = 0.0;
-            for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                let sig = Scratch[signal_base + d];
-                local_sumsq = local_sumsq + sig * sig;
-            }
-            let subgroup_sumsq = subgroupAdd(local_sumsq);
+        // Experiment: H_curr remains the iterative state inside the current token solve,
+        // but it is no longer carried across tokens. Every token now initializes H_curr
+        // from its own signal.
+        var local_sumsq = 0.0;
+        for (var d = tid; d < d_model; d = d + WG_SIZE) {
+            let sig = Scratch[signal_base + d];
+            local_sumsq = local_sumsq + sig * sig;
+        }
+        let subgroup_sumsq = subgroupAdd(local_sumsq);
+        if (subgroupElect()) {
+            subgroup_vals[subgroup_id] = subgroup_sumsq;
+        }
+        workgroupBarrier();
+        if (subgroup_id == 0u) {
+            let partial = select(0.0, subgroup_vals[subgroup_lid], subgroup_lid < num_subgroups);
+            let total = subgroupAdd(partial);
             if (subgroupElect()) {
-                subgroup_vals[subgroup_id] = subgroup_sumsq;
+                subgroup_vals[0] = total;
             }
-            workgroupBarrier();
-            if (subgroup_id == 0u) {
-                let partial = select(0.0, subgroup_vals[subgroup_lid], subgroup_lid < num_subgroups);
-                let total = subgroupAdd(partial);
-                if (subgroupElect()) {
-                    subgroup_vals[0] = total;
-                }
-            }
-            workgroupBarrier();
-            let sig_rms = sqrt(subgroup_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-            for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                H_curr[h_base + slot_off + d] = Scratch[signal_base + d] / max(sig_rms, 1e-6);
-            }
+        }
+        workgroupBarrier();
+        let sig_rms = sqrt(subgroup_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+        for (var d = tid; d < d_model; d = d + WG_SIZE) {
+            H_curr[h_base + slot_off + d] = Scratch[signal_base + d] / max(sig_rms, 1e-6);
         }
 
         var iter = 0u;
