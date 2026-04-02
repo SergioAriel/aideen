@@ -163,6 +163,22 @@ struct PendingChunkMetric {
 }
 
 impl Trainer {
+    fn valid_loss_sample(loss: f32) -> Option<f32> {
+        if loss.is_finite() && loss > 0.0 {
+            Some(loss)
+        } else {
+            None
+        }
+    }
+
+    fn sampled_loss_mean(loss_sum: f32, loss_count: usize) -> Option<f32> {
+        if loss_count > 0 {
+            Some(loss_sum / loss_count as f32)
+        } else {
+            None
+        }
+    }
+
     fn visible_loss_text(&self, fallback: Option<f32>) -> String {
         if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
             format!("{:.4}", self.last_gpu_loss)
@@ -215,10 +231,13 @@ impl Trainer {
                     .open(&path)
                 {
                     use std::io::Write;
+                    let loss_str = Self::valid_loss_sample(pending.loss)
+                        .map(|loss| format!("{:.6}", loss))
+                        .unwrap_or_else(|| "n/a".to_string());
                     let _ = writeln!(
                         f,
-                        "{},{},{:.6},{:.2},{}",
-                        pending.epoch, pending.chunk_id, pending.loss, tps_w, tps_g_str
+                        "{},{},{},{:.2},{}",
+                        pending.epoch, pending.chunk_id, loss_str, tps_w, tps_g_str
                     );
                 }
 
@@ -273,15 +292,15 @@ impl Trainer {
     }
 
     #[cfg(feature = "wgpu")]
-    fn cached_loss_after_sync(&self, gpu: &GpuDeqBackend) -> Option<f32> {
+    fn cached_loss_after_sync(&self, gpu: &GpuDeqBackend, force: bool) -> Option<f32> {
         let every = self.cfg_loss_readback_every;
         let should_read =
-            every != 0 && (every == 1 || (self.optimizer.step_count() % every == 0));
+            force || (every != 0 && (every == 1 || (self.optimizer.step_count() % every == 0)));
         if should_read {
-            self
-                .gpu_lm
+            self.gpu_lm
                 .as_ref()
                 .map(|gpu_lm| gpu_lm.read_cached_loss(&gpu.device))
+                .filter(|loss| loss.is_finite() && *loss > 0.0)
         } else {
             None
         }
@@ -1222,7 +1241,10 @@ impl Trainer {
             // Submit LM forward+backward without blocking for loss readback.
             // For eval_mode (validation) we still read synchronously since there's no adjoint.
             // For train mode, loss is read after apply_gradient_update when GPU is already idle.
-            let read_loss_now = self.eval_mode;
+            let read_loss_now = self.eval_mode
+                || (self.cfg_loss_readback_every != 0
+                    && (self.cfg_loss_readback_every == 1
+                        || (self.optimizer.step_count() % self.cfg_loss_readback_every == 0)));
             let lm_t0 = std::time::Instant::now();
             let current_loss_sync = gpu_lm
                 .train_step_no_readback(
@@ -1240,10 +1262,14 @@ impl Trainer {
             if audit_cost {
                 audit_lm_ms += lm_t0.elapsed().as_secs_f64() * 1e3;
             }
-            if self.eval_mode {
+            if read_loss_now && current_loss_sync.is_finite() && current_loss_sync > 0.0 {
                 self.last_gpu_loss = current_loss_sync;
             }
-            let current_loss = self.last_gpu_loss;
+            let current_loss = if read_loss_now {
+                current_loss_sync
+            } else {
+                f32::NAN
+            };
             if lm_lr > 0.0 {
                 self.lm_head_cpu_stale = true;
             }
@@ -2021,6 +2047,7 @@ impl Trainer {
 
             // Training chunk by chunk over the whole corpus
             let mut epoch_loss = 0.0;
+            let mut epoch_loss_samples = 0usize;
             let mut num_chunks = 0;
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0;
@@ -2061,10 +2088,18 @@ impl Trainer {
                     let warmup_factor = (current_step as f32 + 1.0) / 100.0;
                     let original_lr = self.optimizer.lr;
                     self.optimizer.lr *= warmup_factor;
-                    epoch_loss += self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    let loss = self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    if let Some(loss) = Self::valid_loss_sample(loss) {
+                        epoch_loss += loss;
+                        epoch_loss_samples += 1;
+                    }
                     self.optimizer.lr = original_lr;
                 } else {
-                    epoch_loss += self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    let loss = self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    if let Some(loss) = Self::valid_loss_sample(loss) {
+                        epoch_loss += loss;
+                        epoch_loss_samples += 1;
+                    }
                 }
                 num_chunks += 1;
                 interval_tokens += batch_ctx.len();
@@ -2098,7 +2133,8 @@ impl Trainer {
                     let window_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
                     let epoch_elapsed = t_start.elapsed().as_secs_f32();
                     let epoch_tps = total_tokens as f32 / epoch_elapsed.max(1e-9);
-                    let current_loss_disp = self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
+                    let current_loss_disp =
+                        self.visible_loss_text(Self::sampled_loss_mean(epoch_loss, epoch_loss_samples));
 
                     println!(
                         "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
@@ -2112,11 +2148,7 @@ impl Trainer {
                 }
             }
 
-            let total_loss = if num_chunks > 0 {
-                epoch_loss / num_chunks as f32
-            } else {
-                0.0
-            };
+            let total_loss = Self::sampled_loss_mean(epoch_loss, epoch_loss_samples);
 
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
@@ -2135,7 +2167,7 @@ impl Trainer {
             if let Some(loss) = self
                 .gpu_deq
                 .as_ref()
-                .and_then(|gpu| self.cached_loss_after_sync(gpu))
+                .and_then(|gpu| self.cached_loss_after_sync(gpu, true))
             {
                 self.last_gpu_loss = loss;
             }
@@ -2146,7 +2178,7 @@ impl Trainer {
 
             if epoch % log_every == 0 {
                 // GPU already idle (poll above) — read_cached_loss is near-instant here
-                let display_loss = self.visible_loss_text(Some(total_loss));
+                let display_loss = self.visible_loss_text(total_loss);
                 let mut gpu_suffix = String::new();
                 #[cfg(feature = "wgpu")]
                 if let Some(gpu) = self.gpu_deq.as_ref() {
@@ -2730,6 +2762,7 @@ impl Trainer {
                 }
             });
             let mut epoch_loss = 0.0f32;
+            let mut epoch_loss_samples = 0usize;
             let mut num_chunks = 0usize;
             let mut total_tokens = 0usize;
             let mut interval_start = std::time::Instant::now();
@@ -2849,7 +2882,10 @@ impl Trainer {
                                             num_chunks, loss
                                         );
                                     } else {
-                                        epoch_loss += loss;
+                                        if let Some(loss) = Self::valid_loss_sample(loss) {
+                                            epoch_loss += loss;
+                                            epoch_loss_samples += 1;
+                                        }
                                     }
                                     num_chunks += 1;
                                     total_tokens += batch_train_buf.len();
@@ -2916,7 +2952,10 @@ impl Trainer {
                                         num_chunks, loss
                                     );
                                 } else {
-                                    epoch_loss += loss;
+                                    if let Some(loss) = Self::valid_loss_sample(loss) {
+                                        epoch_loss += loss;
+                                        epoch_loss_samples += 1;
+                                    }
                                 }
                                 num_chunks += 1;
                                 total_tokens += batch_train_buf.len();
@@ -2959,7 +2998,10 @@ impl Trainer {
                     if !batch_train_buf.is_empty() {
                         let eps = self.progressive_epsilon(epoch, epochs);
                         let loss = self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
-                        epoch_loss += loss;
+                        if let Some(loss) = Self::valid_loss_sample(loss) {
+                            epoch_loss += loss;
+                            epoch_loss_samples += 1;
+                        }
                         num_chunks += 1;
                         total_tokens += batch_train_buf.len();
                         batch_train_buf.clear();
@@ -3017,7 +3059,8 @@ impl Trainer {
                         interval_tokens_prev = interval_tokens;
                     }
 
-                    let current_loss = self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
+                    let current_loss =
+                        self.visible_loss_text(Self::sampled_loss_mean(epoch_loss, epoch_loss_samples));
 
                     println!(
                         "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m{}  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
@@ -3062,7 +3105,7 @@ impl Trainer {
             if let Some(loss) = self
                 .gpu_deq
                 .as_ref()
-                .and_then(|gpu| self.cached_loss_after_sync(gpu))
+                .and_then(|gpu| self.cached_loss_after_sync(gpu, true))
             {
                 self.last_gpu_loss = loss;
             }
@@ -3089,11 +3132,8 @@ impl Trainer {
                     }
                 }
 
-                let display_loss = self.visible_loss_text(if num_chunks > 0 {
-                    Some(epoch_loss / num_chunks as f32)
-                } else {
-                    None
-                });
+                let display_loss =
+                    self.visible_loss_text(Self::sampled_loss_mean(epoch_loss, epoch_loss_samples));
 
                 println!(
                     "  epoch {epoch:>4}/{epochs}  loss={}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
