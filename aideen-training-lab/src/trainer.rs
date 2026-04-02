@@ -2822,31 +2822,22 @@ impl Trainer {
                                     }
                                     let eps = self.progressive_epsilon(epoch, epochs);
                                     let t_chunk_start = std::time::Instant::now();
-                                    #[cfg(feature = "wgpu")]
-                                    let slot_start = (num_chunks % 64) as u32 * 2;
-                                    
+
                                     let loss = self.train_sequence(
                                         &batch_train_buf,
                                         &batch_tgt_buf,
                                         seg_start > 0,
                                         eps,
                                     );
-                                    
-                                    #[cfg(feature = "wgpu")]
-                                    if let Some(gpu) = self.gpu_deq.as_ref() {
-                                        gpu.tps_chunk_record(slot_start + 1); // Fin de este chunk
-                                        gpu.tps_resolve_range(slot_start, 2);
-                                        gpu.tps_chunk_record((slot_start + 2) % 128); // Inicio del siguiente
-                                    }
-                                    
-                                    // Registrar en el buffer de métricas pendientes
+
+                                    // Registrar en el buffer de métricas (sin timestamp GPU en hot path)
                                     if self.metrics_log_path.is_some() {
                                         self.metrics_pending.push_back(PendingChunkMetric {
                                             epoch,
                                             chunk_id: num_chunks,
                                             loss,
                                             tokens: batch_train_buf.len(),
-                                            slot_start: (num_chunks % 64) as u32 * 2,
+                                            slot_start: 0, // timestamp GPU solo en progress reports
                                             interval_start_time: t_chunk_start,
                                         });
                                         self.reap_metrics(false);
@@ -2902,18 +2893,10 @@ impl Trainer {
                                     self.eval_mode = true;
                                 }
                                 let t_chunk_start = std::time::Instant::now();
-                                #[cfg(feature = "wgpu")]
-                                let slot_start = (num_chunks % 64) as u32 * 2;
-                                
                                 let eps = self.progressive_epsilon(epoch, epochs);
+
                                 let loss =
                                     self.train_sequence(&batch_train_buf, &batch_tgt_buf, seg_start > 0, eps);
-                                
-                                #[cfg(feature = "wgpu")]
-                                if let Some(gpu) = self.gpu_deq.as_ref() {
-                                    gpu.tps_chunk_record(slot_start + 1);
-                                    gpu.tps_resolve_range(slot_start, 2);
-                                }
 
                                 if self.metrics_log_path.is_some() {
                                     self.metrics_pending.push_back(PendingChunkMetric {
@@ -2921,7 +2904,7 @@ impl Trainer {
                                         chunk_id: num_chunks,
                                         loss,
                                         tokens: batch_train_buf.len(),
-                                        slot_start: (num_chunks % 64) as u32 * 2,
+                                        slot_start: 0, // timestamp GPU solo en progress reports
                                         interval_start_time: t_chunk_start,
                                     });
                                     self.reap_metrics(false);
