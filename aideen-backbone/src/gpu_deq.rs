@@ -4050,7 +4050,11 @@ impl GpuDeqBackend {
             buf.unmap();
             duration
         } else {
-            // No está listo aún, no bloqueamos.
+            // Dato no listo aún — cancelamos el mapa pendiente para que el buffer
+            // pueda volver a usarse en el próximo tps_resolve_range (copy_buffer_to_buffer).
+            // wgpu aborta el map_async pendiente en el unmap(); el callback se llamará
+            // con error pero rx se dropea a continuación, así que el send falla silenciosamente.
+            buf.unmap();
             None
         }
     }
