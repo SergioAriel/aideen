@@ -399,17 +399,17 @@ impl GpuDeqBackend {
             let query = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("AIDEEN TPS Timestamp QuerySet"),
                 ty: wgpu::QueryType::Timestamp,
-                count: 2,
+                count: 128,
             });
             let resolve = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("AIDEEN TPS Timestamp Resolve"),
-                size: 2 * std::mem::size_of::<u64>() as u64,
+                size: 128 * std::mem::size_of::<u64>() as u64,
                 usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::QUERY_RESOLVE,
                 mapped_at_creation: false,
             });
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("AIDEEN TPS Timestamp Readback"),
-                size: 2 * std::mem::size_of::<u64>() as u64,
+                size: 128 * std::mem::size_of::<u64>() as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -3907,6 +3907,86 @@ impl GpuDeqBackend {
         }
         let period = self.tps_timestamp_period as f64;
         Some((end - start) as f64 * period)
+    }
+    
+    /// Graba un timestamp en un slot específico (0..127).
+    pub fn tps_chunk_record(&self, slot_idx: u32) {
+        if !self.tps_timestamp_enabled {
+            return;
+        }
+        let Some(qs) = self.tps_timestamp_query.as_ref() else {
+            return;
+        };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(&format!("AIDEEN TPS Chunk Record Slot {}", slot_idx)),
+        });
+        encoder.write_timestamp(qs, slot_idx);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Resuelve y copia un rango de queries al buffer de lectura.
+    pub fn tps_resolve_range(&self, first_slot: u32, count: u32) {
+        if !self.tps_timestamp_enabled {
+            return;
+        }
+        let (Some(qs), Some(resolve), Some(readback)) = (
+            self.tps_timestamp_query.as_ref(),
+            self.tps_timestamp_resolve_buf.as_ref(),
+            self.tps_timestamp_readback_buf.as_ref(),
+        ) else {
+            return;
+        };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("AIDEEN TPS Resolve Range"),
+        });
+        encoder.resolve_query_set(qs, first_slot..first_slot + count, resolve, (first_slot as u64) * 8);
+        encoder.copy_buffer_to_buffer(
+            resolve,
+            (first_slot as u64) * 8,
+            readback,
+            (first_slot as u64) * 8,
+            (count as u64) * 8,
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Intenta leer el diferencial en nanosegundos de un par de slots (start_slot, start_slot+1)
+    /// sin bloquear la CPU. Si el buffer no está listo o mapeado, devuelve None.
+    pub fn read_tps_range_ns_async(&self, start_slot: u32) -> Option<f64> {
+        if !self.tps_timestamp_enabled {
+            return None;
+        }
+        let buf = self.tps_timestamp_readback_buf.as_ref()?;
+        
+        // El slice debe cubrir los dos u64 (16 bytes).
+        let offset = (start_slot as u64) * 8;
+        let slice = buf.slice(offset..offset + 16);
+        
+        // En wgpu, Maintain::Poll activa los callbacks de map_async.
+        // Si el buffer ya fue resuelto y copiado, map_async suele completarse tras el primer Poll.
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        
+        // Poll NO bloqueante.
+        self.device.poll(wgpu::Maintain::Poll);
+        
+        if let Ok(Ok(())) = rx.try_recv() {
+            let data = slice.get_mapped_range();
+            let ts: &[u64] = bytemuck::cast_slice(&data);
+            let duration = if ts.len() >= 2 && ts[1] > ts[0] {
+                Some((ts[1] - ts[0]) as f64 * self.tps_timestamp_period as f64)
+            } else {
+                None
+            };
+            drop(data);
+            buf.unmap();
+            duration
+        } else {
+            // No está listo aún, no bloqueamos.
+            None
+        }
     }
 
     pub fn read_scratch_buffer(&self) -> Vec<f32> {

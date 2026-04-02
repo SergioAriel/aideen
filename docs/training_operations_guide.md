@@ -26,8 +26,10 @@ análisis y mejora. Pero sí fija una base operativa estable para:
 - El progreso ahora diferencia:
   - `tps_win`: throughput de ventana
   - `tps_run`: throughput acumulado del run
-- Cuando `AIDEEN_PROGRESS_EVERY>0`, esos TPS ya miden trabajo GPU completado.
-  El trainer sincroniza en cada corte de progreso para evitar números inflados por comandos en cola.
+- Cuando `AIDEEN_PROGRESS_EVERY>0`, el progreso es no bloqueante por default.
+  El trainer usa `Poll` en los cortes de progreso para no serializar el pipeline.
+- El TPS confiable de cierre de epoch debe leerse en `tps_gpu` con `AIDEEN_TPS_GPU_TIMESTAMPS=1`.
+- Si necesitás progreso estrictamente sincronizado para debugging, activá `AIDEEN_PROGRESS_STRICT_SYNC=1`.
 - Si no hay una loss confiable visible, el trainer muestra `loss=n/a` en vez de `0.0000`.
 - La inferencia rápida ya tiene un bin dedicado:
   - `aideen-training-lab/src/bin/infer.rs`

@@ -254,6 +254,7 @@ fn run_large_file(
     trainer.frozen_deq = freeze_deq;
     trainer.frozen_emb = freeze_emb;
     trainer.frozen_lm = freeze_lm;
+    trainer.metrics_log_path = Some(format!("{}_metrics.csv", checkpoint_base));
     if freeze_deq {
         println!("  [Ablation] DEQ Frozen ❄️");
     }
