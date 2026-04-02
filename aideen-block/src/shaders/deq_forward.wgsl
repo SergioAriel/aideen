@@ -85,6 +85,8 @@ fn deq_forward_main(
     var total_iters = 0u;
     var max_contractivity = 0.0;
 
+    // Token loop is intentionally sequential: H_curr is the recurrent carrier shared across
+    // tokens within the chunk. Parallelizing tokens here would require a different state layout.
     for (var t = 0u; t < shape.token_count; t = t + 1u) {
         let global_t = shape.token_start + t;
         let batch_scratch_t = (batch_idx * shape.seq_len + global_t) * scratch_stride;

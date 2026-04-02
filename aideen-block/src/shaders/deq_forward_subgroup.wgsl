@@ -90,6 +90,8 @@ fn deq_forward_main(
     var total_iters = 0u;
     var max_contractivity = 0.0;
 
+    // Subgroup fast path still follows the same sequential token recurrence as the portable
+    // shader. wid.z is deliberately unused while H_curr remains a shared carrier state.
     for (var t = 0u; t < shape.token_count; t = t + 1u) {
         let global_t = shape.token_start + t;
         let batch_scratch_t = (batch_idx * shape.seq_len + global_t) * scratch_stride;

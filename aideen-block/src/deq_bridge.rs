@@ -692,8 +692,10 @@ impl RustDeqBridge {
         });
 
         let h_bytes = (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
-        // Clean DEQ core only needs the current hidden state. The old doubled allocation kept
-        // extra carry/state from the historical path, which this solve no longer uses.
+        // H_curr is the per-batch carrier for the current token solve, not a per-token tensor.
+        // The DEQ forward path reuses this state across the token loop inside the shader, so
+        // token-parallel dispatch in Z would require a different H_curr layout and recurrence.
+        // Keep this compact allocation while the token loop remains semantically sequential.
         let hcurr_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_curr"),
             size: h_bytes,
@@ -1530,6 +1532,8 @@ impl RustDeqBridge {
                 cpass.set_pipeline(&self.pipeline);
             }
             cpass.set_bind_group(0, &self.bind_group, &[]);
+            // Z stays at 1 here on purpose: the current subgroup path shares H_curr across
+            // the token loop, so dispatching token_count in Z would change the recurrence.
             cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
         }
         {
