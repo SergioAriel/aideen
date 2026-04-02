@@ -340,7 +340,7 @@ impl GpuDeqBackend {
 
     /// Inicializa la conexión con Apple Metal / Vulkan y compila los Shaders WGSL del DEQ
     pub async fn new_async(config: ArchitectureConfig) -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });

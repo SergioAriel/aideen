@@ -39,4 +39,4 @@ ed25519-dalek  = { version = "2", features = ["rand_core"] }
 # Optional GPU deps — sólo con --features wgpu
 aideen-block = { path = "../aideen-block", optional = true }
 pollster     = { version = "0.3", optional = true }
-wgpu         = { version = "23", optional = true }
+wgpu         = { version = "24", optional = true }

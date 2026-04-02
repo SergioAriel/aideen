@@ -20,7 +20,7 @@ futures    = "0.3"
 # Optional GPU deps — only pulled in with `--features wgpu`
 aideen-block = { path = "../aideen-block", optional = true }
 pollster   = { version = "0.3", optional = true }
-wgpu       = { version = "23", optional = true }
+wgpu       = { version = "24", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 rand = "0.8.5"
 tokenizers = "0.21"
