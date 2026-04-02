@@ -159,7 +159,7 @@ struct PendingChunkMetric {
     loss: f32,
     tokens: usize,
     slot_start: u32,
-    interval_start_time: std::time::Instant,
+    duration: std::time::Duration,
 }
 
 impl Trainer {
@@ -206,8 +206,8 @@ impl Trainer {
                     "n/a".to_string()
                 };
 
-                let elapsed = pending.interval_start_time.elapsed().as_secs_f32().max(1e-9);
-                let tps_w = (pending.tokens as f32) / elapsed;
+                let elapsed_sec = pending.duration.as_secs_f32().max(1e-9);
+                let tps_w = (pending.tokens as f32) / elapsed_sec;
 
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .append(true)
@@ -2837,10 +2837,10 @@ impl Trainer {
                                             chunk_id: num_chunks,
                                             loss,
                                             tokens: batch_train_buf.len(),
-                                            slot_start: 0, // timestamp GPU solo en progress reports
-                                            interval_start_time: t_chunk_start,
+                                            slot_start: 0, 
+                                            duration: t_chunk_start.elapsed(),
                                         });
-                                        self.reap_metrics(false);
+                                        // No hacemos reap_metrics aquí (hot path); lo hacemos en el progress report
                                     }
                                     if is_val {
                                         self.eval_mode = false;
@@ -2904,10 +2904,10 @@ impl Trainer {
                                         chunk_id: num_chunks,
                                         loss,
                                         tokens: batch_train_buf.len(),
-                                        slot_start: 0, // timestamp GPU solo en progress reports
-                                        interval_start_time: t_chunk_start,
+                                        slot_start: 0,
+                                        duration: t_chunk_start.elapsed(),
                                     });
-                                    self.reap_metrics(false);
+                                    // No hacemos reap_metrics aquí (hot path); lo hacemos en el progress report
                                 }
                                 if is_val {
                                     self.eval_mode = false;
@@ -2996,6 +2996,9 @@ impl Trainer {
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps_run = total_tokens as f32 / elapsed.max(1e-9);
                     let tps_win = interval_tokens as f32 / interval_start.elapsed().as_secs_f32().max(1e-9);
+
+                    // Reaping y vaciado de métricas CSV ahora sucede aquí, fuera del hot path.
+                    self.reap_metrics(false);
 
                     let mut tps_gpu_text = String::new();
                     #[cfg(feature = "wgpu")]
