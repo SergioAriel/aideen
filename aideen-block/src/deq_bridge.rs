@@ -179,6 +179,12 @@ impl RustDeqBridge {
         let signal = d_model * h_slots;
         if enable_slot_attn_real_staged {
             signal * 5
+        } else if std::env::var("AIDEEN_DEQ_MODE")
+            .ok()
+            .map(|v| v.trim().eq_ignore_ascii_case("hist_gated"))
+            .unwrap_or(false)
+        {
+            d_model * (h_slots * 8) + h_slots * h_slots + h_slots
         } else if enable_slot_qkv_probe {
             signal * 4
         } else {
@@ -719,10 +725,10 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Clean DEQ core scratch layout per (batch, token):
-        //   signal [h*d]
-        // The old full-DEQ layout reserved q/k/v/attn/mamba/history regions that the clean
-        // solve no longer touches.
+        // Scratch layout is mode-dependent:
+        // - clean core: signal only
+        // - qkv probe / staged slot-attn: extended probe layout
+        // - hist_gated: full forward history layout matching the old fused DEQ path
         let scratch_stride = Self::clean_scratch_stride(
             d_model,
             h_slots,
