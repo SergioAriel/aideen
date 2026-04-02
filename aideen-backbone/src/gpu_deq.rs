@@ -4001,13 +4001,17 @@ impl GpuDeqBackend {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("AIDEEN TPS Resolve Range"),
         });
-        encoder.resolve_query_set(qs, first_slot..first_slot + count, resolve, (first_slot as u64) * 8);
+        // QUERY_RESOLVE_BUFFER_ALIGNMENT is 256 bytes. Each timestamp = 8 bytes, so only
+        // destination offset 0 is always aligned. We resolve from slot 0 to first_slot+count
+        // into the buffer at offset 0, which is always valid.
+        let total_slots = first_slot + count;
+        encoder.resolve_query_set(qs, 0..total_slots, resolve, 0);
         encoder.copy_buffer_to_buffer(
             resolve,
-            (first_slot as u64) * 8,
+            0,
             readback,
-            (first_slot as u64) * 8,
-            (count as u64) * 8,
+            0,
+            (total_slots as u64) * 8,
         );
         self.queue.submit(Some(encoder.finish()));
     }
