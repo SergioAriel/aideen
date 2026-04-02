@@ -13,7 +13,7 @@ struct UpdateUniforms {
     n_total_weights: u32,  // total AllWeights elements (for apply_grad_update_main bounds)
     batch_size: u32,       // number of sequences processed in parallel
     apply_accum: u32,      // 1=apply accumulated gradients (apply_grad_update_main)
-    _pad0: u32,
+    grid_stride_x: u32,    // X dimension of the dispatch grid (for 2D dispatch linearisation)
 };
 
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
@@ -1809,7 +1809,10 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute
 @workgroup_size(256, 1, 1)
 fn apply_grad_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    // Reconstruct linear workgroup index from 2D grid (supports n_workgroups > 65535).
+    // When n_workgroups <= 65535: grid_stride_x == n_workgroups, gid.y == 0, reduces to gid.x.
+    let wg_idx = gid.y * params.grid_stride_x + gid.x;
+    let i = wg_idx;
     if (i >= params.n_total_weights) { return; }
     let d = params.d_model;
     let h = params.h_slots;

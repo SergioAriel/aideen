@@ -25,8 +25,29 @@ struct UpdateUniforms {
     n_total_weights: u32, // total AllWeights elements (for apply_grad_update_main)
     batch_size: u32,      // number of sequences processed in parallel
     apply_accum: u32,     // 1=apply accumulated gradients (apply_grad_update_main)
-    _pad0: u32,
+    grid_stride_x: u32,   // X dimension of the dispatch grid for 2D dispatch linearisation
 }
+
+/// Compute a safe 2D dispatch grid for a 1D kernel that spans `n_workgroups` groups.
+///
+/// GPU hardware limits each dimension to 65,535. For larger workloads we spread
+/// across X and Y, keeping X ≤ 65,535. The shader must reconstruct the linear
+/// index as: `wg_idx = gid.y * stride_x + gid.x`.
+///
+/// Returns `(x, y, z, stride_x)`.  When `n_workgroups ≤ 65_535` this returns
+/// `(n_workgroups, 1, 1, n_workgroups)` — identical to a plain 1D dispatch.
+#[inline]
+fn dispatch_1d(n_workgroups: u32) -> (u32, u32, u32, u32) {
+    const MAX: u32 = 65_535;
+    if n_workgroups <= MAX {
+        (n_workgroups, 1, 1, n_workgroups)
+    } else {
+        let x = MAX;
+        let y = n_workgroups.div_ceil(MAX);
+        (x, y, 1, x)
+    }
+}
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -2376,7 +2397,7 @@ impl GpuDeqBackend {
             n_total_weights: 0,
             batch_size,
             apply_accum: 0,
-            _pad0: 0,
+            grid_stride_x: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -2990,7 +3011,7 @@ impl GpuDeqBackend {
             n_total_weights: 0,
             batch_size,
             apply_accum: 0,
-            _pad0: 0,
+            grid_stride_x: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3136,7 +3157,8 @@ impl GpuDeqBackend {
             n_total_weights,
             batch_size,
             apply_accum: if apply_accum { 1 } else { 0 },
-            _pad0: 0,
+            // grid_stride_x used by apply_grad_update_main; set at dispatch time below.
+            grid_stride_x: 0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3336,11 +3358,35 @@ impl GpuDeqBackend {
                 add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
             }
             if grad_accum_mode == 1 && apply_accum {
-                add_pass!(
-                    &self.fused_update_apply_grad_pipeline,
-                    n_total_weights.div_ceil(256),
-                    1
+                let (ag_x, ag_y, ag_z, ag_stride) = dispatch_1d(n_total_weights.div_ceil(256));
+                // apply_grad_update_main needs grid_stride_x in its uniform.
+                // We submit the batched stage encoder first, then patch the uniform and
+                // issue apply_grad in a separate submit — this avoids writing uniforms
+                // mid-encoder while also keeping the stage encoder's non-blocking Poll.
+                self.queue.submit(Some(enc.finish()));
+                self.device.poll(wgpu::Maintain::Poll);
+                let patched = UpdateUniforms { grid_stride_x: ag_stride, ..params };
+                self.queue.write_buffer(
+                    &self.fused_update_params_buf,
+                    0,
+                    bytemuck::bytes_of(&patched),
                 );
+                let mut ag_enc = self.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("Apply Grad Update") },
+                );
+                {
+                    let mut pass = ag_enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Apply Grad Update"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.fused_update_apply_grad_pipeline);
+                    pass.set_bind_group(0, &self.fused_update_bg0, &[]);
+                    pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                    pass.dispatch_workgroups(ag_x, ag_y, ag_z);
+                }
+                self.queue.submit(Some(ag_enc.finish()));
+                self.device.poll(wgpu::Maintain::Poll);
+                return Ok(());
             }
             self.queue.submit(Some(enc.finish()));
             // Non-blocking queue drain for long batched encoders. This preserves overlap while
@@ -3748,8 +3794,10 @@ impl GpuDeqBackend {
             n_total_weights,
             batch_size: 1,
             apply_accum: 0,
-            _pad0: 0,
+            grid_stride_x: 0, // patched below after dispatch_1d
         };
+        let (ag_x, ag_y, ag_z, ag_stride) = dispatch_1d(n_total_weights.div_ceil(256));
+        let params = UpdateUniforms { grid_stride_x: ag_stride, ..params };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
             0,
@@ -3768,7 +3816,7 @@ impl GpuDeqBackend {
             pass.set_pipeline(&self.fused_update_apply_grad_pipeline);
             pass.set_bind_group(0, &self.fused_update_bg0, &[]);
             pass.set_bind_group(1, &self.fused_update_bg1, &[]);
-            pass.dispatch_workgroups(n_total_weights.div_ceil(256), 1, 1);
+            pass.dispatch_workgroups(ag_x, ag_y, ag_z);
         }
         self.queue.submit(Some(encoder.finish()));
         // Explicit API boundary: callers expect accumulated gradients to be fully applied when
