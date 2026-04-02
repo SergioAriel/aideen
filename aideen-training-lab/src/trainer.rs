@@ -173,38 +173,56 @@ impl Trainer {
         }
     }
 
-    /// Recolecta métricas de la GPU de forma asíncrona y las escribe al CSV si están listas.
+    /// Recolecta métricas de la GPU de forma asíncrona y las escribe al CSV.
+    /// Siempre emite una fila por chunk: usa tps_gpu del timestamp GPU si está
+    /// disponible, y "n/a" si no. Nunca bloquea el pipeline en el path normal.
     fn reap_metrics(&mut self, force_wait: bool) {
         #[cfg(feature = "wgpu")]
         {
-            let gpu = if let Some(g) = self.gpu_deq.as_ref() { g } else { return };
-            let path = if let Some(p) = self.metrics_log_path.as_ref() { p } else { return };
+            let path = if let Some(p) = self.metrics_log_path.as_ref() {
+                p.clone()
+            } else {
+                return;
+            };
 
             while let Some(pending) = self.metrics_pending.front() {
-                let ns_opt = if force_wait {
-                    // Forzar sincronización al final para no perder los últimos chunks
-                    gpu.device.poll(wgpu::Maintain::Wait);
-                    gpu.read_tps_range_ns_async(pending.slot_start)
+                // En force_wait hacemos un Poll::Wait para maximizar la posibilidad
+                // de obtener el timestamp; pero escribimos la fila de todas formas.
+                if force_wait {
+                    if let Some(g) = self.gpu_deq.as_ref() {
+                        g.device.poll(wgpu::Maintain::Wait);
+                    }
+                }
+
+                let tps_g_str = if let Some(g) = self.gpu_deq.as_ref() {
+                    match g.read_tps_range_ns_async(pending.slot_start) {
+                        Some(ns) if ns > 0.0 => {
+                            let tps = (pending.tokens as f64) / (ns / 1e9);
+                            format!("{:.2}", tps)
+                        }
+                        _ => "n/a".to_string(),
+                    }
                 } else {
-                    gpu.read_tps_range_ns_async(pending.slot_start)
+                    "n/a".to_string()
                 };
 
-                if let Some(ns) = ns_opt {
-                    let duration_sec = ns / 1e9;
-                    let tps_g = (pending.tokens as f64) / duration_sec;
-                    let tps_w = (pending.tokens as f32) / pending.interval_start_time.elapsed().as_secs_f32().max(1e-9);
-                    
-                    // Abrir en modo append
-                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "{},{},{:.6},{:.2},{:.2}", 
-                            pending.epoch, pending.chunk_id, pending.loss, tps_w, tps_g);
-                    }
-                    
-                    self.metrics_pending.pop_front();
-                } else {
-                    break;
+                let elapsed = pending.interval_start_time.elapsed().as_secs_f32().max(1e-9);
+                let tps_w = (pending.tokens as f32) / elapsed;
+
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "{},{},{:.6},{:.2},{}",
+                        pending.epoch, pending.chunk_id, pending.loss, tps_w, tps_g_str
+                    );
                 }
+
+                self.metrics_pending.pop_front();
             }
         }
     }
