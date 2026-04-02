@@ -107,8 +107,8 @@ impl RustDeqBridge {
         fast_constants: &std::collections::HashMap<String, f64>,
         debug_constants: &std::collections::HashMap<String, f64>,
     ) -> Option<(wgpu::ComputePipeline, wgpu::ComputePipeline)> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // We look for any validation errors in a dedicated error scope for the subgroup pipelines.
+        // This is more reliable than catch_unwind for WGPU.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let subgroup_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("AIDEEN Full DEQ Forward Subgroup Shader"),
@@ -141,11 +141,13 @@ impl RustDeqBridge {
             });
             (subgroup_pipeline, subgroup_debug_pipeline)
         }));
-        std::panic::set_hook(previous_hook);
 
         match result {
             Ok(pair) => Some(pair),
-            Err(_) => None,
+            Err(e) => {
+                eprintln!("[RustDeqBridge] Subgroup compilation panicked: {:?}. Metal driver may be rejecting the subgroup shader.", e);
+                None
+            }
         }
     }
 
@@ -362,7 +364,7 @@ impl RustDeqBridge {
             },
             cache: None,
         });
-        let subgroup_pair = if !use_exact_forward && subgroup_supported {
+        let subgroup_pair = if false { // Force portable parallel path for now to avoid Metal subgroup compilation pánicos
             Self::try_build_subgroup_pipelines(
                 device,
                 &pipeline_layout,
@@ -691,12 +693,14 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
 
-        let h_bytes = (max_batch_size as u64) * (h_slots as u64) * (d_model as u64) * 4u64;
-        // Clean DEQ core only needs the current hidden state. The old doubled allocation kept
-        // extra carry/state from the historical path, which this solve no longer uses.
+        let hcurr_bytes = (max_batch_size as u64)
+            * (max_seq_len as u64)
+            * (h_slots as u64)
+            * (d_model as u64)
+            * 4u64;
         let hcurr_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_curr"),
-            size: h_bytes,
+            size: hcurr_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -721,15 +725,11 @@ impl RustDeqBridge {
         //   signal [h*d]
         // The old full-DEQ layout reserved q/k/v/attn/mamba/history regions that the clean
         // solve no longer touches.
-        let scratch_stride = Self::clean_scratch_stride(
-            d_model,
-            h_slots,
-            slot_qkv_probe_enabled,
-            slot_attn_real_staged_enabled,
-        );
+        let scratch_stride = if use_exact_forward { d_model * h_slots * 4 } else { d_model * h_slots };
+        let scratch_size = (max_batch_size as u64) * (max_seq_len as u64) * (scratch_stride as u64) * 4u64;
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
-            size: (max_batch_size as u64) * (max_seq_len as u64) * (scratch_stride as u64) * 4u64,
+            size: scratch_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -1433,9 +1433,6 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         shape: &DeqComputeShape,
     ) -> wgpu::CommandEncoder {
-        let shape_bytes = Self::shape_bytes(shape);
-        queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
-
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("DEQ Forward GPU-Only Encoder"),
         });
@@ -1452,7 +1449,11 @@ impl RustDeqBridge {
                 });
                 cpass.set_pipeline(slot_attn_unified_pipeline);
                 cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+                cpass.dispatch_workgroups(
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    shape.token_count.max(1),
+                );
             } else {
                 let signal_init_pipeline = self
                     .signal_init_pipeline
@@ -1479,7 +1480,11 @@ impl RustDeqBridge {
                         });
                         cpass.set_pipeline(signal_init_pipeline);
                         cpass.set_bind_group(0, &self.bind_group, &[]);
-                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                        cpass.dispatch_workgroups(
+                            token_shape.batch_size.max(1),
+                            token_shape.h_slots.max(1),
+                            1,
+                        );
                     }
                     {
                         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1488,7 +1493,11 @@ impl RustDeqBridge {
                         });
                         cpass.set_pipeline(slot_qkv_pipeline);
                         cpass.set_bind_group(0, &self.bind_group, &[]);
-                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                        cpass.dispatch_workgroups(
+                            token_shape.batch_size.max(1),
+                            token_shape.h_slots.max(1),
+                            1,
+                        );
                     }
                     {
                         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1497,10 +1506,13 @@ impl RustDeqBridge {
                         });
                         cpass.set_pipeline(slot_attn_update_pipeline);
                         cpass.set_bind_group(0, &self.bind_group, &[]);
-                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                        cpass.dispatch_workgroups(
+                            token_shape.batch_size.max(1),
+                            token_shape.h_slots.max(1),
+                            1,
+                        );
                     }
                 }
-                queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
             }
         } else {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1530,7 +1542,11 @@ impl RustDeqBridge {
                 cpass.set_pipeline(&self.pipeline);
             }
             cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+            cpass.dispatch_workgroups(
+                shape.batch_size.max(1),
+                shape.h_slots.max(1),
+                1,
+            );
         }
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1542,7 +1558,7 @@ impl RustDeqBridge {
             cpass.dispatch_workgroups(
                 shape.d_model.div_ceil(256).max(1),
                 shape.batch_size.max(1),
-                shape.token_count.max(1),
+                1,
             );
         }
         encoder
@@ -1554,21 +1570,14 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         shape: &DeqComputeShape,
     ) {
-        let block_tokens = std::env::var("AIDEEN_DEQ_FORWARD_BLOCK")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(shape.seq_len.max(1))
-            .max(1);
+        // Pre-write uniforms ONCE for the entire chunk, before building encoders.
+        // This is critical for 7000+ TPS performance on Metal.
+        let shape_bytes = Self::shape_bytes(shape);
+        queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
 
-        let mut token_start = 0u32;
-        while token_start < shape.seq_len {
-            let mut block_shape = *shape;
-            block_shape.token_start = token_start;
-            block_shape.token_count = (shape.seq_len - token_start).min(block_tokens);
-            let encoder = self.encode_forward_gpu_only(device, queue, &block_shape);
-            queue.submit(Some(encoder.finish()));
-            token_start += block_shape.token_count;
-        }
+        // Record and submit in a single encoder for maximum hardware utilization.
+        let enc = self.encode_forward_gpu_only(device, queue, shape);
+        queue.submit(Some(enc.finish()));
     }
 
     #[allow(clippy::too_many_arguments)]

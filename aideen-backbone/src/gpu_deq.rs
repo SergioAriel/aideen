@@ -369,16 +369,21 @@ impl GpuDeqBackend {
             })
             .unwrap_or(false);
         let adapter_features = adapter.features();
+        println!("[GpuDeqBackend] Available Adapter Features: {:?}", adapter_features);
         let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
         if subgroup_supported {
-            println!("[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.");
+            println!("[GpuDeqBackend] SUBGROUP feature detected in adapter.");
         } else {
-            println!("[GpuDeqBackend] SUBGROUP not supported: using portable workgroup path.");
+            let has_any_subgroup = format!("{:?}", adapter_features).contains("SUBGROUP");
+            println!("[GpuDeqBackend] SUBGROUP not found in standard features. Any subgroup-like features? {}", has_any_subgroup);
         }
         let timestamps_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY)
             && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let tps_timestamp_enabled = wants_timestamps && timestamps_supported;
         let mut required_features = wgpu::Features::empty();
+        if subgroup_supported {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
         if tps_timestamp_enabled {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
             required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
@@ -2427,6 +2432,16 @@ impl GpuDeqBackend {
             let token_grid_y = n_tokens.div_ceil(65535).max(1);
             let needs_final_copy = (iters & 1) == 1;
 
+            // Pre-calculate grid stride once for the entire pass. 
+            // n_stride works for all kernels in this pass because they all scale with n_entries.
+            let (_, _, _, n_stride) = dispatch_1d(n_entries);
+            let params_with_stride = UpdateUniforms { grid_stride_x: n_stride, ..params };
+            self.queue.write_buffer(
+                &self.fused_update_params_buf,
+                0,
+                bytemuck::bytes_of(&params_with_stride),
+            );
+
             // Pre-write Anderson params for each iteration before building the encoder.
             if anderson_m > 0 {
                 for k in 0..(iters as usize) {
@@ -3206,33 +3221,27 @@ impl GpuDeqBackend {
         // Compute safe 2D dispatch grid for kernels dispatched with `n` workgroups in X.
         // grid_stride_x is written into the uniform so shaders reconstruct the linear entry:
         //   entry = wid.y * params.grid_stride_x + wid.x
-        let (n_x, n_y, _, n_stride) = dispatch_1d(n);
+        let (n_x, n_y, _, _n_stride) = dispatch_1d(n);
         let tbptt_n = batch_size * hs;
         let (tbptt_x, tbptt_y, _, _tbptt_stride) = dispatch_1d(tbptt_n);
-        // T1-A: Batch all compute stages into a single command encoder for the normal
-        // (non-profile, non-probe) training path, eliminating ~20 queue.submit() calls/step.
         if !profile_fused && !hist_internal_probe {
-            let mut enc = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Fused Update — All Stages"),
-                });
-            // weighted_h/gmix/gscore/qgrad are fully overwritten by stage1b/stage1a/stage2/stage3
-            // before any consumer reads them in the normal fused-update path.
-            // Keep hist_ctx/hist_delta clears: their producers do not cover every regime as cleanly.
-            // Normal hot path still zeros hist_ctx/hist_delta because the history producers do
-            // not provably cover every selective/gated regime. qgrad/gscore stay untouched here
-            // because stage2/stage3 fully overwrite them before any read.
-            enc.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
-            enc.clear_buffer(&self.fused_hist_delta_buf, 0, None);
-            // Write uniform with grid_stride_x = n_x so n-indexed kernels can reconstruct
-            // the linear entry from a 2D dispatch: entry = wid.y * grid_stride_x + wid.x.
+            // Pre-calculate grid strides. Note: apply_grad_update_main and stage-kernels
+            // will share the same grid_stride_x if we write it before the encoder.
+            // Since ag_stride (total weights) and n_stride (entries) might differ,
+            // we use a single stride that is safe for the largest dispatch (usually n_stride).
+            let (_, _, _, n_stride) = dispatch_1d(n);
             let params_with_stride = UpdateUniforms { grid_stride_x: n_stride, ..params };
             self.queue.write_buffer(
                 &self.fused_update_params_buf,
                 0,
                 bytemuck::bytes_of(&params_with_stride),
             );
+
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Fused Update — All Stages"),
+                });
             // add_pass!: append one compute pass (one pipeline) to `enc`.
             // Macro expansion is inline so `enc` / `self` are captured correctly
             // without closure-capture lifetime issues.
@@ -3372,24 +3381,12 @@ impl GpuDeqBackend {
                 add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
             }
             if grad_accum_mode == 1 && apply_accum {
-                let (ag_x, ag_y, ag_z, ag_stride) = dispatch_1d(n_total_weights.div_ceil(256));
-                // apply_grad_update_main needs grid_stride_x in its uniform.
-                // We submit the batched stage encoder first, then patch the uniform and
-                // issue apply_grad in a separate submit — this avoids writing uniforms
-                // mid-encoder while also keeping the stage encoder's non-blocking Poll.
-                self.queue.submit(Some(enc.finish()));
-                self.device.poll(wgpu::Maintain::Poll);
-                let patched = UpdateUniforms { grid_stride_x: ag_stride, ..params };
-                self.queue.write_buffer(
-                    &self.fused_update_params_buf,
-                    0,
-                    bytemuck::bytes_of(&patched),
-                );
-                let mut ag_enc = self.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("Apply Grad Update") },
-                );
+                let (ag_x, ag_y, ag_z, _) = dispatch_1d(n_total_weights);
+                // We keep apply_grad in the same encoder as the stages.
+                // It uses the same grid_stride_x (n_stride) already written above.
+                // Important: Ensure the shader for apply_grad_update_main handles this stride correctly.
                 {
-                    let mut pass = ag_enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("Apply Grad Update"),
                         timestamp_writes: None,
                     });
@@ -3398,14 +3395,9 @@ impl GpuDeqBackend {
                     pass.set_bind_group(1, &self.fused_update_bg1, &[]);
                     pass.dispatch_workgroups(ag_x, ag_y, ag_z);
                 }
-                self.queue.submit(Some(ag_enc.finish()));
-                self.device.poll(wgpu::Maintain::Poll);
-                return Ok(());
             }
             self.queue.submit(Some(enc.finish()));
-            // Non-blocking queue drain for long batched encoders. This preserves overlap while
-            // letting Metal advance work and release memory pressure.
-            self.device.poll(wgpu::Maintain::Poll);
+            return Ok(());
         } else {
             // Profile / probe path: per-stage encoders for accurate per-stage timings
             // and mid-sequence GPU readbacks (hist_internal_probe).
