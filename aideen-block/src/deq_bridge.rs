@@ -48,16 +48,6 @@ struct SpectralParams {
 
 pub struct RustDeqBridge {
     pub h_slots: u32,
-    exact_forward_layout: bool,
-    pub slot_qkv_probe_enabled: bool,
-    pub pipeline: wgpu::ComputePipeline,
-    pub debug_pipeline: wgpu::ComputePipeline,
-    pub subgroup_pipeline: Option<wgpu::ComputePipeline>,
-    pub subgroup_debug_pipeline: Option<wgpu::ComputePipeline>,
-    pub subgroup_fastpath_enabled: bool,
-    pub hist_v2_signal_cache_pipeline: wgpu::ComputePipeline,
-    pub hist_v2_project_pipeline: wgpu::ComputePipeline,
-    pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
     pub slot_attn_unified_pipeline: wgpu::ComputePipeline,
     pub pool_pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
@@ -101,104 +91,12 @@ pub fn aw_hist_byte_off(d: u64, h: u64) -> u64 { aw_nscale_byte_off(d, h) + d * 
 pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 { aw_hist_byte_off(d, h) + hist_len * 4 }
 
 impl RustDeqBridge {
-    fn try_build_subgroup_pipelines(
-        device: &wgpu::Device,
-        pipeline_layout: &wgpu::PipelineLayout,
-        fast_constants: &std::collections::HashMap<String, f64>,
-        debug_constants: &std::collections::HashMap<String, f64>,
-    ) -> Option<(wgpu::ComputePipeline, wgpu::ComputePipeline)> {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let subgroup_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("AIDEEN Full DEQ Forward Subgroup Shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("shaders/deq_forward_subgroup.wgsl").into(),
-                ),
-            });
-            let subgroup_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("DEQ Forward Subgroup Pipeline"),
-                layout: Some(pipeline_layout),
-                module: &subgroup_shader,
-                entry_point: Some("deq_forward_main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: fast_constants,
-                    zero_initialize_workgroup_memory: true,
-                },
-                cache: None,
-            });
-            let subgroup_debug_pipeline =
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("DEQ Forward Subgroup Debug Pipeline"),
-                    layout: Some(pipeline_layout),
-                    module: &subgroup_shader,
-                    entry_point: Some("deq_forward_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        constants: debug_constants,
-                        zero_initialize_workgroup_memory: true,
-                    },
-                    cache: None,
-            });
-            (subgroup_pipeline, subgroup_debug_pipeline)
-        }));
-        std::panic::set_hook(previous_hook);
-
-        match result {
-            Ok(pair) => Some(pair),
-            Err(payload) => {
-                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown subgroup pipeline panic".to_string()
-                };
-                eprintln!("[RustDeqBridge] Subgroup pipeline build failed: {msg}");
-                None
-            }
-        }
-    }
-
-    fn pipeline_constants(
-        enable_debug_metrics: bool,
-        enable_slot_qkv_probe: bool,
-        enable_token_carry: bool,
-    ) -> std::collections::HashMap<String, f64> {
-        let mut constants = std::collections::HashMap::new();
-        constants.insert(
-            "ENABLE_DEBUG_METRICS".to_string(),
-            if enable_debug_metrics { 1.0 } else { 0.0 },
-        );
-        constants.insert(
-            "ENABLE_SLOT_QKV_PROBE".to_string(),
-            if enable_slot_qkv_probe { 1.0 } else { 0.0 },
-        );
-        constants.insert(
-            "ENABLE_TOKEN_CARRY".to_string(),
-            if enable_token_carry { 1.0 } else { 0.0 },
-        );
-        constants
-    }
-
-    fn clean_scratch_stride(
-        d_model: u32,
-        h_slots: u32,
-        enable_slot_qkv_probe: bool,
-    ) -> u32 {
+    fn clean_scratch_stride(d_model: u32, h_slots: u32) -> u32 {
         let signal = d_model * h_slots;
-        if enable_slot_qkv_probe {
-            signal * 4
-        } else {
-            signal * 5
-        }
+        signal * 2
     }
 
-    fn pooled_elements(
-        _exact_forward_layout: bool,
-        batch_size: u32,
-        seq_len: u32,
-        d_model: u32,
-    ) -> u64 {
+    fn pooled_elements(batch_size: u32, seq_len: u32, d_model: u32) -> u64 {
         let b = batch_size as u64;
         let t = seq_len as u64;
         let d = d_model as u64;
@@ -218,28 +116,8 @@ impl RustDeqBridge {
         h_slots: u32,
         max_batch_size: u32,
         max_seq_len: u32,
-        subgroup_supported: bool,
+        _subgroup_supported: bool,
     ) -> Self {
-        // Runtime path selection for the DEQ forward family:
-        // - the canonical training path uses unified slot-attention inside the DEQ operator
-        // - deq_forward.wgsl / deq_forward_subgroup.wgsl remain as legacy review paths
-        // - deq_forward_exact.wgsl is still an alternate diagnostic path
-        // - explicit history shaders remain available in the repo, but the canonical runtime
-        //   path currently bypasses them while we validate the H_curr-centered baseline
-        let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let slot_qkv_probe_enabled = std::env::var("AIDEEN_DEQ_SLOT_QKV_PROBE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
         let token_carry_enabled = std::env::var("AIDEEN_DEQ_TOKEN_CARRY")
             .ok()
             .map(|v| {
@@ -252,22 +130,6 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|v| v.clamp(8, 32))
             .unwrap_or(32);
-        let disable_subgroup_fastpath = std::env::var("AIDEEN_DEQ_DISABLE_SUBGROUP")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let shader_src = if use_exact_forward {
-            include_str!("shaders/deq_forward_exact.wgsl")
-        } else {
-            include_str!("shaders/deq_forward.wgsl")
-        };
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("AIDEEN Full DEQ Forward Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
 
         let mut entries = Vec::new();
         entries.push(wgpu::BindGroupLayoutEntry {
@@ -327,68 +189,6 @@ impl RustDeqBridge {
             push_constant_ranges: &[],
         });
 
-        let fast_constants = Self::pipeline_constants(
-            false,
-            slot_qkv_probe_enabled,
-            token_carry_enabled,
-        );
-        let debug_constants = Self::pipeline_constants(
-            true,
-            slot_qkv_probe_enabled,
-            token_carry_enabled,
-        );
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("DEQ Forward Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("deq_forward_main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &fast_constants,
-                zero_initialize_workgroup_memory: true,
-            },
-            cache: None,
-        });
-        let debug_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("DEQ Forward Debug Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("deq_forward_main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &debug_constants,
-                zero_initialize_workgroup_memory: true,
-            },
-            cache: None,
-        });
-        let subgroup_pair = if !use_exact_forward && subgroup_supported && !disable_subgroup_fastpath {
-            Self::try_build_subgroup_pipelines(
-                device,
-                &pipeline_layout,
-                &fast_constants,
-                &debug_constants,
-            )
-        } else {
-            None
-        };
-        let (subgroup_pipeline, subgroup_debug_pipeline, subgroup_fastpath_enabled) =
-            if let Some((subgroup_pipeline, subgroup_debug_pipeline)) = subgroup_pair {
-                eprintln!("[RustDeqBridge] Subgroup DEQ fast path enabled.");
-                (
-                    Some(subgroup_pipeline),
-                    Some(subgroup_debug_pipeline),
-                    true,
-                )
-            } else {
-                if disable_subgroup_fastpath {
-                    eprintln!(
-                        "[RustDeqBridge] Subgroup fast path disabled by AIDEEN_DEQ_DISABLE_SUBGROUP; using portable path."
-                    );
-                } else if subgroup_supported && !use_exact_forward {
-                    eprintln!(
-                        "[RustDeqBridge] Subgroup supported by adapter but unavailable in current WGSL toolchain; using portable path."
-                    );
-                }
-                (None, None, false)
-            };
         let pool_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("AIDEEN DEQ Forward Pool Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/deq_forward_pool.wgsl").into()),
@@ -401,51 +201,6 @@ impl RustDeqBridge {
             compilation_options: Default::default(),
             cache: None,
         });
-        let hist_v2_signal_cache_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("AIDEEN Hist V2 Signal Cache Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/hist_v2_signal_cache.wgsl").into(),
-            ),
-        });
-        let hist_v2_signal_cache_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Hist V2 Signal Cache Pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &hist_v2_signal_cache_shader,
-                entry_point: Some("hist_v2_signal_cache_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let hist_v2_project_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("AIDEEN Hist V2 Project Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/hist_v2_project.wgsl").into(),
-            ),
-        });
-        let hist_v2_project_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Hist V2 Project Pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &hist_v2_project_shader,
-                entry_point: Some("hist_v2_project_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let hist_v2_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("AIDEEN Hist V2 Temporal Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/hist_v2_temporal.wgsl").into(),
-            ),
-        });
-        let hist_v2_temporal_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Hist V2 Temporal Pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &hist_v2_temporal_shader,
-                entry_point: Some("hist_v2_temporal_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
         let unified_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("AIDEEN DEQ SlotAttn Unified Shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -700,7 +455,6 @@ impl RustDeqBridge {
         let scratch_stride = Self::clean_scratch_stride(
             d_model,
             h_slots,
-            slot_qkv_probe_enabled,
         );
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
@@ -712,12 +466,7 @@ impl RustDeqBridge {
         });
         let hpooled_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("H_pooled"),
-            size: Self::pooled_elements(
-                use_exact_forward,
-                max_batch_size,
-                max_seq_len,
-                d_model,
-            ) * 4u64,
+            size: Self::pooled_elements(max_batch_size, max_seq_len, d_model) * 4u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -1046,16 +795,6 @@ impl RustDeqBridge {
 
         Self {
             h_slots,
-            exact_forward_layout: use_exact_forward,
-            slot_qkv_probe_enabled,
-            pipeline,
-            debug_pipeline,
-            subgroup_pipeline,
-            subgroup_debug_pipeline,
-            subgroup_fastpath_enabled,
-            hist_v2_signal_cache_pipeline,
-            hist_v2_project_pipeline,
-            hist_v2_temporal_pipeline,
             slot_attn_unified_pipeline,
             pool_pipeline,
             bind_group_layout,
@@ -1383,7 +1122,6 @@ impl RustDeqBridge {
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
         let b = shape.batch_size as usize;
         let pooled_floats = Self::pooled_elements(
-            self.exact_forward_layout,
             shape.batch_size,
             shape.seq_len,
             shape.d_model,
@@ -1521,7 +1259,6 @@ impl RustDeqBridge {
         let b = shape.batch_size as usize;
         let h = shape.h_slots as usize;
         let pooled_floats = Self::pooled_elements(
-            self.exact_forward_layout,
             shape.batch_size,
             shape.seq_len,
             shape.d_model,

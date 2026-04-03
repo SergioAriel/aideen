@@ -15,8 +15,6 @@ It is intentionally scoped to the DEQ/history training path in this branch.
 | Path | File | Selected by | Role |
 |---|---|---|---|
 | Unified slot-attn DEQ | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl` | canonical runtime path | Main DEQ forward path with `slot_ctx = Attn(signal)` and `H_curr` carry in the DEQ solve |
-| DEQ forward portable | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward.wgsl` | legacy fallback / review | Legacy non-canonical DEQ forward path |
-| DEQ forward subgroup | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_subgroup.wgsl` | legacy fallback / review | Legacy fast-path variant of the old forward family |
 | DEQ pool | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_pool.wgsl` | always after forward | Pools per-slot output for LM head |
 | Hist v2 project | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_project.wgsl` | legacy review only | Builds explicit frozen `hist_ctx` from temporal memory |
 | Hist v2 temporal | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_temporal.wgsl` | legacy review only | Updates explicit temporal carrier `m_t` from `H*` |
@@ -29,7 +27,6 @@ It is intentionally scoped to the DEQ/history training path in this branch.
 
 | Path | File | Selector | Notes |
 |---|---|---|---|
-| Exact DEQ forward | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_exact.wgsl` | `AIDEEN_DEQ_FORWARD_EXACT=1` | Alternate forward path; not the default training path |
 | Clean staged adjoint Picard | `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/shaders/staged_adjoint_picard_clean.wgsl` | clean-path selection inside GPU backend | Secondary adjoint path, not the primary one we benchmarked |
 
 ## Likely Legacy / Review Candidates
@@ -42,10 +39,7 @@ It is intentionally scoped to the DEQ/history training path in this branch.
 ## Runtime Selection Hotspots
 
 - `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/deq_bridge.rs`
-  - selects `deq_forward` vs `deq_forward_exact`
-  - enables subgroup fast path
-  - enables staged slot-attention paths
-  - canonical runtime currently bypasses the explicit history loop and runs:
+  - canonical runtime currently runs:
     `deq_slot_attn_unified_clean -> deq_forward_pool`
 
 - `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/gpu_deq.rs`

@@ -70,7 +70,6 @@ env \
   AIDEEN_CHECKPOINT_BASE=/Users/sergiosolis/Programacion/AIDEEN/artifacts/checkpoints/model_histv2_clean_pretrain_latest \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
-  AIDEEN_DEQ_HIST_GATED=0 \
   AIDEEN_DEQ_TOKEN_CARRY=1 \
   AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=0 \
@@ -91,8 +90,6 @@ env \
   - perfil validado para M1 Pro en el path canónico `unified`
 - `AIDEEN_CTX_LEN=512`
   - mejor ocupación que `256` en este régimen
-- `AIDEEN_DEQ_HIST_GATED=0`
-  - desactiva el path histórico legacy
 - `AIDEEN_DEQ_TOKEN_CARRY=1`
   - mantiene `H_curr` activo como estado/carry baseline del DEQ
 - path canónico actual
@@ -216,7 +213,6 @@ env \
   AIDEEN_CHECKPOINT_BASE=model_report \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
-  AIDEEN_DEQ_HIST_GATED=0 \
   AIDEEN_DEQ_TOKEN_CARRY=0 \
   AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=20 \

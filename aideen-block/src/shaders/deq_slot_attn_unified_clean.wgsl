@@ -70,7 +70,6 @@ fn compute_slot_attn(
     head_dim: u32,
     h_base: u32,
     batch_scratch_t: u32,
-    signal_span: u32,
     wq_mat_base: u32,
     wk_bias_root: u32,
     wq_bias_base: u32,
@@ -240,7 +239,7 @@ fn deq_slot_attn_unified_main(
     let slot_offset = slot_idx * d_model;
     let h_base = batch_idx * total_elements;
     let signal_span = d_model * h_slots;
-    let scratch_stride = signal_span * 5u;
+    let scratch_stride = signal_span * 2u;
     let wq_mat_base = aw_wq_base(d_model, h_slots) + slot_idx * d_model * d_model;
     let wk_bias_root = aw_wk_base(d_model, h_slots) + h_slots * d_model * d_model;
     let wq_bias_base = aw_wq_base(d_model, h_slots) + h_slots * d_model * d_model + slot_idx * d_model;
@@ -267,7 +266,7 @@ fn deq_slot_attn_unified_main(
         let batch_scratch_t = (batch_idx * shape.seq_len + global_t) * scratch_stride;
         let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements;
         let signal_base = batch_scratch_t + slot_offset;
-        let attn_base = batch_scratch_t + signal_span * 4u + slot_offset;
+        let attn_base = batch_scratch_t + signal_span + slot_offset;
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
 
         if (d_model == WG_SIZE * 2u) {
@@ -330,7 +329,6 @@ fn deq_slot_attn_unified_main(
                     head_dim,
                     h_base,
                     batch_scratch_t,
-                    signal_span,
                     wq_mat_base,
                     wk_bias_root,
                     wq_bias_base,
