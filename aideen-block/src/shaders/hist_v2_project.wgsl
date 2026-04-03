@@ -108,6 +108,8 @@ fn hist_v2_project_main(
                 prev_inj = prev_inj + AllWeights[w_idx] * S_in[prev_s_in_base + j];
             }
         }
+        // Reuse HistCtx as a temporary cache for the causal local projection before final writeback.
+        HistCtx[hist_out + d] = prev_inj;
         local_prev_inj_sumsq = local_prev_inj_sumsq + prev_inj * prev_inj;
     }
     shared_vals[tid] = local_prev_inj_sumsq;
@@ -132,12 +134,7 @@ fn hist_v2_project_main(
         let slot_scale = AllWeights[hist_base + hist_slot_scale_base + slot_off + d];
         u = u + slot_scale * prev_unit;
         if (has_prev_token) {
-            var prev_inj = 0.0;
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let w_idx = aw_win_base(d_model, h_slots) + j * d_model + d;
-                prev_inj = prev_inj + AllWeights[w_idx] * S_in[prev_s_in_base + j];
-            }
-            let prev_inj_unit = prev_inj / max(prev_inj_rms, 1e-6);
+            let prev_inj_unit = HistCtx[hist_out + d] / max(prev_inj_rms, 1e-6);
             let local_mix = AllWeights[hist_base + hist_bias_base + slot_off + d];
             u = u + 0.15 * local_mix * prev_inj_unit;
         }

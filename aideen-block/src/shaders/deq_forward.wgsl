@@ -19,6 +19,7 @@ override ENABLE_DEBUG_METRICS: bool = true;
 override ENABLE_SLOT_QKV_PROBE: bool = false;
 override ENABLE_SLOT_ATTN_MINIMAL: bool = false;
 override ENABLE_HIST_V2_MINIMAL: bool = false;
+override ENABLE_TOKEN_CARRY: bool = true;
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
 @group(0) @binding(1) var<storage, read> S_in: array<f32>;
@@ -131,7 +132,7 @@ fn deq_forward_main(
             }
         }
         workgroupBarrier();
-        if (global_t == 0u || ENABLE_HIST_V2_MINIMAL) {
+        if (global_t == 0u || !ENABLE_TOKEN_CARRY) {
             var local_sumsq = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 var sig = Scratch[signal_base + d];

@@ -21,7 +21,9 @@ struct RunUniforms {
 @group(0) @binding(9) var<storage, read_write> MState: array<f32>;
 
 const WG_SIZE: u32 = 256u;
+const MAX_TEMPORAL_DMODEL: u32 = 1024u;
 var<workgroup> shared_vals: array<f32, WG_SIZE>;
+var<workgroup> shared_m_next: array<f32, MAX_TEMPORAL_DMODEL>;
 
 fn aw_wo_base(d: u32, h: u32) -> u32 { return 3u * h * d * d + 2u * h * d; }
 fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d, h) + h * d * d; }
@@ -50,49 +52,53 @@ fn hist_v2_temporal_main(
     let aw_wout = aw_wout_base(d_model, h_slots);
     let aw_alog = aw_alog_base(d_model, h_slots);
 
-    for (var t = 0u; t < shape.token_count; t = t + 1u) {
-        let global_t = shape.token_start + t;
-        if (global_t >= shape.seq_len) {
-            continue;
-        }
-        let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
+    if (shape.token_count == 0u) {
+        return;
+    }
 
-        var local_h_sumsq = 0.0;
-        for (var d = tid; d < d_model; d = d + WG_SIZE) {
-            let h_val = H_next[h_base_t + d];
-            local_h_sumsq = local_h_sumsq + h_val * h_val;
-        }
-        shared_vals[tid] = local_h_sumsq;
-        workgroupBarrier();
-        for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
-            if (tid < stride) {
-                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        let h_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+    let last_token = shape.token_count - 1u;
+    let global_t = shape.token_start + last_token;
+    if (global_t >= shape.seq_len) {
+        return;
+    }
+    let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
 
-        for (var d = tid; d < d_model; d = d + WG_SIZE) {
-            let m_prev = MState[m_base + d];
-            let a_bar = 1.0 / (1.0 + exp(AllWeights[aw_alog + slot_off + d]));
-            let b_bar = 1.0 - a_bar;
-            let h_unit_d = H_next[h_base_t + d] / max(h_rms, 1e-6);
-            let wx_diag = 0.5 * tanh(AllWeights[aw_wx + d * d_model + d]);
-            let x_proj_d = h_unit_d + wx_diag * h_unit_d;
-            let m_next_d = a_bar * m_prev + b_bar * x_proj_d;
-
-            var out_proj = 0.0;
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let a_bar_j = 1.0 / (1.0 + exp(AllWeights[aw_alog + slot_off + j]));
-                let b_bar_j = 1.0 - a_bar_j;
-                let h_unit_j = H_next[h_base_t + j] / max(h_rms, 1e-6);
-                let wx_diag_j = 0.5 * tanh(AllWeights[aw_wx + j * d_model + j]);
-                let x_proj_j = h_unit_j + wx_diag_j * h_unit_j;
-                let m_next_j = a_bar_j * MState[m_base + j] + b_bar_j * x_proj_j;
-                out_proj = out_proj + AllWeights[aw_wout + j * d_model + d] * m_next_j;
-            }
-            MState[m_base + d] = m_next_d + out_proj;
+    var local_h_sumsq = 0.0;
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        let h_val = H_next[h_base_t + d];
+        local_h_sumsq = local_h_sumsq + h_val * h_val;
+    }
+    shared_vals[tid] = local_h_sumsq;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
         }
         workgroupBarrier();
     }
+    let h_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+
+    if (d_model > MAX_TEMPORAL_DMODEL) {
+        return;
+    }
+
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        let m_prev = MState[m_base + d];
+        let a_bar = 1.0 / (1.0 + exp(AllWeights[aw_alog + slot_off + d]));
+        let b_bar = 1.0 - a_bar;
+        let h_unit_d = H_next[h_base_t + d] / max(h_rms, 1e-6);
+        let wx_diag = 0.5 * tanh(AllWeights[aw_wx + d * d_model + d]);
+        let x_proj_d = h_unit_d + wx_diag * h_unit_d;
+        shared_m_next[d] = a_bar * m_prev + b_bar * x_proj_d;
+    }
+    workgroupBarrier();
+
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        var out_proj = 0.0;
+        for (var j = 0u; j < d_model; j = j + 1u) {
+            out_proj = out_proj + AllWeights[aw_wout + j * d_model + d] * shared_m_next[j];
+        }
+        MState[m_base + d] = shared_m_next[d] + out_proj;
+    }
+    workgroupBarrier();
 }

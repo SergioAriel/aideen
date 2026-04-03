@@ -169,6 +169,7 @@ impl RustDeqBridge {
         enable_slot_qkv_probe: bool,
         enable_slot_attn_minimal: bool,
         enable_hist_v2_minimal: bool,
+        enable_token_carry: bool,
     ) -> std::collections::HashMap<String, f64> {
         let mut constants = std::collections::HashMap::new();
         constants.insert(
@@ -186,6 +187,10 @@ impl RustDeqBridge {
         constants.insert(
             "ENABLE_HIST_V2_MINIMAL".to_string(),
             if enable_hist_v2_minimal { 1.0 } else { 0.0 },
+        );
+        constants.insert(
+            "ENABLE_TOKEN_CARRY".to_string(),
+            if enable_token_carry { 1.0 } else { 0.0 },
         );
         constants
     }
@@ -277,6 +282,15 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let token_carry_enabled = std::env::var("AIDEEN_DEQ_TOKEN_CARRY")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            // Preserve current behavior unless the toggle is explicitly requested:
+            // legacy forward carries H_curr across tokens; hist_v2 reinitializes per token.
+            .unwrap_or(!hist_v2_minimal_enabled);
         let slot_attn_head_dim = std::env::var("AIDEEN_DEQ_SLOT_ATTN_HEAD_DIM")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -378,12 +392,14 @@ impl RustDeqBridge {
             slot_qkv_probe_enabled,
             slot_attn_minimal_enabled,
             hist_v2_minimal_enabled,
+            token_carry_enabled,
         );
         let debug_constants = Self::pipeline_constants(
             true,
             slot_qkv_probe_enabled,
             slot_attn_minimal_enabled,
             hist_v2_minimal_enabled,
+            token_carry_enabled,
         );
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("DEQ Forward Pipeline"),
