@@ -44,7 +44,9 @@ fn hist_v2_project_main(
     let tid = lid.x;
     let batch_idx = wid.x;
     let slot_idx = wid.y;
-    if (batch_idx >= shape.batch_size || slot_idx >= shape.h_slots) {
+    let token_local = wid.z;
+    let global_t = shape.token_start + token_local;
+    if (batch_idx >= shape.batch_size || slot_idx >= shape.h_slots || token_local >= shape.token_count || global_t >= shape.seq_len) {
         return;
     }
 
@@ -56,79 +58,71 @@ fn hist_v2_project_main(
     let hist_slot_scale_base = hist_base + d_model * d_model;
     let hist_bias_base = hist_slot_scale_base + h_slots * d_model;
     let hist_gate_base = hist_bias_base + h_slots * d_model;
+    let hist_out = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
+    let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
+    let m_base = batch_idx * total_elements + slot_off;
 
-    for (var t = 0u; t < shape.token_count; t = t + 1u) {
-        let global_t = shape.token_start + t;
-        if (global_t >= shape.seq_len) {
-            continue;
+    var local_inj_sumsq = 0.0;
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        var inj = 0.0;
+        for (var j = 0u; j < d_model; j = j + 1u) {
+            let w_idx = aw_win_base(d_model, h_slots) + j * d_model + d;
+            inj = inj + AllWeights[w_idx] * S_in[s_in_base + j];
         }
-        let hist_out = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
-        let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
-        let m_base = batch_idx * total_elements + slot_off;
-
-        var local_inj_sumsq = 0.0;
-        for (var d = tid; d < d_model; d = d + WG_SIZE) {
-            var inj = 0.0;
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let w_idx = aw_win_base(d_model, h_slots) + j * d_model + d;
-                inj = inj + AllWeights[w_idx] * S_in[s_in_base + j];
-            }
-            local_inj_sumsq = local_inj_sumsq + inj * inj;
-        }
-        shared_vals[tid] = local_inj_sumsq;
-        workgroupBarrier();
-        for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
-            if (tid < stride) {
-                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        let inj_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-
-        var local_prev_sumsq = 0.0;
-        for (var d = tid; d < d_model; d = d + WG_SIZE) {
-            let m_val = MState[m_base + d];
-            local_prev_sumsq = local_prev_sumsq + m_val * m_val;
-        }
-        shared_vals[tid] = local_prev_sumsq;
-        workgroupBarrier();
-        for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
-            if (tid < stride) {
-                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        let prev_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-        let alpha = hist_alpha(AllWeights[hist_base + hist_gate_base + slot_idx]);
-
-        var local_u_sumsq = 0.0;
-        for (var d = tid; d < d_model; d = d + WG_SIZE) {
-            let prev_m = MState[m_base + d];
-            let prev_unit = prev_m / max(prev_rms, 1e-6);
-            var u = 0.0;
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let w_idx = hist_base + j * d_model + d;
-                u = u + AllWeights[w_idx] * MState[m_base + j];
-            }
-            let slot_scale = AllWeights[hist_base + hist_slot_scale_base + slot_off + d];
-            u = u + slot_scale * prev_unit;
-            HistCtx[hist_out + d] = u;
-            local_u_sumsq = local_u_sumsq + u * u;
-        }
-        shared_vals[tid] = local_u_sumsq;
-        workgroupBarrier();
-        for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
-            if (tid < stride) {
-                shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        let u_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
-        let scale = select(1.0, min(inj_rms / u_rms, 1.0), u_rms > 1e-6);
-
-        for (var d = tid; d < d_model; d = d + WG_SIZE) {
-            HistCtx[hist_out + d] = HistCtx[hist_out + d] * (alpha * scale);
+        local_inj_sumsq = local_inj_sumsq + inj * inj;
+    }
+    shared_vals[tid] = local_inj_sumsq;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
         }
         workgroupBarrier();
+    }
+    let inj_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+
+    var local_prev_sumsq = 0.0;
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        let m_val = MState[m_base + d];
+        local_prev_sumsq = local_prev_sumsq + m_val * m_val;
+    }
+    shared_vals[tid] = local_prev_sumsq;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let prev_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+    let alpha = hist_alpha(AllWeights[hist_base + hist_gate_base + slot_idx]);
+
+    var local_u_sumsq = 0.0;
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        let prev_m = MState[m_base + d];
+        let prev_unit = prev_m / max(prev_rms, 1e-6);
+        var u = 0.0;
+        for (var j = 0u; j < d_model; j = j + 1u) {
+            let w_idx = hist_base + j * d_model + d;
+            u = u + AllWeights[w_idx] * MState[m_base + j];
+        }
+        let slot_scale = AllWeights[hist_base + hist_slot_scale_base + slot_off + d];
+        u = u + slot_scale * prev_unit;
+        HistCtx[hist_out + d] = u;
+        local_u_sumsq = local_u_sumsq + u * u;
+    }
+    shared_vals[tid] = local_u_sumsq;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let u_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1e-6);
+    let scale = select(1.0, min(inj_rms / u_rms, 1.0), u_rms > 1e-6);
+
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        HistCtx[hist_out + d] = HistCtx[hist_out + d] * (alpha * scale);
     }
 }

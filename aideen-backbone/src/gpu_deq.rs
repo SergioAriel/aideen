@@ -1922,6 +1922,9 @@ impl GpuDeqBackend {
         // El clean DEQ reutiliza Scratch como estado transitorio por token; debe quedar limpio
         // al iniciar una secuencia nueva para no arrastrar señal entre runs.
         encoder.clear_buffer(&self.bridge.scratch_buf, 0, None);
+        // Hist V2 keeps an explicit memory state across chunks and must reset on document boundaries.
+        encoder.clear_buffer(&self.bridge.hist_ctx_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.mstate_buf, 0, None);
         // Clear TBPTT carry on document reset.
         encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
         self.queue.submit(Some(encoder.finish()));

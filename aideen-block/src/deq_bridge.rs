@@ -1549,77 +1549,71 @@ impl RustDeqBridge {
         });
 
         if self.hist_v2_minimal_enabled {
-            encoder.clear_buffer(&self.hist_ctx_buf, 0, None);
-            encoder.clear_buffer(&self.mstate_buf, 0, None);
-            for token_local in 0..shape.token_count.max(1) {
-                let mut token_shape = *shape;
-                token_shape.token_start = shape.token_start + token_local;
-                token_shape.token_count = 1;
-                let token_shape_bytes = Self::shape_bytes(&token_shape);
-                queue.write_buffer(&self.uniform_buf, 0, &token_shape_bytes);
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Hist V2 Project Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(&self.hist_v2_project_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                }
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("DEQ Forward Hist V2 Pass"),
-                        timestamp_writes: None,
-                    });
-                    let use_subgroup = self.subgroup_fastpath_enabled
-                        && self.subgroup_pipeline.is_some()
-                        && self.subgroup_debug_pipeline.is_some();
-                    if token_shape.debug_enable != 0 {
-                        if use_subgroup {
-                            cpass.set_pipeline(
-                                self.subgroup_debug_pipeline
-                                    .as_ref()
-                                    .expect("subgroup debug pipeline present"),
-                            );
-                        } else {
-                            cpass.set_pipeline(&self.debug_pipeline);
-                        }
-                    } else if use_subgroup {
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hist V2 Project Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.hist_v2_project_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    shape.token_count.max(1),
+                );
+            }
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("DEQ Forward Hist V2 Pass"),
+                    timestamp_writes: None,
+                });
+                let use_subgroup = self.subgroup_fastpath_enabled
+                    && self.subgroup_pipeline.is_some()
+                    && self.subgroup_debug_pipeline.is_some();
+                if shape.debug_enable != 0 {
+                    if use_subgroup {
                         cpass.set_pipeline(
-                            self.subgroup_pipeline
+                            self.subgroup_debug_pipeline
                                 .as_ref()
-                                .expect("subgroup pipeline present"),
+                                .expect("subgroup debug pipeline present"),
                         );
                     } else {
-                        cpass.set_pipeline(&self.pipeline);
+                        cpass.set_pipeline(&self.debug_pipeline);
                     }
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                }
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("DEQ Forward Pool Hist V2 Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(&self.pool_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(
-                        token_shape.d_model.div_ceil(256).max(1),
-                        token_shape.batch_size.max(1),
-                        1,
+                } else if use_subgroup {
+                    cpass.set_pipeline(
+                        self.subgroup_pipeline
+                            .as_ref()
+                            .expect("subgroup pipeline present"),
                     );
+                } else {
+                    cpass.set_pipeline(&self.pipeline);
                 }
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Hist V2 Temporal Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(&self.hist_v2_temporal_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                }
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
             }
-            queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("DEQ Forward Pool Hist V2 Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.pool_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(
+                    shape.d_model.div_ceil(256).max(1),
+                    shape.batch_size.max(1),
+                    shape.token_count.max(1),
+                );
+            }
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hist V2 Temporal Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.hist_v2_temporal_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+            }
         } else if self.slot_attn_real_staged_enabled {
             if self.slot_attn_real_unified_enabled {
                 let slot_attn_unified_pipeline = self
