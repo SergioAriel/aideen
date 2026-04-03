@@ -22,9 +22,9 @@ struct RunUniforms {
 @group(0) @binding(4) var<storage, read_write> H_next: array<f32>;
 @group(0) @binding(5) var<storage, read_write> Scratch: array<f32>;
 @group(0) @binding(7) var<storage, read_write> DebugLog: array<f32>;
+@group(0) @binding(8) var<storage, read_write> HistCtx: array<f32>;
 
 override SLOT_ATTN_HEAD_DIM: u32 = 32u;
-override SLOT_ATTN_DYNAMIC_QKV: bool = false;
 const WG_SIZE: u32 = 256u;
 const MAX_SLOTS: u32 = 8u;
 const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
@@ -226,7 +226,7 @@ fn deq_slot_attn_unified_main(
     let h_slots = shape.h_slots;
     let head_dim = min(d_model, SLOT_ATTN_HEAD_DIM);
     let total_elements = h_slots * d_model;
-    let slot_off = slot_idx * d_model;
+    let slot_offset = slot_idx * d_model;
     let h_base = batch_idx * total_elements;
     let signal_span = d_model * h_slots;
     let scratch_stride = signal_span * 5u;
@@ -235,7 +235,7 @@ fn deq_slot_attn_unified_main(
     let wq_bias_base = aw_wq_base(d_model, h_slots) + h_slots * d_model * d_model + slot_idx * d_model;
     let wo_mat_base = aw_wo_base(d_model, h_slots) + slot_idx * d_model * d_model;
     let win_base = aw_win_base(d_model, h_slots) + slot_idx * d_model * d_model;
-    let slot_anchor_mat_base = aw_hist_base(d_model, h_slots) + slot_anchor_base(d_model, h_slots) + slot_off;
+    let slot_anchor_mat_base = aw_hist_base(d_model, h_slots) + slot_anchor_base(d_model, h_slots) + slot_offset;
     let nscale_base = aw_nscale_base(d_model, h_slots);
     let inv_d_model = 1.0 / max(1.0, f32(d_model));
     let zero_win_diag = shape.diag_zero_win != 0u;
@@ -255,8 +255,8 @@ fn deq_slot_attn_unified_main(
         let global_t = shape.token_start + t;
         let batch_scratch_t = (batch_idx * shape.seq_len + global_t) * scratch_stride;
         let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements;
-        let signal_base = batch_scratch_t + slot_off;
-        let attn_base = batch_scratch_t + signal_span * 4u + slot_off;
+        let signal_base = batch_scratch_t + slot_offset;
+        let attn_base = batch_scratch_t + signal_span * 4u + slot_offset;
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
 
         if (d_model == WG_SIZE * 2u) {
@@ -302,7 +302,7 @@ fn deq_slot_attn_unified_main(
             }
             let sig_rms = sqrt(shared_vals[0] * inv_d_model + 1e-6);
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                H_curr[h_base + slot_off + d] = Scratch[signal_base + d] / max(sig_rms, 1e-6);
+                H_curr[h_base + slot_offset + d] = Scratch[signal_base + d] / max(sig_rms, 1e-6);
             }
             workgroupBarrier();
         }
@@ -310,7 +310,7 @@ fn deq_slot_attn_unified_main(
         var iter = 0u;
         var converged = false;
         while (iter < iter_limit && !converged) {
-            if (SLOT_ATTN_DYNAMIC_QKV || iter == 0u) {
+            if (iter == 0u) {
                 compute_slot_attn(
                     tid,
                     slot_idx,
@@ -328,10 +328,14 @@ fn deq_slot_attn_unified_main(
 
             var local_sumsq = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
+                let hist_ctx = HistCtx[h_base_t + slot_offset + d];
+                let h_prev = H_curr[h_base + slot_offset + d];
                 let pre = Scratch[signal_base + d]
+                    + h_prev
                     + Scratch[attn_base + d]
+                    + hist_ctx
                     + AllWeights[slot_anchor_mat_base + d];
-                H_next[h_base_t + slot_off + d] = pre;
+                H_next[h_base_t + slot_offset + d] = pre;
                 local_sumsq = local_sumsq + pre * pre;
             }
             shared_vals[tid] = local_sumsq;
@@ -346,12 +350,12 @@ fn deq_slot_attn_unified_main(
 
             var local_max_delta = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                let h_prev = H_curr[h_base + slot_off + d];
-                let f_h = AllWeights[nscale_base + d] * (H_next[h_base_t + slot_off + d] / rms);
+                let h_prev = H_curr[h_base + slot_offset + d];
+                let f_h = AllWeights[nscale_base + d] * (H_next[h_base_t + slot_offset + d] / rms);
                 let val = shape.damping * f_h + (1.0 - shape.damping) * h_prev;
                 local_max_delta = max(local_max_delta, abs(val - h_prev));
-                H_curr[h_base + slot_off + d] = val;
-                H_next[h_base_t + slot_off + d] = val;
+                H_curr[h_base + slot_offset + d] = val;
+                H_next[h_base_t + slot_offset + d] = val;
             }
             shared_vals[tid] = local_max_delta;
             workgroupBarrier();
@@ -389,8 +393,8 @@ fn deq_slot_attn_unified_main(
     let final_t = shape.token_start + shape.token_count - 1u;
     let final_h_base_t = (batch_idx * shape.seq_len + final_t) * total_elements;
     for (var d = tid; d < d_model; d = d + WG_SIZE) {
-        let h_val = H_curr[h_base + slot_off + d];
-        H_next[final_h_base_t + slot_off + d] = h_val;
+        let h_val = H_curr[h_base + slot_offset + d];
+        H_next[final_h_base_t + slot_offset + d] = h_val;
         local_max_h = max(local_max_h, abs(h_val));
     }
     shared_vals[tid] = local_max_h;

@@ -51,9 +51,6 @@ pub struct RustDeqBridge {
     exact_forward_layout: bool,
     pub hist_v2_minimal_enabled: bool,
     pub slot_qkv_probe_enabled: bool,
-    pub slot_attn_minimal_enabled: bool,
-    pub slot_attn_real_staged_enabled: bool,
-    pub slot_attn_real_unified_enabled: bool,
     pub pipeline: wgpu::ComputePipeline,
     pub debug_pipeline: wgpu::ComputePipeline,
     pub subgroup_pipeline: Option<wgpu::ComputePipeline>,
@@ -62,10 +59,7 @@ pub struct RustDeqBridge {
     pub hist_v2_signal_cache_pipeline: wgpu::ComputePipeline,
     pub hist_v2_project_pipeline: wgpu::ComputePipeline,
     pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
-    pub signal_init_pipeline: Option<wgpu::ComputePipeline>,
-    pub slot_qkv_pipeline: Option<wgpu::ComputePipeline>,
-    pub slot_attn_update_pipeline: Option<wgpu::ComputePipeline>,
-    pub slot_attn_unified_pipeline: Option<wgpu::ComputePipeline>,
+    pub slot_attn_unified_pipeline: wgpu::ComputePipeline,
     pub pool_pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
@@ -169,7 +163,6 @@ impl RustDeqBridge {
     fn pipeline_constants(
         enable_debug_metrics: bool,
         enable_slot_qkv_probe: bool,
-        enable_slot_attn_minimal: bool,
         enable_hist_v2_minimal: bool,
         enable_token_carry: bool,
     ) -> std::collections::HashMap<String, f64> {
@@ -181,10 +174,6 @@ impl RustDeqBridge {
         constants.insert(
             "ENABLE_SLOT_QKV_PROBE".to_string(),
             if enable_slot_qkv_probe { 1.0 } else { 0.0 },
-        );
-        constants.insert(
-            "ENABLE_SLOT_ATTN_MINIMAL".to_string(),
-            if enable_slot_attn_minimal { 1.0 } else { 0.0 },
         );
         constants.insert(
             "ENABLE_HIST_V2_MINIMAL".to_string(),
@@ -201,15 +190,12 @@ impl RustDeqBridge {
         d_model: u32,
         h_slots: u32,
         enable_slot_qkv_probe: bool,
-        enable_slot_attn_real_staged: bool,
     ) -> u32 {
         let signal = d_model * h_slots;
-        if enable_slot_attn_real_staged {
-            signal * 5
-        } else if enable_slot_qkv_probe {
+        if enable_slot_qkv_probe {
             signal * 4
         } else {
-            signal
+            signal * 5
         }
     }
 
@@ -241,12 +227,11 @@ impl RustDeqBridge {
         subgroup_supported: bool,
     ) -> Self {
         // Runtime path selection for the DEQ forward family:
-        // - deq_forward.wgsl is the primary production/training path
-        // - deq_forward_subgroup.wgsl is the fast-path variant of that same family
-        // - deq_forward_exact.wgsl is an alternate/diagnostic path and should not be treated
-        //   as the default baseline without explicitly enabling it
-        // - AIDEEN_HIST_V2_MINIMAL=1 keeps the same core forward kernels but wraps them in a
-        //   token-sequential explicit-history loop: project hist_ctx -> forward -> pool -> temporal
+        // - the canonical training path uses unified slot-attention inside the DEQ operator
+        // - deq_forward.wgsl / deq_forward_subgroup.wgsl remain as legacy review paths
+        // - deq_forward_exact.wgsl is still an alternate diagnostic path
+        // - AIDEEN_HIST_V2_MINIMAL=1 wraps the canonical solve in:
+        //   signal_cache -> hist_ctx project -> unified slot-attn DEQ -> pool -> temporal
         let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
             .ok()
             .map(|v| {
@@ -255,22 +240,6 @@ impl RustDeqBridge {
             })
             .unwrap_or(false);
         let slot_qkv_probe_enabled = std::env::var("AIDEEN_DEQ_SLOT_QKV_PROBE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        // Staged slot-attention shaders are optional experimental paths. They are not part of
-        // the default forward baseline and should be treated as separately benchmarked branches.
-        let slot_attn_real_staged_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let slot_attn_real_unified_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED")
             .ok()
             .map(|v| {
                 let vl = v.trim().to_ascii_lowercase();
@@ -298,21 +267,6 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|v| v.clamp(8, 32))
             .unwrap_or(32);
-        let slot_attn_dynamic_qkv = std::env::var("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let slot_attn_minimal_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_MINIMAL")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false)
-            && !slot_attn_real_staged_enabled;
         let disable_subgroup_fastpath = std::env::var("AIDEEN_DEQ_DISABLE_SUBGROUP")
             .ok()
             .map(|v| {
@@ -320,7 +274,6 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
-        let slot_qkv_probe_enabled = slot_qkv_probe_enabled && !slot_attn_real_staged_enabled;
         let shader_src = if use_exact_forward {
             include_str!("shaders/deq_forward_exact.wgsl")
         } else {
@@ -392,14 +345,12 @@ impl RustDeqBridge {
         let fast_constants = Self::pipeline_constants(
             false,
             slot_qkv_probe_enabled,
-            slot_attn_minimal_enabled,
             hist_v2_minimal_enabled,
             token_carry_enabled,
         );
         let debug_constants = Self::pipeline_constants(
             true,
             slot_qkv_probe_enabled,
-            slot_attn_minimal_enabled,
             hist_v2_minimal_enabled,
             token_carry_enabled,
         );
@@ -512,103 +463,29 @@ impl RustDeqBridge {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let (signal_init_pipeline, slot_qkv_pipeline, slot_attn_update_pipeline, slot_attn_unified_pipeline) =
-            if slot_attn_real_staged_enabled {
-                let signal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("AIDEEN DEQ SlotAttn Signal Init Shader"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("shaders/deq_slot_signal_init.wgsl").into(),
-                    ),
-                });
-                let qkv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("AIDEEN DEQ SlotAttn QKV Shader"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("shaders/deq_slot_qkv_clean.wgsl").into(),
-                    ),
-                });
-                let update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("AIDEEN DEQ SlotAttn Update Shader"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("shaders/deq_slot_attn_update_clean.wgsl").into(),
-                    ),
-                });
-                let unified_shader = if slot_attn_real_unified_enabled {
-                    Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("AIDEEN DEQ SlotAttn Unified Shader"),
-                        source: wgpu::ShaderSource::Wgsl(
-                            include_str!("shaders/deq_slot_attn_unified_clean.wgsl").into(),
-                        ),
-                    }))
-                } else {
-                    None
-                };
-                let mut slot_attn_constants = std::collections::HashMap::new();
-                slot_attn_constants.insert(
-                    "SLOT_ATTN_HEAD_DIM".to_string(),
-                    slot_attn_head_dim as f64,
-                );
-                slot_attn_constants.insert(
-                    "SLOT_ATTN_DYNAMIC_QKV".to_string(),
-                    if slot_attn_dynamic_qkv { 1.0 } else { 0.0 },
-                );
-                let signal_init_pipeline = device.create_compute_pipeline(
-                    &wgpu::ComputePipelineDescriptor {
-                        label: Some("DEQ SlotAttn Signal Init Pipeline"),
-                        layout: Some(&pipeline_layout),
-                        module: &signal_shader,
-                        entry_point: Some("deq_slot_signal_init_main"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    },
-                );
-                let slot_qkv_pipeline = device.create_compute_pipeline(
-                    &wgpu::ComputePipelineDescriptor {
-                        label: Some("DEQ SlotAttn QKV Pipeline"),
-                        layout: Some(&pipeline_layout),
-                        module: &qkv_shader,
-                        entry_point: Some("deq_slot_qkv_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &slot_attn_constants,
-                            zero_initialize_workgroup_memory: true,
-                        },
-                        cache: None,
-                    },
-                );
-                let slot_attn_update_pipeline = device.create_compute_pipeline(
-                    &wgpu::ComputePipelineDescriptor {
-                        label: Some("DEQ SlotAttn Update Pipeline"),
-                        layout: Some(&pipeline_layout),
-                        module: &update_shader,
-                        entry_point: Some("deq_slot_attn_update_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &slot_attn_constants,
-                            zero_initialize_workgroup_memory: true,
-                        },
-                        cache: None,
-                    },
-                );
-                let slot_attn_unified_pipeline = unified_shader.as_ref().map(|shader| {
-                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("DEQ SlotAttn Unified Pipeline"),
-                        layout: Some(&pipeline_layout),
-                        module: shader,
-                        entry_point: Some("deq_slot_attn_unified_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &slot_attn_constants,
-                            zero_initialize_workgroup_memory: true,
-                        },
-                        cache: None,
-                    })
-                });
-                (
-                    Some(signal_init_pipeline),
-                    Some(slot_qkv_pipeline),
-                    Some(slot_attn_update_pipeline),
-                    slot_attn_unified_pipeline,
-                )
-            } else {
-                (None, None, None, None)
-            };
+        let unified_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AIDEEN DEQ SlotAttn Unified Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/deq_slot_attn_unified_clean.wgsl").into(),
+            ),
+        });
+        let mut slot_attn_constants = std::collections::HashMap::new();
+        slot_attn_constants.insert(
+            "SLOT_ATTN_HEAD_DIM".to_string(),
+            slot_attn_head_dim as f64,
+        );
+        let slot_attn_unified_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("DEQ SlotAttn Unified Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &unified_shader,
+                entry_point: Some("deq_slot_attn_unified_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_attn_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
 
         let update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("AIDEEN DEQ SGD Update Shader"),
@@ -837,7 +714,6 @@ impl RustDeqBridge {
             d_model,
             h_slots,
             slot_qkv_probe_enabled,
-            slot_attn_real_staged_enabled,
         );
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
@@ -1186,9 +1062,6 @@ impl RustDeqBridge {
             exact_forward_layout: use_exact_forward,
             hist_v2_minimal_enabled,
             slot_qkv_probe_enabled,
-            slot_attn_minimal_enabled,
-            slot_attn_real_staged_enabled,
-            slot_attn_real_unified_enabled,
             pipeline,
             debug_pipeline,
             subgroup_pipeline,
@@ -1197,9 +1070,6 @@ impl RustDeqBridge {
             hist_v2_signal_cache_pipeline,
             hist_v2_project_pipeline,
             hist_v2_temporal_pipeline,
-            signal_init_pipeline,
-            slot_qkv_pipeline,
-            slot_attn_update_pipeline,
             slot_attn_unified_pipeline,
             pool_pipeline,
             bind_group_layout,
@@ -1620,31 +1490,10 @@ impl RustDeqBridge {
             }
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("DEQ Forward Hist V2 Pass"),
+                    label: Some("DEQ Forward Hist V2 Unified SlotAttn Pass"),
                     timestamp_writes: None,
                 });
-                let use_subgroup = self.subgroup_fastpath_enabled
-                    && self.subgroup_pipeline.is_some()
-                    && self.subgroup_debug_pipeline.is_some();
-                if shape.debug_enable != 0 {
-                    if use_subgroup {
-                        cpass.set_pipeline(
-                            self.subgroup_debug_pipeline
-                                .as_ref()
-                                .expect("subgroup debug pipeline present"),
-                        );
-                    } else {
-                        cpass.set_pipeline(&self.debug_pipeline);
-                    }
-                } else if use_subgroup {
-                    cpass.set_pipeline(
-                        self.subgroup_pipeline
-                            .as_ref()
-                            .expect("subgroup pipeline present"),
-                    );
-                } else {
-                    cpass.set_pipeline(&self.pipeline);
-                }
+                cpass.set_pipeline(&self.slot_attn_unified_pipeline);
                 cpass.set_bind_group(0, &self.bind_group, &[]);
                 cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
             }
@@ -1670,95 +1519,12 @@ impl RustDeqBridge {
                 cpass.set_bind_group(0, &self.bind_group, &[]);
                 cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
             }
-        } else if self.slot_attn_real_staged_enabled {
-            if self.slot_attn_real_unified_enabled {
-                let slot_attn_unified_pipeline = self
-                    .slot_attn_unified_pipeline
-                    .as_ref()
-                    .expect("slot attention unified pipeline present");
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("DEQ SlotAttn Unified Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(slot_attn_unified_pipeline);
-                cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
-            } else {
-                let signal_init_pipeline = self
-                    .signal_init_pipeline
-                    .as_ref()
-                    .expect("slot attention signal-init pipeline present");
-                let slot_qkv_pipeline = self
-                    .slot_qkv_pipeline
-                    .as_ref()
-                    .expect("slot attention qkv pipeline present");
-                let slot_attn_update_pipeline = self
-                    .slot_attn_update_pipeline
-                    .as_ref()
-                    .expect("slot attention update pipeline present");
-                for token_local in 0..shape.token_count.max(1) {
-                    let mut token_shape = *shape;
-                    token_shape.token_start = shape.token_start + token_local;
-                    token_shape.token_count = 1;
-                    let token_shape_bytes = Self::shape_bytes(&token_shape);
-                    queue.write_buffer(&self.uniform_buf, 0, &token_shape_bytes);
-                    {
-                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("DEQ SlotAttn Signal Init Pass"),
-                            timestamp_writes: None,
-                        });
-                        cpass.set_pipeline(signal_init_pipeline);
-                        cpass.set_bind_group(0, &self.bind_group, &[]);
-                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                    }
-                    {
-                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("DEQ SlotAttn QKV Pass"),
-                            timestamp_writes: None,
-                        });
-                        cpass.set_pipeline(slot_qkv_pipeline);
-                        cpass.set_bind_group(0, &self.bind_group, &[]);
-                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                    }
-                    {
-                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("DEQ SlotAttn Update Pass"),
-                            timestamp_writes: None,
-                        });
-                        cpass.set_pipeline(slot_attn_update_pipeline);
-                        cpass.set_bind_group(0, &self.bind_group, &[]);
-                        cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
-                    }
-                }
-                queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
-            }
         } else {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DEQ Forward GPU-Only Pass"),
+                label: Some("DEQ Forward Unified SlotAttn Pass"),
                 timestamp_writes: None,
             });
-            let use_subgroup = self.subgroup_fastpath_enabled
-                && self.subgroup_pipeline.is_some()
-                && self.subgroup_debug_pipeline.is_some();
-            if shape.debug_enable != 0 {
-                if use_subgroup {
-                    cpass.set_pipeline(
-                        self.subgroup_debug_pipeline
-                            .as_ref()
-                            .expect("subgroup debug pipeline present"),
-                    );
-                } else {
-                    cpass.set_pipeline(&self.debug_pipeline);
-                }
-            } else if use_subgroup {
-                cpass.set_pipeline(
-                    self.subgroup_pipeline
-                        .as_ref()
-                        .expect("subgroup pipeline present"),
-                );
-            } else {
-                cpass.set_pipeline(&self.pipeline);
-            }
+            cpass.set_pipeline(&self.slot_attn_unified_pipeline);
             cpass.set_bind_group(0, &self.bind_group, &[]);
             cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
         }

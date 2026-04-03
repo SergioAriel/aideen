@@ -17,7 +17,6 @@ struct RunUniforms {
 
 override ENABLE_DEBUG_METRICS: bool = true;
 override ENABLE_SLOT_QKV_PROBE: bool = false;
-override ENABLE_SLOT_ATTN_MINIMAL: bool = false;
 override ENABLE_HIST_V2_MINIMAL: bool = false;
 override ENABLE_TOKEN_CARRY: bool = true;
 
@@ -51,7 +50,6 @@ var<workgroup> max_delta_seen: f32;
 var<workgroup> last_delta: f32;
 var<workgroup> curr_contractivity: f32;
 var<workgroup> max_h_seen: f32;
-var<workgroup> slot_attn_weights: array<f32, MAX_SLOTS>;
 
 @compute @workgroup_size(256, 1, 1)
 fn deq_forward_main(
@@ -77,8 +75,6 @@ fn deq_forward_main(
     let zero_win_diag = shape.diag_zero_win != 0u;
     let iter_limit = select(shape.max_iters, 1u, shape.diag_one_iter != 0u);
     let inv_d_model = 1.0 / max(1.0, f32(d_model));
-    let slot_attn_rank = min(d_model, 32u);
-    let slot_attn_scale = inverseSqrt(max(1.0, f32(slot_attn_rank)));
     let hist_base = aw_hist_base(d_model, h_slots);
     let hist_slot_scale_base = hist_base + d_model * d_model;
     let hist_bias_base = hist_slot_scale_base + h_slots * d_model;
@@ -179,46 +175,12 @@ fn deq_forward_main(
         var iter = 0u;
         var converged = false;
         while (iter < iter_limit && !converged) {
-            if (ENABLE_SLOT_ATTN_MINIMAL) {
-                if (tid < h_slots) {
-                    let k_off = tid * d_model;
-                    var score = 0.0;
-                    for (var j = 0u; j < slot_attn_rank; j = j + 1u) {
-                        score = score + H_curr[h_base + slot_off + j] * H_curr[h_base + k_off + j];
-                    }
-                    slot_attn_weights[tid] = score * slot_attn_scale;
-                }
-                workgroupBarrier();
-                if (tid == 0u) {
-                    var max_s = -1e30;
-                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                        max_s = max(max_s, slot_attn_weights[ks]);
-                    }
-                    var sum_exp = 0.0;
-                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                        let w = exp(slot_attn_weights[ks] - max_s);
-                        slot_attn_weights[ks] = w;
-                        sum_exp = sum_exp + w;
-                    }
-                    sum_exp = max(sum_exp, 1e-12);
-                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                        slot_attn_weights[ks] = slot_attn_weights[ks] / sum_exp;
-                    }
-                }
-                workgroupBarrier();
-            }
             var local_max_delta = 0.0;
             var local_sumsq = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                var attn_ctx = 0.0;
-                if (ENABLE_SLOT_ATTN_MINIMAL) {
-                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                        attn_ctx = attn_ctx + slot_attn_weights[ks] * H_curr[h_base + ks * d_model + d];
-                    }
-                }
                 let hist_ctx = select(0.0, HistCtx[h_base_t + slot_off + d], ENABLE_HIST_V2_MINIMAL);
                 let slot_bias = select(0.0, AllWeights[hist_base + slot_anchor_base + slot_off + d], ENABLE_HIST_V2_MINIMAL);
-                let pre = Scratch[signal_base + d] + H_curr[h_base + slot_off + d] + 0.25 * attn_ctx + hist_ctx + slot_bias;
+                let pre = Scratch[signal_base + d] + H_curr[h_base + slot_off + d] + hist_ctx + slot_bias;
                 local_sumsq = local_sumsq + pre * pre;
             }
             shared_vals[tid] = local_sumsq;
@@ -233,15 +195,9 @@ fn deq_forward_main(
 
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 let h_prev = H_curr[h_base + slot_off + d];
-                var attn_ctx = 0.0;
-                if (ENABLE_SLOT_ATTN_MINIMAL) {
-                    for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-                        attn_ctx = attn_ctx + slot_attn_weights[ks] * H_curr[h_base + ks * d_model + d];
-                    }
-                }
                 let hist_ctx = select(0.0, HistCtx[h_base_t + slot_off + d], ENABLE_HIST_V2_MINIMAL);
                 let slot_bias = select(0.0, AllWeights[hist_base + slot_anchor_base + slot_off + d], ENABLE_HIST_V2_MINIMAL);
-                let pre = Scratch[signal_base + d] + h_prev + 0.25 * attn_ctx + hist_ctx + slot_bias;
+                let pre = Scratch[signal_base + d] + h_prev + hist_ctx + slot_bias;
                 let f_h = AllWeights[aw_nscale + d] * (pre / rms);
                 let val = shape.damping * f_h + (1.0 - shape.damping) * h_prev;
                 local_max_delta = max(local_max_delta, abs(val - h_prev));

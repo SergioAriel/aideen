@@ -54,16 +54,16 @@ fn hist_v2_project_main(
     let d_model = shape.d_model;
     let h_slots = shape.h_slots;
     let total_elements = h_slots * d_model;
-    let slot_off = slot_idx * d_model;
+    let slot_offset = slot_idx * d_model;
     let hist_base = aw_hist_base(d_model, h_slots);
     let hist_slot_scale_base = hist_base + d_model * d_model;
     let hist_bias_base = hist_slot_scale_base + h_slots * d_model;
     let hist_gate_base = hist_bias_base + h_slots * d_model;
-    let hist_out = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
+    let hist_out = (batch_idx * shape.seq_len + global_t) * total_elements + slot_offset;
     let cache_base = (batch_idx * shape.seq_len + global_t) * d_model;
     let prev_cache_base = (batch_idx * shape.seq_len + max(shape.token_start, global_t) - select(0u, 1u, global_t > shape.token_start)) * d_model;
     let has_prev_token = global_t > shape.token_start;
-    let m_base = batch_idx * total_elements + slot_off;
+    let m_base = batch_idx * total_elements + slot_offset;
 
     var local_inj_sumsq = 0.0;
     for (var d = tid; d < d_model; d = d + WG_SIZE) {
@@ -122,11 +122,11 @@ fn hist_v2_project_main(
             let w_idx = hist_base + j * d_model + d;
             u = u + AllWeights[w_idx] * MState[m_base + j];
         }
-        let slot_scale = AllWeights[hist_base + hist_slot_scale_base + slot_off + d];
+        let slot_scale = AllWeights[hist_base + hist_slot_scale_base + slot_offset + d];
         u = u + slot_scale * prev_unit;
         if (has_prev_token) {
             let prev_inj_unit = HistCtx[hist_out + d] / max(prev_inj_rms, 1e-6);
-            let local_mix = AllWeights[hist_base + hist_bias_base + slot_off + d];
+            let local_mix = AllWeights[hist_base + hist_bias_base + slot_offset + d];
             u = u + 0.15 * local_mix * prev_inj_unit;
         }
         HistCtx[hist_out + d] = u;

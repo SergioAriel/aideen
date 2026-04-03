@@ -3818,8 +3818,6 @@ impl GpuDeqBackend {
 
     /// Spectral renormalization fully on GPU.
     pub fn renormalize_spectral(&self) -> Result<(), String> {
-        let dynamic_slot_attn =
-            std::env::var("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED").ok().as_deref() == Some("1");
         let attn_threshold = Self::env_f32("AIDEEN_DEQ_ATTN_THRESHOLD")
             .unwrap_or(0.10)
             .max(0.01);
@@ -3827,10 +3825,10 @@ impl GpuDeqBackend {
             .unwrap_or(0.30)
             .max(0.05);
         let wv_threshold = Self::env_f32("AIDEEN_DEQ_WV_THRESHOLD")
-            .unwrap_or(if dynamic_slot_attn { 0.10 } else { 0.50 })
+            .unwrap_or(0.50)
             .max(0.01);
         let wo_threshold = Self::env_f32("AIDEEN_DEQ_WO_THRESHOLD")
-            .unwrap_or(if dynamic_slot_attn { 0.10 } else { 0.50 })
+            .unwrap_or(0.50)
             .max(0.01);
         self.bridge.renormalize_spectral(
             &self.device,

@@ -146,8 +146,7 @@ pub struct Trainer {
     cfg_system_cost_audit: bool,   // AIDEEN_SYSTEM_COST_AUDIT
     cfg_system_cost_wait: bool,    // AIDEEN_SYSTEM_COST_WAIT
     cfg_force_renorm: bool,        // AIDEEN_DEQ_FORCE_RENORM
-    cfg_slot_attn_unified: bool,   // AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED
-    cfg_dynamic_qkv: bool,         // AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV
+    cfg_slot_attn_unified: bool,   // canonical unified slot-attn path
     cfg_lm_force_cpu_dldh: bool,   // AIDEEN_LM_FORCE_CPU_DLDH
     cfg_lm_dldh_parity: bool,      // AIDEEN_LM_DLDH_PARITY
     cfg_clean_deq_mode: bool,      // derived from DEQ env at construction
@@ -528,11 +527,6 @@ impl Trainer {
         if Self::env_flag("AIDEEN_DEQ_ONLY") {
             return true;
         }
-        if Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
-            || Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED")
-        {
-            return false;
-        }
         if std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
             || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
             || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
@@ -562,15 +556,13 @@ impl Trainer {
         let iters = max_iters as f64;
         let f32_bytes = std::mem::size_of::<f32>() as f64;
         let slot_attn_unified = self.cfg_slot_attn_unified;
-        let dynamic_qkv = self.cfg_dynamic_qkv;
-
         if self.cfg_clean_deq_mode {
             let win_bytes = b * t * (h * d * d * f32_bytes);
             return (0.0, 0.0, win_bytes, 0.0);
         }
 
         // Lower bounds derived from the hot dense matrices touched in deq_forward.wgsl.
-        let attn_iters = if slot_attn_unified && !dynamic_qkv {
+        let attn_iters = if slot_attn_unified {
             1.0
         } else {
             iters
@@ -804,8 +796,7 @@ impl Trainer {
             cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
             cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
             cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
-            cfg_slot_attn_unified: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED"),
-            cfg_dynamic_qkv: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV"),
+            cfg_slot_attn_unified: true,
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
             cfg_clean_deq_mode: Self::clean_deq_mode_active(),
@@ -935,8 +926,7 @@ impl Trainer {
             cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
             cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
             cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
-            cfg_slot_attn_unified: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED"),
-            cfg_dynamic_qkv: Self::env_flag("AIDEEN_DEQ_SLOT_ATTN_DYNAMIC_QKV"),
+            cfg_slot_attn_unified: true,
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
             cfg_clean_deq_mode: Self::clean_deq_mode_active(),

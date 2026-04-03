@@ -46,8 +46,8 @@ fn hist_v2_temporal_main(
     let d_model = shape.d_model;
     let h_slots = shape.h_slots;
     let total_elements = h_slots * d_model;
-    let slot_off = slot_idx * d_model;
-    let m_base = batch_idx * total_elements + slot_off;
+    let slot_offset = slot_idx * d_model;
+    let m_base = batch_idx * total_elements + slot_offset;
     let aw_wx = aw_wx_base(d_model, h_slots);
     let aw_wout = aw_wout_base(d_model, h_slots);
     let aw_alog = aw_alog_base(d_model, h_slots);
@@ -61,7 +61,7 @@ fn hist_v2_temporal_main(
     if (global_t >= shape.seq_len) {
         return;
     }
-    let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
+    let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements + slot_offset;
 
     var local_h_sumsq = 0.0;
     for (var d = tid; d < d_model; d = d + WG_SIZE) {
@@ -84,7 +84,7 @@ fn hist_v2_temporal_main(
 
     for (var d = tid; d < d_model; d = d + WG_SIZE) {
         let m_prev = MState[m_base + d];
-        let a_bar = 1.0 / (1.0 + exp(AllWeights[aw_alog + slot_off + d]));
+        let a_bar = 1.0 / (1.0 + exp(AllWeights[aw_alog + slot_offset + d]));
         let b_bar = 1.0 - a_bar;
         let h_unit_d = H_next[h_base_t + d] / max(h_rms, 1e-6);
         let wx_diag = 0.5 * tanh(AllWeights[aw_wx + d * d_model + d]);

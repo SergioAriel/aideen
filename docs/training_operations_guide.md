@@ -72,7 +72,7 @@ env \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_DEQ_HIST_GATED=0 \
   AIDEEN_HIST_V2_MINIMAL=1 \
-  AIDEEN_DEQ_TOKEN_CARRY=0 \
+  AIDEEN_DEQ_TOKEN_CARRY=1 \
   AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=0 \
   AIDEEN_TPS_SYNC_EVERY=0 \
@@ -95,9 +95,9 @@ env \
 - `AIDEEN_DEQ_HIST_GATED=0`
   - desactiva el path histórico legacy
 - `AIDEEN_HIST_V2_MINIMAL=1`
-  - activa la historia explícita actual
-- `AIDEEN_DEQ_TOKEN_CARRY=0`
-  - deja el carry local apagado para el baseline actual de `hist_v2`
+  - activa la historia explícita actual sobre el path canónico con `slot-attn unified`
+- `AIDEEN_DEQ_TOKEN_CARRY=1`
+  - mantiene `H_curr` activo como estado/carry baseline del DEQ
 - `AIDEEN_ADJ_ITERS_OVERRIDE=2`
   - fija el adjoint para comparativas limpias y evita que el scheduler por epoch contamine TPS/loss
 - `AIDEEN_LOSS_READBACK_EVERY=0`

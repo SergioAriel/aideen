@@ -14,8 +14,9 @@ It is intentionally scoped to the DEQ/history training path in this branch.
 
 | Path | File | Selected by | Role |
 |---|---|---|---|
-| DEQ forward portable | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward.wgsl` | default | Main DEQ forward path |
-| DEQ forward subgroup | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_subgroup.wgsl` | adapter subgroup support + no `AIDEEN_DEQ_DISABLE_SUBGROUP` + not exact-forward | Fast-path variant of main forward |
+| Unified slot-attn DEQ | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl` | canonical runtime path | Main DEQ forward path with `H_curr`, `slot_ctx`, and `HistCtx` |
+| DEQ forward portable | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward.wgsl` | legacy fallback / review | Legacy non-canonical DEQ forward path |
+| DEQ forward subgroup | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_subgroup.wgsl` | legacy fallback / review | Legacy fast-path variant of the old forward family |
 | DEQ pool | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_pool.wgsl` | always after forward | Pools per-slot output for LM head |
 | Hist v2 project | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_project.wgsl` | `AIDEEN_HIST_V2_MINIMAL=1` | Builds explicit frozen `hist_ctx` from temporal memory |
 | Hist v2 temporal | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_temporal.wgsl` | `AIDEEN_HIST_V2_MINIMAL=1` | Updates explicit temporal carrier `m_t` from `H*` |
@@ -29,10 +30,6 @@ It is intentionally scoped to the DEQ/history training path in this branch.
 | Path | File | Selector | Notes |
 |---|---|---|---|
 | Exact DEQ forward | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_exact.wgsl` | `AIDEEN_DEQ_FORWARD_EXACT=1` | Alternate forward path; not the default training path |
-| Clean staged slot-attn init | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_signal_init.wgsl` | `AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED=1` | Used only in staged slot-attn mode |
-| Clean staged slot-attn qkv | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_qkv_clean.wgsl` | `AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED=1` | Used only in staged slot-attn mode |
-| Clean staged slot-attn update | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_attn_update_clean.wgsl` | `AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED=1` | Used only in staged slot-attn mode |
-| Clean unified slot-attn | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl` | staged slot-attn + `AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED=1` | Alternate staged slot-attn path |
 | Clean staged adjoint Picard | `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/shaders/staged_adjoint_picard_clean.wgsl` | clean-path selection inside GPU backend | Secondary adjoint path, not the primary one we benchmarked |
 
 ## Likely Legacy / Review Candidates
