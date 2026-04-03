@@ -541,6 +541,19 @@ cd /Users/sergiosolis/Programacion/AIDEEN
 Para continuation probes, `AIDEEN_LR` también aplica con `--resume`.
 Usar un valor explícito y chico para retomar desde un checkpoint ya entrenado.
 
+Baseline provisional validado para continuation sobre
+`artifacts/checkpoints/model_histv2_clean_pretrain_latest`:
+
+- `AIDEEN_LR=0.00002`
+- `AIDEEN_MAX_CHUNKS=160`
+- `AIDEEN_ADJ_ITERS_OVERRIDE=2`
+- `AIDEEN_HIST_V2_MINIMAL=1`
+- `AIDEEN_DEQ_TOKEN_CARRY=0`
+
+En esta configuración, los probes de continuación quedaron en una banda útil de
+`loss` alta-7 / baja-8, claramente mejor que el régimen previo de resume que
+había degradado hasta ~`8.0-9.9`.
+
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN
 AIDEEN_RESUME_BASE=/Users/sergiosolis/Programacion/AIDEEN/artifacts/checkpoints/model_histv2_clean_pretrain_latest \
