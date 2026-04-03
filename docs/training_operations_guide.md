@@ -71,7 +71,6 @@ env \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_DEQ_HIST_GATED=0 \
-  AIDEEN_HIST_V2_MINIMAL=1 \
   AIDEEN_DEQ_TOKEN_CARRY=1 \
   AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=0 \
@@ -89,15 +88,17 @@ env \
 ### Qué hace cada flag importante
 
 - `AIDEEN_BATCH_SIZE=4`
-  - perfil validado para M1 Pro en el path `hist_v2`
+  - perfil validado para M1 Pro en el path canónico `unified`
 - `AIDEEN_CTX_LEN=512`
   - mejor ocupación que `256` en este régimen
 - `AIDEEN_DEQ_HIST_GATED=0`
   - desactiva el path histórico legacy
-- `AIDEEN_HIST_V2_MINIMAL=1`
-  - activa la historia explícita actual sobre el path canónico con `slot-attn unified`
 - `AIDEEN_DEQ_TOKEN_CARRY=1`
   - mantiene `H_curr` activo como estado/carry baseline del DEQ
+- path canónico actual
+  - `slot_ctx = Attn(signal)`
+  - `pre = signal + H_curr + slot_ctx + slot_anchor`
+  - la historia explícita `HistCtx/MState` queda fuera del baseline por ahora
 - `AIDEEN_ADJ_ITERS_OVERRIDE=2`
   - fija el adjoint para comparativas limpias y evita que el scheduler por epoch contamine TPS/loss
 - `AIDEEN_LOSS_READBACK_EVERY=0`
@@ -191,15 +192,14 @@ Este run no busca calidad final. Busca validar que:
 
 1. el modelo aprenda una distribución más coherente;
 2. no reaparezcan tokens degenerados tipo `ASS/USER/IST/ANT`;
-3. la historia siga viva sin que el corpus la tape.
+3. el carry local `H_curr` siga estable sin que el corpus lo tape.
 
 ### Invariante importante
 
 `train_on_file` resetea el estado temporal al inicio de cada epoch.
 
-Eso es obligatorio cuando hay historia persistente entre chunks (`hist_v2`), porque el
-archivo vuelve al principio en cada epoch y la memoria temporal no puede arrastrar
-estado del final del epoch anterior.
+Eso sigue siendo obligatorio porque el archivo vuelve al principio en cada epoch y
+`H_curr` no puede arrastrar estado del final del epoch anterior.
 
 ---
 
@@ -217,7 +217,6 @@ env \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
   AIDEEN_DEQ_HIST_GATED=0 \
-  AIDEEN_HIST_V2_MINIMAL=1 \
   AIDEEN_DEQ_TOKEN_CARRY=0 \
   AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=20 \
@@ -576,13 +575,12 @@ Overrides disponibles:
 - `AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT=<f>`
 - `AIDEEN_LR_PLATEAU_MIN_LR=<lr>`
 
-Baseline provisional validado para continuation sobre
+Baseline provisional previo validado para continuation sobre
 `artifacts/checkpoints/model_histv2_clean_pretrain_latest`:
 
 - `AIDEEN_LR=0.00002`
 - `AIDEEN_MAX_CHUNKS=160`
 - `AIDEEN_ADJ_ITERS_OVERRIDE=2`
-- `AIDEEN_HIST_V2_MINIMAL=1`
 - `AIDEEN_DEQ_TOKEN_CARRY=0`
 
 En esta configuración, los probes de continuación quedaron en una banda útil de

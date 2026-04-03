@@ -14,12 +14,12 @@ It is intentionally scoped to the DEQ/history training path in this branch.
 
 | Path | File | Selected by | Role |
 |---|---|---|---|
-| Unified slot-attn DEQ | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl` | canonical runtime path | Main DEQ forward path with `H_curr`, `slot_ctx`, and `HistCtx` |
+| Unified slot-attn DEQ | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl` | canonical runtime path | Main DEQ forward path with `slot_ctx = Attn(signal)` and `H_curr` carry in the DEQ solve |
 | DEQ forward portable | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward.wgsl` | legacy fallback / review | Legacy non-canonical DEQ forward path |
 | DEQ forward subgroup | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_subgroup.wgsl` | legacy fallback / review | Legacy fast-path variant of the old forward family |
 | DEQ pool | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/deq_forward_pool.wgsl` | always after forward | Pools per-slot output for LM head |
-| Hist v2 project | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_project.wgsl` | `AIDEEN_HIST_V2_MINIMAL=1` | Builds explicit frozen `hist_ctx` from temporal memory |
-| Hist v2 temporal | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_temporal.wgsl` | `AIDEEN_HIST_V2_MINIMAL=1` | Updates explicit temporal carrier `m_t` from `H*` |
+| Hist v2 project | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_project.wgsl` | legacy review only | Builds explicit frozen `hist_ctx` from temporal memory |
+| Hist v2 temporal | `/Users/sergiosolis/Programacion/AIDEEN/aideen-block/src/shaders/hist_v2_temporal.wgsl` | legacy review only | Updates explicit temporal carrier `m_t` from `H*` |
 | Staged adjoint Picard | `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/shaders/staged_adjoint_picard.wgsl` | training GPU path | Main DEQ adjoint/backward path |
 | Fused DEQ update | `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/shaders/fused_deq_update.wgsl` | training GPU path | Weight update path, including attn/history updates |
 | Embedding train | `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/shaders/embedding_train.wgsl` | training GPU path | Embedding gather/build/update |
@@ -45,8 +45,8 @@ It is intentionally scoped to the DEQ/history training path in this branch.
   - selects `deq_forward` vs `deq_forward_exact`
   - enables subgroup fast path
   - enables staged slot-attention paths
-  - when `AIDEEN_HIST_V2_MINIMAL=1`, runs the token-sequential history v2 loop:
-    `hist_v2_project -> deq_forward -> pool -> hist_v2_temporal`
+  - canonical runtime currently bypasses the explicit history loop and runs:
+    `deq_slot_attn_unified_clean -> deq_forward_pool`
 
 - `/Users/sergiosolis/Programacion/AIDEEN/aideen-backbone/src/gpu_deq.rs`
   - selects history behavior and training/update probes

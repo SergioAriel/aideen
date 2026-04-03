@@ -49,7 +49,6 @@ struct SpectralParams {
 pub struct RustDeqBridge {
     pub h_slots: u32,
     exact_forward_layout: bool,
-    pub hist_v2_minimal_enabled: bool,
     pub slot_qkv_probe_enabled: bool,
     pub pipeline: wgpu::ComputePipeline,
     pub debug_pipeline: wgpu::ComputePipeline,
@@ -163,7 +162,6 @@ impl RustDeqBridge {
     fn pipeline_constants(
         enable_debug_metrics: bool,
         enable_slot_qkv_probe: bool,
-        enable_hist_v2_minimal: bool,
         enable_token_carry: bool,
     ) -> std::collections::HashMap<String, f64> {
         let mut constants = std::collections::HashMap::new();
@@ -174,10 +172,6 @@ impl RustDeqBridge {
         constants.insert(
             "ENABLE_SLOT_QKV_PROBE".to_string(),
             if enable_slot_qkv_probe { 1.0 } else { 0.0 },
-        );
-        constants.insert(
-            "ENABLE_HIST_V2_MINIMAL".to_string(),
-            if enable_hist_v2_minimal { 1.0 } else { 0.0 },
         );
         constants.insert(
             "ENABLE_TOKEN_CARRY".to_string(),
@@ -230,8 +224,8 @@ impl RustDeqBridge {
         // - the canonical training path uses unified slot-attention inside the DEQ operator
         // - deq_forward.wgsl / deq_forward_subgroup.wgsl remain as legacy review paths
         // - deq_forward_exact.wgsl is still an alternate diagnostic path
-        // - AIDEEN_HIST_V2_MINIMAL=1 wraps the canonical solve in:
-        //   signal_cache -> hist_ctx project -> unified slot-attn DEQ -> pool -> temporal
+        // - explicit history shaders remain available in the repo, but the canonical runtime
+        //   path currently bypasses them while we validate the H_curr-centered baseline
         let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
             .ok()
             .map(|v| {
@@ -246,22 +240,13 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
-        let hist_v2_minimal_enabled = std::env::var("AIDEEN_HIST_V2_MINIMAL")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
         let token_carry_enabled = std::env::var("AIDEEN_DEQ_TOKEN_CARRY")
             .ok()
             .map(|v| {
                 let vl = v.trim().to_ascii_lowercase();
                 vl == "1" || vl == "true" || vl == "yes"
             })
-            // Preserve current behavior unless the toggle is explicitly requested:
-            // legacy forward carries H_curr across tokens; hist_v2 reinitializes per token.
-            .unwrap_or(!hist_v2_minimal_enabled);
+            .unwrap_or(true);
         let slot_attn_head_dim = std::env::var("AIDEEN_DEQ_SLOT_ATTN_HEAD_DIM")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -345,13 +330,11 @@ impl RustDeqBridge {
         let fast_constants = Self::pipeline_constants(
             false,
             slot_qkv_probe_enabled,
-            hist_v2_minimal_enabled,
             token_carry_enabled,
         );
         let debug_constants = Self::pipeline_constants(
             true,
             slot_qkv_probe_enabled,
-            hist_v2_minimal_enabled,
             token_carry_enabled,
         );
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -473,6 +456,10 @@ impl RustDeqBridge {
         slot_attn_constants.insert(
             "SLOT_ATTN_HEAD_DIM".to_string(),
             slot_attn_head_dim as f64,
+        );
+        slot_attn_constants.insert(
+            "ENABLE_TOKEN_CARRY".to_string(),
+            if token_carry_enabled { 1.0 } else { 0.0 },
         );
         let slot_attn_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1060,7 +1047,6 @@ impl RustDeqBridge {
         Self {
             h_slots,
             exact_forward_layout: use_exact_forward,
-            hist_v2_minimal_enabled,
             slot_qkv_probe_enabled,
             pipeline,
             debug_pipeline,
@@ -1465,61 +1451,7 @@ impl RustDeqBridge {
             label: Some("DEQ Forward GPU-Only Encoder"),
         });
 
-        if self.hist_v2_minimal_enabled {
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Hist V2 Signal Cache Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.hist_v2_signal_cache_pipeline);
-                cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.token_count.max(1), 1);
-            }
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Hist V2 Project Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.hist_v2_project_pipeline);
-                cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(
-                    shape.batch_size.max(1),
-                    shape.h_slots.max(1),
-                    shape.token_count.max(1),
-                );
-            }
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("DEQ Forward Hist V2 Unified SlotAttn Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.slot_attn_unified_pipeline);
-                cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
-            }
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("DEQ Forward Pool Hist V2 Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.pool_pipeline);
-                cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(
-                    shape.d_model.div_ceil(256).max(1),
-                    shape.batch_size.max(1),
-                    shape.token_count.max(1),
-                );
-            }
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Hist V2 Temporal Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.hist_v2_temporal_pipeline);
-                cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
-            }
-        } else {
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("DEQ Forward Unified SlotAttn Pass"),
                 timestamp_writes: None,

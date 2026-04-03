@@ -69,6 +69,8 @@ fn compute_slot_attn(
     h_slots: u32,
     head_dim: u32,
     h_base: u32,
+    batch_scratch_t: u32,
+    signal_span: u32,
     wq_mat_base: u32,
     wk_bias_root: u32,
     wq_bias_base: u32,
@@ -97,17 +99,21 @@ fn compute_slot_attn(
                 q1 = AllWeights[wq_bias_base + hd1];
             }
             for (var j = 0u; j < d_model; j = j + 1u) {
-                let h_val = H_curr[h_base + ks_off + j];
+                let src_val = select(
+                    H_curr[h_base + ks_off + j],
+                    Scratch[batch_scratch_t + ks_off + j],
+                    true,
+                );
                 let wk_row = wk_mat_base + j * d_model;
                 let wv_row = wv_mat_base + j * d_model;
-                k0 = k0 + AllWeights[wk_row + hd0] * h_val;
-                k1 = k1 + AllWeights[wk_row + hd1] * h_val;
-                v0 = v0 + AllWeights[wv_row + hd0] * h_val;
-                v1 = v1 + AllWeights[wv_row + hd1] * h_val;
+                k0 = k0 + AllWeights[wk_row + hd0] * src_val;
+                k1 = k1 + AllWeights[wk_row + hd1] * src_val;
+                v0 = v0 + AllWeights[wv_row + hd0] * src_val;
+                v1 = v1 + AllWeights[wv_row + hd1] * src_val;
                 if (ks == slot_idx) {
                     let wq_row = wq_mat_base + j * d_model;
-                    q0 = q0 + AllWeights[wq_row + hd0] * h_val;
-                    q1 = q1 + AllWeights[wq_row + hd1] * h_val;
+                    q0 = q0 + AllWeights[wq_row + hd0] * src_val;
+                    q1 = q1 + AllWeights[wq_row + hd1] * src_val;
                 }
             }
             let idx0 = ks * head_dim + hd0;
@@ -136,11 +142,15 @@ fn compute_slot_attn(
                 q = AllWeights[wq_bias_base + hd];
             }
             for (var j = 0u; j < d_model; j = j + 1u) {
-                let h_val = H_curr[h_base + ks_off + j];
-                k = k + AllWeights[wk_mat_base + j * d_model + hd] * h_val;
-                v = v + AllWeights[wv_mat_base + j * d_model + hd] * h_val;
+                let src_val = select(
+                    H_curr[h_base + ks_off + j],
+                    Scratch[batch_scratch_t + ks_off + j],
+                    true,
+                );
+                k = k + AllWeights[wk_mat_base + j * d_model + hd] * src_val;
+                v = v + AllWeights[wv_mat_base + j * d_model + hd] * src_val;
                 if (ks == slot_idx) {
-                    q = q + AllWeights[wq_mat_base + j * d_model + hd] * h_val;
+                    q = q + AllWeights[wq_mat_base + j * d_model + hd] * src_val;
                 }
             }
             k_cache[idx] = k;
@@ -319,6 +329,8 @@ fn deq_slot_attn_unified_main(
                     h_slots,
                     head_dim,
                     h_base,
+                    batch_scratch_t,
+                    signal_span,
                     wq_mat_base,
                     wk_bias_root,
                     wq_bias_base,
@@ -329,12 +341,10 @@ fn deq_slot_attn_unified_main(
 
             var local_sumsq = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
-                let hist_ctx = HistCtx[h_base_t + slot_offset + d];
                 let h_prev = H_curr[h_base + slot_offset + d];
                 let pre = Scratch[signal_base + d]
                     + h_prev
                     + Scratch[attn_base + d]
-                    + hist_ctx
                     + AllWeights[slot_anchor_mat_base + d];
                 H_next[h_base_t + slot_offset + d] = pre;
                 local_sumsq = local_sumsq + pre * pre;
