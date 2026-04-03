@@ -2594,6 +2594,10 @@ impl Trainer {
         let mut batch_tgt_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
 
         for epoch in 0..epochs {
+            // Each epoch restarts the token stream from the beginning of the file.
+            // Reset temporal state here so chunk/history memory does not leak across
+            // epoch boundaries and contaminate the new pass over the dataset.
+            self.reset_state();
             let t_start = std::time::Instant::now();
             let current_lr = self.cosine_lr(epoch, epochs);
             self.optimizer.lr = current_lr;
