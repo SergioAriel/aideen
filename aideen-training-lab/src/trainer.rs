@@ -104,6 +104,10 @@ pub struct Trainer {
     pub contractivity_hi_streak: u32,
     pub force_renorm_done: bool,
     pub completed_file_epochs: usize,
+    pub plateau_best_loss: Option<f32>,
+    pub plateau_bad_epochs: usize,
+    pub plateau_cooldown_left: usize,
+    pub plateau_lr_cap: f32,
 
     // --- v14 Temporal Memory State ---
     pub m_prev: Option<HSlots>,
@@ -145,6 +149,12 @@ pub struct Trainer {
     cfg_lm_dldh_parity: bool,      // AIDEEN_LM_DLDH_PARITY
     cfg_clean_deq_mode: bool,      // derived from DEQ env at construction
     cfg_log_emb_stats: bool,       // AIDEEN_LOG_EMB_STATS
+    cfg_lr_plateau_enable: bool,   // AIDEEN_LR_PLATEAU_ENABLE
+    cfg_lr_plateau_patience: usize, // AIDEEN_LR_PLATEAU_PATIENCE
+    cfg_lr_plateau_cooldown: usize, // AIDEEN_LR_PLATEAU_COOLDOWN
+    cfg_lr_plateau_factor: f32,     // AIDEEN_LR_PLATEAU_FACTOR
+    cfg_lr_plateau_min_rel_improvement: f32, // AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT
+    cfg_lr_plateau_min_lr_override: Option<f32>, // AIDEEN_LR_PLATEAU_MIN_LR
 }
 
 impl Trainer {
@@ -179,6 +189,64 @@ impl Trainer {
             (12, 16, 8usize)
         };
         (progress, floor, cap, adj_iters)
+    }
+
+    fn lr_plateau_min_lr(&self) -> f32 {
+        self.cfg_lr_plateau_min_lr_override
+            .unwrap_or(self.training_config.lr_min)
+            .max(0.0)
+    }
+
+    fn controlled_epoch_lr(&self, global_epoch: usize, total_epochs: usize) -> f32 {
+        let base_lr = self.cosine_lr(global_epoch, total_epochs);
+        if !self.cfg_lr_plateau_enable {
+            return base_lr;
+        }
+        let min_lr = self.lr_plateau_min_lr();
+        base_lr.min(self.plateau_lr_cap).max(min_lr)
+    }
+
+    fn update_lr_plateau_controller(&mut self, epoch_loss: f32, current_lr: f32) -> Option<f32> {
+        if !self.cfg_lr_plateau_enable || !epoch_loss.is_finite() || epoch_loss <= 0.0 {
+            return None;
+        }
+
+        let min_rel = self.cfg_lr_plateau_min_rel_improvement.max(0.0);
+        let improved = self.plateau_best_loss.map_or(true, |best| {
+            epoch_loss < best * (1.0 - min_rel)
+        });
+
+        if improved {
+            self.plateau_best_loss = Some(epoch_loss);
+            self.plateau_bad_epochs = 0;
+            if self.plateau_cooldown_left > 0 {
+                self.plateau_cooldown_left -= 1;
+            }
+            return None;
+        }
+
+        if self.plateau_cooldown_left > 0 {
+            self.plateau_cooldown_left -= 1;
+            return None;
+        }
+
+        self.plateau_bad_epochs += 1;
+        if self.plateau_bad_epochs < self.cfg_lr_plateau_patience.max(1) {
+            return None;
+        }
+
+        let min_lr = self.lr_plateau_min_lr();
+        let new_cap = (current_lr * self.cfg_lr_plateau_factor.clamp(0.05, 0.95)).max(min_lr);
+        if new_cap >= self.plateau_lr_cap - 1e-12 {
+            self.plateau_bad_epochs = 0;
+            self.plateau_cooldown_left = self.cfg_lr_plateau_cooldown;
+            return None;
+        }
+
+        self.plateau_lr_cap = new_cap;
+        self.plateau_bad_epochs = 0;
+        self.plateau_cooldown_left = self.cfg_lr_plateau_cooldown;
+        Some(new_cap)
     }
 
     fn checkpoint_best_base_path(base_path: &str) -> String {
@@ -668,6 +736,10 @@ impl Trainer {
             contractivity_hi_streak: 0,
             force_renorm_done: false,
             completed_file_epochs: 0,
+            plateau_best_loss: None,
+            plateau_bad_epochs: 0,
+            plateau_cooldown_left: 0,
+            plateau_lr_cap: lr,
             m_prev: None,
             grad_accum_counter: 0,
             debug_last_time: None,
@@ -715,6 +787,24 @@ impl Trainer {
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
             cfg_clean_deq_mode: Self::clean_deq_mode_active(),
             cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
+            cfg_lr_plateau_enable: !Self::env_flag("AIDEEN_LR_PLATEAU_DISABLE"),
+            cfg_lr_plateau_patience: std::env::var("AIDEEN_LR_PLATEAU_PATIENCE")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(2),
+            cfg_lr_plateau_cooldown: std::env::var("AIDEEN_LR_PLATEAU_COOLDOWN")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1),
+            cfg_lr_plateau_factor: std::env::var("AIDEEN_LR_PLATEAU_FACTOR")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.5),
+            cfg_lr_plateau_min_rel_improvement: std::env::var("AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.005),
+            cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -773,6 +863,10 @@ impl Trainer {
             contractivity_hi_streak: 0,
             force_renorm_done: false,
             completed_file_epochs: 0,
+            plateau_best_loss: None,
+            plateau_bad_epochs: 0,
+            plateau_cooldown_left: 0,
+            plateau_lr_cap: lr,
             m_prev: None,
             grad_accum_counter: 0,
             debug_last_time: None,
@@ -820,6 +914,24 @@ impl Trainer {
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
             cfg_clean_deq_mode: Self::clean_deq_mode_active(),
             cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
+            cfg_lr_plateau_enable: !Self::env_flag("AIDEEN_LR_PLATEAU_DISABLE"),
+            cfg_lr_plateau_patience: std::env::var("AIDEEN_LR_PLATEAU_PATIENCE")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(2),
+            cfg_lr_plateau_cooldown: std::env::var("AIDEEN_LR_PLATEAU_COOLDOWN")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1),
+            cfg_lr_plateau_factor: std::env::var("AIDEEN_LR_PLATEAU_FACTOR")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.5),
+            cfg_lr_plateau_min_rel_improvement: std::env::var("AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.005),
+            cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
         };
         trainer.apply_experimental_profile_from_env();
         trainer
@@ -2708,7 +2820,7 @@ impl Trainer {
             let t_start = std::time::Instant::now();
             let global_epoch = self.completed_file_epochs + epoch;
             let total_schedule_epochs = self.completed_file_epochs + epochs;
-            let current_lr = self.cosine_lr(global_epoch, total_schedule_epochs);
+            let current_lr = self.controlled_epoch_lr(global_epoch, total_schedule_epochs);
             self.optimizer.lr = current_lr;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
@@ -3096,6 +3208,16 @@ impl Trainer {
                         best_epoch_loss = Some(loss_avg);
                     }
                 }
+
+                if let Some(new_lr) = self.update_lr_plateau_controller(loss_avg, current_lr) {
+                    eprintln!(
+                        "[lr-controller] plateau detectado: lr_cap -> {:.6} (best_loss={:.6}, cooldown={}, patience={})",
+                        new_lr,
+                        self.plateau_best_loss.unwrap_or(loss_avg),
+                        self.cfg_lr_plateau_cooldown,
+                        self.cfg_lr_plateau_patience,
+                    );
+                }
             }
 
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {
@@ -3312,6 +3434,22 @@ impl Trainer {
             "completed_file_epochs".to_string(),
             self.completed_file_epochs.to_string(),
         );
+        if let Some(best) = self.plateau_best_loss {
+            model.metadata
+                .insert("plateau_best_loss".to_string(), best.to_string());
+        }
+        model.metadata.insert(
+            "plateau_bad_epochs".to_string(),
+            self.plateau_bad_epochs.to_string(),
+        );
+        model.metadata.insert(
+            "plateau_cooldown_left".to_string(),
+            self.plateau_cooldown_left.to_string(),
+        );
+        model.metadata.insert(
+            "plateau_lr_cap".to_string(),
+            self.plateau_lr_cap.to_string(),
+        );
         model.metadata.insert(
             "damping_boost_left".to_string(),
             self.damping_boost_left.to_string(),
@@ -3424,6 +3562,34 @@ impl Trainer {
             .and_then(|s| s.parse().ok())
         {
             trainer.completed_file_epochs = v;
+        }
+        if let Some(v) = model
+            .metadata
+            .get("plateau_best_loss")
+            .and_then(|s| s.parse().ok())
+        {
+            trainer.plateau_best_loss = Some(v);
+        }
+        if let Some(v) = model
+            .metadata
+            .get("plateau_bad_epochs")
+            .and_then(|s| s.parse().ok())
+        {
+            trainer.plateau_bad_epochs = v;
+        }
+        if let Some(v) = model
+            .metadata
+            .get("plateau_cooldown_left")
+            .and_then(|s| s.parse().ok())
+        {
+            trainer.plateau_cooldown_left = v;
+        }
+        if let Some(v) = model
+            .metadata
+            .get("plateau_lr_cap")
+            .and_then(|s| s.parse().ok())
+        {
+            trainer.plateau_lr_cap = v;
         }
         if let Some(v) = model
             .metadata

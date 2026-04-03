@@ -242,6 +242,7 @@ fn run_large_file(
         t.training_config.lr_min = lr / 10.0;
         t.training_config.warmup_epochs = 0;
         t.training_config.epochs = epochs;
+        t.plateau_lr_cap = t.plateau_lr_cap.min(lr);
         t
     } else {
         if let Some(seed) = train_seed {

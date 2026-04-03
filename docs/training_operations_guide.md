@@ -550,6 +550,32 @@ Además, el scheduler de `train_on_file` ahora continúa por epochs globales del
 checkpoint: al reanudar no vuelve a empezar en el LR alto del primer epoch de la
 nueva corrida.
 
+### Autorregulación de LR en runtime
+
+`train_on_file` ahora incluye un controller de plateau persistente:
+
+- mide la `loss` efectiva del epoch
+- mantiene `best_loss` interno del run
+- reduce el `lr_cap` cuando hay plateau sostenido
+- persiste ese estado en el checkpoint
+
+Defaults actuales:
+
+- patience: `2` epochs
+- cooldown: `1` epoch
+- factor: `0.5`
+- mejora relativa mínima: `0.005`
+- `min_lr`: usa `training_config.lr_min` salvo override
+
+Overrides disponibles:
+
+- `AIDEEN_LR_PLATEAU_DISABLE=1`
+- `AIDEEN_LR_PLATEAU_PATIENCE=<n>`
+- `AIDEEN_LR_PLATEAU_COOLDOWN=<n>`
+- `AIDEEN_LR_PLATEAU_FACTOR=<f>`
+- `AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT=<f>`
+- `AIDEEN_LR_PLATEAU_MIN_LR=<lr>`
+
 Baseline provisional validado para continuation sobre
 `artifacts/checkpoints/model_histv2_clean_pretrain_latest`:
 
@@ -569,6 +595,19 @@ Validación operativa mínima del schedule continuo:
 - resume inmediato por `1` epoch sobre el mismo checkpoint: `lr=0.000011`
 
 O sea: el resume ya no reinicia el cosine schedule desde cero.
+
+Validación operativa mínima del controller de plateau:
+
+- probe forzada de `3` epochs con:
+  - `AIDEEN_LR_PLATEAU_PATIENCE=1`
+  - `AIDEEN_LR_PLATEAU_COOLDOWN=0`
+  - `AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT=0.05`
+- resultado:
+  - epoch 0: `lr=0.000020`
+  - epoch 1: plateau detectado, `lr_cap -> 0.000005`
+  - epoch 2: `lr=0.00000321`
+
+O sea: el run ya puede bajar LR dentro de la misma corrida sin depender de relanzes manuales.
 
 Además, el trainer ahora guarda automáticamente:
 
