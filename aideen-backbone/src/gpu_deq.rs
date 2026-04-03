@@ -385,6 +385,9 @@ impl GpuDeqBackend {
             && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let tps_timestamp_enabled = wants_timestamps && timestamps_supported;
         let mut required_features = wgpu::Features::empty();
+        if subgroup_supported {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
         if tps_timestamp_enabled {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
             required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;

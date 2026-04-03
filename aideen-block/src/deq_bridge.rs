@@ -145,7 +145,17 @@ impl RustDeqBridge {
 
         match result {
             Ok(pair) => Some(pair),
-            Err(_) => None,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown subgroup pipeline panic".to_string()
+                };
+                eprintln!("[RustDeqBridge] Subgroup pipeline build failed: {msg}");
+                None
+            }
         }
     }
 

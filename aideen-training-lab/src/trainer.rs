@@ -202,10 +202,10 @@ impl Trainer {
     }
 
     #[cfg(feature = "wgpu")]
-    fn cached_loss_after_sync(&self, gpu: &GpuDeqBackend) -> Option<f32> {
+    fn cached_loss_after_sync(&self, gpu: &GpuDeqBackend, force: bool) -> Option<f32> {
         let every = self.cfg_loss_readback_every;
         let should_read =
-            every != 0 && (every == 1 || (self.optimizer.step_count() % every == 0));
+            force || (every != 0 && (every == 1 || (self.optimizer.step_count() % every == 0)));
         if should_read {
             self
                 .gpu_lm
@@ -2061,7 +2061,7 @@ impl Trainer {
             if let Some(loss) = self
                 .gpu_deq
                 .as_ref()
-                .and_then(|gpu| self.cached_loss_after_sync(gpu))
+                .and_then(|gpu| self.cached_loss_after_sync(gpu, true))
             {
                 self.last_gpu_loss = loss;
             }
@@ -2902,7 +2902,7 @@ impl Trainer {
             if let Some(loss) = self
                 .gpu_deq
                 .as_ref()
-                .and_then(|gpu| self.cached_loss_after_sync(gpu))
+                .and_then(|gpu| self.cached_loss_after_sync(gpu, true))
             {
                 self.last_gpu_loss = loss;
             }
