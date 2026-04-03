@@ -60,56 +60,64 @@ Cada una requiere un perfil distinto.
 
 ## 1. Training real estable
 
-Este es el comando base recomendado para un run real sobre el corpus grande.
+Este es el comando base recomendado hoy para pretraining real sobre el corpus limpio.
 
 ### Comando
 
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN && \
 env \
-  AIDEEN_CHECKPOINT_BASE=model_large \
-  AIDEEN_BATCH_SIZE=8 \
+  AIDEEN_CHECKPOINT_BASE=/Users/sergiosolis/Programacion/AIDEEN/artifacts/checkpoints/model_histv2_clean_pretrain_latest \
+  AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
-  AIDEEN_LM_FUSED_B19=1 \
-  AIDEEN_DEQ_HIST_GATED=1 \
+  AIDEEN_DEQ_HIST_GATED=0 \
+  AIDEEN_HIST_V2_MINIMAL=1 \
+  AIDEEN_DEQ_TOKEN_CARRY=0 \
+  AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=0 \
   AIDEEN_TPS_SYNC_EVERY=0 \
   AIDEEN_VAL_EVERY=0 \
-  AIDEEN_PROGRESS_EVERY=20 \
+  AIDEEN_PROGRESS_EVERY=0 \
+  AIDEEN_MAX_CHUNKS=160 \
   cargo run --release --features wgpu -p aideen-training --bin train -- \
-    --file /Users/sergiosolis/Programacion/aideen/corpus_combined.txt \
-    --epochs 12 \
+    --file /Users/sergiosolis/Programacion/AIDEEN/corpus_pretrain_minimal.txt \
+    --epochs 2 \
     --log-every 1 \
-    --save-every 0
+    --save-every 1
 ```
 
 ### Qué hace cada flag importante
 
-- `AIDEEN_BATCH_SIZE=8`
-  - perfil de throughput alto razonable para M1 Pro
+- `AIDEEN_BATCH_SIZE=4`
+  - perfil validado para M1 Pro en el path `hist_v2`
 - `AIDEEN_CTX_LEN=512`
   - mejor ocupación que `256` en este régimen
-- `AIDEEN_LM_FUSED_B19=1`
-  - usar path fused rápido del LM
-- `AIDEEN_DEQ_HIST_GATED=1`
-  - mantener history activa en el sistema real
+- `AIDEEN_DEQ_HIST_GATED=0`
+  - desactiva el path histórico legacy
+- `AIDEEN_HIST_V2_MINIMAL=1`
+  - activa la historia explícita actual
+- `AIDEEN_DEQ_TOKEN_CARRY=0`
+  - deja el carry local apagado para el baseline actual de `hist_v2`
+- `AIDEEN_ADJ_ITERS_OVERRIDE=2`
+  - fija el adjoint para comparativas limpias y evita que el scheduler por epoch contamine TPS/loss
 - `AIDEEN_LOSS_READBACK_EVERY=0`
   - no bloquear training por loss readbacks intra-step
 - `AIDEEN_TPS_SYNC_EVERY=0`
   - no meter syncs de observabilidad en el hot path
 - `AIDEEN_VAL_EVERY=0`
   - no validar durante training throughput
-- `AIDEEN_PROGRESS_EVERY=20`
-  - da visibilidad sin demasiado ruido
-- `AIDEEN_CHECKPOINT_BASE=model_large`
-  - base del checkpoint que se usaría si activás guardado
-  - útil para corridas comparativas sin pisar un checkpoint previo
+- `AIDEEN_PROGRESS_EVERY=0`
+  - evita syncs extra en esta receta de throughput estable
+- `AIDEEN_MAX_CHUNKS=160`
+  - receta mínima seria que ya mostró mejora real en el corpus limpio
+- `AIDEEN_CHECKPOINT_BASE=.../model_histv2_clean_pretrain_latest`
+  - guarda en `artifacts/checkpoints/` y evita ensuciar el root del repo
 
 ### Cuándo usarlo
 
-- runs largos
-- throughput real
-- entrenamiento de checkpoint principal
+- runs reales sobre el corpus limpio
+- throughput real con historia actual
+- entrenamiento del checkpoint principal
 
 ### Qué no esperar
 
@@ -117,7 +125,7 @@ env \
 - `val_loss` intermedia
 - diagnóstico fino de calidad
 
-Este perfil está optimizado para **correr**, no para explicar por qué aprende o no.
+Este perfil está optimizado para **correr** en el régimen actual bueno, no para comparar variantes.
 
 ---
 
@@ -141,7 +149,7 @@ cd /Users/sergiosolis/Programacion/AIDEEN
 python3 prepare_training_corpora.py
 ```
 
-Esto genera en `/Users/sergiosolis/Programacion/aideen`:
+Esto genera en el workspace actual:
 
 - `corpus_pretrain_minimal.txt`
 - `corpus_chat_instruct.txt`
@@ -167,7 +175,7 @@ Esto genera en `/Users/sergiosolis/Programacion/aideen`:
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN
 AIDEEN_LADDER_BASE=model_clean_probe \
-AIDEEN_CORPUS_FILE=/Users/sergiosolis/Programacion/aideen/corpus_pretrain_minimal.txt \
+AIDEEN_CORPUS_FILE=/Users/sergiosolis/Programacion/AIDEEN/corpus_pretrain_minimal.txt \
 AIDEEN_TINY_EPOCHS=1 \
 AIDEEN_CORPUS_EPOCHS=1 \
 AIDEEN_MAX_CHUNKS=40 \
@@ -180,6 +188,14 @@ Este run no busca calidad final. Busca validar que:
 1. el modelo aprenda una distribución más coherente;
 2. no reaparezcan tokens degenerados tipo `ASS/USER/IST/ANT`;
 3. la historia siga viva sin que el corpus la tape.
+
+### Invariante importante
+
+`train_on_file` resetea el estado temporal al inicio de cada epoch.
+
+Eso es obligatorio cuando hay historia persistente entre chunks (`hist_v2`), porque el
+archivo vuelve al principio en cada epoch y la memoria temporal no puede arrastrar
+estado del final del epoch anterior.
 
 ---
 
@@ -196,15 +212,17 @@ env \
   AIDEEN_CHECKPOINT_BASE=model_report \
   AIDEEN_BATCH_SIZE=4 \
   AIDEEN_CTX_LEN=512 \
-  AIDEEN_LM_FUSED_B19=1 \
-  AIDEEN_DEQ_HIST_GATED=1 \
+  AIDEEN_DEQ_HIST_GATED=0 \
+  AIDEEN_HIST_V2_MINIMAL=1 \
+  AIDEEN_DEQ_TOKEN_CARRY=0 \
+  AIDEEN_ADJ_ITERS_OVERRIDE=2 \
   AIDEEN_LOSS_READBACK_EVERY=20 \
   AIDEEN_TPS_SYNC_EVERY=20 \
   AIDEEN_VAL_EVERY=200 \
   AIDEEN_PROGRESS_EVERY=20 \
   AIDEEN_MAX_CHUNKS=200 \
   cargo run --release --features wgpu -p aideen-training --bin train -- \
-    --file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt \
+    --file /Users/sergiosolis/Programacion/AIDEEN/corpus_pretrain_minimal.txt \
     --epochs 1 \
     --log-every 1 \
     --save-every 0
@@ -520,9 +538,15 @@ cd /Users/sergiosolis/Programacion/AIDEEN
 
 ### Resume estable
 
+Para continuation probes, `AIDEEN_LR` también aplica con `--resume`.
+Usar un valor explícito y chico para retomar desde un checkpoint ya entrenado.
+
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN
-AIDEEN_RESUME_BASE=model_large AIDEEN_CHECKPOINT_BASE=model_large_resume ./resume_training.sh 3
+AIDEEN_RESUME_BASE=/Users/sergiosolis/Programacion/AIDEEN/artifacts/checkpoints/model_histv2_clean_pretrain_latest \
+AIDEEN_CHECKPOINT_BASE=/Users/sergiosolis/Programacion/AIDEEN/artifacts/checkpoints/model_histv2_clean_pretrain_latest \
+AIDEEN_LR=0.00002 \
+./resume_training.sh 3
 ```
 
 ---

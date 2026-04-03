@@ -234,7 +234,15 @@ fn run_large_file(
     let train_seed = env_u64("AIDEEN_TRAIN_SEED");
     let mut trainer = if let Some(ref base) = resume_path {
         println!("  Resumiendo desde checkpoint: {base}");
-        Trainer::load_checkpoint(base).expect("Error cargando checkpoint")
+        let mut t = Trainer::load_checkpoint(base).expect("Error cargando checkpoint");
+        // Resume should still allow an explicit LR override for continuation probes.
+        // Without this, AIDEEN_LR only affects fresh runs and resume experiments silently
+        // keep the checkpoint's stored schedule.
+        t.training_config.lr = lr;
+        t.training_config.lr_min = lr / 10.0;
+        t.training_config.warmup_epochs = 0;
+        t.training_config.epochs = epochs;
+        t
     } else {
         if let Some(seed) = train_seed {
             println!("  Init seed: {seed}");
