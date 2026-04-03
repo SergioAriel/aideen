@@ -59,6 +59,7 @@ pub struct RustDeqBridge {
     pub subgroup_pipeline: Option<wgpu::ComputePipeline>,
     pub subgroup_debug_pipeline: Option<wgpu::ComputePipeline>,
     pub subgroup_fastpath_enabled: bool,
+    pub hist_v2_signal_cache_pipeline: wgpu::ComputePipeline,
     pub hist_v2_project_pipeline: wgpu::ComputePipeline,
     pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
     pub signal_init_pipeline: Option<wgpu::ComputePipeline>,
@@ -87,6 +88,7 @@ pub struct RustDeqBridge {
     pub debug_buf: wgpu::Buffer,
     pub hist_ctx_buf: wgpu::Buffer,
     pub mstate_buf: wgpu::Buffer,
+    pub signal_cache_buf: wgpu::Buffer,
 
     pub bind_group: wgpu::BindGroup,
 }
@@ -363,8 +365,8 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // bindings 3-9: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState
-        for i in 3u32..=9 {
+        // bindings 3-10: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState, SignalCache
+        for i in 3u32..=10 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -465,6 +467,21 @@ impl RustDeqBridge {
             compilation_options: Default::default(),
             cache: None,
         });
+        let hist_v2_signal_cache_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AIDEEN Hist V2 Signal Cache Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/hist_v2_signal_cache.wgsl").into(),
+            ),
+        });
+        let hist_v2_signal_cache_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Hist V2 Signal Cache Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &hist_v2_signal_cache_shader,
+                entry_point: Some("hist_v2_signal_cache_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let hist_v2_project_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("AIDEEN Hist V2 Project Shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -868,6 +885,14 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let signal_cache_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hist V2 Signal Cache"),
+            size: (max_batch_size as u64) * (max_seq_len as u64) * (d_model as u64) * 4u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DEQ Forward Persistent Bind Group"),
             layout: &bind_group_layout,
@@ -911,6 +936,10 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: mstate_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: signal_cache_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1165,6 +1194,7 @@ impl RustDeqBridge {
             subgroup_pipeline,
             subgroup_debug_pipeline,
             subgroup_fastpath_enabled,
+            hist_v2_signal_cache_pipeline,
             hist_v2_project_pipeline,
             hist_v2_temporal_pipeline,
             signal_init_pipeline,
@@ -1191,6 +1221,7 @@ impl RustDeqBridge {
             debug_buf,
             hist_ctx_buf,
             mstate_buf,
+            signal_cache_buf,
             bind_group,
         }
     }
@@ -1565,6 +1596,15 @@ impl RustDeqBridge {
         });
 
         if self.hist_v2_minimal_enabled {
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hist V2 Signal Cache Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.hist_v2_signal_cache_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.token_count.max(1), 1);
+            }
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Hist V2 Project Pass"),

@@ -20,6 +20,7 @@ struct RunUniforms {
 @group(0) @binding(2) var<storage, read> AllWeights: array<f32>;
 @group(0) @binding(8) var<storage, read_write> HistCtx: array<f32>;
 @group(0) @binding(9) var<storage, read_write> MState: array<f32>;
+@group(0) @binding(10) var<storage, read_write> SignalCache: array<f32>;
 
 const WG_SIZE: u32 = 256u;
 var<workgroup> shared_vals: array<f32, WG_SIZE>;
@@ -59,18 +60,14 @@ fn hist_v2_project_main(
     let hist_bias_base = hist_slot_scale_base + h_slots * d_model;
     let hist_gate_base = hist_bias_base + h_slots * d_model;
     let hist_out = (batch_idx * shape.seq_len + global_t) * total_elements + slot_off;
-    let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
-    let prev_s_in_base = (batch_idx * shape.seq_len + max(shape.token_start, global_t) - select(0u, 1u, global_t > shape.token_start)) * d_model;
+    let cache_base = (batch_idx * shape.seq_len + global_t) * d_model;
+    let prev_cache_base = (batch_idx * shape.seq_len + max(shape.token_start, global_t) - select(0u, 1u, global_t > shape.token_start)) * d_model;
     let has_prev_token = global_t > shape.token_start;
     let m_base = batch_idx * total_elements + slot_off;
 
     var local_inj_sumsq = 0.0;
     for (var d = tid; d < d_model; d = d + WG_SIZE) {
-        var inj = 0.0;
-        for (var j = 0u; j < d_model; j = j + 1u) {
-            let w_idx = aw_win_base(d_model, h_slots) + j * d_model + d;
-            inj = inj + AllWeights[w_idx] * S_in[s_in_base + j];
-        }
+        let inj = SignalCache[cache_base + d];
         local_inj_sumsq = local_inj_sumsq + inj * inj;
     }
     shared_vals[tid] = local_inj_sumsq;
@@ -101,13 +98,7 @@ fn hist_v2_project_main(
 
     var local_prev_inj_sumsq = 0.0;
     for (var d = tid; d < d_model; d = d + WG_SIZE) {
-        var prev_inj = 0.0;
-        if (has_prev_token) {
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let w_idx = aw_win_base(d_model, h_slots) + j * d_model + d;
-                prev_inj = prev_inj + AllWeights[w_idx] * S_in[prev_s_in_base + j];
-            }
-        }
+        let prev_inj = select(0.0, SignalCache[prev_cache_base + d], has_prev_token);
         // Reuse HistCtx as a temporary cache for the causal local projection before final writeback.
         HistCtx[hist_out + d] = prev_inj;
         local_prev_inj_sumsq = local_prev_inj_sumsq + prev_inj * prev_inj;
