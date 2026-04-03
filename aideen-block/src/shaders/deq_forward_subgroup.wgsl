@@ -1,6 +1,3 @@
-enable subgroups;
-requires subgroup_id, subgroup_uniformity;
-
 struct RunUniforms {
     batch_size: u32,
     d_model: u32,
@@ -115,14 +112,14 @@ fn deq_forward_main(
                 local_sumsq = local_sumsq + sig * sig;
             }
             let subgroup_sumsq = subgroupAdd(local_sumsq);
-            if (subgroupElect()) {
+            if (subgroup_lid == 0u) {
                 subgroup_vals[subgroup_id] = subgroup_sumsq;
             }
             workgroupBarrier();
             if (subgroup_id == 0u) {
                 let partial = select(0.0, subgroup_vals[subgroup_lid], subgroup_lid < num_subgroups);
                 let total = subgroupAdd(partial);
-                if (subgroupElect()) {
+                if (subgroup_lid == 0u) {
                     subgroup_vals[0] = total;
                 }
             }
@@ -144,14 +141,14 @@ fn deq_forward_main(
                 local_sumsq = local_sumsq + pre * pre;
             }
             let subgroup_sumsq = subgroupAdd(local_sumsq);
-            if (subgroupElect()) {
+            if (subgroup_lid == 0u) {
                 subgroup_vals[subgroup_id] = subgroup_sumsq;
             }
             workgroupBarrier();
             if (subgroup_id == 0u) {
                 let partial = select(0.0, subgroup_vals[subgroup_lid], subgroup_lid < num_subgroups);
                 let total = subgroupAdd(partial);
-                if (subgroupElect()) {
+                if (subgroup_lid == 0u) {
                     subgroup_vals[0] = total;
                 }
             }
@@ -168,14 +165,14 @@ fn deq_forward_main(
             }
 
             let subgroup_max_delta = subgroupMax(local_max_delta);
-            if (subgroupElect()) {
+            if (subgroup_lid == 0u) {
                 subgroup_vals[subgroup_id] = subgroup_max_delta;
             }
             workgroupBarrier();
             if (subgroup_id == 0u) {
                 let partial = select(0.0, subgroup_vals[subgroup_lid], subgroup_lid < num_subgroups);
                 let total = subgroupMax(partial);
-                if (subgroupElect()) {
+                if (subgroup_lid == 0u) {
                     subgroup_vals[0] = total;
                 }
             }
@@ -222,14 +219,14 @@ fn deq_forward_main(
         }
         if (ENABLE_DEBUG_METRICS) {
             let subgroup_final_max = subgroupMax(local_final_max_h);
-            if (subgroupElect()) {
+            if (subgroup_lid == 0u) {
                 subgroup_vals[subgroup_id] = subgroup_final_max;
             }
             workgroupBarrier();
             if (subgroup_id == 0u) {
                 let partial = select(0.0, subgroup_vals[subgroup_lid], subgroup_lid < num_subgroups);
                 let total = subgroupMax(partial);
-                if (subgroupElect()) {
+                if (subgroup_lid == 0u) {
                     subgroup_vals[0] = total;
                 }
             }

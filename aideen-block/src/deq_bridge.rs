@@ -261,6 +261,13 @@ impl RustDeqBridge {
             })
             .unwrap_or(false)
             && !slot_attn_real_staged_enabled;
+        let disable_subgroup_fastpath = std::env::var("AIDEEN_DEQ_DISABLE_SUBGROUP")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let slot_qkv_probe_enabled = slot_qkv_probe_enabled && !slot_attn_real_staged_enabled;
         let shader_src = if use_exact_forward {
             include_str!("shaders/deq_forward_exact.wgsl")
@@ -362,7 +369,7 @@ impl RustDeqBridge {
             },
             cache: None,
         });
-        let subgroup_pair = if !use_exact_forward && subgroup_supported {
+        let subgroup_pair = if !use_exact_forward && subgroup_supported && !disable_subgroup_fastpath {
             Self::try_build_subgroup_pipelines(
                 device,
                 &pipeline_layout,
@@ -381,7 +388,11 @@ impl RustDeqBridge {
                     true,
                 )
             } else {
-                if subgroup_supported && !use_exact_forward {
+                if disable_subgroup_fastpath {
+                    eprintln!(
+                        "[RustDeqBridge] Subgroup fast path disabled by AIDEEN_DEQ_DISABLE_SUBGROUP; using portable path."
+                    );
+                } else if subgroup_supported && !use_exact_forward {
                     eprintln!(
                         "[RustDeqBridge] Subgroup supported by adapter but unavailable in current WGSL toolchain; using portable path."
                     );
