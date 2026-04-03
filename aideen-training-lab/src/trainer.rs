@@ -14,6 +14,7 @@ use aideen_core::{
     reasoning::Reasoning,
     state::{ArchitectureConfig, HSlots},
 };
+use std::io::Write;
 
 use crate::{gradients, loss, optimizer::Adam};
 use aideen_backbone::{
@@ -146,14 +147,103 @@ pub struct Trainer {
 }
 
 impl Trainer {
-    fn visible_loss_text(&self, fallback: Option<f32>) -> String {
+    fn visible_loss_value(&self, fallback: Option<f32>) -> Option<f32> {
         if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
-            format!("{:.4}", self.last_gpu_loss)
-        } else if let Some(v) = fallback.filter(|v| v.is_finite() && *v > 0.0) {
+            Some(self.last_gpu_loss)
+        } else {
+            fallback.filter(|v| v.is_finite() && *v > 0.0)
+        }
+    }
+
+    fn visible_loss_text(&self, fallback: Option<f32>) -> String {
+        if let Some(v) = self.visible_loss_value(fallback) {
             format!("{:.4}", v)
         } else {
             "n/a".to_string()
         }
+    }
+
+    fn checkpoint_metrics_path(base_path: &str) -> String {
+        format!("{base_path}_metrics.csv")
+    }
+
+    fn checkpoint_best_base_path(base_path: &str) -> String {
+        format!("{base_path}_best_loss")
+    }
+
+    fn checkpoint_best_meta_path(base_path: &str) -> String {
+        format!("{}.meta", Self::checkpoint_best_base_path(base_path))
+    }
+
+    fn load_best_loss(base_path: &str) -> Option<f32> {
+        if base_path.is_empty() {
+            return None;
+        }
+        let meta_path = Self::checkpoint_best_meta_path(base_path);
+        let contents = std::fs::read_to_string(meta_path).ok()?;
+        for line in contents.lines() {
+            if let Some(value) = line.strip_prefix("loss=") {
+                if let Ok(loss) = value.trim().parse::<f32>() {
+                    return Some(loss);
+                }
+            }
+        }
+        None
+    }
+
+    fn append_epoch_metrics(
+        &self,
+        checkpoint_path: &str,
+        epoch: usize,
+        epoch_loss: f32,
+        lr: f32,
+        tps: f32,
+        total_tokens: usize,
+    ) -> std::io::Result<()> {
+        if checkpoint_path.is_empty() {
+            return Ok(());
+        }
+        let metrics_path = Self::checkpoint_metrics_path(checkpoint_path);
+        if let Some(parent) = std::path::Path::new(&metrics_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let new_file = !std::path::Path::new(&metrics_path).exists();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&metrics_path)?;
+        if new_file {
+            writeln!(file, "epoch,loss,lr,tps_epoch,tokens")?;
+        }
+        writeln!(
+            file,
+            "{epoch},{epoch_loss:.6},{lr:.8},{tps:.3},{total_tokens}"
+        )?;
+        Ok(())
+    }
+
+    fn save_best_loss_checkpoint(
+        &mut self,
+        checkpoint_path: &str,
+        epoch: usize,
+        epoch_loss: f32,
+        lr: f32,
+        total_tokens: usize,
+    ) -> std::io::Result<()> {
+        if checkpoint_path.is_empty() {
+            return Ok(());
+        }
+        let best_base = Self::checkpoint_best_base_path(checkpoint_path);
+        self.save_checkpoint(&best_base)?;
+        let meta_path = Self::checkpoint_best_meta_path(checkpoint_path);
+        let mut meta = String::new();
+        meta.push_str(&format!("loss={epoch_loss:.6}\n"));
+        meta.push_str(&format!("epoch={epoch}\n"));
+        meta.push_str(&format!("lr={lr:.8}\n"));
+        meta.push_str(&format!("tokens={total_tokens}\n"));
+        std::fs::write(meta_path, meta)
     }
 
     fn env_flag(name: &str) -> bool {
@@ -2592,6 +2682,7 @@ impl Trainer {
         let batch_size_file = self.cfg_fwd_batch_size.max(1) as usize;
         let mut batch_train_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
         let mut batch_tgt_buf: Vec<u32> = Vec::with_capacity(batch_size_file * ctx_len);
+        let mut best_epoch_loss = Self::load_best_loss(checkpoint_path);
 
         for epoch in 0..epochs {
             // Each epoch restarts the token stream from the beginning of the file.
@@ -2661,6 +2752,7 @@ impl Trainer {
             });
             let mut epoch_loss = 0.0f32;
             let mut num_chunks = 0usize;
+            let mut train_chunks = 0usize;
             let mut total_tokens = 0usize;
             let mut interval_start = std::time::Instant::now();
             let mut interval_tokens = 0usize;
@@ -2747,6 +2839,7 @@ impl Trainer {
                                         );
                                     } else {
                                         epoch_loss += loss;
+                                        train_chunks += 1;
                                     }
                                     num_chunks += 1;
                                     total_tokens += batch_train_buf.len();
@@ -2790,6 +2883,7 @@ impl Trainer {
                                     );
                                 } else {
                                     epoch_loss += loss;
+                                    train_chunks += 1;
                                 }
                                 num_chunks += 1;
                                 total_tokens += batch_train_buf.len();
@@ -2831,6 +2925,7 @@ impl Trainer {
                         let eps = self.progressive_epsilon(epoch, epochs);
                         let loss = self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
                         epoch_loss += loss;
+                        train_chunks += 1;
                         num_chunks += 1;
                         total_tokens += batch_train_buf.len();
                         batch_train_buf.clear();
@@ -2861,7 +2956,11 @@ impl Trainer {
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps_run = total_tokens as f32 / elapsed.max(1e-9);
                     let tps_win = interval_tokens as f32 / interval_start.elapsed().as_secs_f32().max(1e-9);
-                    let current_loss = self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
+                    let current_loss = self.visible_loss_text(if train_chunks > 0 {
+                        Some(epoch_loss / train_chunks as f32)
+                    } else {
+                        None
+                    });
 
                     println!(
                         "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
@@ -2917,6 +3016,12 @@ impl Trainer {
             } else {
                 0.0
             };
+            let epoch_loss_avg = if train_chunks > 0 {
+                Some(epoch_loss / train_chunks as f32)
+            } else {
+                None
+            };
+            let tracked_epoch_loss = self.visible_loss_value(epoch_loss_avg);
 
             if epoch % log_every == 0 {
                 let mut gpu_stats = String::new();
@@ -2933,16 +3038,53 @@ impl Trainer {
                     }
                 }
 
-                let display_loss = self.visible_loss_text(if num_chunks > 0 {
-                    Some(epoch_loss / num_chunks as f32)
-                } else {
-                    None
-                });
+                let display_loss = self.visible_loss_text(tracked_epoch_loss);
 
                 println!(
                     "  epoch {epoch:>4}/{epochs}  loss={}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
                     display_loss, current_lr, tps, elapsed, total_tokens, gpu_stats
                 );
+            }
+
+            if let Some(loss_avg) = tracked_epoch_loss {
+                if let Err(e) = self.append_epoch_metrics(
+                    checkpoint_path,
+                    epoch,
+                    loss_avg,
+                    current_lr,
+                    tps,
+                    total_tokens,
+                ) {
+                    eprintln!(
+                        "[metrics] Error guardando métricas en '{}': {}",
+                        Self::checkpoint_metrics_path(checkpoint_path),
+                        e
+                    );
+                }
+
+                let should_save_best = best_epoch_loss.map_or(true, |best| loss_avg < best);
+                if should_save_best && !checkpoint_path.is_empty() {
+                    if let Err(e) = self.save_best_loss_checkpoint(
+                        checkpoint_path,
+                        epoch,
+                        loss_avg,
+                        current_lr,
+                        total_tokens,
+                    ) {
+                        eprintln!(
+                            "[checkpoint] Error guardando best_loss para '{}': {}",
+                            checkpoint_path, e
+                        );
+                    } else {
+                        eprintln!(
+                            "[checkpoint] Nuevo best_loss {:.6} guardado en '{}' (epoch {})",
+                            loss_avg,
+                            Self::checkpoint_best_base_path(checkpoint_path),
+                            epoch
+                        );
+                        best_epoch_loss = Some(loss_avg);
+                    }
+                }
             }
 
             if save_every > 0 && (epoch + 1) % save_every == 0 && !checkpoint_path.is_empty() {
@@ -2970,6 +3112,11 @@ impl Trainer {
     /// Guarda el modelo completo más el estado del optimizador.
     /// Formato: <path>.aidn (pesos) + <path>.opt (momentos Adam).
     pub fn save_checkpoint(&mut self, base_path: &str) -> std::io::Result<()> {
+        if let Some(parent) = std::path::Path::new(base_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         // Pesos del modelo
         self.save_full(&format!("{base_path}.aidn"))?;
 

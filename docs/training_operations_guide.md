@@ -112,6 +112,10 @@ env \
   - receta mínima seria que ya mostró mejora real en el corpus limpio
 - `AIDEEN_CHECKPOINT_BASE=.../model_histv2_clean_pretrain_latest`
   - guarda en `artifacts/checkpoints/` y evita ensuciar el root del repo
+  - ahora también genera:
+    - `..._metrics.csv`
+    - `..._best_loss.aidn/.opt`
+    - `..._best_loss.meta`
 
 ### Cuándo usarlo
 
@@ -242,6 +246,8 @@ env \
 - `tps_run`
 - `tps_epoch` al final
 - checkpoint separado si activás `--save-every > 0`
+- métricas persistentes por epoch en `AIDEEN_CHECKPOINT_BASE_metrics.csv`
+- checkpoint automático `best_loss` sin tener que elegir epochs a mano
 
 ---
 
@@ -553,6 +559,17 @@ Baseline provisional validado para continuation sobre
 En esta configuración, los probes de continuación quedaron en una banda útil de
 `loss` alta-7 / baja-8, claramente mejor que el régimen previo de resume que
 había degradado hasta ~`8.0-9.9`.
+
+Además, el trainer ahora guarda automáticamente:
+
+- `AIDEEN_CHECKPOINT_BASE.aidn/.opt`
+  - latest / continuidad operativa
+- `AIDEEN_CHECKPOINT_BASE_best_loss.aidn/.opt`
+  - mejor epoch observado por la loss efectiva visible del epoch
+- `AIDEEN_CHECKPOINT_BASE_best_loss.meta`
+  - loss, epoch, lr y tokens del mejor checkpoint
+- `AIDEEN_CHECKPOINT_BASE_metrics.csv`
+  - serie por epoch para auditar continuidad sin leer logs a mano
 
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN
