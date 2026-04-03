@@ -223,6 +223,11 @@ impl RustDeqBridge {
         max_seq_len: u32,
         subgroup_supported: bool,
     ) -> Self {
+        // Runtime path selection for the DEQ forward family:
+        // - deq_forward.wgsl is the primary production/training path
+        // - deq_forward_subgroup.wgsl is the fast-path variant of that same family
+        // - deq_forward_exact.wgsl is an alternate/diagnostic path and should not be treated
+        //   as the default baseline without explicitly enabling it
         let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
             .ok()
             .map(|v| {
@@ -237,6 +242,8 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        // Staged slot-attention shaders are optional experimental paths. They are not part of
+        // the default forward baseline and should be treated as separately benchmarked branches.
         let slot_attn_real_staged_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_REAL_STAGED")
             .ok()
             .map(|v| {

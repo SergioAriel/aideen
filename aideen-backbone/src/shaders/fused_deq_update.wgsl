@@ -1315,22 +1315,6 @@ fn fused_hist_stage_tbptt_main(
         }
         workgroupBarrier();
 
-        let prev_h_base = (t_abs - 1u) * h_slots * d + off;
-        var local_h_sumsq = 0.0;
-        for (var dim = lane; dim < d; dim = dim + 64u) {
-            let h_val = h_star[prev_h_base + dim];
-            local_h_sumsq = local_h_sumsq + h_val * h_val;
-        }
-        hist_reduce_u[lane] = local_h_sumsq;
-        workgroupBarrier();
-        for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                hist_reduce_u[lane] = hist_reduce_u[lane] + hist_reduce_u[lane + stride];
-            }
-            workgroupBarrier();
-        }
-        let h_rms = sqrt(hist_reduce_u[0] / max(1.0, f32(d)) + 1e-6);
-
         for (var dim = lane; dim < d; dim = dim + 64u) {
             let a_t = hist_ctx_buf[hist_out + dim];
             let g_pre = hist_ginner_vec[dim] * hist_delta_buf[hist_out + dim];
@@ -1349,25 +1333,7 @@ fn fused_hist_stage_tbptt_main(
             }
             hist_total_vec[dim] = g_h_unit;
         }
-
-        let dst_entry = (t_abs - 1u) * h_slots + slot;
-        let dst_off = entry_base(dst_entry, d);
-        var local_dot = 0.0;
         for (var dim = lane; dim < d; dim = dim + 64u) {
-            local_dot = local_dot + hist_total_vec[dim] * h_star[prev_h_base + dim];
-        }
-        hist_reduce_u[lane] = local_dot;
-        workgroupBarrier();
-        for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                hist_reduce_u[lane] = hist_reduce_u[lane] + hist_reduce_u[lane + stride];
-            }
-            workgroupBarrier();
-        }
-        let denom = max(1e-6, f32(d) * h_rms * h_rms * h_rms);
-        let dot_gh_h = hist_reduce_u[0];
-        for (var dim = lane; dim < d; dim = dim + 64u) {
-            let g_h_unit = hist_total_vec[dim];
             let a_t = hist_ctx_buf[hist_out + dim];
             hist_carry_vec[dim] = a_t * hist_ginner_vec[dim];
         }

@@ -1725,6 +1725,11 @@ impl GpuDeqBackend {
             }],
         });
         // Parse all hot-path env vars once at construction.
+        // This backend is the main runtime selector for:
+        // - history mode / selective-history behavior
+        // - staged adjoint Picard variants
+        // - fused update profiling/probing
+        // Keep the set of active selectors understandable here before deleting shader branches.
         let cached_residual_alpha = Self::residual_alpha_from_env();
         let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let cfg_hist_selective = Self::hist_selective_from_env();
