@@ -1,22 +1,58 @@
 # AIDEEN Architecture — Forward Pass Step by Step
 
-> Verified against source code as of 2026-03-18.
-> All line references are to the current file at that path.
+> Canonical runtime updated as of 2026-04-03.
+> Older sections below are preserved as archival notes where explicitly marked.
+
+---
+
+## Canonical Runtime (2026-04-03)
+
+El runtime canónico actual ya no usa `deq_forward.wgsl`, `deq_forward_exact.wgsl`
+ni `deq_forward_subgroup.wgsl`. El path real de forward es:
+
+```text
+embedding_train -> deq_slot_attn_unified_clean -> deq_forward_pool -> lm_train
+```
+
+La ecuación efectiva del bloque DEQ por token/slot es:
+
+```text
+signal_t,s   = W_in,s x_t
+slot_ctx_t,s = SlotAttn(signal_t,1..S)
+pre_t,s      = signal_t,s + H_curr_t-1,s + slot_ctx_t,s + slot_anchor_s
+f_t,s        = NormScale ⊙ RMSNorm(pre_t,s)
+h_t,s(next)  = damping * f_t,s + (1 - damping) * H_curr_t-1,s
+```
+
+con estas decisiones canónicas:
+
+- `slot_ctx` se construye desde `signal`, no desde `H_curr`
+- `H_curr` se mantiene como memoria local rápida entre tokens
+- `H_curr` entra explícitamente en `pre`
+- `H_curr` también ancla el damping
+- la historia explícita `HistCtx/MState` queda fuera del runtime canónico por ahora
+
+Consecuencia práctica:
+
+- el único selector estructural del solve canónico que sigue activo es
+  `AIDEEN_DEQ_TOKEN_CARRY`
+- los shaders de historia (`hist_v2_*`) se conservan como material de referencia,
+  pero no forman parte del path baseline actual
 
 ---
 
 ## Overview
 
 AIDEEN is a **Deep Equilibrium Model (DEQ)** operating on `h_slots` parallel hidden states.
-For each token position `t`, it solves a fixed-point equation:
+For each token position `t`, the canonical solver now computes:
 
 ```
-h*_s = f(h*_s ; s_t, M_{t-1})   for s = 0..h_slots-1
+h*_s = f(h*_s ; s_t, H_{t-1})   for s = 0..h_slots-1
 ```
 
-where `f` involves cross-slot attention, per-slot input injection, per-slot history
-context, and RMSNorm normalization. The Picard iteration finds the fixed point; after
-convergence a separate Mamba-style recurrence updates the temporal memory `M_t`.
+where `f` involves slot attention built from the current token signal, per-slot input
+injection, `H_curr` carry, and RMSNorm normalization. The Picard iteration finds the
+fixed point, and `H_curr` is the only active temporal carrier in the baseline.
 
 ---
 
@@ -34,38 +70,19 @@ Each token index is looked up in the embedding table. The result is a dense vect
 
 ## 2. DEQ Block — Per-Token Loop
 
-**File:** `aideen-block/src/shaders/deq_forward.wgsl`
+**File:** `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`
 
 One GPU workgroup per batch item. Iterates over `t = 0..seq_len-1` sequentially
 (temporal dependency through `M_{t-1}`).
 
 ### 2a. Scratch Buffer Layout
 
-Per token, `scratch_stride = d_model * (h_slots * 7) + h_slots²` floats:
+Per token, `scratch_stride = 2 * h_slots * d_model` floats:
 
 | Region | Offset | Size | Content |
 |--------|--------|------|---------|
-| `q_base` | `0` | `h_slots × d_model` | Q projections |
-| `k_base` | `+h_slots*d` | `h_slots × d_model` | K projections |
-| `v_base` | `+2*h_slots*d` | `h_slots × d_model` | V projections |
-| `attn_base` | `+3*h_slots*d` | `h_slots × d_model` | W_o(mix) output |
-| `mamba_base` | `+4*h_slots*d` | `h_slots × d_model` | **M_t** (temporal state) / temp mix |
-| `signal_base` | `+5*h_slots*d` | `h_slots × d_model` | W_in_s * s_t per slot |
-| `m_inner_base` | `+6*h_slots*d` | `h_slots × d_model` | Inner SSM state (pre W_out) |
-| `attn_weight_base` | `+7*h_slots*d` | `h_slots²` | Attention weights `attn[qs, ks]` |
-
-Note: `M_{t-1}` for a previous token lives at `mamba_base` of that token's scratch region.
-
-### 2b. Operation Mode (sentinel via `residual_alpha`)
-
-| `residual_alpha` range | Mode |
-|------------------------|------|
-| `≤ -1.5` | `deq_only` — no attention, no mamba |
-| `> -1.5, ≤ -1.0` | `no_mamba` — attention active, no mamba |
-| `> -1.0, ≤ -0.75` | `init_mamba` — history only in h₀ |
-| `> -0.75, ≤ -0.5` | **`hist_gated`** ← default production mode |
-| `> -0.5, ≤ -0.25` | `fixed_mamba` — mamba as external bias |
-| `> -0.25` | `full_mamba` — mamba coupled into h |
+| `signal_base` | `0` | `h_slots × d_model` | `W_in,s × s_t` per slot |
+| `attn_base` | `+h_slots*d` | `h_slots × d_model` | slot attention output `slot_ctx` |
 
 ### 2c. Prelude: Per-Slot Input Injection
 
@@ -81,26 +98,20 @@ the same CPU matrix (replicated by `w_in_gpu_flat()`).
 
 Stored at `Scratch[signal_base + s * d_model]`.
 
-### 2d. Prelude: History Context Injection (`hist_gated_mode` only)
+### 2d. Slot Attention Context
 
-For each slot `s`, reads `M_{t-1}_s` (from `mamba_base` of token `t-1`):
+For each slot `s`, Q/K/V are computed from the per-slot `signal` of the current token,
+not from `H_curr`. That yields:
 
-```
-u_s = W_hist × RMSUnit(M_{t-1}_s)
-    + hist_slot_scale_s * RMSUnit(M_{t-1}_s)    (element-wise scale)
-```
-
-Then gated and capped:
-```
-alpha_s  = sigmoid(hist_gate_logit_s)  ∈ [alpha_min, alpha_max]
-hist_cap = min(1, 0.08 * inj_rms / hist_rms)     ← prevents history dominating signal
-hist_ctx_s = alpha_s * hist_cap * u_s
+```text
+slot_ctx_s = SlotAttn(signal_1, ..., signal_S)_s
 ```
 
-Stored at `Scratch[m_inner_base + s * d_model]`.
+This separation is intentional:
 
-**Key property:** `∂hist_ctx/∂h = 0` (stop-gradient). Does not affect the Lipschitz
-constant of `f`. Enters numerator only.
+- `signal` handles token content
+- `slot_ctx` handles inter-slot coordination
+- `H_curr` handles token-to-token memory
 
 ---
 
@@ -117,9 +128,9 @@ V_s = W_v × h_s
 ```
 
 `W_q`, `W_k`, `W_v` are `d_model × d_model` matrices, **shared** across all `h_slots`.
-Diversity between slot representations comes from their different `h_s` states.
+Diversity between slot representations comes from their different `signal_s` states.
 
-Stored at `Scratch[q_base + s*d]`, `Scratch[k_base + s*d]`, `Scratch[v_base + s*d]`.
+The resulting attention output is stored at `Scratch[attn_base + s*d]`.
 
 ### 3b. Cross-Slot Attention
 
@@ -325,6 +336,9 @@ Starting offset 0:
 
 ## 10. Debug Log Layout (DebugLog[])
 
+The table below is archival and refers to the old `deq_forward.wgsl` family. It is no
+longer the canonical runtime path after 2026-04-03.
+
 Written by `deq_forward.wgsl` (batch 0, thread 0), then **partially overwritten**
 by `fused_deq_update.wgsl` at indices 40-44.
 
@@ -374,6 +388,10 @@ read indices 45-51 or add dedicated debug slots.
 ---
 
 ## 11. Complete Data Flow Summary
+
+The diagram below is archival and describes the older history-coupled runtime. The
+canonical runtime now uses `deq_slot_attn_unified_clean.wgsl` with `H_curr` as the
+active temporal carrier.
 
 ```
 token_ids[batch, seq_len]

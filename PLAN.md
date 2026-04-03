@@ -1,5 +1,18 @@
 # Plan Final de Implementación: Memoria Temporal Selectiva y DEQ-Compatible para AIDEEN
 
+> Update 2026-04-03:
+> este documento describe un plan histórico centrado en `hist_gated` / `HistCtx`.
+> El baseline canónico actual ya no usa esa ruta como runtime principal.
+> La base vigente es:
+>
+> - `slot_ctx = Attn(signal)`
+> - `pre = signal + H_curr + slot_ctx + slot_anchor`
+> - `H_curr` como memoria local rápida entre tokens
+> - historia explícita fuera del baseline por ahora
+>
+> A partir de este punto, las próximas fases deben reinterpretarse como material de
+> referencia para reconstruir historia sobre `H_curr`, no como plan operativo vigente.
+
 ## Resumen
 
 Se implementará una memoria temporal fuerte, inspirada en Mamba, pero integrada de forma compatible con el fixed-point del DEQ.
@@ -21,14 +34,43 @@ Este plan es la ruta productiva. La integración interna de memoria dentro del D
 
 En este plan y en los flags actuales, “**mamba**” significa **memoria temporal externa / canal histórico** (el contexto `c_{t,k}` o la inicialización histórica), **no** un “mamba interno” dentro del DEQ.
 
-Referencia rápida de flags:
+Referencia histórica de flags:
 - `AIDEEN_DEQ_ONLY=1` → DEQ sin atención ni historia.
 - `AIDEEN_DEQ_NO_MAMBA=1` → atención ON, **historia OFF**.
 - `AIDEEN_DEQ_HIST_GATED=1` → atención ON, **historia ON** (gated).
 
-Si más adelante implementamos memoria interna al DEQ, los flags se renombrarán para evitar colisión semántica.
+El baseline actual ya no debe depender de esos selectores.
 
-## Estado actual (2026-03-14)
+## Estado actual (2026-04-03)
+
+Baseline canónico validado:
+
+- runtime único por `deq_slot_attn_unified_clean.wgsl`
+- `slot_ctx` construido desde `signal`
+- `H_curr` activo en `pre`
+- `H_curr` activo en damping
+- `AIDEEN_DEQ_TOKEN_CARRY` como único selector central del solve
+- historia explícita `HistCtx/MState` fuera del path baseline
+
+Comparativas controladas contra el baseline previo:
+
+- `seed=42`, `80 chunks`
+  - previo: `loss=8.6026`, `tps=3103.3`
+  - canónico actual: `loss=8.4108`, `tps=3359.6`
+- `seed=11`, `20 chunks`
+  - previo: `loss=10.0097`, `tps=2921.5`
+  - canónico actual: `loss=9.7964`, `tps=3346.7`
+
+Conclusión estructural actual:
+
+- `slot_ctx` sí es esencial
+- `H_curr` sí es esencial
+- la historia explícita previa no justificó su costo en corto horizonte
+- la próxima memoria debe diseñarse a partir de `H_curr` o muy pegada a `H_curr`
+
+---
+
+## Estado histórico (2026-03-14)
 
 **Fase 1 cerrada** con baseline estable:
 - `hist_cap_floor_mult = 0.08`
