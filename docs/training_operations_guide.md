@@ -609,6 +609,24 @@ Validación operativa mínima del controller de plateau:
 
 O sea: el run ya puede bajar LR dentro de la misma corrida sin depender de relanzes manuales.
 
+### Control del fixed-point
+
+El controller del solve ya no depende de `AIDEEN_DEBUG_SAMPLE`.
+
+- `AIDEEN_DEBUG_SAMPLE`
+  - controla solo logs humanos (`[GPU-DEBUG]`, `[GPU-HIST]`, `[GPU-SSM]`)
+- `AIDEEN_SOLVE_CONTROL_EVERY`
+  - controla cada cuántos steps se muestrean métricas del solve para regular:
+    - `adaptive_max_iters`
+    - emergencia
+    - contractividad
+
+Default:
+
+- `AIDEEN_SOLVE_CONTROL_EVERY=10`
+
+Esto evita que apagar logs deje dormido el controller del fixed-point.
+
 Además, el trainer ahora guarda automáticamente:
 
 - `AIDEEN_CHECKPOINT_BASE.aidn/.opt`

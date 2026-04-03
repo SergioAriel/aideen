@@ -108,6 +108,8 @@ pub struct Trainer {
     pub plateau_bad_epochs: usize,
     pub plateau_cooldown_left: usize,
     pub plateau_lr_cap: f32,
+    pub solve_stage_floor: u32,
+    pub solve_stage_cap: u32,
 
     // --- v14 Temporal Memory State ---
     pub m_prev: Option<HSlots>,
@@ -130,6 +132,7 @@ pub struct Trainer {
     // Avoids ~26 env::var syscalls per training step.
     cfg_fwd_batch_size: u32,       // AIDEEN_BATCH_SIZE (for forward dispatch)
     cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
+    cfg_solve_control_every: usize, // AIDEEN_SOLVE_CONTROL_EVERY
     cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
     cfg_tps_sync_every: usize, // AIDEEN_TPS_SYNC_EVERY
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
@@ -247,6 +250,22 @@ impl Trainer {
         self.plateau_bad_epochs = 0;
         self.plateau_cooldown_left = self.cfg_lr_plateau_cooldown;
         Some(new_cap)
+    }
+
+    fn apply_stage_solve_schedule(&mut self, floor: u32, cap: u32, adj_iters: usize) {
+        let floor = floor.max(1);
+        let cap = cap.max(floor);
+        self.solve_stage_floor = floor;
+        self.solve_stage_cap = cap;
+        self.adaptive_max_iters = self.adaptive_max_iters.clamp(floor, cap);
+        self.config.adj_iters = adj_iters.max(1);
+        if self.cfg_adj_iters_override.is_none() {
+            self.adaptive_adj_iters = self.config.adj_iters as u32;
+        }
+    }
+
+    fn emergency_solve_cap(&self) -> u32 {
+        (self.solve_stage_cap + 4).min(48).max(self.solve_stage_cap)
     }
 
     fn checkpoint_best_base_path(base_path: &str) -> String {
@@ -740,6 +759,8 @@ impl Trainer {
             plateau_bad_epochs: 0,
             plateau_cooldown_left: 0,
             plateau_lr_cap: lr,
+            solve_stage_floor: 8,
+            solve_stage_cap: 12,
             m_prev: None,
             grad_accum_counter: 0,
             debug_last_time: None,
@@ -750,6 +771,8 @@ impl Trainer {
                 .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
                 .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+            cfg_solve_control_every: std::env::var("AIDEEN_SOLVE_CONTROL_EVERY")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10).max(1),
             cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
                 .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
@@ -867,6 +890,8 @@ impl Trainer {
             plateau_bad_epochs: 0,
             plateau_cooldown_left: 0,
             plateau_lr_cap: lr,
+            solve_stage_floor: 8,
+            solve_stage_cap: 12,
             m_prev: None,
             grad_accum_counter: 0,
             debug_last_time: None,
@@ -877,6 +902,8 @@ impl Trainer {
                 .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
                 .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+            cfg_solve_control_every: std::env::var("AIDEEN_SOLVE_CONTROL_EVERY")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10).max(1),
             cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
                 .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
@@ -1240,6 +1267,7 @@ impl Trainer {
             self.config.d_r,
             self.config.h_slots,
         );
+        let emergency_iter_cap = self.emergency_solve_cap();
 
         if let (Some(gpu), Some(gpu_lm), Some(gpu_emb)) =
             (gpu_ctx, self.gpu_lm.as_mut(), self.gpu_emb.as_ref())
@@ -1338,7 +1366,8 @@ impl Trainer {
                 );
                 self.invalid_hi_streak = 0;
                 self.emergency_left = 3;
-                self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
+                self.adaptive_max_iters = (self.adaptive_max_iters + 2)
+                    .min(emergency_iter_cap);
                 #[cfg(feature = "wgpu")]
                 {
                     let renorm_t0 = std::time::Instant::now();
@@ -1447,16 +1476,6 @@ impl Trainer {
                 self.grad_accum_counter += 1;
                 if self.grad_accum_counter >= grad_accum {
                     self.grad_accum_counter = 0;
-                    // Refresh debug buffer cache if this is a sample step.
-                    let debug_every = self.cfg_debug_sample_every;
-                    if debug_every != 0
-                        && (self.optimizer.step_count() % debug_every == 0) {
-                        let sync_t0 = std::time::Instant::now();
-                        self.cached_debug_buf = gpu.read_debug_buffer();
-                        if audit_cost {
-                            audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
-                        }
-                    }
                 }
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
@@ -1693,17 +1712,23 @@ impl Trainer {
             self.debug_tokens_accum += num_tokens as u32;
 
             // --- DIAGNÓSTICOS GPU (v13.1 Auto-Healing) ---
-            // Reuse cached debug buffer to avoid blocking GPU every diagnostic step.
+            // Reuse cached debug buffer, but keep the control cadence independent from
+            // human-facing debug sampling so the fixed-point controller stays active in production runs.
             let debug_every = self.cfg_debug_sample_every;
-            if debug_every != 0
-                && (self.optimizer.step_count() % debug_every == 0) {
+            let control_every = self.cfg_solve_control_every;
+            let step = self.optimizer.step_count();
+            let debug_due = debug_every != 0 && step % debug_every == 0;
+            let control_due = step % control_every == 0;
+            let mut metrics_refreshed = false;
+            if control_due || debug_due {
                 let sync_t0 = std::time::Instant::now();
                 self.cached_debug_buf = gpu.read_debug_buffer();
                 if audit_cost {
                     audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
                 }
+                metrics_refreshed = true;
             }
-            if !self.cached_debug_buf.is_empty() {
+            if metrics_refreshed && !self.cached_debug_buf.is_empty() {
                 let fw = &self.cached_debug_buf;
 
                 let rs_cg = 0.0f32;
@@ -1840,13 +1865,17 @@ impl Trainer {
 
                 // Subir iters si se está pegando al techo sostenidamente
                 if self.hit_hi_streak >= 2 {
-                    self.adaptive_max_iters = (self.adaptive_max_iters + 1).min(12);
+                    self.adaptive_max_iters =
+                        (self.adaptive_max_iters + 1).min(self.solve_stage_cap);
                     self.hit_hi_streak = 0;
                 }
 
                 // Bajar iters si está sobrado por un buen rato
                 if self.hit_lo_streak >= 10 {
-                    self.adaptive_max_iters = self.adaptive_max_iters.saturating_sub(1).max(4);
+                    self.adaptive_max_iters = self
+                        .adaptive_max_iters
+                        .saturating_sub(1)
+                        .max(self.solve_stage_floor);
                     self.hit_lo_streak = 0;
                 }
 
@@ -1885,7 +1914,8 @@ impl Trainer {
                     || contractivity > 1.20
                 {
                     self.emergency_left = 3; // 3 windows de debug (~30 steps)
-                    self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(48);
+                    self.adaptive_max_iters = (self.adaptive_max_iters + 2)
+                        .min(emergency_iter_cap);
                     self.max_h_growth_streak = 0;
                     self.max_delta_hi_streak = 0;
                     // Trigger spectral renorm immediately
@@ -1906,6 +1936,10 @@ impl Trainer {
                 }
                 if self.emergency_left > 0 {
                     self.emergency_left -= 1;
+                } else {
+                    self.adaptive_max_iters = self
+                        .adaptive_max_iters
+                        .clamp(self.solve_stage_floor, self.solve_stage_cap);
                 }
 
                 // Determinar modo y damping efectivo
@@ -1921,7 +1955,8 @@ impl Trainer {
                     hit_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
                 let conv_str = if conv_ok { "OK" } else { "FAIL" };
                 let hit_i = hit.round() as i32;
-                println!(
+                if debug_due {
+                    println!(
                     "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
                     hit_i,
@@ -1964,6 +1999,7 @@ impl Trainer {
                     trunc_str,
                     total_elems
                 );
+                }
                 let hist_w_grad = fw.get(64).copied().unwrap_or(0.0);
                 let hist_w_step = fw.get(65).copied().unwrap_or(0.0);
                 let hist_w_before = fw.get(66).copied().unwrap_or(0.0);
@@ -1975,7 +2011,8 @@ impl Trainer {
                 let hist_lr = fw.get(80).copied().unwrap_or(0.0);
                 let hist_grad_scale = fw.get(81).copied().unwrap_or(0.0);
                 let hist_wd = fw.get(82).copied().unwrap_or(0.0);
-                println!(
+                if debug_due {
+                    println!(
                     "    \x1b[90m[GPU-HIST] W_hist grad/step/before/after={:.3e}/{:.3e}/{:.3e}/{:.3e} gate grad/step/before/after={:.3e}/{:.3e}/{:.3e}/{:.3e} lr={:.3e} gscale={:.3e} wd={:.3e}\x1b[0m",
                     hist_w_grad,
                     hist_w_step,
@@ -1989,9 +2026,10 @@ impl Trainer {
                     hist_grad_scale,
                     hist_wd
                 );
+                }
 
                 // GPU-SSM per-slot decay diagnostics (activar con AIDEEN_SSM_DEBUG=1).
-                if self.cfg_ssm_debug {
+                if debug_due && self.cfg_ssm_debug {
                     let carrier = gpu.read_hist_carrier_params_full();
                     let d_r = self.config.d_r;
                     let h_slots = self.config.h_slots;
@@ -2027,7 +2065,7 @@ impl Trainer {
 
                 // Per-token debug (slot 0) for small sequences.
                 let seq_len = heartbeat.max(1.0).round() as usize;
-                if seq_len > 0 && seq_len <= 16 {
+                if debug_due && seq_len > 0 && seq_len <= 16 {
                     let base = 200usize;
                     let mut per_token = String::new();
                     for t in 0..seq_len {
@@ -2158,14 +2196,17 @@ impl Trainer {
             } else {
                 (12, 16)
             };
-            self.adaptive_max_iters = self.adaptive_max_iters.clamp(floor, cap);
-            self.config.adj_iters = if deq_progress < 0.25 {
-                6
-            } else if deq_progress < 0.60 {
-                8
-            } else {
-                10
-            };
+            self.apply_stage_solve_schedule(
+                floor,
+                cap,
+                if deq_progress < 0.25 {
+                    6
+                } else if deq_progress < 0.60 {
+                    8
+                } else {
+                    10
+                },
+            );
 
             // Training chunk by chunk over the whole corpus
             let mut epoch_loss = 0.0;
@@ -2831,17 +2872,11 @@ impl Trainer {
             // solver/LR regime on every new process launch.
             let (_deq_progress, sched_floor, sched_cap, sched_adj_iters) =
                 Self::file_epoch_schedule(global_epoch, total_schedule_epochs);
-            self.adaptive_max_iters = self.adaptive_max_iters.clamp(sched_floor, sched_cap);
-            // Early large-file training was over-solving the adjoint: short and chunk-10
-            // validations preserve loss with 2 Picard adjoint iterations while materially
-            // improving throughput. Keep later phases conservative until we validate them too.
-            self.config.adj_iters = sched_adj_iters;
+            self.apply_stage_solve_schedule(sched_floor, sched_cap, sched_adj_iters);
             if let Some(adj) = self.cfg_adj_iters_override {
                 let adj_usize = (adj.max(1)) as usize;
                 self.config.adj_iters = adj_usize;
                 self.adaptive_adj_iters = adj_usize as u32;
-            } else {
-                self.adaptive_adj_iters = sched_adj_iters as u32;
             }
 
             // Prefetch next chunk on a background thread to overlap disk I/O with GPU work.
