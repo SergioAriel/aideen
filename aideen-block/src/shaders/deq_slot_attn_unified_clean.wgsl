@@ -25,6 +25,7 @@ struct RunUniforms {
 @group(0) @binding(8) var<storage, read_write> HistCtx: array<f32>;
 
 override SLOT_ATTN_HEAD_DIM: u32 = 32u;
+override ENABLE_TOKEN_CARRY: bool = true;
 const WG_SIZE: u32 = 256u;
 const MAX_SLOTS: u32 = 8u;
 const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
@@ -286,7 +287,7 @@ fn deq_slot_attn_unified_main(
         }
         workgroupBarrier();
 
-        if (global_t == 0u) {
+        if (global_t == 0u || !ENABLE_TOKEN_CARRY) {
             var local_sumsq0 = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 let sig = Scratch[signal_base + d];
