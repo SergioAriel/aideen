@@ -49,6 +49,7 @@ struct SpectralParams {
 pub struct RustDeqBridge {
     pub h_slots: u32,
     exact_forward_layout: bool,
+    pub hist_v2_minimal_enabled: bool,
     pub slot_qkv_probe_enabled: bool,
     pub slot_attn_minimal_enabled: bool,
     pub slot_attn_real_staged_enabled: bool,
@@ -58,6 +59,8 @@ pub struct RustDeqBridge {
     pub subgroup_pipeline: Option<wgpu::ComputePipeline>,
     pub subgroup_debug_pipeline: Option<wgpu::ComputePipeline>,
     pub subgroup_fastpath_enabled: bool,
+    pub hist_v2_project_pipeline: wgpu::ComputePipeline,
+    pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
     pub signal_init_pipeline: Option<wgpu::ComputePipeline>,
     pub slot_qkv_pipeline: Option<wgpu::ComputePipeline>,
     pub slot_attn_update_pipeline: Option<wgpu::ComputePipeline>,
@@ -82,6 +85,8 @@ pub struct RustDeqBridge {
     pub scratch_buf: wgpu::Buffer,
     pub hpooled_buf: wgpu::Buffer,
     pub debug_buf: wgpu::Buffer,
+    pub hist_ctx_buf: wgpu::Buffer,
+    pub mstate_buf: wgpu::Buffer,
 
     pub bind_group: wgpu::BindGroup,
 }
@@ -163,6 +168,7 @@ impl RustDeqBridge {
         enable_debug_metrics: bool,
         enable_slot_qkv_probe: bool,
         enable_slot_attn_minimal: bool,
+        enable_hist_v2_minimal: bool,
     ) -> std::collections::HashMap<String, f64> {
         let mut constants = std::collections::HashMap::new();
         constants.insert(
@@ -176,6 +182,10 @@ impl RustDeqBridge {
         constants.insert(
             "ENABLE_SLOT_ATTN_MINIMAL".to_string(),
             if enable_slot_attn_minimal { 1.0 } else { 0.0 },
+        );
+        constants.insert(
+            "ENABLE_HIST_V2_MINIMAL".to_string(),
+            if enable_hist_v2_minimal { 1.0 } else { 0.0 },
         );
         constants
     }
@@ -228,6 +238,8 @@ impl RustDeqBridge {
         // - deq_forward_subgroup.wgsl is the fast-path variant of that same family
         // - deq_forward_exact.wgsl is an alternate/diagnostic path and should not be treated
         //   as the default baseline without explicitly enabling it
+        // - AIDEEN_HIST_V2_MINIMAL=1 keeps the same core forward kernels but wraps them in a
+        //   token-sequential explicit-history loop: project hist_ctx -> forward -> pool -> temporal
         let use_exact_forward = std::env::var("AIDEEN_DEQ_FORWARD_EXACT")
             .ok()
             .map(|v| {
@@ -252,6 +264,13 @@ impl RustDeqBridge {
             })
             .unwrap_or(false);
         let slot_attn_real_unified_enabled = std::env::var("AIDEEN_DEQ_SLOT_ATTN_REAL_UNIFIED")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let hist_v2_minimal_enabled = std::env::var("AIDEEN_HIST_V2_MINIMAL")
             .ok()
             .map(|v| {
                 let vl = v.trim().to_ascii_lowercase();
@@ -330,8 +349,8 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // bindings 3-7: H_curr, H_next, Scratch, H_pooled, DebugLog (read-write)
-        for i in 3u32..=7 {
+        // bindings 3-9: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState
+        for i in 3u32..=9 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -358,11 +377,13 @@ impl RustDeqBridge {
             false,
             slot_qkv_probe_enabled,
             slot_attn_minimal_enabled,
+            hist_v2_minimal_enabled,
         );
         let debug_constants = Self::pipeline_constants(
             true,
             slot_qkv_probe_enabled,
             slot_attn_minimal_enabled,
+            hist_v2_minimal_enabled,
         );
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("DEQ Forward Pipeline"),
@@ -428,6 +449,36 @@ impl RustDeqBridge {
             compilation_options: Default::default(),
             cache: None,
         });
+        let hist_v2_project_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AIDEEN Hist V2 Project Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/hist_v2_project.wgsl").into(),
+            ),
+        });
+        let hist_v2_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Hist V2 Project Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &hist_v2_project_shader,
+                entry_point: Some("hist_v2_project_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let hist_v2_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AIDEEN Hist V2 Temporal Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/hist_v2_temporal.wgsl").into(),
+            ),
+        });
+        let hist_v2_temporal_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Hist V2 Temporal Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &hist_v2_temporal_shader,
+                entry_point: Some("hist_v2_temporal_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let (signal_init_pipeline, slot_qkv_pipeline, slot_attn_update_pipeline, slot_attn_unified_pipeline) =
             if slot_attn_real_staged_enabled {
                 let signal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -785,6 +836,22 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let hist_ctx_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hist V2 Context"),
+            size: hnext_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mstate_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hist V2 MState"),
+            size: h_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DEQ Forward Persistent Bind Group"),
             layout: &bind_group_layout,
@@ -820,6 +887,14 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: debug_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: hist_ctx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: mstate_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1064,6 +1139,7 @@ impl RustDeqBridge {
         Self {
             h_slots,
             exact_forward_layout: use_exact_forward,
+            hist_v2_minimal_enabled,
             slot_qkv_probe_enabled,
             slot_attn_minimal_enabled,
             slot_attn_real_staged_enabled,
@@ -1073,6 +1149,8 @@ impl RustDeqBridge {
             subgroup_pipeline,
             subgroup_debug_pipeline,
             subgroup_fastpath_enabled,
+            hist_v2_project_pipeline,
+            hist_v2_temporal_pipeline,
             signal_init_pipeline,
             slot_qkv_pipeline,
             slot_attn_update_pipeline,
@@ -1095,6 +1173,8 @@ impl RustDeqBridge {
             scratch_buf,
             hpooled_buf,
             debug_buf,
+            hist_ctx_buf,
+            mstate_buf,
             bind_group,
         }
     }
@@ -1468,7 +1548,79 @@ impl RustDeqBridge {
             label: Some("DEQ Forward GPU-Only Encoder"),
         });
 
-        if self.slot_attn_real_staged_enabled {
+        if self.hist_v2_minimal_enabled {
+            encoder.clear_buffer(&self.hist_ctx_buf, 0, None);
+            encoder.clear_buffer(&self.mstate_buf, 0, None);
+            for token_local in 0..shape.token_count.max(1) {
+                let mut token_shape = *shape;
+                token_shape.token_start = shape.token_start + token_local;
+                token_shape.token_count = 1;
+                let token_shape_bytes = Self::shape_bytes(&token_shape);
+                queue.write_buffer(&self.uniform_buf, 0, &token_shape_bytes);
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Hist V2 Project Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.hist_v2_project_pipeline);
+                    cpass.set_bind_group(0, &self.bind_group, &[]);
+                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                }
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("DEQ Forward Hist V2 Pass"),
+                        timestamp_writes: None,
+                    });
+                    let use_subgroup = self.subgroup_fastpath_enabled
+                        && self.subgroup_pipeline.is_some()
+                        && self.subgroup_debug_pipeline.is_some();
+                    if token_shape.debug_enable != 0 {
+                        if use_subgroup {
+                            cpass.set_pipeline(
+                                self.subgroup_debug_pipeline
+                                    .as_ref()
+                                    .expect("subgroup debug pipeline present"),
+                            );
+                        } else {
+                            cpass.set_pipeline(&self.debug_pipeline);
+                        }
+                    } else if use_subgroup {
+                        cpass.set_pipeline(
+                            self.subgroup_pipeline
+                                .as_ref()
+                                .expect("subgroup pipeline present"),
+                        );
+                    } else {
+                        cpass.set_pipeline(&self.pipeline);
+                    }
+                    cpass.set_bind_group(0, &self.bind_group, &[]);
+                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                }
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("DEQ Forward Pool Hist V2 Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.pool_pipeline);
+                    cpass.set_bind_group(0, &self.bind_group, &[]);
+                    cpass.dispatch_workgroups(
+                        token_shape.d_model.div_ceil(256).max(1),
+                        token_shape.batch_size.max(1),
+                        1,
+                    );
+                }
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Hist V2 Temporal Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.hist_v2_temporal_pipeline);
+                    cpass.set_bind_group(0, &self.bind_group, &[]);
+                    cpass.dispatch_workgroups(token_shape.batch_size.max(1), token_shape.h_slots.max(1), 1);
+                }
+            }
+            queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
+        } else if self.slot_attn_real_staged_enabled {
             if self.slot_attn_real_unified_enabled {
                 let slot_attn_unified_pipeline = self
                     .slot_attn_unified_pipeline
@@ -1798,19 +1950,7 @@ impl RustDeqBridge {
             );
         }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("DEQ Forward Encoder"),
-        });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DEQ Forward Pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.dispatch_workgroups(shape.batch_size.max(1), 1, 1);
-        }
-        encoder
+        self.encode_forward_gpu_only(device, queue, shape)
     }
 
     pub fn read_debug_buffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
