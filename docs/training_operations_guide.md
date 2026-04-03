@@ -546,6 +546,9 @@ cd /Users/sergiosolis/Programacion/AIDEEN
 
 Para continuation probes, `AIDEEN_LR` también aplica con `--resume`.
 Usar un valor explícito y chico para retomar desde un checkpoint ya entrenado.
+Además, el scheduler de `train_on_file` ahora continúa por epochs globales del
+checkpoint: al reanudar no vuelve a empezar en el LR alto del primer epoch de la
+nueva corrida.
 
 Baseline provisional validado para continuation sobre
 `artifacts/checkpoints/model_histv2_clean_pretrain_latest`:
@@ -559,6 +562,13 @@ Baseline provisional validado para continuation sobre
 En esta configuración, los probes de continuación quedaron en una banda útil de
 `loss` alta-7 / baja-8, claramente mejor que el régimen previo de resume que
 había degradado hasta ~`8.0-9.9`.
+
+Validación operativa mínima del schedule continuo:
+
+- corrida fresca de `1` epoch: `lr=0.000020`
+- resume inmediato por `1` epoch sobre el mismo checkpoint: `lr=0.000011`
+
+O sea: el resume ya no reinicia el cosine schedule desde cero.
 
 Además, el trainer ahora guarda automáticamente:
 

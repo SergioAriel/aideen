@@ -103,6 +103,7 @@ pub struct Trainer {
     pub invalid_hi_streak: u32,
     pub contractivity_hi_streak: u32,
     pub force_renorm_done: bool,
+    pub completed_file_epochs: usize,
 
     // --- v14 Temporal Memory State ---
     pub m_prev: Option<HSlots>,
@@ -165,6 +166,19 @@ impl Trainer {
 
     fn checkpoint_metrics_path(base_path: &str) -> String {
         format!("{base_path}_metrics.csv")
+    }
+
+    fn file_epoch_schedule(global_epoch: usize, total_epochs: usize) -> (f32, u32, u32, usize) {
+        let total = total_epochs.max(1);
+        let progress = global_epoch as f32 / total as f32;
+        let (floor, cap, adj_iters) = if progress < 0.25 {
+            (8, 12, 2usize)
+        } else if progress < 0.60 {
+            (10, 14, 6usize)
+        } else {
+            (12, 16, 8usize)
+        };
+        (progress, floor, cap, adj_iters)
     }
 
     fn checkpoint_best_base_path(base_path: &str) -> String {
@@ -653,6 +667,7 @@ impl Trainer {
             invalid_hi_streak: 0,
             contractivity_hi_streak: 0,
             force_renorm_done: false,
+            completed_file_epochs: 0,
             m_prev: None,
             grad_accum_counter: 0,
             debug_last_time: None,
@@ -757,6 +772,7 @@ impl Trainer {
             invalid_hi_streak: 0,
             contractivity_hi_streak: 0,
             force_renorm_done: false,
+            completed_file_epochs: 0,
             m_prev: None,
             grad_accum_counter: 0,
             debug_last_time: None,
@@ -2690,37 +2706,30 @@ impl Trainer {
             // epoch boundaries and contaminate the new pass over the dataset.
             self.reset_state();
             let t_start = std::time::Instant::now();
-            let current_lr = self.cosine_lr(epoch, epochs);
+            let global_epoch = self.completed_file_epochs + epoch;
+            let total_schedule_epochs = self.completed_file_epochs + epochs;
+            let current_lr = self.cosine_lr(global_epoch, total_schedule_epochs);
             self.optimizer.lr = current_lr;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
                 gpu.tps_epoch_begin();
             }
 
-            // v13.1 Adaptive Epoch Schedule (Piso de iteraciones)
-            let deq_progress = epoch as f32 / epochs.max(1) as f32;
-            let sched_floor = if deq_progress < 0.25 {
-                8
-            } else if deq_progress < 0.60 {
-                10
-            } else {
-                12
-            };
-            self.adaptive_max_iters = self.adaptive_max_iters.max(sched_floor);
+            // File training should use a global epoch schedule across resumes, not restart the
+            // solver/LR regime on every new process launch.
+            let (_deq_progress, sched_floor, sched_cap, sched_adj_iters) =
+                Self::file_epoch_schedule(global_epoch, total_schedule_epochs);
+            self.adaptive_max_iters = self.adaptive_max_iters.clamp(sched_floor, sched_cap);
             // Early large-file training was over-solving the adjoint: short and chunk-10
             // validations preserve loss with 2 Picard adjoint iterations while materially
             // improving throughput. Keep later phases conservative until we validate them too.
-            self.config.adj_iters = if deq_progress < 0.25 {
-                2
-            } else if deq_progress < 0.60 {
-                6
-            } else {
-                8
-            };
+            self.config.adj_iters = sched_adj_iters;
             if let Some(adj) = self.cfg_adj_iters_override {
                 let adj_usize = (adj.max(1)) as usize;
                 self.config.adj_iters = adj_usize;
                 self.adaptive_adj_iters = adj_usize as u32;
+            } else {
+                self.adaptive_adj_iters = sched_adj_iters as u32;
             }
 
             // Prefetch next chunk on a background thread to overlap disk I/O with GPU work.
@@ -3046,6 +3055,8 @@ impl Trainer {
                 );
             }
 
+            self.completed_file_epochs = global_epoch + 1;
+
             if let Some(loss_avg) = tracked_epoch_loss {
                 if let Err(e) = self.append_epoch_metrics(
                     checkpoint_path,
@@ -3101,6 +3112,7 @@ impl Trainer {
                     );
                 }
             }
+
         }
         Ok(())
     }
@@ -3297,6 +3309,10 @@ impl Trainer {
             self.adaptive_adj_iters.to_string(),
         );
         model.metadata.insert(
+            "completed_file_epochs".to_string(),
+            self.completed_file_epochs.to_string(),
+        );
+        model.metadata.insert(
             "damping_boost_left".to_string(),
             self.damping_boost_left.to_string(),
         );
@@ -3401,6 +3417,13 @@ impl Trainer {
             .and_then(|s| s.parse().ok())
         {
             trainer.adaptive_adj_iters = v;
+        }
+        if let Some(v) = model
+            .metadata
+            .get("completed_file_epochs")
+            .and_then(|s| s.parse().ok())
+        {
+            trainer.completed_file_epochs = v;
         }
         if let Some(v) = model
             .metadata
