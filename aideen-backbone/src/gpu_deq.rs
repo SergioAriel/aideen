@@ -220,6 +220,9 @@ impl GpuDeqBackend {
     ) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
+        // h_hist gamma is stored as a raw logit-like parameter and squashed in the shader.
+        // Initialize conservatively so the effective history injection starts near zero.
+        let hhist_gamma_raw_init = -2.0f32;
         let mut out = Vec::with_capacity(Self::history_params_len(
             self.config.d_r,
             self.config.h_slots,
@@ -270,11 +273,12 @@ impl GpuDeqBackend {
         // Forget gate parameters: W_forget (h×d) and b_forget (h)
         out.extend_from_slice(w_forget);
         out.extend_from_slice(b_forget);
+        out.extend(std::iter::repeat(hhist_gamma_raw_init).take(h));
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
-        (h + 1) * d * d + 5 * h * d + 2 * h + d + 21
+        (h + 1) * d * d + 5 * h * d + 2 * h + d + 21 + h // +h for γ per slot
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -1414,7 +1418,8 @@ impl GpuDeqBackend {
             + 5 * config.h_slots * config.d_r
             + 2 * config.h_slots
             + config.d_r
-            + 21;
+            + 21
+            + config.h_slots; // γ per slot (must match hist_params_len in deq_bridge.rs)
         let all_gradients_size = aw_total_bytes(ag_d64, ag_h64, ag_hist_len as u64);
         let all_gradients_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("AllGradients"),

@@ -977,11 +977,25 @@ impl Trainer {
     #[cfg(feature = "wgpu")]
     fn ensure_gpu_trainers(&mut self, gpu: &GpuDeqBackend) {
         if self.gpu_lm.is_none() {
-            self.gpu_lm = Some(GpuLmHeadTrainer::new(
+            let lm = GpuLmHeadTrainer::new(
                 &gpu.device,
                 self.lm_head.b.len(),
                 self.config.clone(),
-            ));
+            );
+            // Upload CPU LM head weights immediately on GPU trainer creation.
+            // Without this, the GPU LM runs with zero weights until the lazy sync
+            // at line ~1372, which may be hundreds of steps later — causing the DEQ
+            // adjoint to receive zero gradient during those steps, then a large
+            // gradient shock when the real weights are finally uploaded.
+            let w_head = self.lm_head.export_weights();
+            lm.upload_weights_only(
+                &gpu.queue,
+                w_head.get("head.w").unwrap(),
+                w_head.get("head.b").unwrap(),
+                w_head.get("head.g").unwrap(),
+            );
+            self.gpu_lm_weights_uploaded = true;
+            self.gpu_lm = Some(lm);
         }
 
         if self.gpu_emb.is_none() {

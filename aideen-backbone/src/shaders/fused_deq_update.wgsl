@@ -151,6 +151,12 @@ fn b_forget_base(d: u32, h: u32) -> u32 {
     return w_forget_base(d, h) + h * d;
 }
 
+// γ per slot: learnable h_currSSM gain (follows b_forget, h scalars, init=0)
+fn hhist_gamma_base(d: u32, h: u32) -> u32 {
+    return b_forget_base(d, h) + h;
+}
+const H_HIST_GAMMA_SCALE: f32 = 0.1;
+
 // f_gate scratch offset: 1 value per (t_abs, slot) stored after attn_weight region
 fn token_forget_base(t: u32, d: u32, h_slots: u32) -> u32 {
     return token_scratch_base(t, d, h_slots) + 8u * d * h_slots + h_slots * h_slots;
@@ -1901,6 +1907,54 @@ fn fused_hist_stage_forget_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             AllGradients[aw_hist_base(d, h_slots) + bf_idx] += bf_step;
         } else {
             AllWeights[aw_hist_base(d, h_slots) + bf_idx] -= clamp(bf_step, -clip, clip);
+        }
+    }
+}
+
+// ∂L/∂γ[s] = Σ_{t,d} weighted_h[t,s,d] * h_hist[t,s,d]
+// h_hist[t,s,d] reconstructed from h_star: h_hist[0]=0, h_hist[t]=a*h_hist[t-1]+(1-a)*h_star[t-1]
+// Kernel: one thread per dim, inner loop over slots × batches × tokens.
+@compute
+@workgroup_size(64, 1, 1)
+fn fused_hhist_gamma_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dim = gid.x;
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    if (dim >= d) { return; }
+
+    let n_tokens = params.batch_size * params.seq_len;
+    let n_norm = max(1.0, f32(n_tokens));
+    let clip = 0.5;
+
+    for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
+        let a_log_idx = aw_alog_base(d, h_slots) + slot * d + dim;
+        let a_val = 1.0 / (1.0 + exp(AllWeights[a_log_idx]));  // sigmoid(-A_log)
+
+        var grad = 0.0;
+        for (var b = 0u; b < params.batch_size; b = b + 1u) {
+            var h_hist_d = 0.0;  // reconstructed h_hist state for this (slot, dim)
+            for (var t = 0u; t < params.seq_len; t = t + 1u) {
+                let t_abs = b * params.seq_len + t;
+                let entry = t_abs * h_slots + slot;
+                // weighted_h[t,s,d] ≈ ∂L/∂pre[t,s,d] from Picard adjoint
+                let v_d = weighted_h_buf[entry_base(entry, d) + dim];
+                grad = grad + v_d * h_hist_d;
+                // Advance: h_hist[t+1] = a * h_hist[t] + (1-a) * h_star[t]
+                let h_star_d = h_star[t_abs * h_slots * d + slot * d + dim];
+                h_hist_d = a_val * h_hist_d + (1.0 - a_val) * h_star_d;
+            }
+        }
+
+        grad = grad / n_norm;
+        let gamma_idx = aw_hist_base(d, h_slots) + hhist_gamma_base(d, h_slots) + slot;
+        let gamma_raw = AllWeights[gamma_idx];
+        let gamma_sigma = 1.0 / (1.0 + exp(-(gamma_raw - 8.0)));
+        let grad_raw = grad * H_HIST_GAMMA_SCALE * gamma_sigma * (1.0 - gamma_sigma);
+        let raw_step = params.lr * grad_raw * params.grad_scale;
+        if (params.grad_accum_mode == 1u) {
+            AllGradients[gamma_idx] += raw_step;
+        } else {
+            AllWeights[gamma_idx] = AllWeights[gamma_idx] - clamp(raw_step, -clip, clip);
         }
     }
 }

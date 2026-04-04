@@ -632,6 +632,33 @@ Además, el trainer ahora guarda automáticamente:
 - `AIDEEN_CHECKPOINT_BASE_metrics.csv`
   - serie por epoch para auditar continuidad sin leer logs a mano
 
+### Evaluación actual de `H_currSSM` sobre `tinyshakespeare`
+
+Receta canónica para comparar el path `H_currSSM` actual contra baseline:
+
+```bash
+cd /Users/sergiosolis/Programacion/AIDEEN
+for seed in 7 11 13 42; do
+  echo "=== H_currSSM seed=$seed ==="
+  AIDEEN_TRAIN_SEED=$seed \
+  AIDEEN_H_HIST=1 \
+  AIDEEN_CHECKPOINT_BASE=model_hssm_s$seed \
+  AIDEEN_MAX_CHUNKS=100 \
+  AIDEEN_PROGRESS_EVERY=20 \
+  AIDEEN_LOSS_READBACK_EVERY=10 \
+  AIDEEN_BATCH_SIZE=4 \
+  cargo run --release --features wgpu -p aideen-training --bin train -- \
+    --file /Users/sergiosolis/Programacion/aideen/aideen-bench/tinyshakespeare.txt \
+    --epochs 1 --log-every 1 --save-every 0 2>&1 | grep -E "(progress.*chunk|epoch.*loss)"
+done
+```
+
+Notas:
+
+- `AIDEEN_H_HIST=1` habilita la lectura/escritura de `H_hist` en el shader unified.
+- no hace falta pasar `AIDEEN_H_HIST_GAMMA`: el `γ` efectivo actual se obtiene desde el parámetro entrenable interno reparametrizado en shader.
+- usar exactamente estas cuatro seeds para comparar robustez, no una sola corrida corta.
+
 ```bash
 cd /Users/sergiosolis/Programacion/AIDEEN
 AIDEEN_RESUME_BASE=/Users/sergiosolis/Programacion/AIDEEN/artifacts/checkpoints/model_histv2_clean_pretrain_latest \

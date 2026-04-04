@@ -72,6 +72,7 @@ pub struct RustDeqBridge {
     pub hist_ctx_buf: wgpu::Buffer,
     pub mstate_buf: wgpu::Buffer,
     pub signal_cache_buf: wgpu::Buffer,
+    pub h_hist_buf: wgpu::Buffer,
 
     pub bind_group: wgpu::BindGroup,
 }
@@ -165,8 +166,8 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // bindings 3-10: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState, SignalCache
-        for i in 3u32..=10 {
+        // bindings 3-11: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState, SignalCache, H_hist
+        for i in 3u32..=11 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -207,6 +208,16 @@ impl RustDeqBridge {
                 include_str!("shaders/deq_slot_attn_unified_clean.wgsl").into(),
             ),
         });
+        let fpm_enabled = std::env::var("AIDEEN_FPM")
+            .ok()
+            .map(|v| { let vl = v.trim().to_ascii_lowercase(); vl == "1" || vl == "true" })
+            .unwrap_or(false);
+        // Sanity rule: FPM and H_hist are mutually exclusive experimental paths.
+        // If FPM is enabled, disable H_hist so the shader measures one memory mechanism at a time.
+        let h_hist_enabled = !fpm_enabled && std::env::var("AIDEEN_H_HIST")
+            .ok()
+            .map(|v| { let vl = v.trim().to_ascii_lowercase(); vl == "1" || vl == "true" })
+            .unwrap_or(false);
         let mut slot_attn_constants = std::collections::HashMap::new();
         slot_attn_constants.insert(
             "SLOT_ATTN_HEAD_DIM".to_string(),
@@ -215,6 +226,14 @@ impl RustDeqBridge {
         slot_attn_constants.insert(
             "ENABLE_TOKEN_CARRY".to_string(),
             if token_carry_enabled { 1.0 } else { 0.0 },
+        );
+        slot_attn_constants.insert(
+            "ENABLE_H_HIST".to_string(),
+            if h_hist_enabled { 1.0 } else { 0.0 },
+        );
+        slot_attn_constants.insert(
+            "ENABLE_FPM".to_string(),
+            if fpm_enabled { 1.0 } else { 0.0 },
         );
         let slot_attn_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -391,7 +410,8 @@ impl RustDeqBridge {
             + 5u32 * h_slots * d_model
             + 2u32 * h_slots
             + d_model
-            + 21u32;
+            + 21u32
+            + h_slots; // γ per slot (learnable h_currSSM gain, init=0)
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
@@ -505,6 +525,15 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // H_hist: persistent hidden-state history, same shape as H_curr (no seq_len dimension)
+        let h_hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("H_hist"),
+            size: h_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DEQ Forward Persistent Bind Group"),
             layout: &bind_group_layout,
@@ -552,6 +581,10 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: signal_cache_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: h_hist_buf.as_entire_binding(),
                 },
             ],
         });
@@ -817,6 +850,7 @@ impl RustDeqBridge {
             hist_ctx_buf,
             mstate_buf,
             signal_cache_buf,
+            h_hist_buf,
             bind_group,
         }
     }
