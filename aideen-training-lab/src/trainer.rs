@@ -627,6 +627,21 @@ impl Trainer {
         )
     }
 
+    fn decode_slot_observability_metrics(
+        fw: &[f32],
+        h_slots: usize,
+    ) -> Vec<(f32, f32, f32)> {
+        let mut out = Vec::new();
+        for slot in 0..h_slots {
+            let base = 320 + slot * 3;
+            if fw.len() <= base + 2 {
+                break;
+            }
+            out.push((fw[base], fw[base + 1], fw[base + 2]));
+        }
+        out
+    }
+
     fn lmhead_backward_sampled(
         sampled_indices: &[u32],
         target: u32,
@@ -1424,7 +1439,6 @@ impl Trainer {
             if self.eval_mode {
                 self.last_gpu_loss = current_loss_sync;
             }
-            let current_loss = self.last_gpu_loss;
             if lm_lr > 0.0 {
                 self.lm_head_cpu_stale = true;
             }
@@ -1433,7 +1447,7 @@ impl Trainer {
 
             // 5. DEQ Reasoning Core Update (Picard Adjoint + Fused GPU Weight Update)
             if self.eval_mode {
-                return current_loss;
+                return self.last_gpu_loss;
             }
 
             if !self.frozen_deq && !invalid_fixed_point {
@@ -2129,7 +2143,10 @@ impl Trainer {
                 );
             }
 
-            return current_loss;
+            if let Some(loss) = self.cached_loss_after_sync(gpu, false) {
+                self.last_gpu_loss = loss;
+            }
+            return self.last_gpu_loss;
         }
         0.0
     }
@@ -3181,7 +3198,12 @@ impl Trainer {
             } else {
                 None
             };
-            let tracked_epoch_loss = self.visible_loss_value(epoch_loss_avg);
+            let cached_gpu_loss = if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
+                Some(self.last_gpu_loss)
+            } else {
+                None
+            };
+            let tracked_epoch_loss = cached_gpu_loss.or(epoch_loss_avg);
 
             if epoch % log_every == 0 {
                 let mut gpu_stats = String::new();
@@ -3198,12 +3220,59 @@ impl Trainer {
                     }
                 }
 
-                let display_loss = self.visible_loss_text(tracked_epoch_loss);
+                let display_loss = tracked_epoch_loss
+                    .map(|v| format!("{:.4}", v))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let epoch_loss_text = epoch_loss_avg
+                    .map(|v| format!("{:.4}", v))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let cached_loss_text = cached_gpu_loss
+                    .map(|v| format!("{:.4}", v))
+                    .unwrap_or_else(|| "n/a".to_string());
 
                 println!(
-                    "  epoch {epoch:>4}/{epochs}  loss={}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
-                    display_loss, current_lr, tps, elapsed, total_tokens, gpu_stats
+                    "  epoch {epoch:>4}/{epochs}  loss={}  epoch_loss_avg={}  gpu_loss_cached={}  lr={:.6}  tps_epoch={:>8.1}  time={:.2}s  tokens={} {}",
+                    display_loss, epoch_loss_text, cached_loss_text, current_lr, tps, elapsed, total_tokens, gpu_stats
                 );
+                #[cfg(feature = "wgpu")]
+                {
+                    let fpm_enabled = std::env::var("AIDEEN_FPM")
+                        .ok()
+                        .map(|v| {
+                            let vl = v.trim().to_ascii_lowercase();
+                            vl == "1" || vl == "true" || vl == "yes"
+                        })
+                        .unwrap_or(false);
+                    if fpm_enabled && !self.cached_debug_buf.is_empty() {
+                        let slot_obs = Self::decode_slot_observability_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
+                        if slot_obs.iter().any(|(self_w, ent, mov)| {
+                            self_w.abs() > 1e-6 || ent.abs() > 1e-6 || mov.abs() > 1e-6
+                        }) {
+                            let assign = slot_obs
+                                .iter()
+                                .map(|(self_w, _, _)| format!("{self_w:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let entropy = slot_obs
+                                .iter()
+                                .map(|(_, ent, _)| format!("{ent:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let movement = slot_obs
+                                .iter()
+                                .map(|(_, _, mov)| format!("{mov:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            println!(
+                                "    [FPM-SLOTS] self_assign=[{}] entropy=[{}] move=[{}]",
+                                assign, entropy, movement
+                            );
+                        }
+                    }
+                }
             }
 
             self.completed_file_epochs = global_epoch + 1;

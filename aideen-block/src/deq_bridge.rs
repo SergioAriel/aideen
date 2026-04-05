@@ -49,6 +49,9 @@ struct SpectralParams {
 pub struct RustDeqBridge {
     pub h_slots: u32,
     pub slot_attn_unified_pipeline: wgpu::ComputePipeline,
+    pub hist_v2_signal_cache_pipeline: wgpu::ComputePipeline,
+    pub hist_v2_project_pipeline: wgpu::ComputePipeline,
+    pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
     pub pool_pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
@@ -73,6 +76,8 @@ pub struct RustDeqBridge {
     pub mstate_buf: wgpu::Buffer,
     pub signal_cache_buf: wgpu::Buffer,
     pub h_hist_buf: wgpu::Buffer,
+    pub hist_ctx_enabled: bool,
+    pub fpm_enabled: bool,
 
     pub bind_group: wgpu::BindGroup,
 }
@@ -218,6 +223,20 @@ impl RustDeqBridge {
             .ok()
             .map(|v| { let vl = v.trim().to_ascii_lowercase(); vl == "1" || vl == "true" })
             .unwrap_or(false);
+        let hist_ctx_enabled = !fpm_enabled
+            && !h_hist_enabled
+            && std::env::var("AIDEEN_DEQ_HIST_GATED")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(false);
+        let fpm_mem_iters = std::env::var("AIDEEN_FPM_MEM_ITERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8);
         let mut slot_attn_constants = std::collections::HashMap::new();
         slot_attn_constants.insert(
             "SLOT_ATTN_HEAD_DIM".to_string(),
@@ -232,8 +251,16 @@ impl RustDeqBridge {
             if h_hist_enabled { 1.0 } else { 0.0 },
         );
         slot_attn_constants.insert(
+            "ENABLE_HIST_CTX".to_string(),
+            if hist_ctx_enabled { 1.0 } else { 0.0 },
+        );
+        slot_attn_constants.insert(
             "ENABLE_FPM".to_string(),
             if fpm_enabled { 1.0 } else { 0.0 },
+        );
+        slot_attn_constants.insert(
+            "FPM_MEM_ITERS".to_string(),
+            fpm_mem_iters as f64,
         );
         let slot_attn_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -245,6 +272,51 @@ impl RustDeqBridge {
                     constants: &slot_attn_constants,
                     zero_initialize_workgroup_memory: true,
                 },
+                cache: None,
+            });
+        let hist_signal_cache_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hist V2 Signal Cache Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/hist_v2_signal_cache.wgsl").into(),
+            ),
+        });
+        let hist_v2_signal_cache_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Hist V2 Signal Cache Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &hist_signal_cache_shader,
+                entry_point: Some("hist_v2_signal_cache_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let hist_project_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hist V2 Project Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/hist_v2_project.wgsl").into(),
+            ),
+        });
+        let hist_v2_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Hist V2 Project Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &hist_project_shader,
+                entry_point: Some("hist_v2_project_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let hist_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hist V2 Temporal Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/hist_v2_temporal.wgsl").into(),
+            ),
+        });
+        let hist_v2_temporal_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Hist V2 Temporal Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &hist_temporal_shader,
+                entry_point: Some("hist_v2_temporal_main"),
+                compilation_options: Default::default(),
                 cache: None,
             });
 
@@ -829,6 +901,9 @@ impl RustDeqBridge {
         Self {
             h_slots,
             slot_attn_unified_pipeline,
+            hist_v2_signal_cache_pipeline,
+            hist_v2_project_pipeline,
+            hist_v2_temporal_pipeline,
             pool_pipeline,
             bind_group_layout,
             update_pipeline,
@@ -851,6 +926,8 @@ impl RustDeqBridge {
             mstate_buf,
             signal_cache_buf,
             h_hist_buf,
+            hist_ctx_enabled,
+            fpm_enabled,
             bind_group,
         }
     }
@@ -1223,6 +1300,44 @@ impl RustDeqBridge {
             label: Some("DEQ Forward GPU-Only Encoder"),
         });
 
+        if self.fpm_enabled {
+            let h_bytes = (shape.batch_size as u64)
+                * (shape.h_slots as u64)
+                * (shape.d_model as u64)
+                * 4u64;
+            encoder.copy_buffer_to_buffer(&self.h_hist_buf, 0, &self.mstate_buf, 0, h_bytes);
+        }
+
+        {
+            if self.hist_ctx_enabled {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hist V2 Signal Cache Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.hist_v2_signal_cache_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(
+                    shape.batch_size.max(1),
+                    shape.token_count.max(1),
+                    1,
+                );
+            }
+        }
+        {
+            if self.hist_ctx_enabled {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hist V2 Project Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.hist_v2_project_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    shape.token_count.max(1),
+                );
+            }
+        }
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("DEQ Forward Unified SlotAttn Pass"),
@@ -1231,6 +1346,17 @@ impl RustDeqBridge {
             cpass.set_pipeline(&self.slot_attn_unified_pipeline);
             cpass.set_bind_group(0, &self.bind_group, &[]);
             cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+        }
+        {
+            if self.hist_ctx_enabled {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hist V2 Temporal Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.hist_v2_temporal_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
+            }
         }
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

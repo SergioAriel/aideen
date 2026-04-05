@@ -1930,6 +1930,9 @@ impl GpuDeqBackend {
         // Hist V2 keeps an explicit memory state across chunks and must reset on document boundaries.
         encoder.clear_buffer(&self.bridge.hist_ctx_buf, 0, None);
         encoder.clear_buffer(&self.bridge.mstate_buf, 0, None);
+        // FPM/H_hist uses the same buffer (binding 11) as persistent slow memory.
+        // Must reset on document boundaries — otherwise slow memory leaks across epoch boundaries.
+        encoder.clear_buffer(&self.bridge.h_hist_buf, 0, None);
         // Clear TBPTT carry on document reset.
         encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
         self.queue.submit(Some(encoder.finish()));

@@ -57,7 +57,13 @@ pub struct GpuLmHeadTrainer {
 
 impl GpuLmHeadTrainer {
     fn build_sampled_indices(&mut self, targets: &[u32]) -> u32 {
-        let desired = self.config.num_samples.max(targets.len()).min(self.sample_capacity);
+        // MAX_SHADER_SAMPLES must match s_indices_cache and s_logits array sizes in lm_train.wgsl.
+        // Exceeding this causes OOB writes to workgroup memory, corrupting probs and gradients.
+        const MAX_SHADER_SAMPLES: usize = 2048;
+        let desired = self.config.num_samples
+            .max(targets.len())
+            .min(self.sample_capacity)
+            .min(MAX_SHADER_SAMPLES);
         self.sampled_indices_reuse.clear();
         self.sampled_indices_reuse.extend_from_slice(targets);
         self.sampled_indices_reuse.sort_unstable();

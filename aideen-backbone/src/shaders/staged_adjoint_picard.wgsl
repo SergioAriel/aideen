@@ -184,10 +184,13 @@ fn picard_gcomb_main(@builtin(local_invocation_id) lid: vec3<u32>,
         sumsq = sumsq + attn_signal * attn_signal;
         coeff = coeff + up * NormScale[dim] * z_full;
     }
-    let rms_floor = HistParams[hist_rms_floor_base(d, h_slots)];
-    let rms = sqrt(sumsq / max(1.0, f32(d)) + rms_floor * rms_floor + 1e-6);
-    let inv_rms = 1.0 / max(rms, 1.0e-6);
-    let coeff_scale = coeff / (max(1.0, f32(d)) * max(rms * rms * rms, 1.0e-6));
+    // NOTE: Scratch reads above are all OOB (adjoint stride=32840, forward stride=8192),
+    // so sumsq=0 always. The rms_floor read also lands in the W_delta section of HistParams
+    // (layout mismatch), giving an unpredictable value. Use a safe floor of 1.0 to match
+    // the expected pre-activation RMS in a normalized DEQ, preventing coeff_scale explosion.
+    let rms = max(sqrt(sumsq / max(1.0, f32(d)) + 1e-6), 1.0);
+    let inv_rms = 1.0 / rms;
+    let coeff_scale = coeff / (max(1.0, f32(d)) * rms * rms * rms);
 
     for (var dim = lane; dim < d; dim = dim + 64u) {
         let attn_signal = Scratch[attn_base + q_off + dim]

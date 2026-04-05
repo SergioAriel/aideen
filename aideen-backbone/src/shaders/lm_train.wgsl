@@ -65,8 +65,9 @@ var<workgroup> s_scratch:    array<f32, WG_SIZE>;
 var<workgroup> s_rms:        f32;
 var<workgroup> s_target_exp: f32;
 var<workgroup> s_h_tile:     array<f32, WG_SIZE>;
-var<workgroup> s_indices_cache: array<u32, 512>;
-var<workgroup> s_logits: array<f32, 512>;
+// 2048 = 4 * ctx_len (covers batch_size ≤ 4 with ctx_len=512 without OOB).
+var<workgroup> s_indices_cache: array<u32, 2048>;
+var<workgroup> s_logits: array<f32, 2048>;
 
 // =============================================================================
 // Pipeline 1: lm_probs_main
