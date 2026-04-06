@@ -706,8 +706,8 @@ impl GpuDeqBackend {
         });
 
 
-        // fpm_retain_bwd_bg0_layout: 5 bindings for the retain-gate backward kernel.
-        // bindings 0-4: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients.
+        // fpm_retain_bwd_bg0_layout: 6 bindings for the retain-gate backward kernel.
+        // bindings 0-5: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients, tbptt_carry.
         let fpm_retain_bwd_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("FPM Retain Bwd BG0 Layout"),
@@ -754,6 +754,16 @@ impl GpuDeqBackend {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -1824,7 +1834,7 @@ impl GpuDeqBackend {
                 resource: bridge.all_weights_buf.as_entire_binding(),
             }],
         });
-        // Retain bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients
+        // Retain bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients | tbptt_carry
         let fpm_retain_bwd_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("FPM Retain Bwd BG0"),
             layout: &fpm_retain_bwd_bg0_layout,
@@ -1848,6 +1858,10 @@ impl GpuDeqBackend {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: all_gradients_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: tbptt_carry_buf.as_entire_binding(),
                 },
             ],
         });
@@ -3340,7 +3354,7 @@ impl GpuDeqBackend {
         let profile_fused = self.cfg_fused_profile;
         // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
         let deq_only = self.cached_residual_alpha <= -1.5;
-        let hist_gated = self.cfg_hist_gated && !deq_only;
+        let hist_gated = self.cfg_hist_gated && !deq_only && !self.bridge.fpm_enabled;
         let hist_selective = self.cfg_hist_selective;
         let hist_internal_probe = self.cfg_hist_internal_probe;
         if profile_fused {

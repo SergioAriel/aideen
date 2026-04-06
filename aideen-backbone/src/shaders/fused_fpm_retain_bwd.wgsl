@@ -17,10 +17,12 @@
 //   (dm_new ← dm_prev for next iteration)
 //
 // dm_new seeding: currently zero (truncated BPTT within chunk).
-// TODO: add binding(5) for per-token ∂L/∂H_hist[t] and accumulate into dm_new.
+// Seed/output of dm_new uses tbptt_carry_buf, analogous to the hist-gated TBPTT path.
+// For FPM this buffer represents ∂L/∂M_0 of the next chunk and is written back as
+// ∂L/∂M_0 of the current chunk after the backward token sweep.
 //
 // Layout:
-//   @group(0): params, h_star, scratch(signal), fpm_m_buf, AllGradients
+//   @group(0): params, h_star, scratch(signal), fpm_m_buf, AllGradients, tbptt_carry
 //   @group(1): AllWeights (same as fused_deq_update)
 //
 // Dispatch: (h_slots, 1, 1) — one workgroup per slot, WG_SIZE=64.
@@ -48,6 +50,7 @@ struct FpmBwdUniforms {
 @group(0) @binding(2) var<storage, read>      Scratch:    array<f32>;  // clean layout: [batch*seq*2*h*d]
 @group(0) @binding(3) var<storage, read>      fpm_m_buf:  array<f32>;  // [batch*seq*h*d] per-token m_new
 @group(0) @binding(4) var<storage, read_write> AllGradients: array<f32>;
+@group(0) @binding(5) var<storage, read_write> tbptt_carry_buf: array<f32>; // [batch*h*d]
 
 @group(1) @binding(0) var<storage, read_write> AllWeights: array<f32>;
 
@@ -132,13 +135,20 @@ fn fused_fpm_retain_bwd_main(
     // Loop over batch elements independently (truncated BPTT — no cross-batch gradient).
     for (var b = 0u; b < params.batch_size; b = b + 1u) {
 
-        // dm_new[k] holds ∂L/∂m_new for k-th dimension of this thread's assigned dims.
-        // Seeded at 0 — truncated BPTT, no cross-chunk gradient.
-        // TODO: seed from ∂L/∂H_hist[T-1] (requires an additional binding).
-        var dm_new0 = 0.0; var dm_new1 = 0.0;
-        var dm_new2 = 0.0; var dm_new3 = 0.0;
+        let carry_base = (b * h + slot) * d;
+        // dm_new[k] holds ∂L/∂m_new for this slot. Seed from the next chunk's M_0 gradient.
+        var dm_new0 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 0u];
+        var dm_new1 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 1u];
+        var dm_new2 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 2u];
+        var dm_new3 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 3u];
         var dm_new4 = 0.0; var dm_new5 = 0.0;
         var dm_new6 = 0.0; var dm_new7 = 0.0;
+        if (dims_per_lane > 4u) {
+            dm_new4 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 4u];
+            dm_new5 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 5u];
+            dm_new6 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 6u];
+            dm_new7 = tbptt_carry_buf[carry_base + lane * dims_per_lane + 7u];
+        }
 
         // Iterate tokens backward.
         for (var t_rev = 0u; t_rev < params.seq_len; t_rev = t_rev + 1u) {
@@ -323,5 +333,18 @@ fn fused_fpm_retain_bwd_main(
 
             workgroupBarrier();
         } // end token loop
+
+        // Write cross-chunk carry: ∂L/∂M_0 for this sequence/slot.
+        tbptt_carry_buf[carry_base + lane * dims_per_lane + 0u] = dm_new0;
+        tbptt_carry_buf[carry_base + lane * dims_per_lane + 1u] = dm_new1;
+        tbptt_carry_buf[carry_base + lane * dims_per_lane + 2u] = dm_new2;
+        tbptt_carry_buf[carry_base + lane * dims_per_lane + 3u] = dm_new3;
+        if (dims_per_lane > 4u) {
+            tbptt_carry_buf[carry_base + lane * dims_per_lane + 4u] = dm_new4;
+            tbptt_carry_buf[carry_base + lane * dims_per_lane + 5u] = dm_new5;
+            tbptt_carry_buf[carry_base + lane * dims_per_lane + 6u] = dm_new6;
+            tbptt_carry_buf[carry_base + lane * dims_per_lane + 7u] = dm_new7;
+        }
+        workgroupBarrier();
     } // end batch loop
 }
