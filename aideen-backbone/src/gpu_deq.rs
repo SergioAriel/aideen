@@ -129,6 +129,9 @@ pub struct GpuDeqBackend {
     // --- Hot-path cached env vars (parsed once at construction, not per training step) ---
     // Avoids ~52 syscalls/step from std::env::var calls in apply_fused_deq_update and adjoint.
     pub cached_residual_alpha: f32,
+    pub cached_fpm_alpha_m: f32,
+    pub cached_fpm_tau: f32,
+    pub cached_fpm_persist_beta: f32,
     cfg_hist_gated: bool,
     cfg_hist_selective: bool,
     cfg_slot_anchor_zero: bool,
@@ -217,6 +220,9 @@ impl GpuDeqBackend {
         w_gate_hist: &[f32],
         w_forget: &[f32],
         b_forget: &[f32],
+        w_retain_up: &[f32],
+        w_retain_down: &[f32],
+        b_retain: &[f32],
     ) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
@@ -274,11 +280,19 @@ impl GpuDeqBackend {
         out.extend_from_slice(w_forget);
         out.extend_from_slice(b_forget);
         out.extend(std::iter::repeat(hhist_gamma_raw_init).take(h));
+        // Retain gate: W_up (h×d×r), W_down (h×r×d), b_retain (h×d)
+        out.extend_from_slice(w_retain_up);
+        out.extend_from_slice(w_retain_down);
+        out.extend_from_slice(b_retain);
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
-        (h + 1) * d * d + 5 * h * d + 2 * h + d + 21 + h // +h for γ per slot
+        const RETAIN_RANK: usize = 32;
+        // base: (h+1)*d² + 5*h*d + 2*h + d + 21 + h(γ)
+        // retain gate: W_up(h*d*r) + W_down(h*r*d) + b_retain(h*d)
+        (h + 1) * d * d + 5 * h * d + 2 * h + d + 21 + h
+            + 2 * h * d * RETAIN_RANK + h * d
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -1736,6 +1750,18 @@ impl GpuDeqBackend {
         // - fused update profiling/probing
         // Keep the set of active selectors understandable here before deleting shader branches.
         let cached_residual_alpha = Self::residual_alpha_from_env();
+        let cached_fpm_alpha_m = std::env::var("AIDEEN_FPM_ALPHA_M")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.01);
+        let cached_fpm_tau = std::env::var("AIDEEN_FPM_TAU")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.5);
+        let cached_fpm_persist_beta = std::env::var("AIDEEN_FPM_PERSIST_BETA")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.01);
         let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let cfg_hist_selective = Self::hist_selective_from_env();
         let bool_flag = |s: &str| -> Option<bool> {
@@ -1873,6 +1899,9 @@ impl GpuDeqBackend {
             anderson_store_pipeline,
             anderson_mix_pipeline,
             cached_residual_alpha,
+            cached_fpm_alpha_m,
+            cached_fpm_tau,
+            cached_fpm_persist_beta,
             cfg_hist_gated,
             cfg_hist_selective,
             cfg_slot_anchor_zero,
@@ -1965,7 +1994,9 @@ impl GpuDeqBackend {
             // diag_one_iter != 0 => force single-iteration solve
             diag_zero_win: if std::env::var("AIDEEN_DEQ_DIAG_ZERO_WIN").ok().as_deref() == Some("1") { 1 } else { 0 },
             diag_one_iter: if std::env::var("AIDEEN_DEQ_DIAG_ONE_ITER").ok().as_deref() == Some("1") { 1 } else { 0 },
-            _pad0: [0, 0, 0],
+            fpm_alpha_m: self.cached_fpm_alpha_m,
+            fpm_tau: self.cached_fpm_tau,
+            fpm_persist_beta: self.cached_fpm_persist_beta,
         }
     }
 
@@ -1994,6 +2025,9 @@ impl GpuDeqBackend {
         w_gate_hist: &[f32],
         w_forget: &[f32],
         b_forget: &[f32],
+        w_retain_up: &[f32],
+        w_retain_down: &[f32],
+        b_retain: &[f32],
     ) {
         let d = self.config.d_r as u64;
         let h = self.config.h_slots as u64;
@@ -2050,6 +2084,9 @@ impl GpuDeqBackend {
             w_gate_hist,
             w_forget,
             b_forget,
+            w_retain_up,
+            w_retain_down,
+            b_retain,
         );
         queue.write_buffer(
             &self.bridge.all_weights_buf,

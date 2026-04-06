@@ -15,7 +15,9 @@ pub struct DeqComputeShape {
     pub token_count: u32,
     pub diag_zero_win: u32,
     pub diag_one_iter: u32,
-    pub _pad0: [u32; 3],
+    pub fpm_alpha_m: f32,
+    pub fpm_tau: f32,
+    pub fpm_persist_beta: f32,
 }
 
 #[repr(C)]
@@ -567,7 +569,7 @@ impl RustDeqBridge {
 
         let debug_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Debug Log"),
-            size: 2048, // 512 floats (extra space for per-token debug)
+            size: 4096, // 1024 floats for slot observability and FPM diagnostics
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -1305,7 +1307,10 @@ impl RustDeqBridge {
                 * (shape.h_slots as u64)
                 * (shape.d_model as u64)
                 * 4u64;
-            encoder.copy_buffer_to_buffer(&self.h_hist_buf, 0, &self.mstate_buf, 0, h_bytes);
+            if shape.token_start == 0 {
+                encoder.copy_buffer_to_buffer(&self.h_hist_buf, 0, &self.hist_ctx_buf, 0, h_bytes);
+            }
+            encoder.copy_buffer_to_buffer(&self.hist_ctx_buf, 0, &self.mstate_buf, 0, h_bytes);
         }
 
         {
@@ -1380,21 +1385,10 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         shape: &DeqComputeShape,
     ) {
-        let block_tokens = std::env::var("AIDEEN_DEQ_FORWARD_BLOCK")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(shape.seq_len.max(1))
-            .max(1);
-
-        let mut token_start = 0u32;
-        while token_start < shape.seq_len {
-            let mut block_shape = *shape;
-            block_shape.token_start = token_start;
-            block_shape.token_count = (shape.seq_len - token_start).min(block_tokens);
-            let encoder = self.encode_forward_gpu_only(device, queue, &block_shape);
-            queue.submit(Some(encoder.finish()));
-            token_start += block_shape.token_count;
-        }
+        // Single submit for the entire chunk — fpm_m_cache carry between tokens
+        // is handled inside the shader (intra-slot, workgroup memory).
+        let encoder = self.encode_forward_gpu_only(device, queue, shape);
+        queue.submit(Some(encoder.finish()));
     }
 
     #[allow(clippy::too_many_arguments)]
