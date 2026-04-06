@@ -484,6 +484,9 @@ impl Trainer {
             w_gate_hist_rm,
             w_forget_rm,
             b_forget_rm,
+            w_retain_up_rm,
+            w_retain_down_rm,
+            b_retain_rm,
         ) = self.reasoning.history_params_gpu_layout();
         gpu.upload_weights(
             &gpu.queue,
@@ -506,9 +509,9 @@ impl Trainer {
             w_gate_hist_rm.as_slice(),
             w_forget_rm.as_slice(),
             b_forget_rm.as_slice(),
-            &[], // w_retain_up — placeholder until Paso B
-            &[], // w_retain_down — placeholder until Paso B
-            &[], // b_retain — placeholder until Paso B
+            w_retain_up_rm.as_slice(),
+            w_retain_down_rm.as_slice(),
+            b_retain_rm.as_slice(),
         );
     }
 
@@ -532,6 +535,9 @@ impl Trainer {
             _w_gate_hist_rm,
             _w_forget_rm,
             _b_forget_rm,
+            _w_retain_up_rm,
+            _w_retain_down_rm,
+            _b_retain_rm,
         ) = self.reasoning.history_params_gpu_layout();
         let hist_flat = hist_ctx.to_flat();
         let mut slot_anchor_eff = slot_anchor_rm;
@@ -1377,6 +1383,9 @@ impl Trainer {
                         w_gate_hist_rm,
                         w_forget_rm,
                         b_forget_rm,
+                        w_retain_up_rm,
+                        w_retain_down_rm,
+                        b_retain_rm,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
@@ -1399,9 +1408,9 @@ impl Trainer {
                         w_gate_hist_rm.as_slice(),
                         w_forget_rm.as_slice(),
                         b_forget_rm.as_slice(),
-                        &[], // w_retain_up — placeholder until Paso B
-                        &[], // w_retain_down — placeholder until Paso B
-                        &[], // b_retain — placeholder until Paso B
+                        w_retain_up_rm.as_slice(),
+                        w_retain_down_rm.as_slice(),
+                        b_retain_rm.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -1918,6 +1927,9 @@ impl Trainer {
                         w_gate_hist_rm,
                         w_forget_rm,
                         b_forget_rm,
+                        w_retain_up_rm,
+                        w_retain_down_rm,
+                        b_retain_rm,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
@@ -1940,9 +1952,9 @@ impl Trainer {
                         w_gate_hist_rm.as_slice(),
                         w_forget_rm.as_slice(),
                         b_forget_rm.as_slice(),
-                        &[], // w_retain_up — placeholder until Paso B
-                        &[], // w_retain_down — placeholder until Paso B
-                        &[], // b_retain — placeholder until Paso B
+                        w_retain_up_rm.as_slice(),
+                        w_retain_down_rm.as_slice(),
+                        b_retain_rm.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -2880,7 +2892,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -3084,7 +3096,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;

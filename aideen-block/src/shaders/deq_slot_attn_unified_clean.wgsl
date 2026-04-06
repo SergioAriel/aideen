@@ -922,14 +922,34 @@ fn deq_slot_attn_unified_main(
             }
             let proposal0 = tanh(delta_in0);
             let proposal1 = tanh(delta_in1);
-            let novelty0 = abs(proposal0 - m_prev0);
-            let novelty1 = abs(proposal1 - m_prev1);
-            let plastic0 = alpha_m * z * novelty0 * (residual_scale * proposal0);
-            let plastic1 = alpha_m * z * novelty1 * (residual_scale * proposal1);
-            let fatigue0 = FPM_FATIGUE_RATE * m_prev0;
-            let fatigue1 = FPM_FATIGUE_RATE * m_prev1;
-            let m_candidate0 = m_prev0 + plastic0 - fatigue0;
-            let m_candidate1 = m_prev1 + plastic1 - fatigue1;
+            // Retain gate (low-rank r=32): retain = σ(W_down · (W_up · c) + b_retain)
+            // Replaces uniform fatigue decay with input-dependent selective forgetting.
+            let hist_base_r = aw_hist_base(d_model, h_slots);
+            let wup_base = hist_base_r + w_retain_up_base(d_model, h_slots) + slot_idx * d_model * RETAIN_RANK;
+            let wdown_base = hist_base_r + w_retain_down_base(d_model, h_slots) + slot_idx * RETAIN_RANK * d_model;
+            let bret_base = hist_base_r + b_retain_base(d_model, h_slots) + slot_idx * d_model;
+            // Step 1: up = W_up · c  (d_model → RETAIN_RANK)
+            // Threads tid < RETAIN_RANK each compute one element of up, store in shared_vals[0..32]
+            if (tid < RETAIN_RANK) {
+                var up_acc = 0.0;
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let c_j = 0.5 * (H_curr[h_base + slot_offset + j] + Scratch[signal_base + j]);
+                    up_acc = up_acc + AllWeights[wup_base + j * RETAIN_RANK + tid] * c_j;
+                }
+                shared_vals[tid] = up_acc;
+            }
+            workgroupBarrier();
+            // Step 2: retain[d] = σ(W_down[d,:] · up + b_retain[d])
+            var down_acc0 = AllWeights[bret_base + d0];
+            var down_acc1 = AllWeights[bret_base + d1];
+            for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
+                down_acc0 = down_acc0 + AllWeights[wdown_base + r * d_model + d0] * shared_vals[r];
+                down_acc1 = down_acc1 + AllWeights[wdown_base + r * d_model + d1] * shared_vals[r];
+            }
+            let retain0 = 1.0 / (1.0 + exp(-down_acc0));
+            let retain1 = 1.0 / (1.0 + exp(-down_acc1));
+            let m_candidate0 = retain0 * m_prev0 + z * (residual_scale * proposal0);
+            let m_candidate1 = retain1 * m_prev1 + z * (residual_scale * proposal1);
             // Diagnostics: replicate the same reductions as the original per-iter block.
             var local_delta_m_num_p = (m_candidate0 - m_prev0) * (m_candidate0 - m_prev0)
                                     + (m_candidate1 - m_prev1) * (m_candidate1 - m_prev1);
@@ -962,7 +982,9 @@ fn deq_slot_attn_unified_main(
                 workgroupBarrier();
             }
             let iter_max_delta_m_p = shared_vals[0];
-            let upd_num_p = plastic0 * plastic0 + plastic1 * plastic1;
+            let write0 = z * (residual_scale * proposal0);
+            let write1 = z * (residual_scale * proposal1);
+            let upd_num_p = write0 * write0 + write1 * write1;
             let upd_den_p = m_prev0 * m_prev0 + m_prev1 * m_prev1;
             let update_ratio_p = sqrt(upd_num_p / (upd_den_p + FPM_EPS));
             if (tid == 0u) {

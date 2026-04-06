@@ -113,6 +113,24 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) b_forget: DVector<f32>,
 
+    // ── Retain gate (low-rank, r=32) ─────────────────────────────────────────
+    // retain[s,d] = σ(W_down[s] · (W_up[s] · c) + b_retain[s,d])
+    // m_new = retain * m_old + z * tanh(W_delta * c)
+    // replaces uniform fatigue decay with input-dependent selective forgetting
+    // W_up: [h_slots × d_r × r], W_down: [h_slots × r × d_r], b_retain: [h_slots × d_r]
+    #[cfg(feature = "lab")]
+    pub w_retain_up: Vec<DMatrix<f32>>,   // h_slots matrices of shape (d_r, r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_retain_up: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    pub w_retain_down: Vec<DMatrix<f32>>, // h_slots matrices of shape (r, d_r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_retain_down: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    pub b_retain: DMatrix<f32>,           // [h_slots × d_r]
+    #[cfg(not(feature = "lab"))]
+    pub(crate) b_retain: DMatrix<f32>,
+
     // ── LayerNorm por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
     pub norm_scale: DVector<f32>,
@@ -285,6 +303,15 @@ impl MambaSlotReasoning {
             // Allows model to learn to forget selectively once training establishes gradients.
             w_forget: DMatrix::zeros(h_slots, d_r),
             b_forget: DVector::from_element(h_slots, 3.0_f32),
+            // Retain gate (low-rank r=32):
+            // W_up: small random init (d_r × r), W_down: zeros (r × d_r)
+            // → retain = σ(0 + b_retain) = σ(3.0) ≈ 0.95 at init (near-identity, like forget gate)
+            // W_up small random breaks slot symmetry; W_down=zeros keeps gate near 1.0 initially.
+            w_retain_up: (0..h_slots).map(|_| {
+                DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32))
+            }).collect(),
+            w_retain_down: (0..h_slots).map(|_| DMatrix::zeros(32, d_r)).collect(),
+            b_retain: DMatrix::from_element(h_slots, d_r, 3.0_f32),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: random init to immediately break slot symmetry.
             // Zero init would give gscore=0 (uniform attn → zero gradient → saddle point forever).
@@ -578,17 +605,26 @@ impl MambaSlotReasoning {
     pub fn history_params_gpu_layout(
         &self,
     ) -> (
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
+        Vec<f32>,  // w_hist_shared
+        Vec<f32>,  // hist_slot_scale
+        Vec<f32>,  // hist_slot_bias
+        Vec<f32>,  // hist_gate_logit
+        Vec<f32>,  // slot_anchor
+        Vec<f32>,  // w_delta
+        Vec<f32>,  // b_delta
+        Vec<f32>,  // w_gate_hist
+        Vec<f32>,  // w_forget
+        Vec<f32>,  // b_forget
+        Vec<f32>,  // w_retain_up  (h_slots × d_r × r, row-major per slot)
+        Vec<f32>,  // w_retain_down (h_slots × r × d_r, row-major per slot)
+        Vec<f32>,  // b_retain (h_slots × d_r, row-major)
     ) {
+        let w_retain_up_flat: Vec<f32> = self.w_retain_up.iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
+        let w_retain_down_flat: Vec<f32> = self.w_retain_down.iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
         (
             Self::matrix_to_row_major(&self.w_hist_shared),
             Self::matrix_to_row_major(&self.hist_slot_scale),
@@ -600,6 +636,9 @@ impl MambaSlotReasoning {
             Self::matrix_to_row_major(&self.w_gate_hist),
             Self::matrix_to_row_major(&self.w_forget),
             self.b_forget.as_slice().to_vec(),
+            w_retain_up_flat,
+            w_retain_down_flat,
+            Self::matrix_to_row_major(&self.b_retain),
         )
     }
 
@@ -839,6 +878,9 @@ impl MambaSlotReasoning {
             k_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             w_forget: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             b_forget: nalgebra::DVector::from_element(config.h_slots, 3.0_f32),
+            w_retain_up: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
+            w_retain_down: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(32, config.d_r)).collect(),
+            b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 3.0_f32),
             backend: RefCell::new(None),
             damping,
             residual_alpha,

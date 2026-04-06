@@ -480,12 +480,15 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
         // Single AllWeights buffer: W_q | W_k | W_v | W_o | W_in | W_x | W_out | A_log | NormScale | HistParams
+        const RETAIN_RANK: u32 = 32;
         let hist_params_len = (h_slots + 1u32) * d_model * d_model
             + 5u32 * h_slots * d_model
             + 2u32 * h_slots
             + d_model
             + 21u32
-            + h_slots; // γ per slot (learnable h_currSSM gain, init=0)
+            + h_slots  // γ per slot
+            + 2u32 * h_slots * d_model * RETAIN_RANK  // W_retain_up + W_retain_down
+            + h_slots * d_model;                        // b_retain
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
