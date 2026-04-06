@@ -14,6 +14,7 @@ use aideen_core::{
     reasoning::Reasoning,
     state::{ArchitectureConfig, HSlots},
 };
+use std::collections::VecDeque;
 use std::io::Write;
 
 use crate::{gradients, loss, optimizer::Adam};
@@ -56,6 +57,44 @@ impl Default for TrainingConfig {
             emb_lr_mult: 1.0,
             lm_lr_mult: 1.0,
             deq_lr_mult: 0.01,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FpmHealthMetrics {
+    max_err_h: f32,
+    max_err_m: f32,
+    max_z: f32,
+    avg_z: f32,
+    rescue_count: f32,
+    rescue_recovered: f32,
+    dead_slots: f32,
+    max_update_ratio: f32,
+    write_saturation: f32,
+    max_memctx_rms: f32,
+    max_memctx_to_signal: f32,
+    exit_err_h: f32,
+    exit_iter: f32,
+    rescue_entered: f32,
+    pre_rescue_converged: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolveStatus {
+    HealthyConverged,
+    TrivialConverged,
+    Unconverged,
+    NumericInvalid,
+}
+
+impl SolveStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::HealthyConverged => "OK",
+            Self::TrivialConverged => "NULL",
+            Self::Unconverged => "FAIL",
+            Self::NumericInvalid => "INV",
         }
     }
 }
@@ -127,6 +166,10 @@ pub struct Trainer {
     cached_debug_buf: Vec<f32>,
     // --- Cached GPU loss (avoid sync readback every step) ---
     last_gpu_loss: f32,
+    fpm_alpha_m_current: f32,
+    fpm_tau_current: f32,
+    fpm_err_h_window: VecDeque<f32>,
+    fpm_last_err_h_avg: f32,
 
     // --- Cached hot-path env vars (parsed once at construction) ---
     // Avoids ~26 env::var syscalls per training step.
@@ -463,6 +506,9 @@ impl Trainer {
             w_gate_hist_rm.as_slice(),
             w_forget_rm.as_slice(),
             b_forget_rm.as_slice(),
+            &[], // w_retain_up — placeholder until Paso B
+            &[], // w_retain_down — placeholder until Paso B
+            &[], // b_retain — placeholder until Paso B
         );
     }
 
@@ -642,6 +688,168 @@ impl Trainer {
         out
     }
 
+    fn decode_fpm_diag_metrics(
+        fw: &[f32],
+        h_slots: usize,
+    ) -> Vec<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
+        let mut out = Vec::new();
+        for slot in 0..h_slots {
+            let base = 400 + slot * 12;
+            if fw.len() <= base + 11 {
+                break;
+            }
+            out.push((
+                fw[base],
+                fw[base + 1],
+                fw[base + 2],
+                fw[base + 3],
+                fw[base + 4],
+                fw[base + 5],
+                fw[base + 6],
+                fw[base + 7],
+                fw[base + 8],
+                fw[base + 9],
+                fw[base + 10],
+                fw[base + 11],
+            ));
+        }
+        out
+    }
+
+    fn decode_fpm_read_metrics(fw: &[f32], h_slots: usize) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for slot in 0..h_slots {
+            let base = 520 + slot * 2;
+            if fw.len() <= base + 1 {
+                break;
+            }
+            out.push((fw[base], fw[base + 1]));
+        }
+        out
+    }
+
+    fn decode_fpm_health_metrics(fw: &[f32], h_slots: usize) -> Option<FpmHealthMetrics> {
+        let slot_diag = Self::decode_fpm_diag_metrics(fw, h_slots);
+        if slot_diag.is_empty() {
+            return None;
+        }
+        let slot_read = Self::decode_fpm_read_metrics(fw, h_slots);
+        let finite_avg = |vals: Vec<f32>| {
+            let mut sum = 0.0f32;
+            let mut count = 0usize;
+            for v in vals {
+                if v.is_finite() {
+                    sum += v;
+                    count += 1;
+                }
+            }
+            if count == 0 { 0.0 } else { sum / count as f32 }
+        };
+        Some(FpmHealthMetrics {
+            max_err_h: slot_diag.iter().map(|m| m.0).fold(0.0, f32::max),
+            max_err_m: slot_diag.iter().map(|m| m.1).fold(0.0, f32::max),
+            max_z: slot_diag.iter().map(|m| m.2).fold(0.0, f32::max),
+            avg_z: slot_diag.iter().map(|m| m.2).sum::<f32>() / slot_diag.len() as f32,
+            rescue_count: slot_diag.iter().map(|m| m.3).sum::<f32>(),
+            rescue_recovered: slot_diag.iter().map(|m| m.4).sum::<f32>(),
+            dead_slots: slot_diag.iter().map(|m| m.5).sum::<f32>(),
+            max_update_ratio: slot_diag.iter().map(|m| m.6).fold(0.0, f32::max),
+            write_saturation: slot_diag.iter().map(|m| m.7).sum::<f32>(),
+            max_memctx_rms: slot_read.iter().map(|m| m.0).fold(0.0, f32::max),
+            max_memctx_to_signal: slot_read.iter().map(|m| m.1).fold(0.0, f32::max),
+            exit_err_h: finite_avg(slot_diag.iter().map(|m| m.8).collect()),
+            exit_iter: finite_avg(slot_diag.iter().map(|m| m.9).collect()),
+            rescue_entered: slot_diag.iter().map(|m| m.10).sum::<f32>(),
+            pre_rescue_converged: slot_diag.iter().map(|m| m.11).sum::<f32>(),
+        })
+    }
+
+    fn fpm_health_threshold(epsilon: f32) -> f32 {
+        const FPM_ALPHA_H: f32 = 0.2;
+        const FPM_HOMEO_ALPHA_ERR_SCALE: f32 = 0.15;
+        epsilon.max(FPM_ALPHA_H * FPM_HOMEO_ALPHA_ERR_SCALE)
+    }
+
+    fn classify_fpm_solve(
+        metrics: FpmHealthMetrics,
+        max_h: f32,
+        contractivity: f32,
+        epsilon: f32,
+    ) -> SolveStatus {
+        let null_h_floor = 1e-4;
+        let null_z_floor = 1e-4;
+
+        if !metrics.max_err_h.is_finite()
+            || !metrics.max_err_m.is_finite()
+            || !metrics.avg_z.is_finite()
+            || !metrics.max_z.is_finite()
+            || !metrics.max_update_ratio.is_finite()
+            || !max_h.is_finite()
+            || !contractivity.is_finite()
+        {
+            return SolveStatus::NumericInvalid;
+        }
+
+        if contractivity > 1.20 {
+            return SolveStatus::NumericInvalid;
+        }
+
+        if metrics.exit_err_h <= Self::fpm_health_threshold(epsilon) {
+            if max_h <= null_h_floor && metrics.avg_z <= null_z_floor {
+                SolveStatus::TrivialConverged
+            } else {
+                SolveStatus::HealthyConverged
+            }
+        } else {
+            SolveStatus::Unconverged
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn configure_fpm_runtime_controls(&mut self, gpu: &mut GpuDeqBackend) {
+        gpu.cached_fpm_alpha_m = self.fpm_alpha_m_current.clamp(0.01, 0.1);
+        gpu.cached_fpm_tau = self.fpm_tau_current.max(0.5);
+    }
+
+    fn update_fpm_runtime_schedule(&mut self) {
+        let fpm_enabled = std::env::var("AIDEEN_FPM")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        if !fpm_enabled || self.cached_debug_buf.is_empty() {
+            return;
+        }
+
+        let Some(metrics) =
+            Self::decode_fpm_health_metrics(&self.cached_debug_buf, self.config.h_slots)
+        else {
+            return;
+        };
+
+        let err_h_avg = metrics.max_err_h;
+        self.fpm_err_h_window.push_back(err_h_avg);
+        while self.fpm_err_h_window.len() > 100 {
+            self.fpm_err_h_window.pop_front();
+        }
+
+        let dead_slots = metrics.dead_slots.round() as usize;
+        if self.fpm_tau_current < 0.8 && dead_slots * 2 >= self.config.h_slots.max(1) {
+            self.fpm_tau_current = 0.8;
+        }
+
+        if self.fpm_err_h_window.len() == 100 {
+            let mean = self.fpm_err_h_window.iter().copied().sum::<f32>() / 100.0;
+            let stable = mean < 0.08 && (mean - self.fpm_last_err_h_avg).abs() < 0.01;
+            if stable {
+                self.fpm_alpha_m_current = (self.fpm_alpha_m_current + 0.002).min(0.05);
+            }
+            self.fpm_last_err_h_avg = mean;
+        }
+    }
+
     fn lmhead_backward_sampled(
         sampled_indices: &[u32],
         target: u32,
@@ -774,6 +982,10 @@ impl Trainer {
             debug_tokens_accum: 0,
             cached_debug_buf: Vec::new(),
             last_gpu_loss: 0.0,
+            fpm_alpha_m_current: 0.01,
+            fpm_tau_current: 0.5,
+            fpm_err_h_window: VecDeque::with_capacity(100),
+            fpm_last_err_h_avg: f32::INFINITY,
             cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
                 .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
@@ -904,6 +1116,10 @@ impl Trainer {
             debug_tokens_accum: 0,
             cached_debug_buf: Vec::new(),
             last_gpu_loss: 0.0,
+            fpm_alpha_m_current: 0.01,
+            fpm_tau_current: 0.5,
+            fpm_err_h_window: VecDeque::with_capacity(100),
+            fpm_last_err_h_avg: f32::INFINITY,
             cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
                 .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
@@ -1053,9 +1269,10 @@ impl Trainer {
         #[cfg(feature = "wgpu")]
         {
             if self.gpu_deq.is_some() {
-                let gpu = self.take_gpu().expect("gpu_deq checked as Some");
+                let mut gpu = self.take_gpu().expect("gpu_deq checked as Some");
 
                 let out = (|| {
+                    self.configure_fpm_runtime_controls(&mut gpu);
                     self.ensure_gpu_trainers(&gpu);
 
                     let Some(gpu_emb) = self.gpu_emb.as_ref() else {
@@ -1125,9 +1342,10 @@ impl Trainer {
 
         #[cfg(feature = "wgpu")]
         if self.gpu_deq.is_some() {
-            let gpu = self.take_gpu().expect("gpu_deq checked as Some");
+            let mut gpu = self.take_gpu().expect("gpu_deq checked as Some");
 
             let out = (|| {
+                self.configure_fpm_runtime_controls(&mut gpu);
                 self.ensure_gpu_trainers(&gpu);
 
                 // Arreglo defensivo para evitar underflow si seq_len < ctx_len.
@@ -1181,6 +1399,9 @@ impl Trainer {
                         w_gate_hist_rm.as_slice(),
                         w_forget_rm.as_slice(),
                         b_forget_rm.as_slice(),
+                        &[], // w_retain_up — placeholder until Paso B
+                        &[], // w_retain_down — placeholder until Paso B
+                        &[], // b_retain — placeholder until Paso B
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -1360,29 +1581,61 @@ impl Trainer {
             // Use cached debug buffer — refresh deferred to end of step (after GPU is idle).
             // The DEQ-INVALID streak check needs 3 consecutive failures, so 1-step lag is safe.
             let fw = self.cached_debug_buf.clone();
-            let (seq, _max_h_dbg, _avg_iters_dbg, hit_count, max_delta, contractivity, hit_den) =
+            let (seq, max_h_dbg, _avg_iters_dbg, hit_count, max_delta, contractivity, hit_den) =
                 Self::decode_forward_debug_metrics(&fw, self.config.h_slots);
-            let hit_ratio = hit_count.max(0.0) / hit_den.max(1.0);
+            let fpm_enabled_cached = std::env::var("AIDEEN_FPM")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(false);
+            let cached_fpm_metrics = if fpm_enabled_cached {
+                Self::decode_fpm_health_metrics(&fw, self.config.h_slots)
+            } else {
+                None
+            };
+            let cached_fpm_status = cached_fpm_metrics
+                .map(|m| Self::classify_fpm_solve(m, max_h_dbg, contractivity, epsilon));
             // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
             // also being non-contractive. Non-monotone convergence (contr transiently > 1
             // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
             // does NOT indicate an invalid fixed point — the system DID find h*.
-            let invalid_fixed_point =
-                contractivity > 1.0 && max_delta > self.config.deq_epsilon * 10.0;
+            let invalid_fixed_point = if fpm_enabled_cached {
+                matches!(cached_fpm_status, Some(SolveStatus::NumericInvalid))
+                    || (matches!(cached_fpm_status, Some(SolveStatus::Unconverged))
+                        && contractivity > 1.0)
+            } else {
+                contractivity > 1.0 && max_delta > epsilon * 10.0
+            };
             if invalid_fixed_point {
                 self.invalid_hi_streak += 1;
             } else {
                 self.invalid_hi_streak = 0;
             }
             if self.invalid_hi_streak >= 3 {
-                eprintln!(
-                    "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
-                    self.optimizer.step_count(),
-                    contractivity,
-                    hit_ratio,
-                    max_delta,
-                    seq
-                );
+                if let Some(metrics) = cached_fpm_metrics {
+                    eprintln!(
+                        "    [DEQ-INVALID] step={} contr={:.3} status={} err_h={:.3e} z_avg={:.3e} max_h={:.3e} seq={:.0}",
+                        self.optimizer.step_count(),
+                        contractivity,
+                        cached_fpm_status.unwrap_or(SolveStatus::NumericInvalid).label(),
+                        metrics.max_err_h,
+                        metrics.avg_z,
+                        max_h_dbg,
+                        seq
+                    );
+                } else {
+                    let hit_ratio = hit_count.max(0.0) / hit_den.max(1.0);
+                    eprintln!(
+                        "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
+                        self.optimizer.step_count(),
+                        contractivity,
+                        hit_ratio,
+                        max_delta,
+                        seq
+                    );
+                }
                 self.invalid_hi_streak = 0;
                 self.emergency_left = 3;
                 self.adaptive_max_iters = (self.adaptive_max_iters + 2)
@@ -1687,6 +1940,9 @@ impl Trainer {
                         w_gate_hist_rm.as_slice(),
                         w_forget_rm.as_slice(),
                         b_forget_rm.as_slice(),
+                        &[], // w_retain_up — placeholder until Paso B
+                        &[], // w_retain_down — placeholder until Paso B
+                        &[], // b_retain — placeholder until Paso B
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -1747,6 +2003,7 @@ impl Trainer {
                 metrics_refreshed = true;
             }
             if metrics_refreshed && !self.cached_debug_buf.is_empty() {
+                self.update_fpm_runtime_schedule();
                 let fw = &self.cached_debug_buf;
 
                 let rs_cg = 0.0f32;
@@ -1756,6 +2013,7 @@ impl Trainer {
                 let _last_delta = if fw.len() > 17 { fw[17] } else { 0.0 };
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
                 let total_elems = if fw.len() > 19 { fw[19] } else { 0.0 };
+                let eps_runtime_dbg = if fw.len() > 9 { fw[9] } else { 0.0 };
                 let inj_rms = if fw.len() > 22 { fw[22] } else { 0.0 };
                 let hist_rms = if fw.len() > 23 { fw[23] } else { 0.0 };
                 let hist_ratio = if fw.len() > 24 { fw[24] } else { 0.0 };
@@ -1780,6 +2038,44 @@ impl Trainer {
                 let hist_force_nomamba = if fw.len() > 109 { fw[109] } else { 0.0 };
                 let hist_prelude_skip = if fw.len() > 110 { fw[110] } else { 0.0 };
                 let hist_loop_force_nomamba = if fw.len() > 111 { fw[111] } else { 0.0 };
+                let fpm_enabled = std::env::var("AIDEEN_FPM")
+                    .ok()
+                    .map(|v| {
+                        let vl = v.trim().to_ascii_lowercase();
+                        vl == "1" || vl == "true" || vl == "yes"
+                    })
+                    .unwrap_or(false);
+                let mut fpm_status = SolveStatus::Unconverged;
+                let mut fpm_step_diag = String::new();
+                if let Some(metrics) = if fpm_enabled {
+                    Self::decode_fpm_health_metrics(fw, self.config.h_slots)
+                } else {
+                    None
+                } {
+                    fpm_status =
+                        Self::classify_fpm_solve(metrics, max_h, contractivity, epsilon);
+                    fpm_step_diag = format!(
+                        " status={} err_h={:.3e} exit_err_h={:.3e} exit_iter={:.2} err_M={:.3e} z_max={:.3} z_avg={:.3} u2v_max={:.3e} memctx_rms={:.3e} memctx/sig={:.3e} dead={:.0} sat={:.0} rescue={:.0}/{:.0} pre_rescue={:.0} eps={:.3e} a_m={:.3} tau={:.2}",
+                        fpm_status.label(),
+                        metrics.max_err_h,
+                        metrics.exit_err_h,
+                        metrics.exit_iter,
+                        metrics.max_err_m,
+                        metrics.max_z,
+                        metrics.avg_z,
+                        metrics.max_update_ratio,
+                        metrics.max_memctx_rms,
+                        metrics.max_memctx_to_signal,
+                        metrics.dead_slots,
+                        metrics.write_saturation,
+                        metrics.rescue_entered,
+                        metrics.rescue_recovered,
+                        metrics.pre_rescue_converged,
+                        eps_runtime_dbg,
+                        self.fpm_alpha_m_current,
+                        self.fpm_tau_current
+                    );
+                }
 
                 let trunc_str = if trunc_flag >= 0.5 { "TRUNC" } else { "OK" };
 
@@ -1819,7 +2115,6 @@ impl Trainer {
                 let seq = heartbeat.max(1.0);
                 let hit = hit_count.max(0.0);
                 let hit_ratio = hit / hit_den.max(1.0);
-
                 // ---------- v13.2 Stability Oracle Logic ----------
 
                 // 1. CG Adaptation
@@ -1855,7 +2150,22 @@ impl Trainer {
                 // 3. Forward Iters Hysteresis (v13.3)
                 // For very short sequences (e.g. seq=1), hit_ratio is not informative
                 // and tends to force unnecessary iteration growth.
-                if seq >= 8.0 {
+                if fpm_enabled {
+                    match fpm_status {
+                        SolveStatus::HealthyConverged => {
+                            self.hit_lo_streak += 1;
+                            self.hit_hi_streak = 0;
+                        }
+                        SolveStatus::TrivialConverged => {
+                            self.hit_hi_streak = 0;
+                            self.hit_lo_streak = 0;
+                        }
+                        SolveStatus::Unconverged | SolveStatus::NumericInvalid => {
+                            self.hit_hi_streak += 1;
+                            self.hit_lo_streak = 0;
+                        }
+                    }
+                } else if seq >= 8.0 {
                     if hit_ratio > 0.08 {
                         self.hit_hi_streak += 1;
                         self.hit_lo_streak = 0;
@@ -1867,8 +2177,8 @@ impl Trainer {
                         self.hit_lo_streak = 0;
                     }
                 } else {
-                    let hi_delta = (self.config.deq_epsilon * 12.0).max(1.2e-3);
-                    let lo_delta = (self.config.deq_epsilon * 3.0).max(3e-4);
+                    let hi_delta = (epsilon * 12.0).max(1.2e-3);
+                    let lo_delta = (epsilon * 3.0).max(3e-4);
                     if max_delta > hi_delta {
                         self.hit_hi_streak += 1;
                         self.hit_lo_streak = 0;
@@ -1898,7 +2208,13 @@ impl Trainer {
                 }
 
                 // BOOST de Damping por inestabilidad puntual o hit ratio alto
-                if hit_ratio > 0.20 || max_delta > 1e-3 {
+                if (fpm_enabled
+                    && matches!(
+                        fpm_status,
+                        SolveStatus::Unconverged | SolveStatus::NumericInvalid
+                    ))
+                    || (!fpm_enabled && (hit_ratio > 0.20 || max_delta > 1e-3))
+                {
                     self.damping_boost_left = 2; // 2 windows de debug (~20 steps)
                 }
 
@@ -1917,7 +2233,9 @@ impl Trainer {
                     self.max_h_growth_streak = 0;
                 }
 
-                if max_delta > 5e-1 {
+                if (!fpm_enabled && max_delta > 5e-1)
+                    || (fpm_enabled && matches!(fpm_status, SolveStatus::NumericInvalid))
+                {
                     self.max_delta_hi_streak += 1;
                 } else {
                     self.max_delta_hi_streak = 0;
@@ -1929,6 +2247,7 @@ impl Trainer {
                     || self.max_delta_hi_streak >= 3
                     || max_h.is_nan()
                     || max_delta.is_nan()
+                    || (fpm_enabled && matches!(fpm_status, SolveStatus::NumericInvalid))
                     || contractivity > 1.20
                 {
                     self.emergency_left = 3; // 3 windows de debug (~30 steps)
@@ -1969,19 +2288,35 @@ impl Trainer {
                 } else {
                     "NORMAL"
                 };
-                let conv_ok =
-                    hit_ratio <= 0.05 || max_delta <= (self.config.deq_epsilon * 4.0).max(3e-4);
-                let conv_str = if conv_ok { "OK" } else { "FAIL" };
+                let conv_ok = if fpm_enabled {
+                    matches!(fpm_status, SolveStatus::HealthyConverged)
+                } else {
+                    hit_ratio <= 0.05 || max_delta <= (epsilon * 4.0).max(3e-4)
+                };
+                let conv_str = if fpm_enabled {
+                    fpm_status.label()
+                } else if conv_ok {
+                    "OK"
+                } else {
+                    "FAIL"
+                };
+                let solve_metric = if fpm_enabled {
+                    Self::decode_fpm_health_metrics(fw, self.config.h_slots)
+                        .map(|m| m.max_err_h)
+                        .unwrap_or(max_delta)
+                } else {
+                    max_delta
+                };
                 let hit_i = hit.round() as i32;
                 if debug_due {
                     println!(
-                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} maxΔ={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
+                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} solve={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
                     self.optimizer.step_count() % 100,
                     hit_i,
                     hit_den,
                     100.0 * hit_ratio,
                     contractivity,
-                    max_delta,
+                    solve_metric,
                     rs_cg,
                     avg_iters,
                     self.adaptive_max_iters,
@@ -2017,6 +2352,9 @@ impl Trainer {
                     trunc_str,
                     total_elems
                 );
+                    if !fpm_step_diag.is_empty() {
+                        println!("    \x1b[90m[FPM-STEP]{}\x1b[0m", fpm_step_diag);
+                    }
                 }
                 let hist_w_grad = fw.get(64).copied().unwrap_or(0.0);
                 let hist_w_step = fw.get(65).copied().unwrap_or(0.0);
@@ -3248,6 +3586,10 @@ impl Trainer {
                             &self.cached_debug_buf,
                             self.config.h_slots,
                         );
+                        let slot_diag = Self::decode_fpm_diag_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
                         if slot_obs.iter().any(|(self_w, ent, mov)| {
                             self_w.abs() > 1e-6 || ent.abs() > 1e-6 || mov.abs() > 1e-6
                         }) {
@@ -3270,6 +3612,81 @@ impl Trainer {
                                 "    [FPM-SLOTS] self_assign=[{}] entropy=[{}] move=[{}]",
                                 assign, entropy, movement
                             );
+                        }
+                        if !slot_diag.is_empty() {
+                            let err_h = slot_diag
+                                .iter()
+                                .map(|(err_h, _, _, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{err_h:.3e}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let exit_err_h = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, exit_err_h, _, _, _)| {
+                                    format!("{exit_err_h:.3e}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let exit_iter = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, exit_iter, _, _)| {
+                                    format!("{exit_iter:.2}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let err_m = slot_diag
+                                .iter()
+                                .map(|(_, err_m, _, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{err_m:.3e}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let z = slot_diag
+                                .iter()
+                                .map(|(_, _, z, _, _, _, _, _, _, _, _, _)| format!("{z:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let rescue = slot_diag
+                                .iter()
+                                .map(|(_, _, _, rescue, recovered, _, _, _, _, _, entered, pre)| {
+                                    format!("{:.0}/{:.0}/{:.0}/{:.0}", rescue, recovered, entered, pre)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let dead = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, dead, _, _, _, _, _, _)| format!("{dead:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let ratio = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, _, ratio, _, _, _, _, _)| format!("{ratio:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let sat = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, sat, _, _, _, _)| format!("{sat:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            println!(
+                                "    [FPM-DIAG] err_h=[{}] exit_err_h=[{}] exit_iter=[{}] err_M=[{}] z=[{}] rescue=[{}] dead=[{}] u2v=[{}] sat=[{}] alpha_m={:.3} tau={:.2}",
+                                err_h,
+                                exit_err_h,
+                                exit_iter,
+                                err_m,
+                                z,
+                                rescue,
+                                dead,
+                                ratio,
+                                sat,
+                                self.fpm_alpha_m_current,
+                                self.fpm_tau_current
+                            );
+                            /*
+                             * rescue tuple semantics:
+                             *   entered-during-loop / recovered-after-rescue / rescue-entered-count / converged-before-rescue
+                             */
                         }
                     }
                 }

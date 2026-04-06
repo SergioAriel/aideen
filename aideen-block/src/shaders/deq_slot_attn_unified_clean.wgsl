@@ -348,6 +348,19 @@ fn deq_slot_attn_unified_main(
     var rescue_entered_sum = 0.0;
     var pre_rescue_converged_sum = 0.0;
 
+    // FPM intra-slot m carry: load once before the token loop.
+    // fpm_m_cache evolves token-to-token within the chunk via plastic write.
+    // Cross-slot coordination uses MState (from previous chunk) via fpm_ctx.
+    if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
+        fpm_m_cache[tid]          = MState[h_base + slot_offset + tid];
+        fpm_m_cache[tid + WG_SIZE] = MState[h_base + slot_offset + tid + WG_SIZE];
+        if (tid < h_slots) {
+            slot_attn_weights[tid] = 1.0 / max(1.0, f32(h_slots));
+            slot_attn_prev[tid]    = slot_attn_weights[tid];
+        }
+        workgroupBarrier();
+    }
+
     for (var t = 0u; t < shape.token_count; t = t + 1u) {
         let global_t = shape.token_start + t;
         let batch_scratch_t = (batch_idx * shape.seq_len + global_t) * scratch_stride;
@@ -387,8 +400,7 @@ fn deq_slot_attn_unified_main(
         // ENABLE_H_HIST and ENABLE_FPM are mutually exclusive — both use binding 11.
         var h_hist0 = 0.0;
         var h_hist1 = 0.0;
-        var fpm_base0 = 0.0;
-        var fpm_base1 = 0.0;
+        // fpm_base0/1 removed — fpm_m_cache carries between tokens (initialized before loop)
         var fpm_ctx0 = 0.0;
         var fpm_ctx1 = 0.0;
         var hist_ctx0 = 0.0;
@@ -403,11 +415,10 @@ fn deq_slot_attn_unified_main(
                 hhist_gamma_wg = H_HIST_GAMMA_SCALE / (1.0 + exp(-(gamma_raw - 8.0)));
             }
         } else if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
-            // Joint DEQ-memory: m is a persistent state co-resolved with h during Picard.
+            // FPM: h_hist loaded per-token (for persist_beta blending at end).
+            // fpm_base/fpm_m_cache are NOT reloaded here — they carry from token to token.
             h_hist0 = H_hist[h_base + slot_offset + tid];
             h_hist1 = H_hist[h_base + slot_offset + tid + WG_SIZE];
-            fpm_base0 = MState[h_base + slot_offset + tid];
-            fpm_base1 = MState[h_base + slot_offset + tid + WG_SIZE];
         } else if (ENABLE_HIST_CTX && d_model == WG_SIZE * 2u) {
             let hist_base_t = (batch_idx * shape.seq_len + global_t) * total_elements;
             hist_ctx0 = HistCtx[hist_base_t + slot_offset + tid];
@@ -416,10 +427,8 @@ fn deq_slot_attn_unified_main(
         workgroupBarrier();
 
         if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
-            fpm_m_cache[tid] = fpm_base0;
-            fpm_m_cache[tid + WG_SIZE] = fpm_base1;
+            // fpm_m_cache already carries from previous token — no reinit here.
             if (tid < h_slots) {
-                slot_attn_weights[tid] = 1.0 / max(1.0, f32(h_slots));
                 slot_attn_prev[tid] = slot_attn_weights[tid];
             }
             workgroupBarrier();
