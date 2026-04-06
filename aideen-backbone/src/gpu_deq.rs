@@ -97,6 +97,8 @@ pub struct GpuDeqBackend {
     fused_update_hist_wgate_pipeline: wgpu::ComputePipeline,
     fused_update_hist_forget_pipeline: wgpu::ComputePipeline,
     fused_update_apply_grad_pipeline: wgpu::ComputePipeline,
+    fpm_retain_bwd_pipeline: wgpu::ComputePipeline,
+    fpm_retain_bwd_bg0: wgpu::BindGroup,
     staged_picard_bg: wgpu::BindGroup,
     staged_picard_bg_alt: wgpu::BindGroup,
     staged_picard_bg1: wgpu::BindGroup,
@@ -516,6 +518,12 @@ impl GpuDeqBackend {
             label: Some("Fused DEQ Update Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fused_deq_update.wgsl").into()),
         });
+        let fpm_retain_bwd_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FPM Retain Gate Backward Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/fused_fpm_retain_bwd.wgsl").into(),
+            ),
+        });
         let staged_picard_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Staged Picard Adjoint Shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -697,6 +705,65 @@ impl GpuDeqBackend {
             ],
         });
 
+
+        // fpm_retain_bwd_bg0_layout: 5 bindings for the retain-gate backward kernel.
+        // bindings 0-4: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients.
+        let fpm_retain_bwd_bg0_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FPM Retain Bwd BG0 Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         // bg1_layout: 10 read_write bindings — used by staged_picard_pl (staged_adjoint_picard.wgsl)
         // fused_update_bg1_layout: 1 binding — AllWeights for fused_deq_update.wgsl @group(1)
@@ -1039,6 +1106,20 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("apply_grad_update_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fpm_retain_bwd_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FPM Retain Bwd PL"),
+            bind_group_layouts: &[&fpm_retain_bwd_bg0_layout, &fused_update_bg1_layout],
+            push_constant_ranges: &[],
+        });
+        let fpm_retain_bwd_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM Retain Gate Backward Pipeline"),
+                layout: Some(&fpm_retain_bwd_pl),
+                module: &fpm_retain_bwd_shader,
+                entry_point: Some("fused_fpm_retain_bwd_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1743,6 +1824,33 @@ impl GpuDeqBackend {
                 resource: bridge.all_weights_buf.as_entire_binding(),
             }],
         });
+        // Retain bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients
+        let fpm_retain_bwd_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FPM Retain Bwd BG0"),
+            layout: &fpm_retain_bwd_bg0_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fused_update_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bridge.hnext_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bridge.scratch_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bridge.hist_ctx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_gradients_buf.as_entire_binding(),
+                },
+            ],
+        });
         // Parse all hot-path env vars once at construction.
         // This backend is the main runtime selector for:
         // - history mode / selective-history behavior
@@ -1872,6 +1980,8 @@ impl GpuDeqBackend {
             fused_update_hist_wgate_pipeline,
             fused_update_hist_forget_pipeline,
             fused_update_apply_grad_pipeline,
+            fpm_retain_bwd_pipeline,
+            fpm_retain_bwd_bg0,
             staged_picard_bg,
             staged_picard_bg_alt,
             staged_picard_bg1,
@@ -3425,6 +3535,18 @@ impl GpuDeqBackend {
                     n_total_weights.div_ceil(256),
                     1
                 );
+            }
+            // FPM retain-gate backward: dispatch after all other update stages.
+            // One workgroup per slot, WG_SIZE=64. Uses separate bind groups.
+            if self.bridge.fpm_enabled {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("FPM Retain Bwd"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.fpm_retain_bwd_pipeline);
+                pass.set_bind_group(0, &self.fpm_retain_bwd_bg0, &[]);
+                pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                pass.dispatch_workgroups(hs, 1, 1);
             }
             self.queue.submit(Some(enc.finish()));
             // Non-blocking queue drain for long batched encoders. This preserves overlap while

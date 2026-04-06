@@ -1007,8 +1007,10 @@ fn deq_slot_attn_unified_main(
         if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
             let working0 = fpm_m_cache[tid];
             let working1 = fpm_m_cache[tid + WG_SIZE];
-            HistCtx[h_base + slot_offset + tid] = working0;
-            HistCtx[h_base + slot_offset + tid + WG_SIZE] = working1;
+            // Per-token storage for retain-gate backward: index includes token dimension.
+            // encode_forward_gpu_only copies the last-token entry → mstate_buf between chunks.
+            HistCtx[h_base_t + slot_offset + tid] = working0;
+            HistCtx[h_base_t + slot_offset + tid + WG_SIZE] = working1;
             let beta = clamp(shape.fpm_persist_beta, 0.0, 1.0);
             let init_hist = global_t == 0u && abs(h_hist0) + abs(h_hist1) < 1e-6;
             H_hist[h_base + slot_offset + tid] = select(h_hist0 + beta * (working0 - h_hist0), working0, init_hist);

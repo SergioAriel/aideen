@@ -55,7 +55,9 @@ async fn test_deq_forward_wgpu_dispatch() {
         token_count: 1,
         diag_zero_win: 0,
         diag_one_iter: 0,
-        _pad0: [0; 3],
+        fpm_alpha_m: 0.01,
+        fpm_tau: 0.5,
+        fpm_persist_beta: 0.01,
     };
 
     let len_sq = d * d;

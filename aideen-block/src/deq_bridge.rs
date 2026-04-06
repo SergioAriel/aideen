@@ -1305,16 +1305,20 @@ impl RustDeqBridge {
             label: Some("DEQ Forward GPU-Only Encoder"),
         });
 
-        if self.fpm_enabled {
-            let h_bytes = (shape.batch_size as u64)
-                * (shape.h_slots as u64)
-                * (shape.d_model as u64)
-                * 4u64;
+        let fpm_slot_stride = if self.fpm_enabled {
+            let slot_stride = (shape.h_slots as u64) * (shape.d_model as u64) * 4u64;
+            // FPM pre-dispatch: seed MState from h_hist_buf on the first chunk.
+            // For subsequent chunks MState is already set from the previous chunk's post-copy.
             if shape.token_start == 0 {
-                encoder.copy_buffer_to_buffer(&self.h_hist_buf, 0, &self.hist_ctx_buf, 0, h_bytes);
+                for b in 0..shape.batch_size as u64 {
+                    let src_off = b * slot_stride;
+                    encoder.copy_buffer_to_buffer(&self.h_hist_buf, src_off, &self.mstate_buf, b * slot_stride, slot_stride);
+                }
             }
-            encoder.copy_buffer_to_buffer(&self.hist_ctx_buf, 0, &self.mstate_buf, 0, h_bytes);
-        }
+            Some(slot_stride)
+        } else {
+            None
+        };
 
         {
             if self.hist_ctx_enabled {
@@ -1378,6 +1382,16 @@ impl RustDeqBridge {
                 shape.batch_size.max(1),
                 shape.token_count.max(1),
             );
+        }
+        // FPM post-dispatch: copy each batch element's LAST-token m_new → mstate_buf.
+        // Executes after the compute pass (commands in one encoder are ordered).
+        if let Some(slot_stride) = fpm_slot_stride {
+            let last_token = (shape.token_start + shape.token_count - 1) as u64;
+            for b in 0..shape.batch_size as u64 {
+                let src_off = (b * shape.seq_len as u64 + last_token) * slot_stride;
+                let dst_off = b * slot_stride;
+                encoder.copy_buffer_to_buffer(&self.hist_ctx_buf, src_off, &self.mstate_buf, dst_off, slot_stride);
+            }
         }
         encoder
     }
