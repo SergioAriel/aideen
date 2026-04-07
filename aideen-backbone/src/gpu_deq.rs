@@ -225,7 +225,10 @@ impl GpuDeqBackend {
         w_retain_up: &[f32],
         w_retain_down: &[f32],
         b_retain: &[f32],
+        w_q_mem: &[f32],
+        w_k_mem: &[f32],
     ) -> Vec<f32> {
+        const MEM_READ_RANK: usize = 32;
         let d = self.config.d_r;
         let h = self.config.h_slots;
         // h_hist gamma is stored as a raw logit-like parameter and squashed in the shader.
@@ -286,15 +289,23 @@ impl GpuDeqBackend {
         out.extend_from_slice(w_retain_up);
         out.extend_from_slice(w_retain_down);
         out.extend_from_slice(b_retain);
+        // Memory read projections: W_q_mem (h×d×r), W_k_mem (h×d×r)
+        debug_assert_eq!(w_q_mem.len(), h * d * MEM_READ_RANK);
+        debug_assert_eq!(w_k_mem.len(), h * d * MEM_READ_RANK);
+        out.extend_from_slice(w_q_mem);
+        out.extend_from_slice(w_k_mem);
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
         const RETAIN_RANK: usize = 32;
+        const MEM_READ_RANK: usize = 32;
         // base: (h+1)*d² + 5*h*d + 2*h + d + 21 + h(γ)
         // retain gate: W_up(h*d*r) + W_down(h*r*d) + b_retain(h*d)
+        // memory read: W_q_mem(h*d*r) + W_k_mem(h*d*r)
         (h + 1) * d * d + 5 * h * d + 2 * h + d + 21 + h
             + 2 * h * d * RETAIN_RANK + h * d
+            + 2 * h * d * MEM_READ_RANK
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -1519,12 +1530,7 @@ impl GpuDeqBackend {
         // n_accum forward passes in mode=1. Zero-initialized (GPU zero-inits storage buffers).
         let ag_d64 = config.d_r as u64;
         let ag_h64 = config.h_slots as u64;
-        let ag_hist_len = (config.h_slots + 1) * config.d_r * config.d_r
-            + 5 * config.h_slots * config.d_r
-            + 2 * config.h_slots
-            + config.d_r
-            + 21
-            + config.h_slots; // γ per slot (must match hist_params_len in deq_bridge.rs)
+        let ag_hist_len = Self::history_params_len(config.d_r, config.h_slots);
         let all_gradients_size = aw_total_bytes(ag_d64, ag_h64, ag_hist_len as u64);
         let all_gradients_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("AllGradients"),
@@ -2152,6 +2158,8 @@ impl GpuDeqBackend {
         w_retain_up: &[f32],
         w_retain_down: &[f32],
         b_retain: &[f32],
+        w_q_mem: &[f32],
+        w_k_mem: &[f32],
     ) {
         let d = self.config.d_r as u64;
         let h = self.config.h_slots as u64;
@@ -2211,6 +2219,8 @@ impl GpuDeqBackend {
             w_retain_up,
             w_retain_down,
             b_retain,
+            w_q_mem,
+            w_k_mem,
         );
         queue.write_buffer(
             &self.bridge.all_weights_buf,

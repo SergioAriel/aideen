@@ -130,6 +130,17 @@ pub struct MambaSlotReasoning {
     pub b_retain: DMatrix<f32>,           // [h_slots × d_r]
     #[cfg(not(feature = "lab"))]
     pub(crate) b_retain: DMatrix<f32>,
+    // ── Memory read projections (low-rank, r=32) ───────────────────────────
+    // q_mem[s] = W_q_mem[s] · h_s, k_mem[s] = W_k_mem[s] · m_s
+    // Used for cross-slot relational memory read over M_{t-1}.
+    #[cfg(feature = "lab")]
+    pub w_q_mem: Vec<DMatrix<f32>>,       // h_slots matrices of shape (d_r, r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_q_mem: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    pub w_k_mem: Vec<DMatrix<f32>>,       // h_slots matrices of shape (d_r, r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_k_mem: Vec<DMatrix<f32>>,
 
     // ── LayerNorm por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
@@ -312,6 +323,14 @@ impl MambaSlotReasoning {
             }).collect(),
             w_retain_down: (0..h_slots).map(|_| DMatrix::zeros(32, d_r)).collect(),
             b_retain: DMatrix::from_element(h_slots, d_r, 3.0_f32),
+            // Memory read projections: small random init preserves near-uniform read at step 0
+            // while allowing slots to learn distinct memory queries/keys quickly.
+            w_q_mem: (0..h_slots).map(|_| {
+                DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32))
+            }).collect(),
+            w_k_mem: (0..h_slots).map(|_| {
+                DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32))
+            }).collect(),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: random init to immediately break slot symmetry.
             // Zero init would give gscore=0 (uniform attn → zero gradient → saddle point forever).
@@ -586,6 +605,38 @@ impl MambaSlotReasoning {
             self.b_forget.as_slice().to_vec(),
         );
         weights.insert(
+            "reasoning.w_retain_up".to_string(),
+            self.w_retain_up
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
+            "reasoning.w_retain_down".to_string(),
+            self.w_retain_down
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
+            "reasoning.b_retain".to_string(),
+            Self::matrix_to_row_major(&self.b_retain),
+        );
+        weights.insert(
+            "reasoning.w_q_mem".to_string(),
+            self.w_q_mem
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
+            "reasoning.w_k_mem".to_string(),
+            self.w_k_mem
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
             "reasoning.a_log".to_string(),
             Self::matrix_to_row_major(&self.a_log),
         );
@@ -618,11 +669,19 @@ impl MambaSlotReasoning {
         Vec<f32>,  // w_retain_up  (h_slots × d_r × r, row-major per slot)
         Vec<f32>,  // w_retain_down (h_slots × r × d_r, row-major per slot)
         Vec<f32>,  // b_retain (h_slots × d_r, row-major)
+        Vec<f32>,  // w_q_mem (h_slots × d_r × r, row-major per slot)
+        Vec<f32>,  // w_k_mem (h_slots × d_r × r, row-major per slot)
     ) {
         let w_retain_up_flat: Vec<f32> = self.w_retain_up.iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
         let w_retain_down_flat: Vec<f32> = self.w_retain_down.iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
+        let w_q_mem_flat: Vec<f32> = self.w_q_mem.iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
+        let w_k_mem_flat: Vec<f32> = self.w_k_mem.iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
         (
@@ -639,6 +698,8 @@ impl MambaSlotReasoning {
             w_retain_up_flat,
             w_retain_down_flat,
             Self::matrix_to_row_major(&self.b_retain),
+            w_q_mem_flat,
+            w_k_mem_flat,
         )
     }
 
@@ -783,6 +844,76 @@ impl MambaSlotReasoning {
                 }
             }
         }
+        {
+            let h_slots = self.config.h_slots;
+            const RETAIN_RANK: usize = 32;
+            if let Some(data) = weights.get("reasoning.w_retain_up") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_retain_up size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_retain_up = data
+                    .chunks_exact(d_r * RETAIN_RANK)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
+                    .collect();
+            }
+            if let Some(data) = weights.get("reasoning.w_retain_down") {
+                let expected = h_slots * RETAIN_RANK * d_r;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_retain_down size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_retain_down = data
+                    .chunks_exact(RETAIN_RANK * d_r)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(RETAIN_RANK, d_r, chunk))
+                    .collect();
+            }
+            if let Some(data) = weights.get("reasoning.b_retain") {
+                if data.len() != h_slots * d_r {
+                    return Err(format!(
+                        "reasoning.b_retain size mismatch: expected {}, got {}",
+                        h_slots * d_r,
+                        data.len()
+                    ));
+                }
+                self.b_retain = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+            }
+            if let Some(data) = weights.get("reasoning.w_q_mem") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_q_mem size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_q_mem = data
+                    .chunks_exact(d_r * RETAIN_RANK)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
+                    .collect();
+            }
+            if let Some(data) = weights.get("reasoning.w_k_mem") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_k_mem size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_k_mem = data
+                    .chunks_exact(d_r * RETAIN_RANK)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
+                    .collect();
+            }
+        }
 
         {
             let h_slots = self.config.h_slots;
@@ -881,6 +1012,8 @@ impl MambaSlotReasoning {
             w_retain_up: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
             w_retain_down: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(32, config.d_r)).collect(),
             b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 3.0_f32),
+            w_q_mem: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
+            w_k_mem: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
             backend: RefCell::new(None),
             damping,
             residual_alpha,

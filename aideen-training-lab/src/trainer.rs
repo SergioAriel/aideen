@@ -487,6 +487,8 @@ impl Trainer {
             w_retain_up_rm,
             w_retain_down_rm,
             b_retain_rm,
+            w_q_mem_rm,
+            w_k_mem_rm,
         ) = self.reasoning.history_params_gpu_layout();
         gpu.upload_weights(
             &gpu.queue,
@@ -512,6 +514,8 @@ impl Trainer {
             w_retain_up_rm.as_slice(),
             w_retain_down_rm.as_slice(),
             b_retain_rm.as_slice(),
+            w_q_mem_rm.as_slice(),
+            w_k_mem_rm.as_slice(),
         );
     }
 
@@ -538,6 +542,8 @@ impl Trainer {
             _w_retain_up_rm,
             _w_retain_down_rm,
             _b_retain_rm,
+            _w_q_mem_rm,
+            _w_k_mem_rm,
         ) = self.reasoning.history_params_gpu_layout();
         let hist_flat = hist_ctx.to_flat();
         let mut slot_anchor_eff = slot_anchor_rm;
@@ -722,14 +728,14 @@ impl Trainer {
         out
     }
 
-    fn decode_fpm_read_metrics(fw: &[f32], h_slots: usize) -> Vec<(f32, f32)> {
+    fn decode_fpm_read_metrics(fw: &[f32], h_slots: usize) -> Vec<(f32, f32, f32, f32, f32, f32)> {
         let mut out = Vec::new();
         for slot in 0..h_slots {
-            let base = 520 + slot * 2;
-            if fw.len() <= base + 1 {
+            let base = 520 + slot * 6;
+            if fw.len() <= base + 5 {
                 break;
             }
-            out.push((fw[base], fw[base + 1]));
+            out.push((fw[base], fw[base + 1], fw[base + 2], fw[base + 3], fw[base + 4], fw[base + 5]));
         }
         out
     }
@@ -1386,6 +1392,8 @@ impl Trainer {
                         w_retain_up_rm,
                         w_retain_down_rm,
                         b_retain_rm,
+                        w_q_mem_rm,
+                        w_k_mem_rm,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
@@ -1411,6 +1419,8 @@ impl Trainer {
                         w_retain_up_rm.as_slice(),
                         w_retain_down_rm.as_slice(),
                         b_retain_rm.as_slice(),
+                        w_q_mem_rm.as_slice(),
+                        w_k_mem_rm.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -1930,6 +1940,8 @@ impl Trainer {
                         w_retain_up_rm,
                         w_retain_down_rm,
                         b_retain_rm,
+                        w_q_mem_rm,
+                        w_k_mem_rm,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
@@ -1955,6 +1967,8 @@ impl Trainer {
                         w_retain_up_rm.as_slice(),
                         w_retain_down_rm.as_slice(),
                         b_retain_rm.as_slice(),
+                        w_q_mem_rm.as_slice(),
+                        w_k_mem_rm.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -2892,7 +2906,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -3096,7 +3110,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -3602,6 +3616,10 @@ impl Trainer {
                             &self.cached_debug_buf,
                             self.config.h_slots,
                         );
+                        let slot_read = Self::decode_fpm_read_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
                         if slot_obs.iter().any(|(self_w, ent, mov)| {
                             self_w.abs() > 1e-6 || ent.abs() > 1e-6 || mov.abs() > 1e-6
                         }) {
@@ -3681,8 +3699,38 @@ impl Trainer {
                                 .map(|(_, _, _, _, _, _, _, sat, _, _, _, _)| format!("{sat:.0}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
+                            let read_rms = slot_read
+                                .iter()
+                                .map(|(rms, _, _, _, _, _)| format!("{rms:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let read_to_sig = slot_read
+                                .iter()
+                                .map(|(_, ratio, _, _, _, _)| format!("{ratio:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let retain_max = slot_read
+                                .iter()
+                                .map(|(_, _, mx, _, _, _)| format!("{mx:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let retain_avg = slot_read
+                                .iter()
+                                .map(|(_, _, _, avg, _, _)| format!("{avg:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let prop_rms = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, pr, _)| format!("{pr:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let cand_rms = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, cr)| format!("{cr:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
                             println!(
-                                "    [FPM-DIAG] err_h=[{}] exit_err_h=[{}] exit_iter=[{}] err_M=[{}] z=[{}] rescue=[{}] dead=[{}] u2v=[{}] sat=[{}] alpha_m={:.3} tau={:.2}",
+                                "    [FPM-DIAG] err_h=[{}] exit_err_h=[{}] exit_iter=[{}] err_M=[{}] z=[{}] rescue=[{}] dead=[{}] u2v=[{}] sat=[{}] read_rms=[{}] read2sig=[{}] retain_max=[{}] retain_avg=[{}] prop_rms=[{}] cand_rms=[{}] alpha_m={:.3} tau={:.2}",
                                 err_h,
                                 exit_err_h,
                                 exit_iter,
@@ -3692,6 +3740,12 @@ impl Trainer {
                                 dead,
                                 ratio,
                                 sat,
+                                read_rms,
+                                read_to_sig,
+                                retain_max,
+                                retain_avg,
+                                prop_rms,
+                                cand_rms,
                                 self.fpm_alpha_m_current,
                                 self.fpm_tau_current
                             );
@@ -4241,6 +4295,91 @@ impl Trainer {
                     self.reasoning.a_log = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
                 }
                 self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
+                {
+                    let d_r = self.reasoning.config.d_r;
+                    let h_slots = self.reasoning.config.h_slots;
+                    let hist = gpu.read_hist_params_full();
+                    let hist_mat_base = 0usize;
+                    let slot_scale_base = hist_mat_base + d_r * d_r;
+                    let hist_bias_base = slot_scale_base + h_slots * d_r;
+                    let hist_gate_base = hist_bias_base + h_slots * d_r;
+                    let slot_anchor_base = hist_gate_base + h_slots;
+                    let w_delta_base = slot_anchor_base + h_slots * d_r;
+                    let b_delta_base = w_delta_base + h_slots * d_r * d_r;
+                    let scalar_base = b_delta_base + d_r;
+                    let w_gate_hist_base = scalar_base + 21;
+                    let w_forget_base = w_gate_hist_base + h_slots * d_r;
+                    let b_forget_base = w_forget_base + h_slots * d_r;
+                    let hhist_gamma_base = b_forget_base + h_slots;
+                    let w_retain_up_base = hhist_gamma_base + h_slots;
+                    let w_retain_down_base = w_retain_up_base + h_slots * d_r * 32;
+                    let b_retain_base = w_retain_down_base + h_slots * 32 * d_r;
+                    let w_q_mem_base = b_retain_base + h_slots * d_r;
+                    let w_k_mem_base = w_q_mem_base + h_slots * d_r * 32;
+
+                    self.reasoning.w_hist_shared = nalgebra::DMatrix::from_row_slice(
+                        d_r,
+                        d_r,
+                        &hist[hist_mat_base..slot_scale_base],
+                    );
+                    self.reasoning.hist_slot_scale = nalgebra::DMatrix::from_row_slice(
+                        h_slots,
+                        d_r,
+                        &hist[slot_scale_base..hist_bias_base],
+                    );
+                    self.reasoning.hist_slot_bias = nalgebra::DMatrix::from_row_slice(
+                        h_slots,
+                        d_r,
+                        &hist[hist_bias_base..hist_gate_base],
+                    );
+                    self.reasoning.hist_gate_logit =
+                        nalgebra::DVector::from_column_slice(&hist[hist_gate_base..slot_anchor_base]);
+                    self.reasoning.slot_anchor = nalgebra::DMatrix::from_row_slice(
+                        h_slots,
+                        d_r,
+                        &hist[slot_anchor_base..w_delta_base],
+                    );
+                    self.reasoning.w_delta = nalgebra::DMatrix::from_row_slice(
+                        h_slots * d_r,
+                        d_r,
+                        &hist[w_delta_base..b_delta_base],
+                    );
+                    self.reasoning.b_delta =
+                        nalgebra::DVector::from_column_slice(&hist[b_delta_base..scalar_base]);
+                    self.reasoning.w_gate_hist = nalgebra::DMatrix::from_row_slice(
+                        h_slots,
+                        d_r,
+                        &hist[w_gate_hist_base..w_forget_base],
+                    );
+                    self.reasoning.w_forget = nalgebra::DMatrix::from_row_slice(
+                        h_slots,
+                        d_r,
+                        &hist[w_forget_base..b_forget_base],
+                    );
+                    self.reasoning.b_forget =
+                        nalgebra::DVector::from_column_slice(&hist[b_forget_base..hhist_gamma_base]);
+                    self.reasoning.w_retain_up = hist[w_retain_up_base..w_retain_down_base]
+                        .chunks_exact(d_r * 32)
+                        .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                        .collect();
+                    self.reasoning.w_retain_down = hist[w_retain_down_base..b_retain_base]
+                        .chunks_exact(32 * d_r)
+                        .map(|chunk| nalgebra::DMatrix::from_row_slice(32, d_r, chunk))
+                        .collect();
+                    self.reasoning.b_retain = nalgebra::DMatrix::from_row_slice(
+                        h_slots,
+                        d_r,
+                        &hist[b_retain_base..w_q_mem_base],
+                    );
+                    self.reasoning.w_q_mem = hist[w_q_mem_base..w_k_mem_base]
+                        .chunks_exact(d_r * 32)
+                        .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                        .collect();
+                    self.reasoning.w_k_mem = hist[w_k_mem_base..]
+                        .chunks_exact(d_r * 32)
+                        .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                        .collect();
+                }
                 self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
                 self.gpu_cg_weights_uploaded = true;
                 }

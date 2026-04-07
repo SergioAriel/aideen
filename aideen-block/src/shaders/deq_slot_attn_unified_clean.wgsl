@@ -105,6 +105,8 @@ const RETAIN_RANK: u32 = 32u;
 fn w_retain_up_base(d: u32, h: u32) -> u32 { return hhist_gamma_base(d, h) + h; }
 fn w_retain_down_base(d: u32, h: u32) -> u32 { return w_retain_up_base(d, h) + h * d * RETAIN_RANK; }
 fn b_retain_base(d: u32, h: u32) -> u32 { return w_retain_down_base(d, h) + h * RETAIN_RANK * d; }
+fn w_q_mem_base(d: u32, h: u32) -> u32 { return b_retain_base(d, h) + h * d; }
+fn w_k_mem_base(d: u32, h: u32) -> u32 { return w_q_mem_base(d, h) + h * d * RETAIN_RANK; }
 
 @group(0) @binding(11) var<storage, read_write> H_hist: array<f32>;
 
@@ -121,7 +123,11 @@ const FPM_GATE_CLAMP: f32 = 0.5;
 const FPM_FATIGUE_RATE: f32 = 0.002;
 const FPM_RESCUE_TAIL: u32 = 2u;
 const FPM_DEAD_THRESHOLD: f32 = 0.01;
-const FPM_SAT_THRESHOLD: f32 = 0.45;
+// Saturation now refers to near-max use of the slot's write budget.
+// Under the old z∈[0, 0.5] clamp, 0.45 meant "almost fully saturated".
+// With z reparameterized into [0, 1], the same semantics are recovered by
+// checking for near-ceiling utilization instead of mid-range activity.
+const FPM_SAT_THRESHOLD: f32 = 0.95;
 const FPM_EPS: f32 = 1e-6;
 const FPM_HOMEO_MIN_ITERS: u32 = 4u;
 const FPM_HOMEO_ALPHA_ERR_SCALE: f32 = 0.15;
@@ -339,6 +345,11 @@ fn deq_slot_attn_unified_main(
         total_iters_seen = 0u;
         failed_hits_seen = 0u;
         converged_flag_wg = 0u;
+        let slot_probe_base = 520u + slot_idx * 6u;
+        DebugLog[slot_probe_base + 2u] = 0.0;
+        DebugLog[slot_probe_base + 3u] = 0.0;
+        DebugLog[slot_probe_base + 4u] = 0.0;
+        DebugLog[slot_probe_base + 5u] = 0.0;
     }
     workgroupBarrier();
 
@@ -350,7 +361,8 @@ fn deq_slot_attn_unified_main(
 
     // FPM intra-slot m carry: load once before the token loop.
     // fpm_m_cache evolves token-to-token within the chunk via plastic write.
-    // Cross-slot coordination uses MState (from previous chunk) via fpm_ctx.
+    // Cross-slot memory read uses HistCtx[t-1] within the chunk and MState only
+    // as first-token fallback / inter-chunk persistence.
     if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
         fpm_m_cache[tid]          = MState[h_base + slot_offset + tid];
         fpm_m_cache[tid + WG_SIZE] = MState[h_base + slot_offset + tid + WG_SIZE];
@@ -368,6 +380,12 @@ fn deq_slot_attn_unified_main(
         let signal_base = batch_scratch_t + slot_offset;
         let attn_base = batch_scratch_t + signal_span + slot_offset;
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
+        let use_prev_token_mem = global_t > 0u;
+        let prev_hist_base_t = select(
+            0u,
+            (batch_idx * shape.seq_len + (global_t - 1u)) * total_elements,
+            use_prev_token_mem,
+        );
 
         if (d_model == WG_SIZE * 2u) {
             let d0 = tid;
@@ -430,6 +448,31 @@ fn deq_slot_attn_unified_main(
             // fpm_m_cache already carries from previous token — no reinit here.
             if (tid < h_slots) {
                 slot_attn_prev[tid] = slot_attn_weights[tid];
+                slot_attn_weights[tid] = 1.0 / max(1.0, f32(h_slots));
+                slot_attn_prev[tid] = slot_attn_weights[tid];
+            }
+            let hist_base = aw_hist_base(d_model, h_slots);
+            if (tid < h_slots * RETAIN_RANK) {
+                let ms = tid / RETAIN_RANK;
+                let r = tid % RETAIN_RANK;
+                let mem_off = h_base + ms * d_model;
+                let kmem_base = hist_base + w_k_mem_base(d_model, h_slots) + ms * d_model * RETAIN_RANK;
+                let scale_base = hist_base + hist_scale_base(d_model, h_slots) + ms * d_model;
+                let bias_base = hist_base + hist_bias_base(d_model, h_slots) + ms * d_model;
+                var key_acc = 0.0;
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let m_j = select(
+                        MState[mem_off + j],
+                        HistCtx[prev_hist_base_t + ms * d_model + j],
+                        use_prev_token_mem,
+                    );
+                    let keyed_m_j =
+                        m_j
+                        + AllWeights[scale_base + j] * tanh(m_j)
+                        + AllWeights[bias_base + j];
+                    key_acc = key_acc + AllWeights[kmem_base + j * RETAIN_RANK + r] * keyed_m_j;
+                }
+                k_cache[tid] = key_acc;
             }
             workgroupBarrier();
         } else if (ENABLE_HIST_CTX && d_model == WG_SIZE * 2u) {
@@ -529,28 +572,29 @@ fn deq_slot_attn_unified_main(
             }
 
             if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
+                let hist_base = aw_hist_base(d_model, h_slots);
                 if (tid < h_slots) {
                     slot_attn_prev[tid] = slot_attn_weights[tid];
+                }
+                if (tid < RETAIN_RANK) {
+                    let qmem_base = hist_base + w_q_mem_base(d_model, h_slots) + slot_idx * d_model * RETAIN_RANK;
+                    var q_acc = 0.0;
+                    for (var j = 0u; j < d_model; j = j + 1u) {
+                        q_acc = q_acc + AllWeights[qmem_base + j * RETAIN_RANK + tid]
+                            * H_curr[h_base + slot_offset + j];
+                    }
+                    shared_vals[tid] = q_acc;
                 }
                 workgroupBarrier();
                 if (tid < h_slots) {
                     let ms = tid;
-                    let mem_off = h_base + ms * d_model;
-                    let hist_base = aw_hist_base(d_model, h_slots);
-                    let scale_base = hist_base + hist_scale_base(d_model, h_slots) + ms * d_model;
-                    let bias_base = hist_base + hist_bias_base(d_model, h_slots) + ms * d_model;
                     var score = 0.0;
-                    for (var j = 0u; j < d_model; j = j + 1u) {
-                        let h_j = H_curr[h_base + slot_offset + j];
-                        let m_j = MState[mem_off + j];
-                        let keyed_m_j =
-                            m_j
-                            + AllWeights[scale_base + j] * tanh(m_j)
-                            + AllWeights[bias_base + j];
-                        score = score + h_j * keyed_m_j;
+                    for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
+                        score = score + shared_vals[r] * k_cache[ms * RETAIN_RANK + r];
                     }
                     score = score + AllWeights[hist_base + hist_gate_base(d_model, h_slots) + ms];
-                    slot_attn_weights[ms] = score * inverseSqrt(max(1.0, f32(d_model))) / max(shape.fpm_tau, 1e-3);
+                    slot_attn_weights[ms] =
+                        score * inverseSqrt(max(1.0, f32(RETAIN_RANK))) / max(shape.fpm_tau, 1e-3);
                 }
                 workgroupBarrier();
                 if (tid == 0u) {
@@ -574,8 +618,17 @@ fn deq_slot_attn_unified_main(
                 var mem_raw1 = 0.0;
                 for (var ms = 0u; ms < h_slots; ms = ms + 1u) {
                     let mem_off = h_base + ms * d_model;
-                    let m0 = MState[mem_off + tid];
-                    let m1 = MState[mem_off + tid + WG_SIZE];
+                    let hist_slot_off = prev_hist_base_t + ms * d_model;
+                    let m0 = select(
+                        MState[mem_off + tid],
+                        HistCtx[hist_slot_off + tid],
+                        use_prev_token_mem,
+                    );
+                    let m1 = select(
+                        MState[mem_off + tid + WG_SIZE],
+                        HistCtx[hist_slot_off + tid + WG_SIZE],
+                        use_prev_token_mem,
+                    );
                     let w = slot_attn_weights[ms];
                     let value_m0 = tanh(m0);
                     let value_m1 = tanh(m1);
@@ -591,10 +644,10 @@ fn deq_slot_attn_unified_main(
                     1.0,
                     rescue_active,
                 );
-                fpm_ctx0 = tanh(mem_raw0) * read_gate;
-                fpm_ctx1 = tanh(mem_raw1) * read_gate;
-                let fpm_ctx_sq = fpm_ctx0 * fpm_ctx0 + fpm_ctx1 * fpm_ctx1;
-                shared_vals[tid] = fpm_ctx_sq;
+                let mem_unit0 = tanh(mem_raw0);
+                let mem_unit1 = tanh(mem_raw1);
+                let mem_unit_sq = mem_unit0 * mem_unit0 + mem_unit1 * mem_unit1;
+                shared_vals[tid] = mem_unit_sq;
                 workgroupBarrier();
                 for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
                     if (tid < stride) {
@@ -602,7 +655,7 @@ fn deq_slot_attn_unified_main(
                     }
                     workgroupBarrier();
                 }
-                let fpm_ctx_norm = sqrt(max(shared_vals[0], 1e-6));
+                let mem_unit_norm = sqrt(max(shared_vals[0], 1e-6));
                 let signal_sq = Scratch[signal_base + tid] * Scratch[signal_base + tid]
                     + Scratch[signal_base + tid + WG_SIZE] * Scratch[signal_base + tid + WG_SIZE];
                 shared_vals[tid] = signal_sq;
@@ -614,6 +667,12 @@ fn deq_slot_attn_unified_main(
                     workgroupBarrier();
                 }
                 let signal_norm = sqrt(max(shared_vals[0], 1e-6));
+                // Structural scale matching: memory read enters the solve with the same RMS
+                // order as the token signal, instead of an unconstrained absolute scale.
+                let mem_to_signal = signal_norm / max(mem_unit_norm, 1e-6);
+                fpm_ctx0 = mem_unit0 * mem_to_signal * read_gate;
+                fpm_ctx1 = mem_unit1 * mem_to_signal * read_gate;
+                let fpm_ctx_norm = signal_norm * read_gate;
                 if (tid == 0u) {
                     let memctx_rms = fpm_ctx_norm / sqrt(max(1.0, f32(d_model)));
                     let signal_rms = signal_norm / sqrt(max(1.0, f32(d_model)));
@@ -733,8 +792,9 @@ fn deq_slot_attn_unified_main(
             }
             let iter_max_delta_a = shared_vals[0];
             // FPM plastic write deferred to once per token after convergence (below).
-            // fpm_ctx reads MState (global, frozen during Picard) — not fpm_m_cache —
-            // so h* is identical whether m is updated per-iter or once with h*.
+            // fpm_ctx reads the previous token's frozen memory snapshot:
+            // HistCtx[t-1] within the chunk, MState only for the first absolute token.
+            // That preserves Picard stability while restoring causal token-to-token memory.
             var local_max_delta_m = 0.0;
             var local_gate = 0.0;
             var local_update_ratio = 0.0;
@@ -905,12 +965,7 @@ fn deq_slot_attn_unified_main(
             let gate_bias = AllWeights[hist_base + hist_gate_base(d_model, h_slots) + slot_idx]
                 + AllWeights[hist_base + b_forget_base(d_model, h_slots) + slot_idx]
                 + FPM_GATE_BIAS;
-            let z = clamp(
-                (1.0 / (1.0 + exp(-(shared_vals[0] * inverseSqrt(max(1.0, f32(d_model))) + gate_bias))))
-                    * slot_attn_weights[slot_idx],
-                0.0,
-                FPM_GATE_CLAMP,
-            );
+            let raw_z = 1.0 / (1.0 + exp(-(shared_vals[0] * inverseSqrt(max(1.0, f32(d_model))) + gate_bias)));
             let wd_base = hist_base + hist_delta_base(d_model, h_slots) + slot_idx * d_model * d_model;
             let bd_base = hist_base + hist_delta_bias_base(d_model, h_slots);
             var delta_in0 = AllWeights[bd_base + d0];
@@ -922,6 +977,30 @@ fn deq_slot_attn_unified_main(
             }
             let proposal0 = tanh(delta_in0);
             let proposal1 = tanh(delta_in1);
+            let proposal_sq = proposal0 * proposal0 + proposal1 * proposal1;
+            shared_vals[tid] = proposal_sq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let proposal_norm = sqrt(max(shared_vals[0], 1e-6));
+            let prev_sq = m_prev0 * m_prev0 + m_prev1 * m_prev1;
+            shared_vals[tid] = prev_sq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let prev_norm = sqrt(max(shared_vals[0], 1e-6));
+            // Structural novelty gate: write strength scales with how much the proposal differs
+            // from the carried memory, rather than saturating at a fixed global clamp.
+            let novelty = proposal_norm / (proposal_norm + prev_norm + 1e-6);
+            let z = clamp(raw_z * novelty, 0.0, 1.0);
             // Retain gate (low-rank r=32): retain = σ(W_down · (W_up · c) + b_retain)
             // Replaces uniform fatigue decay with input-dependent selective forgetting.
             let hist_base_r = aw_hist_base(d_model, h_slots);
@@ -948,8 +1027,19 @@ fn deq_slot_attn_unified_main(
             }
             let retain0 = 1.0 / (1.0 + exp(-down_acc0));
             let retain1 = 1.0 / (1.0 + exp(-down_acc1));
-            let m_candidate0 = retain0 * m_prev0 + z * (residual_scale * proposal0);
-            let m_candidate1 = retain1 * m_prev1 + z * (residual_scale * proposal1);
+            // Structural update budget: write magnitude is coupled to the amount of forgetting.
+            // If retain≈1, the slot is choosing to preserve its memory and must not inject
+            // a full-strength write on top of that same retained state.
+            let write_budget0 = (1.0 - retain0) * z;
+            let write_budget1 = (1.0 - retain1) * z;
+            let write0 = write_budget0 * (residual_scale * proposal0);
+            let write1 = write_budget1 * (residual_scale * proposal1);
+            let m_candidate0 = retain0 * m_prev0 + write0;
+            let m_candidate1 = retain1 * m_prev1 + write1;
+            let proposal_rms_p = sqrt(0.5 * (proposal0 * proposal0 + proposal1 * proposal1));
+            let candidate_rms_p = sqrt(0.5 * (m_candidate0 * m_candidate0 + m_candidate1 * m_candidate1));
+            let retain_avg_p = 0.5 * (retain0 + retain1);
+            let retain_max_p = max(retain0, retain1);
             // Diagnostics: replicate the same reductions as the original per-iter block.
             var local_delta_m_num_p = (m_candidate0 - m_prev0) * (m_candidate0 - m_prev0)
                                     + (m_candidate1 - m_prev1) * (m_candidate1 - m_prev1);
@@ -982,8 +1072,6 @@ fn deq_slot_attn_unified_main(
                 workgroupBarrier();
             }
             let iter_max_delta_m_p = shared_vals[0];
-            let write0 = z * (residual_scale * proposal0);
-            let write1 = z * (residual_scale * proposal1);
             let upd_num_p = write0 * write0 + write1 * write1;
             let upd_den_p = m_prev0 * m_prev0 + m_prev1 * m_prev1;
             let update_ratio_p = sqrt(upd_num_p / (upd_den_p + FPM_EPS));
@@ -996,6 +1084,11 @@ fn deq_slot_attn_unified_main(
                 if (z > FPM_SAT_THRESHOLD) {
                     write_saturation_seen = write_saturation_seen + 1.0;
                 }
+                let slot_probe_base = 520u + slot_idx * 6u;
+                DebugLog[slot_probe_base + 2u] = max(DebugLog[slot_probe_base + 2u], retain_max_p);
+                DebugLog[slot_probe_base + 3u] = DebugLog[slot_probe_base + 3u] + retain_avg_p;
+                DebugLog[slot_probe_base + 4u] = max(DebugLog[slot_probe_base + 4u], proposal_rms_p);
+                DebugLog[slot_probe_base + 5u] = max(DebugLog[slot_probe_base + 5u], candidate_rms_p);
             }
             fpm_m_cache[d0] = m_candidate0;
             fpm_m_cache[d1] = m_candidate1;
@@ -1065,9 +1158,10 @@ fn deq_slot_attn_unified_main(
         DebugLog[slot_diag_base + 9u] = exit_iter_sum / token_den;
         DebugLog[slot_diag_base + 10u] = rescue_entered_sum;
         DebugLog[slot_diag_base + 11u] = pre_rescue_converged_sum;
-        let slot_read_base = 520u + slot_idx * 2u;
+        let slot_read_base = 520u + slot_idx * 6u;
         DebugLog[slot_read_base + 0u] = max_memctx_rms_seen;
         DebugLog[slot_read_base + 1u] = max_memctx_to_signal_seen;
+        DebugLog[slot_read_base + 3u] = DebugLog[slot_read_base + 3u] / token_den;
         if (slot_idx == 0u) {
             DebugLog[8] = 901.0;
             DebugLog[9] = shape.epsilon;
