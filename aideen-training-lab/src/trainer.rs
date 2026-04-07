@@ -203,6 +203,45 @@ pub struct Trainer {
 }
 
 impl Trainer {
+    #[cfg(feature = "wgpu")]
+    fn w_delta_rank_summary(
+        w_delta: &nalgebra::DMatrix<f32>,
+        h_slots: usize,
+        d_r: usize,
+    ) -> Option<(String, String, String)> {
+        if h_slots == 0 || d_r == 0 || w_delta.nrows() != h_slots * d_r || w_delta.ncols() != d_r {
+            return None;
+        }
+        let mut stable_ranks = Vec::with_capacity(h_slots);
+        let mut top8 = Vec::with_capacity(h_slots);
+        let mut top32 = Vec::with_capacity(h_slots);
+        for slot in 0..h_slots {
+            let block = w_delta.rows(slot * d_r, d_r).into_owned();
+            let svd = nalgebra::linalg::SVD::new(block, false, false);
+            let mut sigmas = svd.singular_values.as_slice().to_vec();
+            if sigmas.is_empty() {
+                stable_ranks.push("0.0".to_string());
+                top8.push("0.000".to_string());
+                top32.push("0.000".to_string());
+                continue;
+            }
+            sigmas.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let energy: f32 = sigmas.iter().map(|s| s * s).sum();
+            let sigma_max_sq = sigmas[0] * sigmas[0];
+            let stable_rank = if sigma_max_sq > 0.0 {
+                energy / sigma_max_sq
+            } else {
+                0.0
+            };
+            let top8_energy: f32 = sigmas.iter().take(8).map(|s| s * s).sum();
+            let top32_energy: f32 = sigmas.iter().take(32).map(|s| s * s).sum();
+            stable_ranks.push(format!("{stable_rank:.1}"));
+            top8.push(format!("{:.3}", top8_energy / energy.max(1e-12)));
+            top32.push(format!("{:.3}", top32_energy / energy.max(1e-12)));
+        }
+        Some((stable_ranks.join(","), top8.join(","), top32.join(",")))
+    }
+
     fn visible_loss_value(&self, fallback: Option<f32>) -> Option<f32> {
         if self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
             Some(self.last_gpu_loss)
@@ -824,6 +863,16 @@ impl Trainer {
     }
 
     fn update_fpm_runtime_schedule(&mut self) {
+        let runtime_schedule_enabled = std::env::var("AIDEEN_FPM_RUNTIME_SCHEDULE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        if !runtime_schedule_enabled {
+            return;
+        }
         let fpm_enabled = std::env::var("AIDEEN_FPM")
             .ok()
             .map(|v| {
@@ -3607,6 +3656,13 @@ impl Trainer {
                             vl == "1" || vl == "true" || vl == "yes"
                         })
                         .unwrap_or(false);
+                    let wdelta_audit = std::env::var("AIDEEN_WDELTA_AUDIT")
+                        .ok()
+                        .map(|v| {
+                            let vl = v.trim().to_ascii_lowercase();
+                            vl == "1" || vl == "true" || vl == "yes"
+                        })
+                        .unwrap_or(false);
                     if fpm_enabled && !self.cached_debug_buf.is_empty() {
                         let slot_obs = Self::decode_slot_observability_metrics(
                             &self.cached_debug_buf,
@@ -3753,6 +3809,40 @@ impl Trainer {
                              * rescue tuple semantics:
                              *   entered-during-loop / recovered-after-rescue / rescue-entered-count / converged-before-rescue
                              */
+                        }
+                    }
+                    if fpm_enabled && wdelta_audit {
+                        self.sync_inference_weights();
+                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                            let ((w_hist_mean, w_hist_max), (w_delta_mean, w_delta_max), (b_delta_mean, b_delta_max)) =
+                                gpu.read_hist_selective_param_stats();
+                            let ((delta_mean, delta_max, delta_nz), (a_mean, a_min, a_max)) =
+                                gpu.read_hist_selective_forward_stats(self.config.ctx_len as u32);
+                            println!(
+                                "    [WDELTA-STATS] w_hist(mean_abs={:.3e},max_abs={:.3e}) w_delta(mean_abs={:.3e},max_abs={:.3e}) b_delta(mean_abs={:.3e},max_abs={:.3e}) delta(mean_abs={:.3e},max_abs={:.3e},nz={}) a_t(mean={:.3e},min={:.3e},max={:.3e})",
+                                w_hist_mean,
+                                w_hist_max,
+                                w_delta_mean,
+                                w_delta_max,
+                                b_delta_mean,
+                                b_delta_max,
+                                delta_mean,
+                                delta_max,
+                                delta_nz,
+                                a_mean,
+                                a_min,
+                                a_max
+                            );
+                        }
+                        if let Some((stable_rank, top8, top32)) = Self::w_delta_rank_summary(
+                            &self.reasoning.w_delta,
+                            self.config.h_slots,
+                            self.config.d_r,
+                        ) {
+                            println!(
+                                "    [WDELTA-RANK] stable_rank=[{}] top8_energy=[{}] top32_energy=[{}]",
+                                stable_rank, top8, top32
+                            );
                         }
                     }
                 }
