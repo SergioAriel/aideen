@@ -90,6 +90,8 @@ pub struct GpuDeqBackend {
     slot_coord_update_stage2_pipeline: wgpu::ComputePipeline,
     slot_coord_update_stage3_pipeline: wgpu::ComputePipeline,
     slot_coord_update_stage4_signal_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_signal_reduce_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_signal_finalize_pipeline: wgpu::ComputePipeline,
     slot_coord_update_stage4_anchor_pipeline: wgpu::ComputePipeline,
     slot_coord_update_stage4_wo_win_pipeline: wgpu::ComputePipeline,
     slot_coord_update_stage4_wq_pipeline: wgpu::ComputePipeline,
@@ -1037,32 +1039,10 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let slot_coord_bias_mode = std::env::var("AIDEEN_SLOT_COORD_BIAS_MODE")
-            .unwrap_or_else(|_| "trainable".to_string());
-        let slot_coord_use_bias = !matches!(slot_coord_bias_mode.as_str(), "off" | "none" | "0");
-        let slot_coord_train_bias =
-            matches!(slot_coord_bias_mode.as_str(), "trainable" | "on" | "1");
-        let slot_coord_logit_gain = std::env::var("AIDEEN_SLOT_COORD_LOGIT_GAIN")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.1, 32.0);
         let mut slot_coord_constants = std::collections::HashMap::new();
         slot_coord_constants.insert(
             "SLOT_COORD_HEAD_DIM".to_string(),
             slot_coord_head_dim as f64,
-        );
-        slot_coord_constants.insert(
-            "SLOT_COORD_USE_BIAS".to_string(),
-            if slot_coord_use_bias { 1.0 } else { 0.0 },
-        );
-        slot_coord_constants.insert(
-            "SLOT_COORD_TRAIN_BIAS".to_string(),
-            if slot_coord_train_bias { 1.0 } else { 0.0 },
-        );
-        slot_coord_constants.insert(
-            "SLOT_COORD_LOGIT_GAIN".to_string(),
-            slot_coord_logit_gain as f64,
         );
         let slot_coord_update_stage0_scale_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1130,6 +1110,30 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &slot_coord_update_shader,
                 entry_point: Some("slot_coord_stage4_signal_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_signal_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Signal Reduce Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_signal_reduce_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_signal_finalize_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Signal Finalize Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_signal_finalize_main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &slot_coord_constants,
                     zero_initialize_workgroup_memory: true,
@@ -2205,6 +2209,8 @@ impl GpuDeqBackend {
             slot_coord_update_stage2_pipeline,
             slot_coord_update_stage3_pipeline,
             slot_coord_update_stage4_signal_pipeline,
+            slot_coord_update_stage4_signal_reduce_pipeline,
+            slot_coord_update_stage4_signal_finalize_pipeline,
             slot_coord_update_stage4_anchor_pipeline,
             slot_coord_update_stage4_wo_win_pipeline,
             slot_coord_update_stage4_wq_pipeline,
@@ -3800,14 +3806,25 @@ impl GpuDeqBackend {
                     n.div_ceil(16)
                 );
                 add_pass!(
+                    &self.slot_coord_update_stage4_signal_reduce_pipeline,
+                    n,
+                    1
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_signal_finalize_pipeline,
+                    d.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass!(
                     &self.slot_coord_update_stage4_anchor_pipeline,
                     d.div_ceil(16),
                     hs.div_ceil(16)
                 );
-                add_pass!(
+                add_pass_3d!(
                     &self.slot_coord_update_stage4_wo_win_pipeline,
-                    d.div_ceil(16),
-                    d.div_ceil(16)
+                    d.div_ceil(8),
+                    d.div_ceil(8),
+                    hs
                 );
                 add_pass_3d!(
                     &self.slot_coord_update_stage4_wk_pipeline,
@@ -4222,6 +4239,28 @@ impl GpuDeqBackend {
                 run_stage(
                     &self.device,
                     &self.queue,
+                    "slot_coord_stage4_signal_reduce",
+                    &self.slot_coord_update_stage4_signal_reduce_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    n,
+                    1,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_signal_finalize",
+                    &self.slot_coord_update_stage4_signal_finalize_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
                     "slot_coord_stage4_anchor",
                     &self.slot_coord_update_stage4_anchor_pipeline,
                     &self.fused_update_bg0,
@@ -4230,15 +4269,16 @@ impl GpuDeqBackend {
                     hs.div_ceil(16),
                     profile_fused,
                 );
-                run_stage(
+                run_stage_3d(
                     &self.device,
                     &self.queue,
                     "slot_coord_stage4_wo_win",
                     &self.slot_coord_update_stage4_wo_win_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
-                    d.div_ceil(16),
-                    d.div_ceil(16),
+                    d.div_ceil(8),
+                    d.div_ceil(8),
+                    hs,
                     profile_fused,
                 );
                 run_stage_3d(

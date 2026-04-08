@@ -31,8 +31,8 @@ override SLOT_ATTN_HEAD_DIM: u32 = 32u;
 override ENABLE_TOKEN_CARRY: bool = true;
 override ENABLE_H_HIST: bool = false;
 override ENABLE_HIST_CTX: bool = false;
-override SLOT_COORD_USE_BIAS: bool = true;
-override SLOT_COORD_LOGIT_GAIN: f32 = 1.0;
+const SLOT_COORD_USE_BIAS: bool = true;
+const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
 const WG_SIZE: u32 = 256u;
 const FPM_CACHE_CAP: u32 = 512u;
 const MAX_SLOTS: u32 = 8u;
@@ -131,7 +131,6 @@ override ENABLE_FPM: bool = false;
 //   (h, m)^(k+1) = Phi((h, m)^k; signal, slot_ctx, anchor)
 // Memory participates in the same fixed-point search as the token state.
 override FPM_MEM_ITERS: u32 = 1u;
-override SLOT_COORD_REFRESH_ITERS: u32 = 0u; // 0 => refresh every Picard iter
 const FPM_ALPHA_H: f32 = 0.2;
 const FPM_RESIDUAL_SCALE: f32 = 0.1;
 const FPM_RESCUE_RESIDUAL_SCALE: f32 = 0.01;
@@ -265,7 +264,15 @@ fn compute_slot_coord(
         for (var d = 0u; d < head_dim; d = d + 1u) {
             score = score + q_self[d] * k_cache[ks_head + d];
         }
-        slot_coord_weights[ks] = score * inverseSqrt(max(1.0, f32(head_dim))) * SLOT_COORD_LOGIT_GAIN;
+        // Slot coordination already has identity through signal/residual/slot_anchor.
+        // The relational branch should carry cross-slot information, not learn a redundant
+        // self-loop that can dominate alpha and destabilize the solve.
+        if (h_slots > 1u && ks == slot_idx) {
+            slot_coord_weights[ks] = -1.0e30;
+        } else {
+            slot_coord_weights[ks] =
+                score * inverseSqrt(max(1.0, f32(head_dim))) * SLOT_COORD_LOGIT_GAIN;
+        }
     }
     workgroupBarrier();
     if (tid == 0u) {

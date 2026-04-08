@@ -274,18 +274,10 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(1)
             .clamp(1, 8);
-        let slot_coord_refresh_iters = std::env::var("AIDEEN_SLOT_COORD_REFRESH_ITERS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(1);
-        let slot_coord_bias_mode = std::env::var("AIDEEN_SLOT_COORD_BIAS_MODE")
-            .unwrap_or_else(|_| "trainable".to_string());
-        let slot_coord_use_bias = !matches!(slot_coord_bias_mode.as_str(), "off" | "none" | "0");
-        let slot_coord_logit_gain = std::env::var("AIDEEN_SLOT_COORD_LOGIT_GAIN")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.1, 32.0);
+        // Slot coordination uses bias only as a structural bootstrap to break permutation
+        // symmetry. Training the bias let the router collapse onto the shortcut instead of
+        // pushing specialization into W_q/W_k, and disabling bias entirely weakened the
+        // initial slot geometry. The audited stable regime is: use bias, do not train it.
         let mut slot_coord_constants = std::collections::HashMap::new();
         slot_coord_constants.insert("SLOT_ATTN_HEAD_DIM".to_string(), slot_attn_head_dim as f64);
         slot_coord_constants.insert(
@@ -305,18 +297,6 @@ impl RustDeqBridge {
             if fpm_enabled { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert("FPM_MEM_ITERS".to_string(), fpm_mem_iters as f64);
-        slot_coord_constants.insert(
-            "SLOT_COORD_REFRESH_ITERS".to_string(),
-            slot_coord_refresh_iters as f64,
-        );
-        slot_coord_constants.insert(
-            "SLOT_COORD_USE_BIAS".to_string(),
-            if slot_coord_use_bias { 1.0 } else { 0.0 },
-        );
-        slot_coord_constants.insert(
-            "SLOT_COORD_LOGIT_GAIN".to_string(),
-            slot_coord_logit_gain as f64,
-        );
         let slot_coord_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("DEQ SlotCoord Unified Pipeline"),

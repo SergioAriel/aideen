@@ -442,26 +442,23 @@ impl MambaSlotReasoning {
     }
 
     /// GPU flat layout for W_v: [h_slots × d_r×d_r matrices] (no bias — W_o absorbs output bias).
-    /// Each slot matrix is the shared w_v plus a deterministic per-slot jitter (smaller than Q/K).
+    /// We replicate the same learned matrix for every slot; slot-specific structure must come
+    /// from explicit slot parameters and learned dynamics, not from upload-time perturbations.
     /// Shader accesses slot s: W_v[s*d*d + j*d + d_out].
     pub fn w_v_gpu_flat(&self) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
         let base = self.w_v.as_slice(); // column-major, d*d floats
         let mut v = Vec::with_capacity(h * d * d);
-        for s in 0..h {
-            for (i, &x) in base.iter().enumerate() {
-                // Smaller jitter than Q/K (0.03 vs 0.05) to keep V more stable
-                let jitter =
-                    ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.3_f32).sin() * 0.03_f32;
-                v.push(x + jitter);
-            }
+        for _ in 0..h {
+            v.extend_from_slice(base);
         }
         v
     }
 
     /// GPU flat layout for W_o: [h_slots × d_r×d_r matrices].
-    /// Each slot matrix is the shared w_o plus a deterministic per-slot jitter.
+    /// We keep W_o identical across slots at upload time; slot-specific behavior should come
+    /// from learned per-slot parameters and states, not from a hidden upload-time perturbation.
     /// Shader accesses slot s: W_o[s*d*d + j*d + d_out].
     pub fn w_o_gpu_flat(&self) -> Vec<f32> {
         let d = self.config.d_r;
@@ -472,23 +469,9 @@ impl MambaSlotReasoning {
             || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
         let attn_t = if slot_coord_mode { 0.30_f32 } else { 0.10_f32 };
         let n_iter = 20;
-        let jitter_scale = std::env::var("AIDEEN_DEQ_WO_JITTER")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.0)
-            .clamp(0.0, 0.05);
         let mut v = Vec::with_capacity(h * d * d);
-        for s in 0..h {
+        for _ in 0..h {
             let mut mat = self.w_o.clone();
-            for r in 0..d {
-                for c in 0..d {
-                    // Slightly smaller jitter than W_q/W_k to keep output stable.
-                    let i = r * d + c;
-                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin()
-                        * jitter_scale;
-                    mat[(r, c)] += jitter;
-                }
-            }
             spectral_norm::normalize_if_needed(&mut mat, attn_t, n_iter);
             v.extend_from_slice(mat.as_slice());
         }
@@ -496,7 +479,8 @@ impl MambaSlotReasoning {
     }
 
     /// GPU flat layout for W_q: [h_slots × d_r×d_r matrices | h_slots×d_r q_bias (row-major)].
-    /// Each slot matrix is the shared w_q plus a deterministic per-slot jitter for symmetry breaking.
+    /// Each slot matrix starts from the same learned base; slot identity comes from q_bias,
+    /// slot_anchor, and learned per-slot GPU updates, not from hidden upload-time noise.
     /// Shader accesses slot s matrix: W_q[s*d*d + j*d + d_out].
     /// Bias: W_q[h_slots*d*d + s*d + d_out].
     pub fn w_q_gpu_flat(&self) -> Vec<f32> {
@@ -504,12 +488,8 @@ impl MambaSlotReasoning {
         let h = self.config.h_slots;
         let base = self.w_q.as_slice(); // column-major, d*d floats
         let mut v = Vec::with_capacity(h * d * d + h * d);
-        for s in 0..h {
-            for (i, &x) in base.iter().enumerate() {
-                // Deterministic jitter: sin(index) * scale — same for same init, different per slot
-                let jitter = ((s * d * d + i) as f32 * 0.0001_f32).sin() * 0.05_f32;
-                v.push(x + jitter);
-            }
+        for _ in 0..h {
+            v.extend_from_slice(base);
         }
         v.extend_from_slice(&Self::matrix_to_row_major(&self.q_bias));
         v
@@ -521,11 +501,8 @@ impl MambaSlotReasoning {
         let h = self.config.h_slots;
         let base = self.w_k.as_slice();
         let mut v = Vec::with_capacity(h * d * d + h * d);
-        for s in 0..h {
-            for (i, &x) in base.iter().enumerate() {
-                let jitter = ((s * d * d + i) as f32 * 0.0001_f32).sin() * 0.05_f32;
-                v.push(x + jitter);
-            }
+        for _ in 0..h {
+            v.extend_from_slice(base);
         }
         v.extend_from_slice(&Self::matrix_to_row_major(&self.k_bias));
         v

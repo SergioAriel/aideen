@@ -819,11 +819,19 @@ impl Trainer {
                         let base_b = (token * h + b) * width;
                         let vb = &data[base_b..base_b + width];
                         let mut dist2 = 0.0f32;
+                        let mut used = 0u32;
                         for i in 0..va.len() {
+                            if !va[i].is_finite() || !vb[i].is_finite() {
+                                continue;
+                            }
                             let dv = va[i] - vb[i];
                             dist2 += dv * dv;
+                            used += 1;
                         }
-                        acc += (dist2 / va.len().max(1) as f32).sqrt();
+                        if used == 0 {
+                            continue;
+                        }
+                        acc += (dist2 / used as f32).sqrt();
                         pairs += 1;
                     }
                 }
@@ -837,8 +845,19 @@ impl Trainer {
                 for slot in 0..h {
                     let base = (token * h + slot) * width;
                     let v = &data[base..base + width];
-                    let sumsq: f32 = v.iter().map(|x| x * x).sum();
-                    acc += (sumsq / v.len().max(1) as f32).sqrt();
+                    let mut sumsq = 0.0f32;
+                    let mut used = 0u32;
+                    for x in v {
+                        if !x.is_finite() {
+                            continue;
+                        }
+                        sumsq += x * x;
+                        used += 1;
+                    }
+                    if used == 0 {
+                        continue;
+                    }
+                    acc += (sumsq / used as f32).sqrt();
                     count += 1;
                 }
             }
@@ -915,19 +934,28 @@ impl Trainer {
                 for ks in 0..h {
                     let k_base = (token * h + ks) * hd;
                     let kv = &k_forward_flat[k_base..k_base + hd];
-                    let mut dot = 0.0f32;
-                    for i in 0..hd {
-                        dot += qv[i] * kv[i];
-                    }
-                    let score = dot * inv_sqrt_hd;
+                    let score = if h > 1 && ks == qs {
+                        f32::NEG_INFINITY
+                    } else {
+                        let mut dot = 0.0f32;
+                        for i in 0..hd {
+                            dot += qv[i] * kv[i];
+                        }
+                        dot * inv_sqrt_hd
+                    };
                     score_flat[score_base + ks] = score;
-                    max_s = max_s.max(score);
+                    if score.is_finite() {
+                        max_s = max_s.max(score);
+                    }
                 }
                 let mut sum_exp = 0.0f32;
                 let mut top1 = f32::NEG_INFINITY;
                 let mut top2 = f32::NEG_INFINITY;
                 for ks in 0..h {
                     let s = score_flat[score_base + ks];
+                    if !s.is_finite() {
+                        continue;
+                    }
                     if s > top1 {
                         top2 = top1;
                         top1 = s;
@@ -940,12 +968,19 @@ impl Trainer {
                 let mut self_prob = 0.0f32;
                 sum_exp = sum_exp.max(1.0e-12);
                 for ks in 0..h {
-                    let p = (score_flat[score_base + ks] - max_s).exp() / sum_exp;
+                    let s = score_flat[score_base + ks];
+                    let p = if s.is_finite() {
+                        (s - max_s).exp() / sum_exp
+                    } else {
+                        0.0
+                    };
                     incoming_acc[ks] += p;
                     if ks == qs {
                         self_prob = p;
                     }
-                    entropy -= p * p.max(1.0e-12).ln();
+                    if p > 0.0 {
+                        entropy -= p * p.ln();
+                    }
                 }
                 score_margin_acc += top1 - top2.max(f32::NEG_INFINITY);
                 self_prob_acc += self_prob;
@@ -2117,11 +2152,7 @@ impl Trainer {
                 let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
                 let apply_accum = grad_accum == 1 || self.grad_accum_counter + 1 >= grad_accum;
                 let update_t0 = std::time::Instant::now();
-                let deq_grad_scale = if Self::slot_coord_mode_active() {
-                    1.0
-                } else {
-                    self.config.deq_grad_scale
-                };
+                let deq_grad_scale = self.config.deq_grad_scale;
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
                     deq_grad_scale,
@@ -3990,12 +4021,12 @@ impl Trainer {
                                 .and_then(Self::extract_slot_incoming)
                             {
                                 println!(
-                                    "    [SLOT-COORD] self_assign=[{}] incoming=[{}] entropy=[{}] err_h=[{}] iters=[{}] self_lt_tau=[{}]",
+                                    "    [SLOT-COORD] diag_assign=[{}] incoming=[{}] entropy=[{}] err_h=[{}] iters=[{}] diag_lt_tau=[{}]",
                                     assign, incoming, entropy, err_h, iters, dead
                                 );
                             } else {
                                 println!(
-                                    "    [SLOT-COORD] self_assign=[{}] entropy=[{}] err_h=[{}] iters=[{}] self_lt_tau=[{}]",
+                                    "    [SLOT-COORD] diag_assign=[{}] entropy=[{}] err_h=[{}] iters=[{}] diag_lt_tau=[{}]",
                                     assign, entropy, err_h, iters, dead
                                 );
                             }

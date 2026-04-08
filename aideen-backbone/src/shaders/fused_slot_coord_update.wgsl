@@ -36,10 +36,9 @@ struct UpdateUniforms {
 @group(1) @binding(0) var<storage, read_write> AllWeights: array<f32>;
 
 override SLOT_COORD_HEAD_DIM: u32 = 32u;
-override SLOT_COORD_TRAIN_BIAS: bool = true;
-override SLOT_COORD_LOGIT_GAIN: f32 = 1.0;
+const SLOT_COORD_TRAIN_BIAS: bool = false;
+const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
 const MAX_SLOT_CAP: u32 = 16u;
-const SLOT_COORD_QK_SCALE: f32 = 1.0;
 const SLOT_COORD_VALUE_SCALE: f32 = 0.1;
 const SLOT_COORD_ANCHOR_SCALE: f32 = 0.1;
 
@@ -345,27 +344,58 @@ fn slot_coord_stage4_signal_main(@builtin(global_invocation_id) gid: vec3<u32>) 
     let token = entry / h_slots;
     let slot = entry % h_slots;
     let src_rms = max(slot_src_rms_cache(entry), 1.0e-6);
-    var grad = 0.0;
+    var grad_pre = 0.0;
     for (var head = 0u; head < hd; head = head + 1u) {
-        grad = grad
+        grad_pre = grad_pre
             + qgrad_buf[entry_base(entry, d) + head] * AllWeights[q_weight_idx(slot, dim, head, d)]
             + slot_k_work_buf[entry_base(entry, d) + head] * AllWeights[k_weight_idx(slot, dim, head, d)]
             + slot_v_buf[entry_base(entry, d) + head] * AllWeights[v_weight_idx(slot, dim, head, d)];
     }
+    // Stage 4 signal is the hot path of the slot updater. Store the pre-normalization source
+    // gradient once so the reduction over j can reuse it instead of rebuilding the same
+    // projection d times per output dimension.
+    gmix_buf[entry_base(entry, d) + dim] = grad_pre;
+}
 
+@compute
+@workgroup_size(64, 1, 1)
+fn slot_coord_stage4_signal_reduce_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let entry = gid.x;
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
+    if (entry >= n_entries) { return; }
+
+    let token = entry / h_slots;
+    let slot = entry % h_slots;
+    let src_rms = max(slot_src_rms_cache(entry), 1.0e-6);
     var dot_gx = 0.0;
     for (var j = 0u; j < d; j = j + 1u) {
-        var grad_j = 0.0;
-        for (var head = 0u; head < hd; head = head + 1u) {
-            grad_j = grad_j
-                + qgrad_buf[entry_base(entry, d) + head] * AllWeights[q_weight_idx(slot, j, head, d)]
-                + slot_k_work_buf[entry_base(entry, d) + head] * AllWeights[k_weight_idx(slot, j, head, d)]
-                + slot_v_buf[entry_base(entry, d) + head] * AllWeights[v_weight_idx(slot, j, head, d)];
-        }
-        dot_gx = dot_gx + grad_j * src_norm_with_rms(token, slot, j, d, h_slots, src_rms);
+        dot_gx = dot_gx
+            + gmix_buf[entry_base(entry, d) + j] * src_norm_with_rms(token, slot, j, d, h_slots, src_rms);
     }
+    // qgrad_buf is no longer needed after stage4_wq. Bias training is fixed off for slot_coord,
+    // so we can safely reuse the first lane per entry to carry this scalar into finalize.
+    qgrad_buf[entry_base(entry, d)] = dot_gx;
+}
+
+@compute
+@workgroup_size(16, 16, 1)
+fn slot_coord_stage4_signal_finalize_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dim = gid.x;
+    let entry = gid.y;
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    let n_entries = params.batch_size * params.seq_len * h_slots;
+    if (dim >= d || entry >= n_entries) { return; }
+
+    let token = entry / h_slots;
+    let slot = entry % h_slots;
+    let src_rms = max(slot_src_rms_cache(entry), 1.0e-6);
+    let grad_pre = gmix_buf[entry_base(entry, d) + dim];
+    let dot_gx = qgrad_buf[entry_base(entry, d)];
     let src_norm = src_norm_with_rms(token, slot, dim, d, h_slots, src_rms);
-    let grad_src = grad / src_rms - src_norm * dot_gx / max(f32(d) * src_rms, 1.0e-6);
+    let grad_src = grad_pre / src_rms - src_norm * dot_gx / max(f32(d) * src_rms, 1.0e-6);
     // Reuse gmix_buf after the prep passes: from here on the dedicated slot path no longer
     // needs per-head gmix, but W_in/slot_anchor still need the indirect source gradient carried
     // through the normalized Q/K/V projections.
@@ -402,16 +432,16 @@ fn slot_coord_stage4_anchor_main(@builtin(global_invocation_id) gid: vec3<u32>) 
 }
 
 @compute
-@workgroup_size(16, 16, 1)
+@workgroup_size(8, 8, 1)
 fn slot_coord_stage4_wo_win_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_dim = gid.x;
     let in_dim = gid.y;
+    let slot = gid.z;
     let d = params.d_model;
     let h_slots = params.h_slots;
     let hd = head_dim(d);
-    if (out_dim >= d || in_dim >= d) { return; }
+    if (out_dim >= d || in_dim >= d || slot >= h_slots) { return; }
 
-    let n_entries = params.batch_size * params.seq_len * h_slots;
     let n_tokens = params.batch_size * params.seq_len;
     let lr = params.lr;
     let wd_factor = 1.0 - lr * params.weight_decay;
@@ -419,38 +449,34 @@ fn slot_coord_stage4_wo_win_main(@builtin(global_invocation_id) gid: vec3<u32>) 
     let seq_scale = 1.0 / max(1.0, f32(n_tokens));
     let clip = 0.5;
 
-    var g_wo: array<f32, MAX_SLOT_CAP>;
-    var g_win: array<f32, MAX_SLOT_CAP>;
-
-    for (var entry = 0u; entry < n_entries; entry = entry + 1u) {
-        let token = entry / h_slots;
-        let slot = entry % h_slots;
+    var g_wo = 0.0;
+    var g_win = 0.0;
+    for (var token = 0u; token < n_tokens; token = token + 1u) {
+        let entry = token * h_slots + slot;
         let g_attn = v_adjoint[entry_base(entry, d) + out_dim];
         let attn_scale = slot_attn_scale_cache(entry);
         if (in_dim < hd) {
-            g_wo[slot] = g_wo[slot] + g_attn * attn_scale * mix_buf[entry_base(entry, d) + in_dim];
+            g_wo = g_wo + g_attn * attn_scale * mix_buf[entry_base(entry, d) + in_dim];
         }
         let g_signal = g_attn + gmix_buf[entry_base(entry, d) + out_dim];
-        g_win[slot] = g_win[slot] + q_input[token * d + in_dim] * g_signal;
+        g_win = g_win + q_input[token * d + in_dim] * g_signal;
     }
 
-    for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
-        if (in_dim < hd) {
-            let wo_idx = o_weight_idx(slot, in_dim, out_dim, d);
-            let raw_wo = lr * g_wo[slot] * seq_scale * grad_scale * SLOT_COORD_VALUE_SCALE;
-            if (params.grad_accum_mode == 1u) {
-                AllGradients[wo_idx] = AllGradients[wo_idx] + raw_wo;
-            } else {
-                AllWeights[wo_idx] = AllWeights[wo_idx] * wd_factor - clamp(raw_wo, -clip, clip);
-            }
-        }
-        let win_idx = win_weight_idx(slot, in_dim, out_dim, d);
-        let raw_win = lr * g_win[slot] * seq_scale * grad_scale * SLOT_COORD_VALUE_SCALE;
+    if (in_dim < hd) {
+        let wo_idx = o_weight_idx(slot, in_dim, out_dim, d);
+        let raw_wo = lr * g_wo * seq_scale * grad_scale * SLOT_COORD_VALUE_SCALE;
         if (params.grad_accum_mode == 1u) {
-            AllGradients[win_idx] = AllGradients[win_idx] + raw_win;
+            AllGradients[wo_idx] = AllGradients[wo_idx] + raw_wo;
         } else {
-            AllWeights[win_idx] = AllWeights[win_idx] * wd_factor - clamp(raw_win, -clip, clip);
+            AllWeights[wo_idx] = AllWeights[wo_idx] * wd_factor - clamp(raw_wo, -clip, clip);
         }
+    }
+    let win_idx = win_weight_idx(slot, in_dim, out_dim, d);
+    let raw_win = lr * g_win * seq_scale * grad_scale * SLOT_COORD_VALUE_SCALE;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[win_idx] = AllGradients[win_idx] + raw_win;
+    } else {
+        AllWeights[win_idx] = AllWeights[win_idx] * wd_factor - clamp(raw_win, -clip, clip);
     }
 }
 
@@ -476,7 +502,7 @@ fn slot_coord_stage4_wq_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lr = params.lr;
     let wd_factor = 1.0 - lr * params.weight_decay;
     let seq_scale = 1.0 / max(1.0, f32(n_tokens));
-    let raw = lr * grad * seq_scale * params.grad_scale * SLOT_COORD_QK_SCALE;
+    let raw = lr * grad * seq_scale * params.grad_scale;
     let idx = q_weight_idx(slot, in_dim, head, d);
     let clip = 0.5;
     if (params.grad_accum_mode == 1u) {
@@ -554,7 +580,7 @@ fn slot_coord_stage4_wk_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lr = params.lr;
     let wd_factor = 1.0 - lr * params.weight_decay;
     let seq_scale = 1.0 / max(1.0, f32(n_tokens));
-    let raw = lr * grad * seq_scale * params.grad_scale * SLOT_COORD_QK_SCALE;
+    let raw = lr * grad * seq_scale * params.grad_scale;
     let idx = k_weight_idx(slot, in_dim, head, d);
     let clip = 0.5;
     if (params.grad_accum_mode == 1u) {
@@ -610,7 +636,7 @@ fn slot_coord_stage4_bias_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lr = params.lr;
     let wd_factor = 1.0 - lr * params.weight_decay;
     let seq_scale = 1.0 / max(1.0, f32(n_tokens));
-    let raw_scale = lr * seq_scale * params.grad_scale * SLOT_COORD_QK_SCALE;
+    let raw_scale = lr * seq_scale * params.grad_scale;
     let clip = 0.5;
 
     for (var slot = 0u; slot < h_slots; slot = slot + 1u) {

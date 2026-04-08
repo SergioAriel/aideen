@@ -44,12 +44,12 @@ impl Default for ArchitectureConfig {
             d_sim: 1024,
             h_slots: 8,        // 8 Slots — especialización temporal multi-escala
             vocab_size: 50257, // DEBE coincidir con tu tokenizer.json
-            ctx_len: 256,      // Ventana de memoria para chat
+            ctx_len: 512,      // Baseline estable actual para memoria/throughput en GPU de escritorio
             max_deq_iters: 16, // v14 (Optimizado tras sweep: garantiza 100% conv con alpha=0)
             deq_epsilon: 1e-4,
-            adj_iters: 6, // contr≈0.20 → error residual 0.20^6≈6e-5, prácticamente exacto
+            adj_iters: 2, // Baseline estable actual: mejor relación costo/robustez para el adjoint
             train_deq: true,
-            deq_grad_scale: 0.01,
+            deq_grad_scale: 1.0,
             renorm_every_steps: 4, // Cada 4 steps: ~0.25x overhead vs inline, σ controlada en ventana corta
             num_samples: 512,
             weight_decay: 0.01,
