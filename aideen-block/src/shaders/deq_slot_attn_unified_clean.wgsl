@@ -31,20 +31,22 @@ override SLOT_ATTN_HEAD_DIM: u32 = 32u;
 override ENABLE_TOKEN_CARRY: bool = true;
 override ENABLE_H_HIST: bool = false;
 override ENABLE_HIST_CTX: bool = false;
+override SLOT_COORD_USE_BIAS: bool = true;
+override SLOT_COORD_LOGIT_GAIN: f32 = 1.0;
 const WG_SIZE: u32 = 256u;
 const FPM_CACHE_CAP: u32 = 512u;
 const MAX_SLOTS: u32 = 8u;
 const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
 const SLOT_HEAD_CAP: u32 = MAX_SLOTS * MAX_SLOT_ATTN_HEAD_DIM;
 
-var<workgroup> slot_attn_weights: array<f32, MAX_SLOTS>;
+var<workgroup> slot_coord_weights: array<f32, MAX_SLOTS>;
 var<workgroup> shared_vals: array<f32, WG_SIZE>;
 var<workgroup> q_self: array<f32, MAX_SLOT_ATTN_HEAD_DIM>;
 var<workgroup> k_cache: array<f32, SLOT_HEAD_CAP>;
 var<workgroup> v_cache: array<f32, SLOT_HEAD_CAP>;
 var<workgroup> head_mix: array<f32, MAX_SLOT_ATTN_HEAD_DIM>;
 var<workgroup> fpm_m_cache: array<f32, FPM_CACHE_CAP>;
-var<workgroup> slot_attn_prev: array<f32, MAX_SLOTS>;
+var<workgroup> slot_coord_prev: array<f32, MAX_SLOTS>;
 var<workgroup> max_delta_seen: f32;
 var<workgroup> max_m_delta_seen: f32;
 var<workgroup> max_a_delta_seen: f32;
@@ -92,6 +94,20 @@ fn hist_gate_base(d: u32, h_slots: u32) -> u32 { return hist_bias_base(d, h_slot
 fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_slots) + h_slots; }
 fn hist_delta_base(d: u32, h_slots: u32) -> u32 { return slot_anchor_base(d, h_slots) + h_slots * d; }
 fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return hist_delta_base(d, h_slots) + h_slots * d * d; }
+fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d; }
+fn hist_alpha_warmup_factor_base(d: u32, h_slots: u32) -> u32 { return hist_selective_flag_base(d, h_slots) + 1u; }
+fn hist_rms_floor_base(d: u32, h_slots: u32) -> u32 { return hist_alpha_warmup_factor_base(d, h_slots) + 1u; }
+fn hist_contr_floor_base(d: u32, h_slots: u32) -> u32 { return hist_rms_floor_base(d, h_slots) + 1u; }
+fn hist_inject_flag_base(d: u32, h_slots: u32) -> u32 { return hist_contr_floor_base(d, h_slots) + 1u; }
+fn hist_minner_zero_base(d: u32, h_slots: u32) -> u32 { return hist_inject_flag_base(d, h_slots) + 1u; }
+fn hist_force_nomamba_base(d: u32, h_slots: u32) -> u32 { return hist_minner_zero_base(d, h_slots) + 1u; }
+fn hist_prelude_skip_base(d: u32, h_slots: u32) -> u32 { return hist_force_nomamba_base(d, h_slots) + 1u; }
+fn hist_loop_force_nomamba_base(d: u32, h_slots: u32) -> u32 { return hist_prelude_skip_base(d, h_slots) + 1u; }
+fn signal_zero_base(d: u32, h_slots: u32) -> u32 { return hist_loop_force_nomamba_base(d, h_slots) + 1u; }
+fn attn_out_mode_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, h_slots) + 1u; }
+fn attn_uniform_base(d: u32, h_slots: u32) -> u32 { return attn_out_mode_base(d, h_slots) + 1u; }
+fn attn_freeze_base(d: u32, h_slots: u32) -> u32 { return attn_uniform_base(d, h_slots) + 1u; }
+fn signal_scale_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, h_slots) + 7u; }
 fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d + 21u; }
 fn w_forget_base(d: u32, h_slots: u32) -> u32 { return hist_gate_query_base(d, h_slots) + h_slots * d; }
 fn b_forget_base(d: u32, h_slots: u32) -> u32 { return w_forget_base(d, h_slots) + h_slots * d; }
@@ -115,6 +131,7 @@ override ENABLE_FPM: bool = false;
 //   (h, m)^(k+1) = Phi((h, m)^k; signal, slot_ctx, anchor)
 // Memory participates in the same fixed-point search as the token state.
 override FPM_MEM_ITERS: u32 = 1u;
+override SLOT_COORD_REFRESH_ITERS: u32 = 0u; // 0 => refresh every Picard iter
 const FPM_ALPHA_H: f32 = 0.2;
 const FPM_RESIDUAL_SCALE: f32 = 0.1;
 const FPM_RESCUE_RESIDUAL_SCALE: f32 = 0.01;
@@ -133,20 +150,33 @@ const FPM_HOMEO_MIN_ITERS: u32 = 4u;
 const FPM_HOMEO_ALPHA_ERR_SCALE: f32 = 0.15;
 const FPM_HOMEO_PLATEAU_TOL: f32 = 0.10;
 
-fn compute_slot_attn(
+fn compute_slot_coord(
     tid: u32,
     slot_idx: u32,
     d_model: u32,
     h_slots: u32,
     head_dim: u32,
-    h_base: u32,
-    batch_scratch_t: u32,
+    signal_token_base: u32,
+    alpha_base: u32,
     wq_mat_base: u32,
     wk_bias_root: u32,
     wq_bias_base: u32,
     wo_mat_base: u32,
     attn_base: u32,
 ) {
+    let hist_base = aw_hist_base(d_model, h_slots);
+    let slot_anchor_root = hist_base + slot_anchor_base(d_model, h_slots);
+    if (tid < h_slots) {
+        let ks = tid;
+        let ks_off = ks * d_model;
+        var sumsq = 0.0;
+        for (var j = 0u; j < d_model; j = j + 1u) {
+            let src = Scratch[signal_token_base + ks_off + j] + AllWeights[slot_anchor_root + ks_off + j];
+            sumsq = sumsq + src * src;
+        }
+        slot_coord_prev[ks] = sqrt(sumsq / max(1.0, f32(d_model)) + 1.0e-6);
+    }
+    workgroupBarrier();
     if (head_dim == 32u) {
         let half_head = head_dim / 2u;
         let active_lanes = h_slots * half_head;
@@ -158,22 +188,20 @@ fn compute_slot_attn(
             let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
             let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
             let wk_bias_base = wk_bias_root + ks_off;
-            var k0 = AllWeights[wk_bias_base + hd0];
-            var k1 = AllWeights[wk_bias_base + hd1];
+            var k0 = select(0.0, AllWeights[wk_bias_base + hd0], SLOT_COORD_USE_BIAS);
+            var k1 = select(0.0, AllWeights[wk_bias_base + hd1], SLOT_COORD_USE_BIAS);
             var v0 = 0.0;
             var v1 = 0.0;
             var q0 = 0.0;
             var q1 = 0.0;
             if (ks == slot_idx) {
-                q0 = AllWeights[wq_bias_base + hd0];
-                q1 = AllWeights[wq_bias_base + hd1];
+                q0 = select(0.0, AllWeights[wq_bias_base + hd0], SLOT_COORD_USE_BIAS);
+                q1 = select(0.0, AllWeights[wq_bias_base + hd1], SLOT_COORD_USE_BIAS);
             }
             for (var j = 0u; j < d_model; j = j + 1u) {
-                let src_val = select(
-                    H_curr[h_base + ks_off + j],
-                    Scratch[batch_scratch_t + ks_off + j],
-                    true,
-                );
+                let src_val =
+                    (Scratch[signal_token_base + ks_off + j]
+                    + AllWeights[slot_anchor_root + ks_off + j]) / max(slot_coord_prev[ks], 1.0e-6);
                 let wk_row = wk_mat_base + j * d_model;
                 let wv_row = wv_mat_base + j * d_model;
                 k0 = k0 + AllWeights[wk_row + hd0] * src_val;
@@ -205,18 +233,16 @@ fn compute_slot_attn(
             let wk_mat_base = aw_wk_base(d_model, h_slots) + ks_off * d_model;
             let wv_mat_base = aw_wv_base(d_model, h_slots) + ks_off * d_model;
             let wk_bias_base = wk_bias_root + ks_off;
-            var k = AllWeights[wk_bias_base + hd];
+            var k = select(0.0, AllWeights[wk_bias_base + hd], SLOT_COORD_USE_BIAS);
             var v = 0.0;
             var q = 0.0;
             if (ks == slot_idx) {
-                q = AllWeights[wq_bias_base + hd];
+                q = select(0.0, AllWeights[wq_bias_base + hd], SLOT_COORD_USE_BIAS);
             }
             for (var j = 0u; j < d_model; j = j + 1u) {
-                let src_val = select(
-                    H_curr[h_base + ks_off + j],
-                    Scratch[batch_scratch_t + ks_off + j],
-                    true,
-                );
+                let src_val =
+                    (Scratch[signal_token_base + ks_off + j]
+                    + AllWeights[slot_anchor_root + ks_off + j]) / max(slot_coord_prev[ks], 1.0e-6);
                 k = k + AllWeights[wk_mat_base + j * d_model + hd] * src_val;
                 v = v + AllWeights[wv_mat_base + j * d_model + hd] * src_val;
                 if (ks == slot_idx) {
@@ -239,33 +265,39 @@ fn compute_slot_attn(
         for (var d = 0u; d < head_dim; d = d + 1u) {
             score = score + q_self[d] * k_cache[ks_head + d];
         }
-        slot_attn_weights[ks] = score * inverseSqrt(max(1.0, f32(head_dim)));
+        slot_coord_weights[ks] = score * inverseSqrt(max(1.0, f32(head_dim))) * SLOT_COORD_LOGIT_GAIN;
     }
     workgroupBarrier();
     if (tid == 0u) {
         var max_s = -1e30;
         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-            max_s = max(max_s, slot_attn_weights[ks]);
+            max_s = max(max_s, slot_coord_weights[ks]);
         }
         var sum_exp = 0.0;
         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-            let w = exp(slot_attn_weights[ks] - max_s);
-            slot_attn_weights[ks] = w;
+            let w = exp(slot_coord_weights[ks] - max_s);
+            slot_coord_weights[ks] = w;
             sum_exp = sum_exp + w;
         }
         sum_exp = max(sum_exp, 1e-12);
         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-            slot_attn_weights[ks] = slot_attn_weights[ks] / sum_exp;
+            slot_coord_weights[ks] = slot_coord_weights[ks] / sum_exp;
+        }
+        for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
+            Scratch[alpha_base + slot_idx * h_slots + ks] = slot_coord_weights[ks];
         }
     }
     workgroupBarrier();
 
     for (var h = tid; h < head_dim; h = h + WG_SIZE) {
         var mix = 0.0;
+        var mean_v = 0.0;
         for (var ks = 0u; ks < h_slots; ks = ks + 1u) {
-            mix = mix + slot_attn_weights[ks] * v_cache[ks * head_dim + h];
+            let v = v_cache[ks * head_dim + h];
+            mix = mix + slot_coord_weights[ks] * v;
+            mean_v = mean_v + v;
         }
-        head_mix[h] = mix;
+        head_mix[h] = mix - mean_v / max(1.0, f32(h_slots));
     }
     workgroupBarrier();
 
@@ -291,10 +323,29 @@ fn compute_slot_attn(
         }
     }
     workgroupBarrier();
+    var attn_sumsq = 0.0;
+    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+        let attn = Scratch[attn_base + d];
+        attn_sumsq = attn_sumsq + attn * attn;
+    }
+    shared_vals[tid] = attn_sumsq;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    if (tid == 0u) {
+        let attn_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)) + 1.0e-6);
+        let src_rms = max(slot_coord_prev[slot_idx], 1.0e-6);
+        slot_coord_prev[0] = src_rms / max(attn_rms, 1.0e-6);
+    }
+    workgroupBarrier();
 }
 
 @compute @workgroup_size(256, 1, 1)
-fn deq_slot_attn_unified_main(
+fn deq_slot_coord_unified_main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>
 ) {
@@ -310,7 +361,7 @@ fn deq_slot_attn_unified_main(
     let slot_offset = slot_idx * d_model;
     let h_base = batch_idx * total_elements;
     let signal_span = d_model * h_slots;
-    let scratch_stride = signal_span * 2u;
+    let scratch_stride = signal_span * 3u + h_slots * h_slots;
     let wq_mat_base = aw_wq_base(d_model, h_slots) + slot_idx * d_model * d_model;
     let wk_bias_root = aw_wk_base(d_model, h_slots) + h_slots * d_model * d_model;
     let wq_bias_base = aw_wq_base(d_model, h_slots) + h_slots * d_model * d_model + slot_idx * d_model;
@@ -321,6 +372,8 @@ fn deq_slot_attn_unified_main(
     let inv_d_model = 1.0 / max(1.0, f32(d_model));
     let zero_win_diag = shape.diag_zero_win != 0u;
     let iter_limit = select(shape.max_iters, 1u, shape.diag_one_iter != 0u);
+    let enable_slot_coord = shape.residual_alpha > -1.5;
+    let slot_attn_scale = select(1.0, slot_coord_prev[0], enable_slot_coord);
 
     if (tid == 0u) {
         max_delta_seen = 0.0;
@@ -358,6 +411,13 @@ fn deq_slot_attn_unified_main(
     var exit_iter_sum = 0.0;
     var rescue_entered_sum = 0.0;
     var pre_rescue_converged_sum = 0.0;
+    var solve_signal_rms_seen = 0.0;
+    var solve_pre_rms_seen = 0.0;
+    var solve_fh_rms_seen = 0.0;
+    var solve_hprev_rms_seen = 0.0;
+    var solve_nscale_abs_seen = 0.0;
+    var solve_pre_to_hprev_seen = 0.0;
+    var solve_fh_to_hprev_seen = 0.0;
 
     // FPM intra-slot m carry: load once before the token loop.
     // fpm_m_cache evolves token-to-token within the chunk via plastic write.
@@ -367,8 +427,8 @@ fn deq_slot_attn_unified_main(
         fpm_m_cache[tid]          = MState[h_base + slot_offset + tid];
         fpm_m_cache[tid + WG_SIZE] = MState[h_base + slot_offset + tid + WG_SIZE];
         if (tid < h_slots) {
-            slot_attn_weights[tid] = 1.0 / max(1.0, f32(h_slots));
-            slot_attn_prev[tid]    = slot_attn_weights[tid];
+            slot_coord_weights[tid] = 1.0 / max(1.0, f32(h_slots));
+            slot_coord_prev[tid]    = slot_coord_weights[tid];
         }
         workgroupBarrier();
     }
@@ -379,6 +439,7 @@ fn deq_slot_attn_unified_main(
         let h_base_t = (batch_idx * shape.seq_len + global_t) * total_elements;
         let signal_base = batch_scratch_t + slot_offset;
         let attn_base = batch_scratch_t + signal_span + slot_offset;
+        let alpha_base = batch_scratch_t + signal_span * 2u;
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
         let use_prev_token_mem = global_t > 0u;
         let prev_hist_base_t = select(
@@ -392,6 +453,9 @@ fn deq_slot_attn_unified_main(
             let d1 = tid + WG_SIZE;
             var inj0 = 0.0;
             var inj1 = 0.0;
+            let hist_base = aw_hist_base(d_model, h_slots);
+            let signal_zero = AllWeights[hist_base + signal_zero_base(d_model, h_slots)] > 0.5;
+            let signal_scale = AllWeights[hist_base + signal_scale_base(d_model, h_slots)];
             if (!zero_win_diag) {
                 for (var j = 0u; j < d_model; j = j + 1u) {
                     let s = S_in[s_in_base + j];
@@ -399,15 +463,30 @@ fn deq_slot_attn_unified_main(
                     inj1 = inj1 + AllWeights[win_base + j * d_model + d1] * s;
                 }
             }
+            if (zero_win_diag || signal_zero) {
+                inj0 = 0.0;
+                inj1 = 0.0;
+            } else {
+                inj0 = inj0 * signal_scale;
+                inj1 = inj1 * signal_scale;
+            }
             Scratch[signal_base + d0] = inj0;
             Scratch[signal_base + d1] = inj1;
         } else {
             for (var d_out = tid; d_out < d_model; d_out = d_out + WG_SIZE) {
                 var inj = 0.0;
+                let hist_base = aw_hist_base(d_model, h_slots);
+                let signal_zero = AllWeights[hist_base + signal_zero_base(d_model, h_slots)] > 0.5;
+                let signal_scale = AllWeights[hist_base + signal_scale_base(d_model, h_slots)];
                 if (!zero_win_diag) {
                     for (var j = 0u; j < d_model; j = j + 1u) {
                         inj = inj + AllWeights[win_base + j * d_model + d_out] * S_in[s_in_base + j];
                     }
+                }
+                if (zero_win_diag || signal_zero) {
+                    inj = 0.0;
+                } else {
+                    inj = inj * signal_scale;
                 }
                 Scratch[signal_base + d_out] = inj;
             }
@@ -447,9 +526,9 @@ fn deq_slot_attn_unified_main(
         if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
             // fpm_m_cache already carries from previous token — no reinit here.
             if (tid < h_slots) {
-                slot_attn_prev[tid] = slot_attn_weights[tid];
-                slot_attn_weights[tid] = 1.0 / max(1.0, f32(h_slots));
-                slot_attn_prev[tid] = slot_attn_weights[tid];
+                slot_coord_prev[tid] = slot_coord_weights[tid];
+                slot_coord_weights[tid] = 1.0 / max(1.0, f32(h_slots));
+                slot_coord_prev[tid] = slot_coord_weights[tid];
             }
             let hist_base = aw_hist_base(d_model, h_slots);
             if (tid < h_slots * RETAIN_RANK) {
@@ -508,6 +587,9 @@ fn deq_slot_attn_unified_main(
                 workgroupBarrier();
             }
             let sig_rms = sqrt(shared_vals[0] * inv_d_model + 1e-6);
+            if (tid == 0u) {
+                solve_signal_rms_seen = max(solve_signal_rms_seen, sig_rms);
+            }
             if (ENABLE_H_HIST && d_model == WG_SIZE * 2u) {
                 // signal normalized, then h_hist added as offset (after normalization)
                 H_curr[h_base + slot_offset + tid] =
@@ -554,27 +636,71 @@ fn deq_slot_attn_unified_main(
                 rescue_entered_sum = rescue_entered_sum + 1.0;
                 last_delta = 0.0;
             }
-            if (iter == 0u) {
-                compute_slot_attn(
+            let refresh_slot_coord = enable_slot_coord && iter == 0u;
+            if (refresh_slot_coord) {
+                compute_slot_coord(
                     tid,
                     slot_idx,
                     d_model,
                     h_slots,
                     head_dim,
-                    h_base,
-                    batch_scratch_t,
+                    signal_base - slot_offset,
+                    alpha_base,
                     wq_mat_base,
                     wk_bias_root,
                     wq_bias_base,
                     wo_mat_base,
                     attn_base,
                 );
+            } else if (!enable_slot_coord) {
+                if (d_model == WG_SIZE * 2u) {
+                    Scratch[attn_base + tid] = 0.0;
+                    Scratch[attn_base + tid + WG_SIZE] = 0.0;
+                } else {
+                    for (var d = tid; d < d_model; d = d + WG_SIZE) {
+                        Scratch[attn_base + d] = 0.0;
+                    }
+                }
+                if (tid < h_slots) {
+                    slot_coord_weights[tid] = 1.0 / max(1.0, f32(h_slots));
+                    slot_coord_prev[tid] = slot_coord_weights[tid];
+                }
+            }
+            workgroupBarrier();
+
+            // Fix k_cache collision: compute_slot_coord (iter==0) overwrites k_cache with signal K
+            // values, clobbering the memory K values set before the Picard loop.
+            // Recompute memory K after iter==0 so subsequent iters use the correct W_k_mem * M keys.
+            if (ENABLE_FPM && d_model == WG_SIZE * 2u && refresh_slot_coord) {
+                let hist_base_kfix = aw_hist_base(d_model, h_slots);
+                if (tid < h_slots * RETAIN_RANK) {
+                    let ms = tid / RETAIN_RANK;
+                    let r  = tid % RETAIN_RANK;
+                    let mem_off   = h_base + ms * d_model;
+                    let kmem_base = hist_base_kfix + w_k_mem_base(d_model, h_slots) + ms * d_model * RETAIN_RANK;
+                    let scale_base_kfix = hist_base_kfix + hist_scale_base(d_model, h_slots) + ms * d_model;
+                    let bias_base_kfix  = hist_base_kfix + hist_bias_base(d_model, h_slots)  + ms * d_model;
+                    var key_acc = 0.0;
+                    for (var j = 0u; j < d_model; j = j + 1u) {
+                        let m_j = select(
+                            MState[mem_off + j],
+                            HistCtx[prev_hist_base_t + ms * d_model + j],
+                            use_prev_token_mem,
+                        );
+                        let keyed_m_j = m_j
+                            + AllWeights[scale_base_kfix + j] * tanh(m_j)
+                            + AllWeights[bias_base_kfix  + j];
+                        key_acc = key_acc + AllWeights[kmem_base + j * RETAIN_RANK + r] * keyed_m_j;
+                    }
+                    k_cache[tid] = key_acc;
+                }
+                workgroupBarrier();
             }
 
             if (ENABLE_FPM && d_model == WG_SIZE * 2u) {
                 let hist_base = aw_hist_base(d_model, h_slots);
                 if (tid < h_slots) {
-                    slot_attn_prev[tid] = slot_attn_weights[tid];
+                    slot_coord_prev[tid] = slot_coord_weights[tid];
                 }
                 if (tid < RETAIN_RANK) {
                     let qmem_base = hist_base + w_q_mem_base(d_model, h_slots) + slot_idx * d_model * RETAIN_RANK;
@@ -593,24 +719,24 @@ fn deq_slot_attn_unified_main(
                         score = score + shared_vals[r] * k_cache[ms * RETAIN_RANK + r];
                     }
                     score = score + AllWeights[hist_base + hist_gate_base(d_model, h_slots) + ms];
-                    slot_attn_weights[ms] =
+                    slot_coord_weights[ms] =
                         score * inverseSqrt(max(1.0, f32(RETAIN_RANK))) / max(shape.fpm_tau, 1e-3);
                 }
                 workgroupBarrier();
                 if (tid == 0u) {
                     var max_s = -1e30;
                     for (var ms = 0u; ms < h_slots; ms = ms + 1u) {
-                        max_s = max(max_s, slot_attn_weights[ms]);
+                        max_s = max(max_s, slot_coord_weights[ms]);
                     }
                     var sum_exp = 0.0;
                     for (var ms = 0u; ms < h_slots; ms = ms + 1u) {
-                        let w = exp(slot_attn_weights[ms] - max_s);
-                        slot_attn_weights[ms] = w;
+                        let w = exp(slot_coord_weights[ms] - max_s);
+                        slot_coord_weights[ms] = w;
                         sum_exp = sum_exp + w;
                     }
                     sum_exp = max(sum_exp, 1e-12);
                     for (var ms = 0u; ms < h_slots; ms = ms + 1u) {
-                        slot_attn_weights[ms] = slot_attn_weights[ms] / sum_exp;
+                        slot_coord_weights[ms] = slot_coord_weights[ms] / sum_exp;
                     }
                 }
                 workgroupBarrier();
@@ -629,7 +755,7 @@ fn deq_slot_attn_unified_main(
                         HistCtx[hist_slot_off + tid + WG_SIZE],
                         use_prev_token_mem,
                     );
-                    let w = slot_attn_weights[ms];
+                    let w = slot_coord_weights[ms];
                     let value_m0 = tanh(m0);
                     let value_m1 = tanh(m1);
                     mem_raw0 = mem_raw0 + w * value_m0;
@@ -693,9 +819,11 @@ fn deq_slot_attn_unified_main(
                 let d1 = tid + WG_SIZE;
                 let h_prev0 = H_curr[h_base + slot_offset + d0];
                 let h_prev1 = H_curr[h_base + slot_offset + d1];
-                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + Scratch[attn_base + d0]
+                let attn0 = select(0.0, Scratch[attn_base + d0] * slot_attn_scale, ENABLE_FPM || iter == 0u);
+                let attn1 = select(0.0, Scratch[attn_base + d1] * slot_attn_scale, ENABLE_FPM || iter == 0u);
+                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + attn0
                            + AllWeights[slot_anchor_mat_base + d0];
-                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + Scratch[attn_base + d1]
+                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + attn1
                            + AllWeights[slot_anchor_mat_base + d1];
                 H_next[h_base_t + slot_offset + d0] = h_dep0 + hhist_gamma_wg * h_hist0;
                 H_next[h_base_t + slot_offset + d1] = h_dep1 + hhist_gamma_wg * h_hist1;
@@ -706,9 +834,9 @@ fn deq_slot_attn_unified_main(
                 let d1 = tid + WG_SIZE;
                 let h_prev0 = H_curr[h_base + slot_offset + d0];
                 let h_prev1 = H_curr[h_base + slot_offset + d1];
-                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + Scratch[attn_base + d0]
+                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + Scratch[attn_base + d0] * slot_attn_scale
                            + AllWeights[slot_anchor_mat_base + d0] + fpm_ctx0;
-                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + Scratch[attn_base + d1]
+                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + Scratch[attn_base + d1] * slot_attn_scale
                            + AllWeights[slot_anchor_mat_base + d1] + fpm_ctx1;
                 H_next[h_base_t + slot_offset + d0] = h_dep0;
                 H_next[h_base_t + slot_offset + d1] = h_dep1;
@@ -718,9 +846,11 @@ fn deq_slot_attn_unified_main(
                 let d1 = tid + WG_SIZE;
                 let h_prev0 = H_curr[h_base + slot_offset + d0];
                 let h_prev1 = H_curr[h_base + slot_offset + d1];
-                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + Scratch[attn_base + d0]
+                let attn0 = select(0.0, Scratch[attn_base + d0] * slot_attn_scale, ENABLE_FPM || iter == 0u);
+                let attn1 = select(0.0, Scratch[attn_base + d1] * slot_attn_scale, ENABLE_FPM || iter == 0u);
+                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + attn0
                            + AllWeights[slot_anchor_mat_base + d0] + hist_mem0;
-                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + Scratch[attn_base + d1]
+                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + attn1
                            + AllWeights[slot_anchor_mat_base + d1] + hist_mem1;
                 H_next[h_base_t + slot_offset + d0] = h_dep0;
                 H_next[h_base_t + slot_offset + d1] = h_dep1;
@@ -728,9 +858,10 @@ fn deq_slot_attn_unified_main(
             } else {
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     let h_prev = H_curr[h_base + slot_offset + d];
+                    let attn = select(0.0, Scratch[attn_base + d] * slot_attn_scale, ENABLE_FPM || iter == 0u);
                     let pre = Scratch[signal_base + d]
                         + h_prev
-                        + Scratch[attn_base + d]
+                        + attn
                         + AllWeights[slot_anchor_mat_base + d];
                     H_next[h_base_t + slot_offset + d] = pre;
                     local_sumsq = local_sumsq + pre * pre;
@@ -749,14 +880,19 @@ fn deq_slot_attn_unified_main(
             let alpha_h = select(FPM_ALPHA_H, FPM_ALPHA_H * 0.5, rescue_active);
             var local_delta_h_num = 0.0;
             var local_delta_h_den = 0.0;
+            var local_fh_sq = 0.0;
+            var local_nscale_abs = 0.0;
             for (var d = tid; d < d_model; d = d + WG_SIZE) {
                 let h_prev = H_curr[h_base + slot_offset + d];
-                let f_h = AllWeights[nscale_base + d] * (H_next[h_base_t + slot_offset + d] / rms);
+                let nscale = AllWeights[nscale_base + d];
+                let f_h = nscale * (H_next[h_base_t + slot_offset + d] / rms);
                 let blend = select(shape.damping, alpha_h, ENABLE_FPM && d_model == WG_SIZE * 2u);
                 let val = blend * f_h + (1.0 - blend) * h_prev;
                 let delta_h = val - h_prev;
                 local_delta_h_num = local_delta_h_num + delta_h * delta_h;
                 local_delta_h_den = local_delta_h_den + h_prev * h_prev;
+                local_fh_sq = local_fh_sq + f_h * f_h;
+                local_nscale_abs = max(local_nscale_abs, abs(nscale));
                 H_curr[h_base + slot_offset + d] = val;
                 H_next[h_base_t + slot_offset + d] = val;
             }
@@ -777,10 +913,32 @@ fn deq_slot_attn_unified_main(
                 }
                 workgroupBarrier();
             }
-            let err_h = sqrt(delta_h_num / (shared_vals[0] + FPM_EPS));
+            let hprev_energy = shared_vals[0];
+            let delta_h_rms = sqrt(delta_h_num * inv_d_model + 1e-12);
+            let err_h_operator = delta_h_rms / max(rms, 1e-6);
+            let err_h = err_h_operator;
+            let hprev_rms = sqrt(hprev_energy * inv_d_model + 1e-6);
+            shared_vals[tid] = local_fh_sq;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let fh_rms = sqrt(shared_vals[0] * inv_d_model + 1e-6);
+            shared_vals[tid] = local_nscale_abs;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = max(shared_vals[tid], shared_vals[tid + stride]);
+                }
+                workgroupBarrier();
+            }
+            let nscale_abs = shared_vals[0];
             var local_max_delta_a = 0.0;
             if (ENABLE_FPM && tid < h_slots) {
-                local_max_delta_a = abs(slot_attn_weights[tid] - slot_attn_prev[tid]);
+                local_max_delta_a = abs(slot_coord_weights[tid] - slot_coord_prev[tid]);
             }
             shared_vals[tid] = local_max_delta_a;
             workgroupBarrier();
@@ -857,17 +1015,31 @@ fn deq_slot_attn_unified_main(
             if (tid == 0u) {
                 let d_curr = stop_err_h;
                 let d_prev = last_delta;
-                if (iter > 0u && d_prev > 1e-12 && d_prev > shape.epsilon * 10.0) {
+                var recurrent_iter = iter;
+                if (enable_slot_coord && !ENABLE_FPM && iter > 0u) {
+                    recurrent_iter = iter - 1u;
+                }
+                if (recurrent_iter > 0u && d_prev > 1e-12 && d_prev > shape.epsilon * 10.0) {
                     max_contractivity = max(max_contractivity, d_curr / d_prev);
                 }
                 last_delta = d_curr;
-                max_delta_seen = max(max_delta_seen, d_curr);
+                if (!(enable_slot_coord && !ENABLE_FPM && iter == 0u)) {
+                    max_delta_seen = max(max_delta_seen, d_curr);
+                }
                 max_m_delta_seen = max(max_m_delta_seen, iter_max_delta_m);
                 max_a_delta_seen = max(max_a_delta_seen, iter_max_delta_a);
                 max_err_h_seen = max(max_err_h_seen, stop_err_h);
                 max_err_m_seen = max(max_err_m_seen, err_m);
                 max_z_seen = max(max_z_seen, local_gate);
                 max_update_ratio_seen = max(max_update_ratio_seen, local_update_ratio);
+                solve_pre_rms_seen = max(solve_pre_rms_seen, rms);
+                solve_fh_rms_seen = max(solve_fh_rms_seen, fh_rms);
+                solve_hprev_rms_seen = max(solve_hprev_rms_seen, hprev_rms);
+                solve_nscale_abs_seen = max(solve_nscale_abs_seen, nscale_abs);
+                solve_pre_to_hprev_seen =
+                    max(solve_pre_to_hprev_seen, rms / max(hprev_rms, 1e-6));
+                solve_fh_to_hprev_seen =
+                    max(solve_fh_to_hprev_seen, fh_rms / max(hprev_rms, 1e-6));
                 token_max_m_delta = max(token_max_m_delta, iter_max_delta_m);
                 token_max_a_delta = max(token_max_a_delta, iter_max_delta_a);
                 if (rescue_active && !converged && iter == iter_limit) {
@@ -893,12 +1065,12 @@ fn deq_slot_attn_unified_main(
             }
             var entropy = 0.0;
             for (var ms = 0u; ms < h_slots; ms = ms + 1u) {
-                let w = slot_attn_weights[ms];
+                let w = slot_coord_weights[ms];
                 entropy = entropy - w * log(max(w, 1e-12));
             }
-            sum_self_assign_seen = sum_self_assign_seen + slot_attn_weights[slot_idx];
+            sum_self_assign_seen = sum_self_assign_seen + slot_coord_weights[slot_idx];
             sum_assign_entropy_seen = sum_assign_entropy_seen + entropy;
-            if (slot_attn_weights[slot_idx] < FPM_DEAD_THRESHOLD) {
+            if (slot_coord_weights[slot_idx] < FPM_DEAD_THRESHOLD) {
                 dead_slot_seen = dead_slot_seen + 1.0;
             }
             if (max_z_seen > FPM_SAT_THRESHOLD) {
@@ -1052,8 +1224,8 @@ fn deq_slot_attn_unified_main(
                 workgroupBarrier();
             }
             let delta_m_num_p = shared_vals[0];
-            var local_delta_m_den_p = m_prev0 * m_prev0 + m_prev1 * m_prev1;
-            shared_vals[tid] = local_delta_m_den_p;
+            var local_delta_m_prev_den_p = m_prev0 * m_prev0 + m_prev1 * m_prev1;
+            shared_vals[tid] = local_delta_m_prev_den_p;
             workgroupBarrier();
             for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
                 if (tid < stride) {
@@ -1061,7 +1233,18 @@ fn deq_slot_attn_unified_main(
                 }
                 workgroupBarrier();
             }
-            let err_m_p = sqrt(delta_m_num_p / (shared_vals[0] + FPM_EPS));
+            let delta_m_prev_den_p = shared_vals[0];
+            let local_delta_m_cand_den_p = m_candidate0 * m_candidate0 + m_candidate1 * m_candidate1;
+            shared_vals[tid] = local_delta_m_cand_den_p;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let delta_m_cand_den_p = shared_vals[0];
+            let err_m_p = sqrt(delta_m_num_p / max(max(delta_m_prev_den_p, delta_m_cand_den_p), FPM_EPS));
             let local_max_delta_m_p = max(abs(m_candidate0 - m_prev0), abs(m_candidate1 - m_prev1));
             shared_vals[tid] = local_max_delta_m_p;
             workgroupBarrier();
@@ -1167,6 +1350,13 @@ fn deq_slot_attn_unified_main(
             DebugLog[9] = shape.epsilon;
             DebugLog[10] = f32(shape.token_count);
             DebugLog[11] = f32(h_slots);
+            DebugLog[12] = solve_signal_rms_seen;
+            DebugLog[13] = solve_pre_rms_seen;
+            DebugLog[14] = solve_fh_rms_seen;
+            DebugLog[15] = solve_hprev_rms_seen;
+            DebugLog[16] = solve_nscale_abs_seen;
+            DebugLog[17] = solve_pre_to_hprev_seen;
+            DebugLog[18] = solve_fh_to_hprev_seen;
         }
     }
 }

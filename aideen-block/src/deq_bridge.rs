@@ -50,7 +50,7 @@ struct SpectralParams {
 
 pub struct RustDeqBridge {
     pub h_slots: u32,
-    pub slot_attn_unified_pipeline: wgpu::ComputePipeline,
+    pub slot_coord_unified_pipeline: wgpu::ComputePipeline,
     pub hist_v2_signal_cache_pipeline: wgpu::ComputePipeline,
     pub hist_v2_project_pipeline: wgpu::ComputePipeline,
     pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
@@ -86,22 +86,44 @@ pub struct RustDeqBridge {
 
 /// AllWeights flat-buffer byte offsets (verified 256-byte aligned for d=512, h=8).
 /// Layout: W_q | W_k | W_v | W_o (per-slot) | W_in | W_x | W_out | A_log | NormScale | HistParams
-pub fn aw_wqk_bytes(d: u64, h: u64) -> u64 { (h * d * d + h * d) * 4 }
-pub fn aw_wk_byte_off(d: u64, h: u64) -> u64 { aw_wqk_bytes(d, h) }
-pub fn aw_wv_byte_off(d: u64, h: u64) -> u64 { 2 * aw_wqk_bytes(d, h) }
-pub fn aw_wo_byte_off(d: u64, h: u64) -> u64 { aw_wv_byte_off(d, h) + h * d * d * 4 }
-pub fn aw_win_byte_off(d: u64, h: u64) -> u64 { aw_wo_byte_off(d, h) + h * d * d * 4 }
-pub fn aw_wx_byte_off(d: u64, h: u64) -> u64 { aw_win_byte_off(d, h) + h * d * d * 4 }
-pub fn aw_wout_byte_off(d: u64, h: u64) -> u64 { aw_wx_byte_off(d, h) + d * d * 4 }
-pub fn aw_alog_byte_off(d: u64, h: u64) -> u64 { aw_wout_byte_off(d, h) + d * d * 4 }
-pub fn aw_nscale_byte_off(d: u64, h: u64) -> u64 { aw_alog_byte_off(d, h) + h * d * 4 }
-pub fn aw_hist_byte_off(d: u64, h: u64) -> u64 { aw_nscale_byte_off(d, h) + d * 4 }
-pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 { aw_hist_byte_off(d, h) + hist_len * 4 }
+pub fn aw_wqk_bytes(d: u64, h: u64) -> u64 {
+    (h * d * d + h * d) * 4
+}
+pub fn aw_wk_byte_off(d: u64, h: u64) -> u64 {
+    aw_wqk_bytes(d, h)
+}
+pub fn aw_wv_byte_off(d: u64, h: u64) -> u64 {
+    2 * aw_wqk_bytes(d, h)
+}
+pub fn aw_wo_byte_off(d: u64, h: u64) -> u64 {
+    aw_wv_byte_off(d, h) + h * d * d * 4
+}
+pub fn aw_win_byte_off(d: u64, h: u64) -> u64 {
+    aw_wo_byte_off(d, h) + h * d * d * 4
+}
+pub fn aw_wx_byte_off(d: u64, h: u64) -> u64 {
+    aw_win_byte_off(d, h) + h * d * d * 4
+}
+pub fn aw_wout_byte_off(d: u64, h: u64) -> u64 {
+    aw_wx_byte_off(d, h) + d * d * 4
+}
+pub fn aw_alog_byte_off(d: u64, h: u64) -> u64 {
+    aw_wout_byte_off(d, h) + d * d * 4
+}
+pub fn aw_nscale_byte_off(d: u64, h: u64) -> u64 {
+    aw_alog_byte_off(d, h) + h * d * 4
+}
+pub fn aw_hist_byte_off(d: u64, h: u64) -> u64 {
+    aw_nscale_byte_off(d, h) + d * 4
+}
+pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 {
+    aw_hist_byte_off(d, h) + hist_len * 4
+}
 
 impl RustDeqBridge {
     fn clean_scratch_stride(d_model: u32, h_slots: u32) -> u32 {
         let signal = d_model * h_slots;
-        signal * 2
+        signal * 2 + h_slots * h_slots
     }
 
     fn pooled_elements(batch_size: u32, seq_len: u32, d_model: u32) -> u64 {
@@ -210,21 +232,34 @@ impl RustDeqBridge {
             cache: None,
         });
         let unified_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("AIDEEN DEQ SlotAttn Unified Shader"),
+            label: Some("AIDEEN DEQ SlotCoord Unified Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/deq_slot_attn_unified_clean.wgsl").into(),
             ),
         });
-        let fpm_enabled = std::env::var("AIDEEN_FPM")
+        let fpm_requested = std::env::var("AIDEEN_FPM")
             .ok()
-            .map(|v| { let vl = v.trim().to_ascii_lowercase(); vl == "1" || vl == "true" })
-            .unwrap_or(false);
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true"
+            })
+            .unwrap_or(true);
+        let deq_only_mode = std::env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1");
+        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1");
+        // Comparison modes must disable FPM at the bridge/shader contract level.
+        // Otherwise DEQ_ONLY/slot_coord still compile and run with FPM memory enabled,
+        // contaminating both behavior and telemetry.
+        let fpm_enabled = fpm_requested && !deq_only_mode && !slot_coord_mode;
         // Sanity rule: FPM and H_hist are mutually exclusive experimental paths.
         // If FPM is enabled, disable H_hist so the shader measures one memory mechanism at a time.
-        let h_hist_enabled = !fpm_enabled && std::env::var("AIDEEN_H_HIST")
-            .ok()
-            .map(|v| { let vl = v.trim().to_ascii_lowercase(); vl == "1" || vl == "true" })
-            .unwrap_or(false);
+        let h_hist_enabled = !fpm_enabled
+            && std::env::var("AIDEEN_H_HIST")
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true"
+                })
+                .unwrap_or(false);
         let hist_ctx_enabled = !fpm_enabled
             && !h_hist_enabled
             && std::env::var("AIDEEN_DEQ_HIST_GATED")
@@ -239,39 +274,57 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(1)
             .clamp(1, 8);
-        let mut slot_attn_constants = std::collections::HashMap::new();
-        slot_attn_constants.insert(
-            "SLOT_ATTN_HEAD_DIM".to_string(),
-            slot_attn_head_dim as f64,
-        );
-        slot_attn_constants.insert(
+        let slot_coord_refresh_iters = std::env::var("AIDEEN_SLOT_COORD_REFRESH_ITERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(1);
+        let slot_coord_bias_mode = std::env::var("AIDEEN_SLOT_COORD_BIAS_MODE")
+            .unwrap_or_else(|_| "trainable".to_string());
+        let slot_coord_use_bias = !matches!(slot_coord_bias_mode.as_str(), "off" | "none" | "0");
+        let slot_coord_logit_gain = std::env::var("AIDEEN_SLOT_COORD_LOGIT_GAIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.1, 32.0);
+        let mut slot_coord_constants = std::collections::HashMap::new();
+        slot_coord_constants.insert("SLOT_ATTN_HEAD_DIM".to_string(), slot_attn_head_dim as f64);
+        slot_coord_constants.insert(
             "ENABLE_TOKEN_CARRY".to_string(),
             if token_carry_enabled { 1.0 } else { 0.0 },
         );
-        slot_attn_constants.insert(
+        slot_coord_constants.insert(
             "ENABLE_H_HIST".to_string(),
             if h_hist_enabled { 1.0 } else { 0.0 },
         );
-        slot_attn_constants.insert(
+        slot_coord_constants.insert(
             "ENABLE_HIST_CTX".to_string(),
             if hist_ctx_enabled { 1.0 } else { 0.0 },
         );
-        slot_attn_constants.insert(
+        slot_coord_constants.insert(
             "ENABLE_FPM".to_string(),
             if fpm_enabled { 1.0 } else { 0.0 },
         );
-        slot_attn_constants.insert(
-            "FPM_MEM_ITERS".to_string(),
-            fpm_mem_iters as f64,
+        slot_coord_constants.insert("FPM_MEM_ITERS".to_string(), fpm_mem_iters as f64);
+        slot_coord_constants.insert(
+            "SLOT_COORD_REFRESH_ITERS".to_string(),
+            slot_coord_refresh_iters as f64,
         );
-        let slot_attn_unified_pipeline =
+        slot_coord_constants.insert(
+            "SLOT_COORD_USE_BIAS".to_string(),
+            if slot_coord_use_bias { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "SLOT_COORD_LOGIT_GAIN".to_string(),
+            slot_coord_logit_gain as f64,
+        );
+        let slot_coord_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("DEQ SlotAttn Unified Pipeline"),
+                label: Some("DEQ SlotCoord Unified Pipeline"),
                 layout: Some(&pipeline_layout),
                 module: &unified_shader,
-                entry_point: Some("deq_slot_attn_unified_main"),
+                entry_point: Some("deq_slot_coord_unified_main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &slot_attn_constants,
+                    constants: &slot_coord_constants,
                     zero_initialize_workgroup_memory: true,
                 },
                 cache: None,
@@ -293,9 +346,7 @@ impl RustDeqBridge {
             });
         let hist_project_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Hist V2 Project Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/hist_v2_project.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/hist_v2_project.wgsl").into()),
         });
         let hist_v2_project_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -308,9 +359,7 @@ impl RustDeqBridge {
             });
         let hist_temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Hist V2 Temporal Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/hist_v2_temporal.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/hist_v2_temporal.wgsl").into()),
         });
         let hist_v2_temporal_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -551,10 +600,7 @@ impl RustDeqBridge {
         //   signal [h*d]
         // The old full-DEQ layout reserved q/k/v/attn/mamba/history regions that the clean
         // solve no longer touches.
-        let scratch_stride = Self::clean_scratch_stride(
-            d_model,
-            h_slots,
-        );
+        let scratch_stride = Self::clean_scratch_stride(d_model, h_slots);
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
             size: (max_batch_size as u64) * (max_seq_len as u64) * (scratch_stride as u64) * 4u64,
@@ -709,13 +755,17 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wv_byte_off(d64, h64), size: wv_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wv_byte_off(d64, h64),
+                        size: wv_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wo_byte_off(d64, h64), size: wo_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wo_byte_off(d64, h64),
+                        size: wo_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
@@ -861,13 +911,17 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wv_byte_off(d64, h64), size: wv_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wv_byte_off(d64, h64),
+                        size: wv_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_weights_buf, offset: aw_wo_byte_off(d64, h64), size: wo_sz,
+                        buffer: &all_weights_buf,
+                        offset: aw_wo_byte_off(d64, h64),
+                        size: wo_sz,
                     }),
                 },
                 wgpu::BindGroupEntry {
@@ -907,7 +961,7 @@ impl RustDeqBridge {
 
         Self {
             h_slots,
-            slot_attn_unified_pipeline,
+            slot_coord_unified_pipeline,
             hist_v2_signal_cache_pipeline,
             hist_v2_project_pipeline,
             hist_v2_temporal_pipeline,
@@ -1085,16 +1139,76 @@ impl RustDeqBridge {
         });
 
         encoder.copy_buffer_to_buffer(&self.all_weights_buf, 0, &st_q, 0, wqk_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wk_byte_off(d, h), &st_k, 0, wqk_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wv_byte_off(d, h), &st_v, 0, wv_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wk_byte_off(d, h), &st_k, 0, wqk_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wv_byte_off(d, h), &st_v, 0, wv_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wo_byte_off(d, h), &st_o, 0, wo_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_win_byte_off(d, h), &st_in, 0, win_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wx_byte_off(d, h), &st_x, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_wout_byte_off(d, h), &st_out, 0, mat_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_alog_byte_off(d, h), &st_a, 0, a_vec_size);
-        encoder.copy_buffer_to_buffer(&self.all_weights_buf, aw_nscale_byte_off(d, h), &st_n, 0, vec_size);
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wk_byte_off(d, h),
+            &st_k,
+            0,
+            wqk_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wv_byte_off(d, h),
+            &st_v,
+            0,
+            wv_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wk_byte_off(d, h),
+            &st_k,
+            0,
+            wqk_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wv_byte_off(d, h),
+            &st_v,
+            0,
+            wv_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wo_byte_off(d, h),
+            &st_o,
+            0,
+            wo_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_win_byte_off(d, h),
+            &st_in,
+            0,
+            win_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wx_byte_off(d, h),
+            &st_x,
+            0,
+            mat_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_wout_byte_off(d, h),
+            &st_out,
+            0,
+            mat_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_alog_byte_off(d, h),
+            &st_a,
+            0,
+            a_vec_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.all_weights_buf,
+            aw_nscale_byte_off(d, h),
+            &st_n,
+            0,
+            vec_size,
+        );
 
         queue.submit(Some(encoder.finish()));
 
@@ -1239,11 +1353,8 @@ impl RustDeqBridge {
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
         let b = shape.batch_size as usize;
-        let pooled_floats = Self::pooled_elements(
-            shape.batch_size,
-            shape.seq_len,
-            shape.d_model,
-        ) as usize;
+        let pooled_floats =
+            Self::pooled_elements(shape.batch_size, shape.seq_len, shape.d_model) as usize;
         let mut encoder = self.encode_forward(
             device,
             queue,
@@ -1314,7 +1425,13 @@ impl RustDeqBridge {
             if shape.token_start == 0 {
                 for b in 0..shape.batch_size as u64 {
                     let src_off = b * slot_stride;
-                    encoder.copy_buffer_to_buffer(&self.h_hist_buf, src_off, &self.mstate_buf, b * slot_stride, slot_stride);
+                    encoder.copy_buffer_to_buffer(
+                        &self.h_hist_buf,
+                        src_off,
+                        &self.mstate_buf,
+                        b * slot_stride,
+                        slot_stride,
+                    );
                 }
             }
             Some(slot_stride)
@@ -1330,11 +1447,7 @@ impl RustDeqBridge {
                 });
                 cpass.set_pipeline(&self.hist_v2_signal_cache_pipeline);
                 cpass.set_bind_group(0, &self.bind_group, &[]);
-                cpass.dispatch_workgroups(
-                    shape.batch_size.max(1),
-                    shape.token_count.max(1),
-                    1,
-                );
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.token_count.max(1), 1);
             }
         }
         {
@@ -1354,10 +1467,10 @@ impl RustDeqBridge {
         }
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DEQ Forward Unified SlotAttn Pass"),
+                label: Some("DEQ Forward Unified SlotCoord Pass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.slot_attn_unified_pipeline);
+            cpass.set_pipeline(&self.slot_coord_unified_pipeline);
             cpass.set_bind_group(0, &self.bind_group, &[]);
             cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
         }
@@ -1392,7 +1505,13 @@ impl RustDeqBridge {
             for b in 0..shape.batch_size as u64 {
                 let src_off = (b * shape.seq_len as u64 + last_token) * slot_stride;
                 let dst_off = b * slot_stride;
-                encoder.copy_buffer_to_buffer(&self.hist_ctx_buf, src_off, &self.mstate_buf, dst_off, slot_stride);
+                encoder.copy_buffer_to_buffer(
+                    &self.hist_ctx_buf,
+                    src_off,
+                    &self.mstate_buf,
+                    dst_off,
+                    slot_stride,
+                );
             }
         }
         encoder
@@ -1431,11 +1550,8 @@ impl RustDeqBridge {
         let d_model = shape.d_model as usize;
         let b = shape.batch_size as usize;
         let h = shape.h_slots as usize;
-        let pooled_floats = Self::pooled_elements(
-            shape.batch_size,
-            shape.seq_len,
-            shape.d_model,
-        ) as usize;
+        let pooled_floats =
+            Self::pooled_elements(shape.batch_size, shape.seq_len, shape.d_model) as usize;
         let mut encoder = self.encode_forward(
             device,
             queue,

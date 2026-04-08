@@ -17,7 +17,7 @@ use aideen_core::{
 use std::collections::VecDeque;
 use std::io::Write;
 
-use crate::{gradients, loss, optimizer::Adam};
+use crate::optimizer::Adam;
 use aideen_backbone::{
     lm_head::LmHead, mamba_slot_reasoning::MambaSlotReasoning, tokenizer::Tokenizer,
 };
@@ -64,10 +64,9 @@ impl Default for TrainingConfig {
 #[derive(Clone, Copy, Debug, Default)]
 struct FpmHealthMetrics {
     max_err_h: f32,
-    max_err_m: f32,
+    max_mem_update: f32,
     max_z: f32,
     avg_z: f32,
-    rescue_count: f32,
     rescue_recovered: f32,
     dead_slots: f32,
     max_update_ratio: f32,
@@ -158,12 +157,14 @@ pub struct Trainer {
 
     // --- TPS tracking for GPU-DEBUG log ---
     debug_last_time: Option<std::time::Instant>,
-    debug_tokens_accum: u32,   // tokens processed since last GPU-DEBUG print
+    debug_tokens_accum: u32, // tokens processed since last GPU-DEBUG print
 
     // --- Debug buffer cache (avoid blocking GPU readback every step) ---
     // read_debug_buffer() calls device.poll(Maintain::Wait) — blocks CPU until GPU finishes.
     // Now deferred to end-of-step (after apply_gradient_update) so GPU is already idle.
     cached_debug_buf: Vec<f32>,
+    cached_debug_gen: u64,
+    invalid_eval_debug_gen: u64,
     // --- Cached GPU loss (avoid sync readback every step) ---
     last_gpu_loss: f32,
     fpm_alpha_m_current: f32,
@@ -177,7 +178,7 @@ pub struct Trainer {
     cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
     cfg_solve_control_every: usize, // AIDEEN_SOLVE_CONTROL_EVERY
     cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
-    cfg_tps_sync_every: usize, // AIDEEN_TPS_SYNC_EVERY
+    cfg_tps_sync_every: usize,     // AIDEEN_TPS_SYNC_EVERY
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
     cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
     cfg_val_every: usize,          // AIDEEN_VAL_EVERY
@@ -188,16 +189,15 @@ pub struct Trainer {
     cfg_adj_iters_override: Option<u32>, // AIDEEN_ADJ_ITERS_OVERRIDE
     cfg_system_cost_audit: bool,   // AIDEEN_SYSTEM_COST_AUDIT
     cfg_system_cost_wait: bool,    // AIDEEN_SYSTEM_COST_WAIT
+    cfg_slot_path_audit: bool,     // AIDEEN_SLOT_PATH_AUDIT
     cfg_force_renorm: bool,        // AIDEEN_DEQ_FORCE_RENORM
-    cfg_slot_attn_unified: bool,   // canonical unified slot-attn path
     cfg_lm_force_cpu_dldh: bool,   // AIDEEN_LM_FORCE_CPU_DLDH
     cfg_lm_dldh_parity: bool,      // AIDEEN_LM_DLDH_PARITY
-    cfg_clean_deq_mode: bool,      // derived from DEQ env at construction
     cfg_log_emb_stats: bool,       // AIDEEN_LOG_EMB_STATS
     cfg_lr_plateau_enable: bool,   // AIDEEN_LR_PLATEAU_ENABLE
     cfg_lr_plateau_patience: usize, // AIDEEN_LR_PLATEAU_PATIENCE
     cfg_lr_plateau_cooldown: usize, // AIDEEN_LR_PLATEAU_COOLDOWN
-    cfg_lr_plateau_factor: f32,     // AIDEEN_LR_PLATEAU_FACTOR
+    cfg_lr_plateau_factor: f32,    // AIDEEN_LR_PLATEAU_FACTOR
     cfg_lr_plateau_min_rel_improvement: f32, // AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT
     cfg_lr_plateau_min_lr_override: Option<f32>, // AIDEEN_LR_PLATEAU_MIN_LR
 }
@@ -296,9 +296,9 @@ impl Trainer {
         }
 
         let min_rel = self.cfg_lr_plateau_min_rel_improvement.max(0.0);
-        let improved = self.plateau_best_loss.map_or(true, |best| {
-            epoch_loss < best * (1.0 - min_rel)
-        });
+        let improved = self
+            .plateau_best_loss
+            .map_or(true, |best| epoch_loss < best * (1.0 - min_rel));
 
         if improved {
             self.plateau_best_loss = Some(epoch_loss);
@@ -479,8 +479,7 @@ impl Trainer {
         let should_read =
             force || (every != 0 && (every == 1 || (self.optimizer.step_count() % every == 0)));
         if should_read {
-            self
-                .gpu_lm
+            self.gpu_lm
                 .as_ref()
                 .map(|gpu_lm| gpu_lm.read_cached_loss(&gpu.device))
         } else {
@@ -631,11 +630,40 @@ impl Trainer {
         {
             return false;
         }
-        true
+        false
+    }
+
+    fn baseline_fpm_enabled() -> bool {
+        std::env::var("AIDEEN_FPM")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(true)
+    }
+
+    fn slot_coord_mode_active() -> bool {
+        std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok()
+    }
+
+    fn effective_fpm_enabled() -> bool {
+        Self::baseline_fpm_enabled() && !Self::clean_deq_mode_active() && !Self::slot_coord_mode_active()
     }
 
     fn default_hist_min_iters() -> u32 {
-        if Self::clean_deq_mode_active() { 1 } else { 20 }
+        if Self::clean_deq_mode_active() || Self::slot_coord_mode_active() {
+            1
+        } else {
+            20
+        }
+    }
+
+    fn default_slot_coord_min_iters() -> u32 {
+        1
     }
 
     fn estimate_forward_bandwidth_bytes(
@@ -650,26 +678,35 @@ impl Trainer {
         let h = h_slots as f64;
         let b = batch_size as f64;
         let t = seq_len as f64;
-        let iters = max_iters as f64;
         let f32_bytes = std::mem::size_of::<f32>() as f64;
-        let slot_attn_unified = self.cfg_slot_attn_unified;
-        if self.cfg_clean_deq_mode {
+        let _ = max_iters;
+        let deq_only = Self::env_flag("AIDEEN_DEQ_ONLY");
+        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        let fpm_enabled = Self::effective_fpm_enabled();
+        if deq_only {
             let win_bytes = b * t * (h * d * d * f32_bytes);
             return (0.0, 0.0, win_bytes, 0.0);
         }
 
-        // Lower bounds derived from the hot dense matrices touched in deq_forward.wgsl.
-        let attn_iters = if slot_attn_unified {
-            1.0
-        } else {
-            iters
-        };
-        let qkv_bytes = b * t * attn_iters * (3.0 * h * d * d * f32_bytes);
-        let wo_bytes = b * t * attn_iters * (h * d * d * f32_bytes);
+        // Lower bounds derived from the hot matrices touched in the active unified shader.
+        // Slot coordination reuses the same Q/K/V/O families in both slot-coord and FPM modes.
+        let qkv_bytes = b * t * (3.0 * h * d * d * f32_bytes);
+        let wo_bytes = b * t * (h * d * d * f32_bytes);
         let win_bytes = b * t * (h * d * d * f32_bytes);
-        let hist_lower_bound = b * t * ((d * d + h * d * d + d * d) * f32_bytes);
+        let aux_lower_bound = if fpm_enabled {
+            let rank = 32.0;
+            // FPM forward touches low-rank read/write projections plus the dense write map.
+            b * t * ((4.0 * h * d * rank + h * d * d + d + 2.0 * h * d) * f32_bytes)
+        } else if slot_coord_mode {
+            0.0
+        } else {
+            0.0
+        };
 
-        (qkv_bytes, wo_bytes, win_bytes, hist_lower_bound)
+        (qkv_bytes, wo_bytes, win_bytes, aux_lower_bound)
     }
 
     fn decode_forward_debug_metrics(
@@ -678,10 +715,7 @@ impl Trainer {
     ) -> (f32, f32, f32, f32, f32, f32, f32) {
         if fw.len() > 11 && fw[8] == 901.0 {
             let seq = fw[10].max(1.0);
-            let slot_count = fw[11]
-                .max(1.0)
-                .min(h_slots as f32)
-                .round() as usize;
+            let slot_count = fw[11].max(1.0).min(h_slots as f32).round() as usize;
             let mut max_delta = 0.0f32;
             let mut hit_count = 0.0f32;
             let mut avg_iters_sum = 0.0f32;
@@ -704,7 +738,15 @@ impl Trainer {
                 0.0
             };
             let hit_den = seq * slot_count.max(1) as f32;
-            return (seq, max_h, avg_iters, hit_count, max_delta, contractivity, hit_den);
+            return (
+                seq,
+                max_h,
+                avg_iters,
+                hit_count,
+                max_delta,
+                contractivity,
+                hit_den,
+            );
         }
 
         let heartbeat = if fw.len() > 10 { fw[10] } else { 0.0 };
@@ -724,10 +766,7 @@ impl Trainer {
         )
     }
 
-    fn decode_slot_observability_metrics(
-        fw: &[f32],
-        h_slots: usize,
-    ) -> Vec<(f32, f32, f32)> {
+    fn decode_slot_observability_metrics(fw: &[f32], h_slots: usize) -> Vec<(f32, f32, f32)> {
         let mut out = Vec::new();
         for slot in 0..h_slots {
             let base = 320 + slot * 3;
@@ -737,6 +776,289 @@ impl Trainer {
             out.push((fw[base], fw[base + 1], fw[base + 2]));
         }
         out
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn slot_path_audit_stats(&self, gpu: &GpuDeqBackend, seq_len: u32) -> Option<String> {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        if d == 0 || h == 0 || seq_len == 0 {
+            return None;
+        }
+        let hd = std::env::var("AIDEEN_DEQ_SLOT_ATTN_HEAD_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(8, 32))
+            .unwrap_or(32)
+            .min(d);
+        let scratch = gpu.read_scratch_buffer();
+        let q_buf = gpu.read_slot_coord_q_forward(seq_len);
+        let k_work_buf = gpu.read_slot_coord_k_work(seq_len);
+        let qgrad = gpu.read_hist_qgrad_signal(seq_len);
+        let gscore = gpu.read_slot_coord_gscore(seq_len);
+        let (_, wk, _, _, _, _, _, _, _) = gpu.read_weights().ok()?;
+        let hist_params = gpu.read_hist_params_full();
+
+        let signal_span = d * h;
+        let scratch_stride = signal_span * 2 + h * h;
+        let hist_mat_len = d * d;
+        let slot_scale_base = hist_mat_len;
+        let hist_bias_base = slot_scale_base + h * d;
+        let hist_gate_base = hist_bias_base + h * d;
+        let slot_anchor_base = hist_gate_base + h;
+        let slot_anchor = &hist_params[slot_anchor_base..slot_anchor_base + h * d];
+
+        let pair_l2_owned = |data: &[f32], width: usize| -> f32 {
+            let mut acc = 0.0f32;
+            let mut pairs = 0u32;
+            for token in 0..seq_len as usize {
+                for a in 0..h {
+                    let base_a = (token * h + a) * width;
+                    let va = &data[base_a..base_a + width];
+                    for b in (a + 1)..h {
+                        let base_b = (token * h + b) * width;
+                        let vb = &data[base_b..base_b + width];
+                        let mut dist2 = 0.0f32;
+                        for i in 0..va.len() {
+                            let dv = va[i] - vb[i];
+                            dist2 += dv * dv;
+                        }
+                        acc += (dist2 / va.len().max(1) as f32).sqrt();
+                        pairs += 1;
+                    }
+                }
+            }
+            if pairs == 0 { 0.0 } else { acc / pairs as f32 }
+        };
+        let mean_rms_owned = |data: &[f32], width: usize| -> f32 {
+            let mut acc = 0.0f32;
+            let mut count = 0u32;
+            for token in 0..seq_len as usize {
+                for slot in 0..h {
+                    let base = (token * h + slot) * width;
+                    let v = &data[base..base + width];
+                    let sumsq: f32 = v.iter().map(|x| x * x).sum();
+                    acc += (sumsq / v.len().max(1) as f32).sqrt();
+                    count += 1;
+                }
+            }
+            if count == 0 { 0.0 } else { acc / count as f32 }
+        };
+
+        let mut src_flat = vec![0.0f32; seq_len as usize * h * d];
+        for token in 0..seq_len as usize {
+            let token_base = token * scratch_stride;
+            for slot in 0..h {
+                let signal_base = token_base + slot * d;
+                let anchor_base = slot * d;
+                let out_base = (token * h + slot) * d;
+                for i in 0..d {
+                    src_flat[out_base + i] = scratch[signal_base + i] + slot_anchor[anchor_base + i];
+                }
+            }
+        }
+        let mut q_flat = vec![0.0f32; seq_len as usize * h * hd];
+        let mut k_forward_flat = vec![0.0f32; seq_len as usize * h * hd];
+        let mut k_work_flat = vec![0.0f32; seq_len as usize * h * hd];
+        let mut qgrad_flat = vec![0.0f32; seq_len as usize * h * hd];
+        let mat_len = d * d;
+        let k_bias_base = h * mat_len;
+        for token in 0..seq_len as usize {
+            for slot in 0..h {
+                let src_base = (token * h + slot) * d;
+                let dst_base = (token * h + slot) * hd;
+                q_flat[dst_base..dst_base + hd].copy_from_slice(&q_buf[src_base..src_base + hd]);
+                k_work_flat[dst_base..dst_base + hd]
+                    .copy_from_slice(&k_work_buf[src_base..src_base + hd]);
+                qgrad_flat[dst_base..dst_base + hd]
+                    .copy_from_slice(&qgrad[src_base..src_base + hd]);
+                let src_slice = &src_flat[src_base..src_base + d];
+                let src_rms =
+                    (src_slice.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32).sqrt().max(1.0e-6);
+                let wk_slot = &wk[slot * mat_len..(slot + 1) * mat_len];
+                let k_bias_slot = &wk[k_bias_base + slot * d..k_bias_base + (slot + 1) * d];
+                for head in 0..hd {
+                    let mut kval = k_bias_slot[head];
+                    for j in 0..d {
+                        kval += wk_slot[j * d + head] * (src_slice[j] / src_rms);
+                    }
+                    k_forward_flat[dst_base + head] = kval;
+                }
+            }
+        }
+
+        let src_pair = pair_l2_owned(&src_flat, d);
+        let src_rms = mean_rms_owned(&src_flat, d);
+        let q_pair = pair_l2_owned(&q_flat, hd);
+        let q_rms = mean_rms_owned(&q_flat, hd);
+        let k_forward_pair = pair_l2_owned(&k_forward_flat, hd);
+        let k_forward_rms = mean_rms_owned(&k_forward_flat, hd);
+        let k_work_pair = pair_l2_owned(&k_work_flat, hd);
+        let k_work_rms = mean_rms_owned(&k_work_flat, hd);
+        let qgrad_pair = pair_l2_owned(&qgrad_flat, hd);
+        let qgrad_rms = mean_rms_owned(&qgrad_flat, hd);
+        let gscore_pair = pair_l2_owned(&gscore, h);
+        let gscore_rms = mean_rms_owned(&gscore, h);
+        let mut score_flat = vec![0.0f32; seq_len as usize * h * h];
+        let inv_sqrt_hd = 1.0f32 / (hd.max(1) as f32).sqrt();
+        let mut score_margin_acc = 0.0f32;
+        let mut self_prob_acc = 0.0f32;
+        let mut score_entropy_acc = 0.0f32;
+        let mut score_count = 0u32;
+        let mut incoming_acc = vec![0.0f32; h];
+        for token in 0..seq_len as usize {
+            for qs in 0..h {
+                let q_base = (token * h + qs) * hd;
+                let qv = &q_flat[q_base..q_base + hd];
+                let score_base = (token * h + qs) * h;
+                let mut max_s = f32::NEG_INFINITY;
+                for ks in 0..h {
+                    let k_base = (token * h + ks) * hd;
+                    let kv = &k_forward_flat[k_base..k_base + hd];
+                    let mut dot = 0.0f32;
+                    for i in 0..hd {
+                        dot += qv[i] * kv[i];
+                    }
+                    let score = dot * inv_sqrt_hd;
+                    score_flat[score_base + ks] = score;
+                    max_s = max_s.max(score);
+                }
+                let mut sum_exp = 0.0f32;
+                let mut top1 = f32::NEG_INFINITY;
+                let mut top2 = f32::NEG_INFINITY;
+                for ks in 0..h {
+                    let s = score_flat[score_base + ks];
+                    if s > top1 {
+                        top2 = top1;
+                        top1 = s;
+                    } else if s > top2 {
+                        top2 = s;
+                    }
+                    sum_exp += (s - max_s).exp();
+                }
+                let mut entropy = 0.0f32;
+                let mut self_prob = 0.0f32;
+                sum_exp = sum_exp.max(1.0e-12);
+                for ks in 0..h {
+                    let p = (score_flat[score_base + ks] - max_s).exp() / sum_exp;
+                    incoming_acc[ks] += p;
+                    if ks == qs {
+                        self_prob = p;
+                    }
+                    entropy -= p * p.max(1.0e-12).ln();
+                }
+                score_margin_acc += top1 - top2.max(f32::NEG_INFINITY);
+                self_prob_acc += self_prob;
+                score_entropy_acc += entropy;
+                score_count += 1;
+            }
+        }
+        let score_pair = pair_l2_owned(&score_flat, h);
+        let score_rms = mean_rms_owned(&score_flat, h);
+        let score_margin = if score_count == 0 { 0.0 } else { score_margin_acc / score_count as f32 };
+        let score_self = if score_count == 0 { 0.0 } else { self_prob_acc / score_count as f32 };
+        let score_entropy =
+            if score_count == 0 { 0.0 } else { score_entropy_acc / score_count as f32 };
+        let incoming_den = (seq_len as usize * h).max(1) as f32;
+        let incoming_mean = incoming_acc
+            .iter()
+            .map(|v| format!("{:.3}", *v / incoming_den))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        Some(format!(
+            "src(pair={src_pair:.3e},rms={src_rms:.3e}) q(pair={q_pair:.3e},rms={q_rms:.3e}) kfwd(pair={k_forward_pair:.3e},rms={k_forward_rms:.3e}) kwork(pair={k_work_pair:.3e},rms={k_work_rms:.3e}) score(pair={score_pair:.3e},rms={score_rms:.3e},margin={score_margin:.3e},self={score_self:.3},ent={score_entropy:.3},incoming=[{incoming_mean}]) qgrad(pair={qgrad_pair:.3e},rms={qgrad_rms:.3e}) gscore(pair={gscore_pair:.3e},rms={gscore_rms:.3e})"
+        ))
+    }
+
+    fn extract_slot_incoming(audit: &str) -> Option<&str> {
+        let start_tag = "incoming=[";
+        let start = audit.find(start_tag)? + start_tag.len();
+        let end = audit[start..].find(']')?;
+        Some(&audit[start..start + end])
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn slot_weight_specialization_stats(
+        &self,
+        gpu: &GpuDeqBackend,
+    ) -> Option<(f32, f32, f32, f32, f32, f32)> {
+        let (wq, wk, wv, wo, win, _, _, _, _) = gpu.read_weights().ok()?;
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        if h == 0 || d == 0 {
+            return None;
+        }
+        let mat_len = d * d;
+        let head_dim = std::env::var("AIDEEN_DEQ_SLOT_ATTN_HEAD_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(8, 32))
+            .unwrap_or(32)
+            .min(d);
+        let mean_pair_l2_slice = |flat: &[f32], pick: &dyn Fn(&[f32]) -> Vec<f32>| -> f32 {
+            let mut acc = 0.0f32;
+            let mut pairs = 0u32;
+            for a in 0..h {
+                let sa = pick(&flat[a * mat_len..(a + 1) * mat_len]);
+                for b in (a + 1)..h {
+                    let sb = pick(&flat[b * mat_len..(b + 1) * mat_len]);
+                    let mut dist2 = 0.0f32;
+                    for i in 0..sa.len() {
+                        let dv = sa[i] - sb[i];
+                        dist2 += dv * dv;
+                    }
+                    acc += (dist2 / sa.len() as f32).sqrt();
+                    pairs += 1;
+                }
+            }
+            if pairs == 0 { 0.0 } else { acc / pairs as f32 }
+        };
+        let pick_qkv = |m: &[f32]| -> Vec<f32> {
+            let mut out = Vec::with_capacity(d * head_dim);
+            for row in 0..d {
+                let base = row * d;
+                out.extend_from_slice(&m[base..base + head_dim]);
+            }
+            out
+        };
+        let pick_wo = |m: &[f32]| -> Vec<f32> {
+            let mut out = Vec::with_capacity(head_dim * d);
+            for row in 0..head_dim {
+                let base = row * d;
+                out.extend_from_slice(&m[base..base + d]);
+            }
+            out
+        };
+        let mean_pair_l2 = |flat: &[f32]| -> f32 { mean_pair_l2_slice(flat, &pick_qkv) };
+        let mean_pair_l2_bias = |flat: &[f32], base: usize| -> f32 {
+            let mut acc = 0.0f32;
+            let mut pairs = 0u32;
+            for a in 0..h {
+                let sa = &flat[base + a * d..base + (a + 1) * d];
+                for b in (a + 1)..h {
+                    let sb = &flat[base + b * d..base + (b + 1) * d];
+                    let mut dist2 = 0.0f32;
+                    for i in 0..d {
+                        let dv = sa[i] - sb[i];
+                        dist2 += dv * dv;
+                    }
+                    acc += (dist2 / d as f32).sqrt();
+                    pairs += 1;
+                }
+            }
+            if pairs == 0 { 0.0 } else { acc / pairs as f32 }
+        };
+        let q_bias_base = h * mat_len;
+        let k_bias_base = h * mat_len;
+        Some((
+            mean_pair_l2(&wq[..h * mat_len]),
+            mean_pair_l2(&wk[..h * mat_len]),
+            mean_pair_l2(&wv[..h * mat_len]),
+            mean_pair_l2_slice(&wo[..h * mat_len], &pick_wo),
+            mean_pair_l2(&win[..h * mat_len]),
+            0.5 * (mean_pair_l2_bias(&wq, q_bias_base) + mean_pair_l2_bias(&wk, k_bias_base)),
+        ))
     }
 
     fn decode_fpm_diag_metrics(
@@ -774,7 +1096,14 @@ impl Trainer {
             if fw.len() <= base + 5 {
                 break;
             }
-            out.push((fw[base], fw[base + 1], fw[base + 2], fw[base + 3], fw[base + 4], fw[base + 5]));
+            out.push((
+                fw[base],
+                fw[base + 1],
+                fw[base + 2],
+                fw[base + 3],
+                fw[base + 4],
+                fw[base + 5],
+            ));
         }
         out
     }
@@ -794,14 +1123,17 @@ impl Trainer {
                     count += 1;
                 }
             }
-            if count == 0 { 0.0 } else { sum / count as f32 }
+            if count == 0 {
+                0.0
+            } else {
+                sum / count as f32
+            }
         };
         Some(FpmHealthMetrics {
             max_err_h: slot_diag.iter().map(|m| m.0).fold(0.0, f32::max),
-            max_err_m: slot_diag.iter().map(|m| m.1).fold(0.0, f32::max),
+            max_mem_update: slot_diag.iter().map(|m| m.1).fold(0.0, f32::max),
             max_z: slot_diag.iter().map(|m| m.2).fold(0.0, f32::max),
             avg_z: slot_diag.iter().map(|m| m.2).sum::<f32>() / slot_diag.len() as f32,
-            rescue_count: slot_diag.iter().map(|m| m.3).sum::<f32>(),
             rescue_recovered: slot_diag.iter().map(|m| m.4).sum::<f32>(),
             dead_slots: slot_diag.iter().map(|m| m.5).sum::<f32>(),
             max_update_ratio: slot_diag.iter().map(|m| m.6).fold(0.0, f32::max),
@@ -831,7 +1163,7 @@ impl Trainer {
         let null_z_floor = 1e-4;
 
         if !metrics.max_err_h.is_finite()
-            || !metrics.max_err_m.is_finite()
+            || !metrics.max_mem_update.is_finite()
             || !metrics.avg_z.is_finite()
             || !metrics.max_z.is_finite()
             || !metrics.max_update_ratio.is_finite()
@@ -873,13 +1205,7 @@ impl Trainer {
         if !runtime_schedule_enabled {
             return;
         }
-        let fpm_enabled = std::env::var("AIDEEN_FPM")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
+        let fpm_enabled = Self::effective_fpm_enabled();
         if !fpm_enabled || self.cached_debug_buf.is_empty() {
             return;
         }
@@ -909,55 +1235,6 @@ impl Trainer {
             }
             self.fpm_last_err_h_avg = mean;
         }
-    }
-
-    fn lmhead_backward_sampled(
-        sampled_indices: &[u32],
-        target: u32,
-        h_pooled: &nalgebra::DVector<f32>,
-        w_lm: &nalgebra::DMatrix<f32>,
-        b_lm: &nalgebra::DVector<f32>,
-        g: &nalgebra::DVector<f32>,
-    ) -> nalgebra::DVector<f32> {
-        let eps = 1e-5_f32;
-        let d = h_pooled.len() as f32;
-        let mean_sq = h_pooled.map(|v| v * v).mean();
-        let rms = (mean_sq + eps).sqrt();
-        let h_norm = h_pooled.map(|v| v / rms);
-        let h_rms = h_norm.component_mul(g);
-
-        let mut logits = Vec::with_capacity(sampled_indices.len());
-        let mut max_logit = f32::NEG_INFINITY;
-        for &v in sampled_indices {
-            let mut logit = b_lm[v as usize];
-            for i in 0..h_rms.len() {
-                logit += w_lm[(v as usize, i)] * h_rms[i];
-            }
-            max_logit = max_logit.max(logit);
-            logits.push(logit);
-        }
-
-        let mut sum = 0.0;
-        for val in logits.iter_mut() {
-            *val = (*val - max_logit).exp();
-            sum += *val;
-        }
-        let inv_sum = 1.0 / sum.max(1e-8);
-
-        let mut dl_dh_rms = nalgebra::DVector::zeros(h_pooled.len());
-        for (idx, &v) in sampled_indices.iter().enumerate() {
-            let mut p = logits[idx] * inv_sum;
-            if v == target {
-                p -= 1.0;
-            }
-            for i in 0..dl_dh_rms.len() {
-                dl_dh_rms[i] += w_lm[(v as usize, i)] * p;
-            }
-        }
-
-        let dx = dl_dh_rms.component_mul(g) / rms;
-        let sum_dx_h = dx.dot(h_pooled);
-        dx - h_pooled.map(|v| v * sum_dx_h / (d * rms * rms))
     }
 
     fn apply_experimental_profile_from_env(&mut self) {
@@ -1042,23 +1319,40 @@ impl Trainer {
             debug_last_time: None,
             debug_tokens_accum: 0,
             cached_debug_buf: Vec::new(),
+            cached_debug_gen: 0,
+            invalid_eval_debug_gen: 0,
             last_gpu_loss: 0.0,
             fpm_alpha_m_current: 0.01,
             fpm_tau_current: 0.5,
             fpm_err_h_window: VecDeque::with_capacity(100),
             fpm_last_err_h_avg: f32::INFINITY,
             cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_solve_control_every: std::env::var("AIDEEN_SOLVE_CONTROL_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10).max(1),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(10)
+                .max(1),
             cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
@@ -1080,14 +1374,14 @@ impl Trainer {
                 .unwrap_or(usize::MAX),
             cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
                 .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok()),
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .or(Some(2)),
             cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
+            cfg_slot_path_audit: Self::env_flag("AIDEEN_SLOT_PATH_AUDIT"),
             cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
             cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
-            cfg_slot_attn_unified: true,
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
-            cfg_clean_deq_mode: Self::clean_deq_mode_active(),
             cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
             cfg_lr_plateau_enable: !Self::env_flag("AIDEEN_LR_PLATEAU_DISABLE"),
             cfg_lr_plateau_patience: std::env::var("AIDEEN_LR_PLATEAU_PATIENCE")
@@ -1102,10 +1396,12 @@ impl Trainer {
                 .ok()
                 .and_then(|v| v.trim().parse::<f32>().ok())
                 .unwrap_or(0.5),
-            cfg_lr_plateau_min_rel_improvement: std::env::var("AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT")
-                .ok()
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .unwrap_or(0.005),
+            cfg_lr_plateau_min_rel_improvement: std::env::var(
+                "AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT",
+            )
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.005),
             cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
         };
         trainer.apply_experimental_profile_from_env();
@@ -1176,23 +1472,40 @@ impl Trainer {
             debug_last_time: None,
             debug_tokens_accum: 0,
             cached_debug_buf: Vec::new(),
+            cached_debug_gen: 0,
+            invalid_eval_debug_gen: 0,
             last_gpu_loss: 0.0,
             fpm_alpha_m_current: 0.01,
             fpm_tau_current: 0.5,
             fpm_err_h_window: VecDeque::with_capacity(100),
             fpm_last_err_h_avg: f32::INFINITY,
             cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_solve_control_every: std::env::var("AIDEEN_SOLVE_CONTROL_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10).max(1),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(10)
+                .max(1),
             cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
-                .ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1),
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
@@ -1214,14 +1527,14 @@ impl Trainer {
                 .unwrap_or(usize::MAX),
             cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
                 .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok()),
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .or(Some(2)),
             cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
+            cfg_slot_path_audit: Self::env_flag("AIDEEN_SLOT_PATH_AUDIT"),
             cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
             cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
-            cfg_slot_attn_unified: true,
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
-            cfg_clean_deq_mode: Self::clean_deq_mode_active(),
             cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
             cfg_lr_plateau_enable: !Self::env_flag("AIDEEN_LR_PLATEAU_DISABLE"),
             cfg_lr_plateau_patience: std::env::var("AIDEEN_LR_PLATEAU_PATIENCE")
@@ -1236,10 +1549,12 @@ impl Trainer {
                 .ok()
                 .and_then(|v| v.trim().parse::<f32>().ok())
                 .unwrap_or(0.5),
-            cfg_lr_plateau_min_rel_improvement: std::env::var("AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT")
-                .ok()
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .unwrap_or(0.005),
+            cfg_lr_plateau_min_rel_improvement: std::env::var(
+                "AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT",
+            )
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.005),
             cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
         };
         trainer.apply_experimental_profile_from_env();
@@ -1269,11 +1584,7 @@ impl Trainer {
     #[cfg(feature = "wgpu")]
     fn ensure_gpu_trainers(&mut self, gpu: &GpuDeqBackend) {
         if self.gpu_lm.is_none() {
-            let lm = GpuLmHeadTrainer::new(
-                &gpu.device,
-                self.lm_head.b.len(),
-                self.config.clone(),
-            );
+            let lm = GpuLmHeadTrainer::new(&gpu.device, self.lm_head.b.len(), self.config.clone());
             // Upload CPU LM head weights immediately on GPU trainer creation.
             // Without this, the GPU LM runs with zero weights until the lazy sync
             // at line ~1372, which may be hundreds of steps later — causing the DEQ
@@ -1400,6 +1711,18 @@ impl Trainer {
                 self.adaptive_max_iters = min_iters;
             }
         }
+        // slot_coord is a one-shot initializer term in the current design. It shares the clean
+        // DEQ Picard regime: frozen slot context, no history recurrence, and no extra Jacobian
+        // term beyond the base solve. Keep its minimum iteration floor aligned with clean DEQ.
+        if Self::slot_coord_mode_active() {
+            let min_iters = Self::default_slot_coord_min_iters();
+            if self.solve_stage_cap < min_iters {
+                self.solve_stage_cap = min_iters;
+            }
+            if self.adaptive_max_iters < min_iters {
+                self.adaptive_max_iters = min_iters;
+            }
+        }
 
         #[cfg(feature = "wgpu")]
         if self.gpu_deq.is_some() {
@@ -1474,11 +1797,8 @@ impl Trainer {
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
                 }
-                // Dynamic slot-attention re-enters the DEQ Jacobian; ensure the GPU buffers
-                // start from the strict spectral regime before the first training step.
-                if !self.force_renorm_done
-                    && (self.cfg_force_renorm || self.cfg_slot_attn_unified)
-                {
+                let slot_coord_mode = Self::slot_coord_mode_active();
+                if !self.force_renorm_done && (self.cfg_force_renorm || slot_coord_mode) {
                     let _ = gpu.renormalize_spectral();
                     self.force_renorm_done = true;
                 }
@@ -1554,10 +1874,7 @@ impl Trainer {
 
         // Sync CPU lm_head only when frozen/debug paths need it — not on every training step.
         #[cfg(feature = "wgpu")]
-        if self.frozen_lm
-            || self.cfg_lm_force_cpu_dldh
-            || self.cfg_lm_dldh_parity
-        {
+        if self.frozen_lm || self.cfg_lm_force_cpu_dldh || self.cfg_lm_dldh_parity {
             self.sync_lm_head_from_gpu_if_needed();
         }
 
@@ -1628,8 +1945,7 @@ impl Trainer {
 
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
             let debug_every = self.cfg_debug_sample_every;
-            let debug_enable = debug_every != 0
-                && (self.optimizer.step_count() % debug_every == 0);
+            let debug_enable = debug_every != 0 && (self.optimizer.step_count() % debug_every == 0);
             let forward_t0 = std::time::Instant::now();
             let _ = gpu.run_forward(
                 fwd_batch_size,
@@ -1651,13 +1967,11 @@ impl Trainer {
             let fw = self.cached_debug_buf.clone();
             let (seq, max_h_dbg, _avg_iters_dbg, hit_count, max_delta, contractivity, hit_den) =
                 Self::decode_forward_debug_metrics(&fw, self.config.h_slots);
-            let fpm_enabled_cached = std::env::var("AIDEEN_FPM")
-                .ok()
-                .map(|v| {
-                    let vl = v.trim().to_ascii_lowercase();
-                    vl == "1" || vl == "true" || vl == "yes"
-                })
-                .unwrap_or(false);
+            let hit_ratio = hit_count.max(0.0) / hit_den.max(1.0);
+            let non_fpm_conv_ok = max_delta <= 0.15;
+            let non_fpm_expand = contractivity > 1.02;
+            let non_fpm_boost_residual = max_delta > 0.30;
+            let fpm_enabled_cached = Self::effective_fpm_enabled();
             let cached_fpm_metrics = if fpm_enabled_cached {
                 Self::decode_fpm_health_metrics(&fw, self.config.h_slots)
             } else {
@@ -1665,6 +1979,11 @@ impl Trainer {
             };
             let cached_fpm_status = cached_fpm_metrics
                 .map(|m| Self::classify_fpm_solve(m, max_h_dbg, contractivity, epsilon));
+            // Evaluate invalidity at most once per freshly captured debug snapshot.
+            // Reusing the same cached sample for several training steps would turn one
+            // bad window into an artificial streak of "consecutive" failures.
+            let fresh_invalid_sample = self.cached_debug_gen != 0
+                && self.cached_debug_gen != self.invalid_eval_debug_gen;
             // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
             // also being non-contractive. Non-monotone convergence (contr transiently > 1
             // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
@@ -1674,14 +1993,17 @@ impl Trainer {
                     || (matches!(cached_fpm_status, Some(SolveStatus::Unconverged))
                         && contractivity > 1.0)
             } else {
-                contractivity > 1.0 && max_delta > epsilon * 10.0
+                max_delta > 0.30 && non_fpm_expand
             };
-            if invalid_fixed_point {
-                self.invalid_hi_streak += 1;
-            } else {
-                self.invalid_hi_streak = 0;
+            if fresh_invalid_sample {
+                self.invalid_eval_debug_gen = self.cached_debug_gen;
+                if invalid_fixed_point {
+                    self.invalid_hi_streak += 1;
+                } else {
+                    self.invalid_hi_streak = 0;
+                }
             }
-            if self.invalid_hi_streak >= 3 {
+            if fresh_invalid_sample && self.invalid_hi_streak >= 3 {
                 if let Some(metrics) = cached_fpm_metrics {
                     eprintln!(
                         "    [DEQ-INVALID] step={} contr={:.3} status={} err_h={:.3e} z_avg={:.3e} max_h={:.3e} seq={:.0}",
@@ -1694,7 +2016,6 @@ impl Trainer {
                         seq
                     );
                 } else {
-                    let hit_ratio = hit_count.max(0.0) / hit_den.max(1.0);
                     eprintln!(
                         "    [DEQ-INVALID] step={} contr={:.3} hit_ratio={:.3} maxΔ={:.3e} seq={:.0}",
                         self.optimizer.step_count(),
@@ -1706,8 +2027,7 @@ impl Trainer {
                 }
                 self.invalid_hi_streak = 0;
                 self.emergency_left = 3;
-                self.adaptive_max_iters = (self.adaptive_max_iters + 2)
-                    .min(emergency_iter_cap);
+                self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(emergency_iter_cap);
                 #[cfg(feature = "wgpu")]
                 {
                     let renorm_t0 = std::time::Instant::now();
@@ -1797,9 +2117,14 @@ impl Trainer {
                 let mode = if grad_accum == 1 { 0u32 } else { 1u32 };
                 let apply_accum = grad_accum == 1 || self.grad_accum_counter + 1 >= grad_accum;
                 let update_t0 = std::time::Instant::now();
+                let deq_grad_scale = if Self::slot_coord_mode_active() {
+                    1.0
+                } else {
+                    self.config.deq_grad_scale
+                };
                 let _ = gpu.apply_fused_deq_update(
                     base_lr,
-                    self.config.deq_grad_scale,
+                    deq_grad_scale,
                     self.training_config.ternary,
                     self.config.weight_decay,
                     per_seq_len,
@@ -1820,208 +2145,6 @@ impl Trainer {
                 self.gpu_cg_weights_uploaded = true;
 
                 // =============================================================================
-                // [LEGACY — NO UTILIZADO] CPU fallback path (CG en CPU con h* leído del GPU).
-                //
-                // Reemplazado por: run_staged_adjoint_picard_no_readback() + apply_fused_deq_update()
-                // (path GPU completo, líneas arriba de este bloque).
-                //
-                // Este bloque nunca ejecuta (if false). Lo que hace:
-                //   1. Lee h* del GPU, recalcula en CPU via reasoning.step()
-                //   2. Corre deq_implicit_grad (CG numérico con finite differences)
-                //   3. Aplica weight update en CPU y re-sube todo a GPU
-                //
-                // Problemas: latencia de readback, CG escalar (O(N²) por iter),
-                // no soporta W_hist ni hist_gate (solo W_q/W_k/W_v/W_o/W_in/NormScale).
-                // =============================================================================
-                if false {
-                    // Strict path: CPU CG with GPU's h_star.
-                    // Reads h_star from hnext_buf after GPU forward, then uses numerical
-                    // JVP through reasoning.step() — captures all weights correctly and
-                    // matches the CPU update direction (fixes update_parity_cpu_vs_gpu).
-                    let query_vec = self.tokenizer.embed_context(context, self.config.ctx_len);
-
-                    // Strict path stability: recompute h* in CPU with the exact same
-                    // reasoning.step() used by deq_implicit_grad. This avoids inheriting
-                    // any CPU↔GPU forward mismatch into DEQ gradient direction.
-                    let mut h_star = self.reasoning.init(&query_vec);
-                    for _ in 0..self.adaptive_max_iters.max(1) {
-                        h_star = self.reasoning.step(&h_star, &query_vec, None);
-                    }
-                    let h_star_flat = h_star.to_flat();
-
-                    let force_cpu_lm_dldh = self.cfg_lm_force_cpu_dldh;
-                    let parity_check = self.cfg_lm_dldh_parity;
-                    let mut dl_dh_cpu_opt: Option<nalgebra::DVector<f32>> = None;
-                    let mut dl_dh_cpu_parity_opt: Option<nalgebra::DVector<f32>> = None;
-
-                    if self.frozen_lm || force_cpu_lm_dldh || parity_check {
-                        // Compute CPU reference dl_dh (matches CPU lm_head.forward + RMSNorm).
-                        let d_r = self.config.d_r;
-                        let h_slots = self.config.h_slots;
-                        let mut h_pooled_buf = vec![0.0f32; d_r];
-                        for k in 0..h_slots {
-                            for d in 0..d_r {
-                                h_pooled_buf[d] += h_star_flat[k * d_r + d];
-                            }
-                        }
-                        for v in h_pooled_buf.iter_mut() {
-                            *v /= h_slots as f32;
-                        }
-                        let h_pooled = nalgebra::DVector::from_vec(h_pooled_buf.clone());
-                        let logits = self.lm_head.forward_on_flat(&h_pooled_buf);
-                        let target = *targets_u32.last().unwrap_or(&0);
-                        let dl_dlogits = loss::cross_entropy_grad(&logits, target);
-                        let (_, dl_dh_cpu) = gradients::lmhead_backward(
-                            &dl_dlogits,
-                            &h_pooled,
-                            &self.lm_head.w,
-                            &self.lm_head.g,
-                        );
-                        dl_dh_cpu_opt = Some(dl_dh_cpu);
-                    }
-                    if parity_check {
-                        let h_pooled_gpu = gpu.read_hpooled();
-                        if !h_pooled_gpu.is_empty() {
-                            let h_pooled = nalgebra::DVector::from_vec(h_pooled_gpu);
-                            let sampled = gpu_lm.last_sampled_indices();
-                            if !sampled.is_empty() {
-                                let target = *targets_u32.first().unwrap_or(&0);
-                                let dl_dh_cpu_parity = Self::lmhead_backward_sampled(
-                                    sampled,
-                                    target,
-                                    &h_pooled,
-                                    &self.lm_head.w,
-                                    &self.lm_head.b,
-                                    &self.lm_head.g,
-                                );
-                                dl_dh_cpu_parity_opt = Some(dl_dh_cpu_parity);
-                            }
-                        }
-                    }
-
-                    let dl_dh_vec = if self.frozen_lm || force_cpu_lm_dldh {
-                        dl_dh_cpu_opt
-                            .as_ref()
-                            .cloned()
-                            .unwrap_or_else(|| nalgebra::DVector::zeros(self.config.d_r))
-                    } else {
-                        match gpu_lm.read_dl_dh(&gpu.device, &gpu.queue, self.config.d_r) {
-                            Ok(v) => nalgebra::DVector::from_vec(v),
-                            Err(_) => nalgebra::DVector::zeros(self.config.d_r),
-                        }
-                    };
-
-                    if parity_check {
-                        // Compare GPU dl_dh with CPU reference to detect LM backward mismatch.
-                        let dl_dh_cpu = dl_dh_cpu_parity_opt.as_ref().or(dl_dh_cpu_opt.as_ref());
-                        if let Some(dl_dh_cpu) = dl_dh_cpu {
-                            let dl_dh_gpu = if self.frozen_lm || force_cpu_lm_dldh {
-                                match gpu_lm.read_dl_dh(&gpu.device, &gpu.queue, self.config.d_r) {
-                                    Ok(v) => nalgebra::DVector::from_vec(v),
-                                    Err(_) => nalgebra::DVector::zeros(self.config.d_r),
-                                }
-                            } else {
-                                dl_dh_vec.clone()
-                            };
-                            let dot = dl_dh_cpu.dot(&dl_dh_gpu);
-                            let n_cpu = dl_dh_cpu.norm();
-                            let n_gpu = dl_dh_gpu.norm();
-                            let cos = if n_cpu > 0.0 && n_gpu > 0.0 {
-                                dot / (n_cpu * n_gpu)
-                            } else {
-                                0.0
-                            };
-                            let d_r = self.config.d_r;
-                            let rms_cpu = n_cpu / (d_r as f32).sqrt();
-                            let rms_gpu = n_gpu / (d_r as f32).sqrt();
-                            let ratio = rms_gpu / (rms_cpu + 1e-12);
-                            eprintln!(
-                                "[LM-DLDH-PARITY] cos={:.6} rms_cpu={:.6e} rms_gpu={:.6e} ratio={:.6} step={}",
-                                cos,
-                                rms_cpu,
-                                rms_gpu,
-                                ratio,
-                                self.optimizer.step_count()
-                            );
-                        }
-                    }
-
-                    // CPU CG: full Jacobian via finite differences through reasoning.step().
-                    let mut v = gradients::deq_implicit_grad(
-                        &self.reasoning,
-                        &h_star,
-                        &query_vec,
-                        &dl_dh_vec,
-                        self.config.adj_iters,
-                    );
-                    Self::clip_grad_norm(&mut v, 1.0);
-
-                    let grad_mat = v.clone() * query_vec.transpose() * self.config.deq_grad_scale;
-                    let grad_vec = v * self.config.deq_grad_scale;
-                    self.optimizer
-                        .step_matrix("deq_wq", &mut self.reasoning.w_q, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wk", &mut self.reasoning.w_k, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wv", &mut self.reasoning.w_v, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_wo", &mut self.reasoning.w_o, &grad_mat);
-                    self.optimizer
-                        .step_matrix("deq_win", &mut self.reasoning.w_in, &grad_mat);
-                    self.optimizer.step_vector(
-                        "deq_norm",
-                        &mut self.reasoning.norm_scale,
-                        &grad_vec,
-                    );
-
-                    // Sync updated weights back to GPU.
-                    let (
-                        w_hist_shared_rm,
-                        hist_slot_scale_rm,
-                        hist_slot_bias_rm,
-                        hist_gate_logit,
-                        slot_anchor_rm,
-                        w_delta_rm,
-                        b_delta,
-                        w_gate_hist_rm,
-                        w_forget_rm,
-                        b_forget_rm,
-                        w_retain_up_rm,
-                        w_retain_down_rm,
-                        b_retain_rm,
-                        w_q_mem_rm,
-                        w_k_mem_rm,
-                    ) = self.reasoning.history_params_gpu_layout();
-                    gpu.upload_weights(
-                        &gpu.queue,
-                        &self.reasoning.w_q_gpu_flat(),
-                        &self.reasoning.w_k_gpu_flat(),
-                        &self.reasoning.w_v_gpu_flat(),
-                        &self.reasoning.w_o_gpu_flat(),
-                        &self.reasoning.w_in_gpu_flat(),
-                        self.reasoning.w_x.as_slice(),
-                        self.reasoning.w_out.as_slice(),
-                        &self.reasoning.a_log_gpu_flat(),
-                        self.reasoning.norm_scale.as_slice(),
-                        w_hist_shared_rm.as_slice(),
-                        hist_slot_scale_rm.as_slice(),
-                        hist_slot_bias_rm.as_slice(),
-                        hist_gate_logit.as_slice(),
-                        slot_anchor_rm.as_slice(),
-                        w_delta_rm.as_slice(),
-                        b_delta.as_slice(),
-                        w_gate_hist_rm.as_slice(),
-                        w_forget_rm.as_slice(),
-                        b_forget_rm.as_slice(),
-                        w_retain_up_rm.as_slice(),
-                        w_retain_down_rm.as_slice(),
-                        b_retain_rm.as_slice(),
-                        w_q_mem_rm.as_slice(),
-                        w_k_mem_rm.as_slice(),
-                    );
-                    self.gpu_weights_uploaded = true;
-                    self.gpu_cg_weights_uploaded = true;
-                }
 
                 // Spectral Renormalization (Periodic)
                 let renorm_every = self.config.renorm_every_steps.max(1);
@@ -2072,6 +2195,7 @@ impl Trainer {
             if control_due || debug_due {
                 let sync_t0 = std::time::Instant::now();
                 self.cached_debug_buf = gpu.read_debug_buffer();
+                self.cached_debug_gen = self.cached_debug_gen.wrapping_add(1);
                 if audit_cost {
                     audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
                 }
@@ -2085,22 +2209,19 @@ impl Trainer {
 
                 let (heartbeat, max_h, avg_iters, hit_count, max_delta, contractivity, hit_den) =
                     Self::decode_forward_debug_metrics(fw, self.config.h_slots);
+                let debug_v901 = fw.len() > 18 && fw[8] == 901.0;
                 let _last_delta = if fw.len() > 17 { fw[17] } else { 0.0 };
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
                 let total_elems = if fw.len() > 19 { fw[19] } else { 0.0 };
                 let eps_runtime_dbg = if fw.len() > 9 { fw[9] } else { 0.0 };
-                let inj_rms = if fw.len() > 22 { fw[22] } else { 0.0 };
-                let hist_rms = if fw.len() > 23 { fw[23] } else { 0.0 };
-                let hist_ratio = if fw.len() > 24 { fw[24] } else { 0.0 };
-                let mamba_rms = if fw.len() > 25 { fw[25] } else { 0.0 };
-                let q_rms = if fw.len() > 26 { fw[26] } else { 0.0 };
-                let k_rms = if fw.len() > 27 { fw[27] } else { 0.0 };
-                let v_rms = if fw.len() > 28 { fw[28] } else { 0.0 };
-                let mix_rms = if fw.len() > 29 { fw[29] } else { 0.0 };
-                let attn_out_rms = if fw.len() > 30 { fw[30] } else { 0.0 };
-                let attn_max = if fw.len() > 31 { fw[31] } else { 0.0 };
-                let attn_entropy = if fw.len() > 32 { fw[32] } else { 0.0 };
-                let combined_rms = if fw.len() > 33 { fw[33] } else { 0.0 };
+                let signal_rms_dbg = if debug_v901 && fw.len() > 12 { fw[12] } else { 0.0 };
+                let pre_rms_dbg = if debug_v901 && fw.len() > 13 { fw[13] } else { 0.0 };
+                let fh_rms_dbg = if debug_v901 && fw.len() > 14 { fw[14] } else { 0.0 };
+                let hprev_rms_dbg = if debug_v901 && fw.len() > 15 { fw[15] } else { 0.0 };
+                let nscale_abs_dbg = if debug_v901 && fw.len() > 16 { fw[16] } else { 0.0 };
+                let pre2h_dbg = if debug_v901 && fw.len() > 17 { fw[17] } else { 0.0 };
+                let fh2h_dbg = if debug_v901 && fw.len() > 18 { fw[18] } else { 0.0 };
+                let mamba_rms = if !debug_v901 && fw.len() > 25 { fw[25] } else { 0.0 };
                 let hist0 = if fw.len() > 100 { fw[100] } else { 0.0 };
                 let hist1 = if fw.len() > 101 { fw[101] } else { 0.0 };
                 let hist2 = if fw.len() > 102 { fw[102] } else { 0.0 };
@@ -2113,13 +2234,7 @@ impl Trainer {
                 let hist_force_nomamba = if fw.len() > 109 { fw[109] } else { 0.0 };
                 let hist_prelude_skip = if fw.len() > 110 { fw[110] } else { 0.0 };
                 let hist_loop_force_nomamba = if fw.len() > 111 { fw[111] } else { 0.0 };
-                let fpm_enabled = std::env::var("AIDEEN_FPM")
-                    .ok()
-                    .map(|v| {
-                        let vl = v.trim().to_ascii_lowercase();
-                        vl == "1" || vl == "true" || vl == "yes"
-                    })
-                    .unwrap_or(false);
+                let fpm_enabled = Self::effective_fpm_enabled();
                 let mut fpm_status = SolveStatus::Unconverged;
                 let mut fpm_step_diag = String::new();
                 if let Some(metrics) = if fpm_enabled {
@@ -2127,15 +2242,14 @@ impl Trainer {
                 } else {
                     None
                 } {
-                    fpm_status =
-                        Self::classify_fpm_solve(metrics, max_h, contractivity, epsilon);
+                    fpm_status = Self::classify_fpm_solve(metrics, max_h, contractivity, epsilon);
                     fpm_step_diag = format!(
-                        " status={} err_h={:.3e} exit_err_h={:.3e} exit_iter={:.2} err_M={:.3e} z_max={:.3} z_avg={:.3} u2v_max={:.3e} memctx_rms={:.3e} memctx/sig={:.3e} dead={:.0} sat={:.0} rescue={:.0}/{:.0} pre_rescue={:.0} eps={:.3e} a_m={:.3} tau={:.2}",
+                        " status={} err_h={:.3e} exit_err_h={:.3e} exit_iter={:.2} upd_M={:.3e} z_max={:.3} z_avg={:.3} u2v_max={:.3e} memctx_rms={:.3e} memctx/sig={:.3e} dead={:.0} sat={:.0} rescue={:.0}/{:.0} pre_rescue={:.0} eps={:.3e} a_m={:.3} tau={:.2}",
                         fpm_status.label(),
                         metrics.max_err_h,
                         metrics.exit_err_h,
                         metrics.exit_iter,
-                        metrics.max_err_m,
+                        metrics.max_mem_update,
                         metrics.max_z,
                         metrics.avg_z,
                         metrics.max_update_ratio,
@@ -2189,7 +2303,6 @@ impl Trainer {
 
                 let seq = heartbeat.max(1.0);
                 let hit = hit_count.max(0.0);
-                let hit_ratio = hit / hit_den.max(1.0);
                 // ---------- v13.2 Stability Oracle Logic ----------
 
                 // 1. CG Adaptation
@@ -2288,7 +2401,7 @@ impl Trainer {
                         fpm_status,
                         SolveStatus::Unconverged | SolveStatus::NumericInvalid
                     ))
-                    || (!fpm_enabled && (hit_ratio > 0.20 || max_delta > 1e-3))
+                    || (!fpm_enabled && (hit_ratio > 0.20 || non_fpm_boost_residual))
                 {
                     self.damping_boost_left = 2; // 2 windows de debug (~20 steps)
                 }
@@ -2326,8 +2439,7 @@ impl Trainer {
                     || contractivity > 1.20
                 {
                     self.emergency_left = 3; // 3 windows de debug (~30 steps)
-                    self.adaptive_max_iters = (self.adaptive_max_iters + 2)
-                        .min(emergency_iter_cap);
+                    self.adaptive_max_iters = (self.adaptive_max_iters + 2).min(emergency_iter_cap);
                     self.max_h_growth_streak = 0;
                     self.max_delta_hi_streak = 0;
                     // Trigger spectral renorm immediately
@@ -2366,7 +2478,7 @@ impl Trainer {
                 let conv_ok = if fpm_enabled {
                     matches!(fpm_status, SolveStatus::HealthyConverged)
                 } else {
-                    hit_ratio <= 0.05 || max_delta <= (epsilon * 4.0).max(3e-4)
+                    non_fpm_conv_ok
                 };
                 let conv_str = if fpm_enabled {
                     fpm_status.label()
@@ -2384,81 +2496,89 @@ impl Trainer {
                 };
                 let hit_i = hit.round() as i32;
                 if debug_due {
-                    println!(
-                    "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} solve={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} inj_rms={:.3e} hist_rms={:.3e} hist/inj={:.3e} mamba_rms={:.3e} q/k/v={:.3e}/{:.3e}/{:.3e} mix/attn={:.3e}/{:.3e} attn_max={:.3} attn_ent={:.3} comb_rms={:.3e} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
-                    self.optimizer.step_count() % 100,
-                    hit_i,
-                    hit_den,
-                    100.0 * hit_ratio,
-                    contractivity,
-                    solve_metric,
-                    rs_cg,
-                    avg_iters,
-                    self.adaptive_max_iters,
-                    damping_eff,
-                    mode_str,
-                    conv_str,
-                    tps_debug,
-                    max_h,
-                    inj_rms,
-                    hist_rms,
-                    hist_ratio,
-                    mamba_rms,
-                    q_rms,
-                    k_rms,
-                    v_rms,
-                    mix_rms,
-                    attn_out_rms,
-                    attn_max,
-                    attn_entropy,
-                    combined_rms,
-                    hist0,
-                    hist1,
-                    hist2,
-                    hist_anchor0,
-                    hist_anchor1,
-                    hist_rms_floor,
-                    hist_contr_floor,
-                    hist_inject,
-                    hist_minner_zero,
-                    hist_force_nomamba,
-                    hist_prelude_skip,
-                    hist_loop_force_nomamba,
-                    trunc_str,
-                    total_elems
-                );
+                    if debug_v901 {
+                        println!(
+                            "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} solve={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} sig/pre/fh/h={:.3e}/{:.3e}/{:.3e}/{:.3e} nscale_max={:.3e} pre/h={:.3e} fh/h={:.3e}\x1b[0m",
+                            self.optimizer.step_count() % 100,
+                            hit_i,
+                            hit_den,
+                            100.0 * hit_ratio,
+                            contractivity,
+                            solve_metric,
+                            rs_cg,
+                            avg_iters,
+                            self.adaptive_max_iters,
+                            damping_eff,
+                            mode_str,
+                            conv_str,
+                            tps_debug,
+                            max_h,
+                            signal_rms_dbg,
+                            pre_rms_dbg,
+                            fh_rms_dbg,
+                            hprev_rms_dbg,
+                            nscale_abs_dbg,
+                            pre2h_dbg,
+                            fh2h_dbg
+                        );
+                    } else {
+                        println!(
+                            "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} solve={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} hist=[{:.3e},{:.3e},{:.3e}] anchor=[{:.3e},{:.3e}] floors=[{:.3e},{:.3e}] flags=[{:.0},{:.0},{:.0},{:.0},{:.0}] shared={} total={:.0}\x1b[0m",
+                            self.optimizer.step_count() % 100,
+                            hit_i,
+                            hit_den,
+                            100.0 * hit_ratio,
+                            contractivity,
+                            solve_metric,
+                            rs_cg,
+                            avg_iters,
+                            self.adaptive_max_iters,
+                            damping_eff,
+                            mode_str,
+                            conv_str,
+                            tps_debug,
+                            max_h,
+                            hist0,
+                            hist1,
+                            hist2,
+                            hist_anchor0,
+                            hist_anchor1,
+                            hist_rms_floor,
+                            hist_contr_floor,
+                            hist_inject,
+                            hist_minner_zero,
+                            hist_force_nomamba,
+                            hist_prelude_skip,
+                            hist_loop_force_nomamba,
+                            trunc_str,
+                            total_elems
+                        );
+                    }
                     if !fpm_step_diag.is_empty() {
                         println!("    \x1b[90m[FPM-STEP]{}\x1b[0m", fpm_step_diag);
                     }
+                    if debug_v901 {
+                        let slot_solve = (0..self.config.h_slots)
+                            .filter_map(|slot| {
+                                let base = 32 + slot * 5;
+                                if fw.len() <= base + 4 {
+                                    return None;
+                                }
+                                Some(format!(
+                                    "s{}:Δ={:.2e},hit={:.0},it={:.1},c={:.2},h={:.2e}",
+                                    slot,
+                                    fw[base],
+                                    fw[base + 1],
+                                    fw[base + 2],
+                                    fw[base + 3],
+                                    fw[base + 4]
+                                ))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        println!("    \x1b[90m[GPU-SLOTS] {}\x1b[0m", slot_solve);
+                    }
                 }
-                let hist_w_grad = fw.get(64).copied().unwrap_or(0.0);
-                let hist_w_step = fw.get(65).copied().unwrap_or(0.0);
-                let hist_w_before = fw.get(66).copied().unwrap_or(0.0);
-                let hist_w_after = fw.get(67).copied().unwrap_or(0.0);
-                let hist_gate_grad = fw.get(68).copied().unwrap_or(0.0);
-                let hist_gate_step = fw.get(69).copied().unwrap_or(0.0);
-                let hist_gate_before = fw.get(70).copied().unwrap_or(0.0);
-                let hist_gate_after = fw.get(71).copied().unwrap_or(0.0);
-                let hist_lr = fw.get(80).copied().unwrap_or(0.0);
-                let hist_grad_scale = fw.get(81).copied().unwrap_or(0.0);
-                let hist_wd = fw.get(82).copied().unwrap_or(0.0);
-                if debug_due {
-                    println!(
-                    "    \x1b[90m[GPU-HIST] W_hist grad/step/before/after={:.3e}/{:.3e}/{:.3e}/{:.3e} gate grad/step/before/after={:.3e}/{:.3e}/{:.3e}/{:.3e} lr={:.3e} gscale={:.3e} wd={:.3e}\x1b[0m",
-                    hist_w_grad,
-                    hist_w_step,
-                    hist_w_before,
-                    hist_w_after,
-                    hist_gate_grad,
-                    hist_gate_step,
-                    hist_gate_before,
-                    hist_gate_after,
-                    hist_lr,
-                    hist_grad_scale,
-                    hist_wd
-                );
-                }
-
                 // GPU-SSM per-slot decay diagnostics (activar con AIDEEN_SSM_DEBUG=1).
                 if debug_due && self.cfg_ssm_debug {
                     let carrier = gpu.read_hist_carrier_params_full();
@@ -2538,11 +2658,11 @@ impl Trainer {
                         + audit_sync_ms
                         + audit_renorm_ms,
                 );
-                let (qkv_bytes, wo_bytes, win_bytes, hist_lower_bound) = audit_forward_bytes;
-                let dense_lower_bound = qkv_bytes + wo_bytes + win_bytes + hist_lower_bound;
+                let (qkv_bytes, wo_bytes, win_bytes, aux_lower_bound) = audit_forward_bytes;
+                let dense_lower_bound = qkv_bytes + wo_bytes + win_bytes + aux_lower_bound;
                 let forward_secs = (audit_forward_ms / 1e3).max(1e-9);
                 eprintln!(
-                    "[FORWARD-BW] step={} batch={} seq={} iters_cap={} qkv_lb={:.3}GiB wo_lb={:.3}GiB win_once={:.3}GiB hist_lb={:.3}GiB dense_lb={:.3}GiB dense_lb_bw={:.1}GiB/s",
+                    "[FORWARD-BW] step={} batch={} seq={} iters_cap={} qkv_lb={:.3}GiB wo_lb={:.3}GiB win_once={:.3}GiB aux_lb={:.3}GiB dense_lb={:.3}GiB dense_lb_bw={:.1}GiB/s",
                     self.optimizer.step_count(),
                     fwd_batch_size,
                     per_seq_len,
@@ -2550,7 +2670,7 @@ impl Trainer {
                     Self::gib(qkv_bytes),
                     Self::gib(wo_bytes),
                     Self::gib(win_bytes),
-                    Self::gib(hist_lower_bound),
+                    Self::gib(aux_lower_bound),
                     Self::gib(dense_lower_bound),
                     Self::gib(dense_lower_bound) / forward_secs,
                 );
@@ -2558,8 +2678,12 @@ impl Trainer {
 
             if let Some(loss) = self.cached_loss_after_sync(gpu, false) {
                 self.last_gpu_loss = loss;
+                return loss;
             }
-            return self.last_gpu_loss;
+            // No fresh GPU loss was read this step. Returning the last cached value would
+            // silently contaminate epoch_loss_avg with stale or zero data, so report "no sample"
+            // and let the caller skip this step in the running average.
+            return f32::NAN;
         }
         0.0
     }
@@ -2684,17 +2808,23 @@ impl Trainer {
                     let warmup_factor = (current_step as f32 + 1.0) / 100.0;
                     let original_lr = self.optimizer.lr;
                     self.optimizer.lr *= warmup_factor;
-                    epoch_loss += self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    let loss = self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    if loss.is_finite() && loss > 0.0 {
+                        epoch_loss += loss;
+                        num_chunks += 1;
+                    }
                     self.optimizer.lr = original_lr;
                 } else {
-                    epoch_loss += self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    let loss = self.train_sequence(batch_ctx, batch_tgt, reset_requested, eps);
+                    if loss.is_finite() && loss > 0.0 {
+                        epoch_loss += loss;
+                        num_chunks += 1;
+                    }
                 }
-                num_chunks += 1;
                 interval_tokens += batch_ctx.len();
                 total_tokens += batch_ctx.len();
                 #[cfg(feature = "wgpu")]
-                if self.cfg_tps_sync_every != 0
-                    && num_chunks % self.cfg_tps_sync_every == 0 {
+                if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0 {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
                         // Progress cadence is observability, not model math. Use a non-blocking
                         // drain here so progress reporting does not stall the fused hot path.
@@ -2717,7 +2847,8 @@ impl Trainer {
                     let window_tps = interval_tokens as f32 / interval_elapsed.max(1e-9);
                     let epoch_elapsed = t_start.elapsed().as_secs_f32();
                     let epoch_tps = total_tokens as f32 / epoch_elapsed.max(1e-9);
-                    let current_loss_disp = self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
+                    let current_loss_disp =
+                        self.visible_loss_text(Some(epoch_loss / num_chunks as f32));
 
                     println!(
                         "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
@@ -3233,15 +3364,6 @@ impl Trainer {
     // Gradient clipping global (L2 norm)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Escala `grad` in-place si su norma L2 supera `max_norm`.
-    /// Equivalente a `clip_grad_norm_` de PyTorch para un único tensor.
-    fn clip_grad_norm(grad: &mut nalgebra::DVector<f32>, max_norm: f32) {
-        let norm = grad.norm();
-        if norm > max_norm {
-            *grad *= max_norm / (norm + 1e-6);
-        }
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
     // Streaming dataloader — entrenamiento desde archivo binario de tokens
     // ─────────────────────────────────────────────────────────────────────────
@@ -3405,7 +3527,8 @@ impl Trainer {
                             let seg_len = train_seg.len().min(tgt_seg.len());
                             let mut offset = 0usize;
                             while offset < seg_len {
-                                let remaining = max_batch_tokens.saturating_sub(batch_train_buf.len());
+                                let remaining =
+                                    max_batch_tokens.saturating_sub(batch_train_buf.len());
                                 if remaining == 0 {
                                     // Flush full batch before consuming more.
                                     let is_val = self.cfg_val_every != 0
@@ -3427,7 +3550,7 @@ impl Trainer {
                                             "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
                                             num_chunks, loss
                                         );
-                                    } else {
+                                    } else if loss.is_finite() && loss > 0.0 {
                                         epoch_loss += loss;
                                         train_chunks += 1;
                                     }
@@ -3438,7 +3561,8 @@ impl Trainer {
                                     batch_tgt_buf.clear();
                                     #[cfg(feature = "wgpu")]
                                     if self.cfg_tps_sync_every != 0
-                                        && num_chunks % self.cfg_tps_sync_every == 0 {
+                                        && num_chunks % self.cfg_tps_sync_every == 0
+                                    {
                                         if let Some(gpu) = self.gpu_deq.as_ref() {
                                             gpu.device.poll(wgpu::Maintain::Poll);
                                         }
@@ -3447,7 +3571,8 @@ impl Trainer {
                                 }
 
                                 let take = remaining.min(seg_len - offset);
-                                batch_train_buf.extend_from_slice(&train_seg[offset..offset + take]);
+                                batch_train_buf
+                                    .extend_from_slice(&train_seg[offset..offset + take]);
                                 batch_tgt_buf.extend_from_slice(&tgt_seg[offset..offset + take]);
                                 offset += take;
                             }
@@ -3463,15 +3588,19 @@ impl Trainer {
                                     self.eval_mode = true;
                                 }
                                 let eps = self.progressive_epsilon(epoch, epochs);
-                                let loss =
-                                    self.train_sequence(&batch_train_buf, &batch_tgt_buf, seg_start > 0, eps);
+                                let loss = self.train_sequence(
+                                    &batch_train_buf,
+                                    &batch_tgt_buf,
+                                    seg_start > 0,
+                                    eps,
+                                );
                                 if is_val {
                                     self.eval_mode = false;
                                     println!(
                                         "    \x1b[93m[VAL] chunk {:>5}  val_loss={:.4}\x1b[0m",
                                         num_chunks, loss
                                     );
-                                } else {
+                                } else if loss.is_finite() && loss > 0.0 {
                                     epoch_loss += loss;
                                     train_chunks += 1;
                                 }
@@ -3482,7 +3611,8 @@ impl Trainer {
                                 batch_tgt_buf.clear();
                                 #[cfg(feature = "wgpu")]
                                 if self.cfg_tps_sync_every != 0
-                                    && num_chunks % self.cfg_tps_sync_every == 0 {
+                                    && num_chunks % self.cfg_tps_sync_every == 0
+                                {
                                     if let Some(gpu) = self.gpu_deq.as_ref() {
                                         gpu.device.poll(wgpu::Maintain::Poll);
                                     }
@@ -3513,16 +3643,19 @@ impl Trainer {
                     // EOF: flush any remaining accumulated chunks (< batch_size_file)
                     if !batch_train_buf.is_empty() {
                         let eps = self.progressive_epsilon(epoch, epochs);
-                        let loss = self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
-                        epoch_loss += loss;
-                        train_chunks += 1;
+                        let loss =
+                            self.train_sequence(&batch_train_buf, &batch_tgt_buf, false, eps);
+                        if loss.is_finite() && loss > 0.0 {
+                            epoch_loss += loss;
+                            train_chunks += 1;
+                        }
                         num_chunks += 1;
                         total_tokens += batch_train_buf.len();
                         batch_train_buf.clear();
                         batch_tgt_buf.clear();
                         #[cfg(feature = "wgpu")]
-                        if self.cfg_tps_sync_every != 0
-                            && num_chunks % self.cfg_tps_sync_every == 0 {
+                        if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0
+                        {
                             if let Some(gpu) = self.gpu_deq.as_ref() {
                                 gpu.device.poll(wgpu::Maintain::Poll);
                             }
@@ -3545,7 +3678,8 @@ impl Trainer {
                     }
                     let elapsed = t_start.elapsed().as_secs_f32();
                     let tps_run = total_tokens as f32 / elapsed.max(1e-9);
-                    let tps_win = interval_tokens as f32 / interval_start.elapsed().as_secs_f32().max(1e-9);
+                    let tps_win =
+                        interval_tokens as f32 / interval_start.elapsed().as_secs_f32().max(1e-9);
                     let current_loss = self.visible_loss_text(if train_chunks > 0 {
                         Some(epoch_loss / train_chunks as f32)
                     } else {
@@ -3649,13 +3783,7 @@ impl Trainer {
                 );
                 #[cfg(feature = "wgpu")]
                 {
-                    let fpm_enabled = std::env::var("AIDEEN_FPM")
-                        .ok()
-                        .map(|v| {
-                            let vl = v.trim().to_ascii_lowercase();
-                            vl == "1" || vl == "true" || vl == "yes"
-                        })
-                        .unwrap_or(false);
+                    let fpm_enabled = Self::effective_fpm_enabled();
                     let wdelta_audit = std::env::var("AIDEEN_WDELTA_AUDIT")
                         .ok()
                         .map(|v| {
@@ -3735,9 +3863,14 @@ impl Trainer {
                                 .join(",");
                             let rescue = slot_diag
                                 .iter()
-                                .map(|(_, _, _, rescue, recovered, _, _, _, _, _, entered, pre)| {
-                                    format!("{:.0}/{:.0}/{:.0}/{:.0}", rescue, recovered, entered, pre)
-                                })
+                                .map(
+                                    |(_, _, _, rescue, recovered, _, _, _, _, _, entered, pre)| {
+                                        format!(
+                                            "{:.0}/{:.0}/{:.0}/{:.0}",
+                                            rescue, recovered, entered, pre
+                                        )
+                                    },
+                                )
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let dead = slot_diag
@@ -3747,7 +3880,9 @@ impl Trainer {
                                 .join(",");
                             let ratio = slot_diag
                                 .iter()
-                                .map(|(_, _, _, _, _, _, ratio, _, _, _, _, _)| format!("{ratio:.3e}"))
+                                .map(|(_, _, _, _, _, _, ratio, _, _, _, _, _)| {
+                                    format!("{ratio:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let sat = slot_diag
@@ -3770,11 +3905,6 @@ impl Trainer {
                                 .map(|(_, _, mx, _, _, _)| format!("{mx:.3}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
-                            let retain_avg = slot_read
-                                .iter()
-                                .map(|(_, _, _, avg, _, _)| format!("{avg:.3}"))
-                                .collect::<Vec<_>>()
-                                .join(",");
                             let prop_rms = slot_read
                                 .iter()
                                 .map(|(_, _, _, _, pr, _)| format!("{pr:.3e}"))
@@ -3786,7 +3916,7 @@ impl Trainer {
                                 .collect::<Vec<_>>()
                                 .join(",");
                             println!(
-                                "    [FPM-DIAG] err_h=[{}] exit_err_h=[{}] exit_iter=[{}] err_M=[{}] z=[{}] rescue=[{}] dead=[{}] u2v=[{}] sat=[{}] read_rms=[{}] read2sig=[{}] retain_max=[{}] retain_avg=[{}] prop_rms=[{}] cand_rms=[{}] alpha_m={:.3} tau={:.2}",
+                                "    [FPM-DIAG] err_h=[{}] exit_err_h=[{}] exit_iter=[{}] upd_M=[{}] z=[{}] rescue=[{}] dead=[{}] u2v=[{}] sat=[{}] read_rms=[{}] read2sig=[{}] retain_max=[{}] prop_rms=[{}] cand_rms=[{}] alpha_m={:.3} tau={:.2}",
                                 err_h,
                                 exit_err_h,
                                 exit_iter,
@@ -3799,7 +3929,6 @@ impl Trainer {
                                 read_rms,
                                 read_to_sig,
                                 retain_max,
-                                retain_avg,
                                 prop_rms,
                                 cand_rms,
                                 self.fpm_alpha_m_current,
@@ -3811,11 +3940,88 @@ impl Trainer {
                              */
                         }
                     }
+                    // Slot-coord diagnostics (slot attention, active in DEQ_NO_MAMBA mode)
+                    if Self::slot_coord_mode_active() && !self.cached_debug_buf.is_empty() {
+                        let slot_obs = Self::decode_slot_observability_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
+                        let slot_diag = Self::decode_fpm_diag_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
+                        let slot_path_audit = if let Some(gpu) = self.gpu_deq.as_ref() {
+                            if self.cfg_slot_path_audit {
+                                self.slot_path_audit_stats(gpu, self.config.ctx_len as u32)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if slot_obs.iter().any(|(sw, ent, _)| sw.abs() > 1e-6 || ent.abs() > 1e-6) {
+                            let assign = slot_obs
+                                .iter()
+                                .map(|(sw, _, _)| format!("{sw:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let entropy = slot_obs
+                                .iter()
+                                .map(|(_, ent, _)| format!("{ent:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let err_h = slot_diag
+                                .iter()
+                                .map(|(eh, _, _, _, _, _, _, _, _, _, _, _)| format!("{eh:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let iters = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, ei, _, _)| format!("{ei:.2}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let dead = slot_diag
+                                .iter()
+                                .map(|(_, _, _, _, _, dead, _, _, _, _, _, _)| format!("{dead:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            if let Some(incoming) = slot_path_audit
+                                .as_deref()
+                                .and_then(Self::extract_slot_incoming)
+                            {
+                                println!(
+                                    "    [SLOT-COORD] self_assign=[{}] incoming=[{}] entropy=[{}] err_h=[{}] iters=[{}] self_lt_tau=[{}]",
+                                    assign, incoming, entropy, err_h, iters, dead
+                                );
+                            } else {
+                                println!(
+                                    "    [SLOT-COORD] self_assign=[{}] entropy=[{}] err_h=[{}] iters=[{}] self_lt_tau=[{}]",
+                                    assign, entropy, err_h, iters, dead
+                                );
+                            }
+                        }
+                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                            if let Some((dq, dk, dv, do_, din, dbias)) =
+                                self.slot_weight_specialization_stats(gpu)
+                            {
+                                println!(
+                                    "    [SLOT-WEIGHTS] q={:.3e} k={:.3e} v={:.3e} o={:.3e} in={:.3e} bias={:.3e}",
+                                    dq, dk, dv, do_, din, dbias
+                                );
+                            }
+                            if let Some(audit) = slot_path_audit {
+                                println!("    [SLOT-PATH] {audit}");
+                            }
+                        }
+                    }
                     if fpm_enabled && wdelta_audit {
                         self.sync_inference_weights();
                         if let Some(gpu) = self.gpu_deq.as_ref() {
-                            let ((w_hist_mean, w_hist_max), (w_delta_mean, w_delta_max), (b_delta_mean, b_delta_max)) =
-                                gpu.read_hist_selective_param_stats();
+                            let (
+                                (w_hist_mean, w_hist_max),
+                                (w_delta_mean, w_delta_max),
+                                (b_delta_mean, b_delta_max),
+                            ) = gpu.read_hist_selective_param_stats();
                             let ((delta_mean, delta_max, delta_nz), (a_mean, a_min, a_max)) =
                                 gpu.read_hist_selective_forward_stats(self.config.ctx_len as u32);
                             println!(
@@ -3915,7 +4121,6 @@ impl Trainer {
                     );
                 }
             }
-
         }
         Ok(())
     }
@@ -4116,7 +4321,8 @@ impl Trainer {
             self.completed_file_epochs.to_string(),
         );
         if let Some(best) = self.plateau_best_loss {
-            model.metadata
+            model
+                .metadata
                 .insert("plateau_best_loss".to_string(), best.to_string());
         }
         model.metadata.insert(
@@ -4307,171 +4513,191 @@ impl Trainer {
 
     #[cfg(feature = "wgpu")]
     pub fn sync_inference_weights(&mut self) {
+        if Self::slot_coord_mode_active() {
+            // Temporary GPU-only guard for slot-coord mode:
+            // the active training state contains per-slot Q/K/V/O/W_in matrices on GPU, while the
+            // CPU-side reasoning object can only represent shared prototypes plus a few slot-wise
+            // terms. Averaging GPU slot matrices back into CPU loses specialization and risks
+            // re-uploading flattened weights later in the same process or after a checkpoint round-trip.
+            //
+            // Removal criteria: replace this guard once checkpoint/export paths can serialize and
+            // restore exact per-slot slot-coord weights instead of lossy shared averages.
+            return;
+        }
         if let Some(gpu) = self.gpu_deq.as_ref() {
             // Sincronizar DEQ Core solo si los pesos fueron subidos/actualizados en GPU.
             if self.gpu_weights_uploaded {
                 if let Ok((wq, wk, wv, wo, win, wx, wout, alog, nscale)) = gpu.read_weights() {
-                let to_mat = |vec: Vec<f32>| {
-                    let d_r = self.config.d_r;
-                    nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
-                };
-                // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    let mat_total = h_slots * d_r * d_r;
-                    // Average per-slot matrices into CPU prototype (used for checkpoint only)
-                    let avg_mat = |flat: &[f32]| -> Vec<f32> {
-                        (0..d_r * d_r)
+                    let to_mat = |vec: Vec<f32>| {
+                        let d_r = self.config.d_r;
+                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &vec)
+                    };
+                    // wq/wk contain [h_slots * d*d matrices | h_slots*d bias] — split and average.
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        let mat_total = h_slots * d_r * d_r;
+                        // Average per-slot matrices into CPU prototype (used for checkpoint only)
+                        let avg_mat = |flat: &[f32]| -> Vec<f32> {
+                            (0..d_r * d_r)
+                                .map(|i| {
+                                    (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                        / h_slots as f32
+                                })
+                                .collect()
+                        };
+                        self.reasoning.w_q = nalgebra::DMatrix::from_column_slice(
+                            d_r,
+                            d_r,
+                            &avg_mat(&wq[..mat_total]),
+                        );
+                        self.reasoning.q_bias =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
+                        self.reasoning.w_k = nalgebra::DMatrix::from_column_slice(
+                            d_r,
+                            d_r,
+                            &avg_mat(&wk[..mat_total]),
+                        );
+                        self.reasoning.k_bias =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
+                    }
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
+                        let avg: Vec<f32> = (0..d_r * d_r)
                             .map(|i| {
-                                (0..h_slots).map(|s| flat[s * d_r * d_r + i]).sum::<f32>()
+                                (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
                                     / h_slots as f32
                             })
-                            .collect()
-                    };
-                    self.reasoning.w_q =
-                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wq[..mat_total]));
-                    self.reasoning.q_bias =
-                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wq[mat_total..]);
-                    self.reasoning.w_k =
-                        nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg_mat(&wk[..mat_total]));
-                    self.reasoning.k_bias =
-                        nalgebra::DMatrix::from_row_slice(h_slots, d_r, &wk[mat_total..]);
-                }
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    // wv is now h_slots*d*d — average slots for CPU prototype (checkpoint only)
-                    let avg: Vec<f32> = (0..d_r * d_r)
-                        .map(|i| {
-                            (0..h_slots).map(|s| wv[s * d_r * d_r + i]).sum::<f32>()
-                                / h_slots as f32
-                        })
-                        .collect();
-                    self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
-                }
-                {
-                    let d_r = self.config.d_r;
-                    let h_slots = self.config.h_slots;
-                    // w_o is per-slot on GPU — average slots for CPU prototype (checkpoint only)
-                    let avg: Vec<f32> = (0..d_r * d_r)
-                        .map(|i| {
-                            (0..h_slots).map(|s| wo[s * d_r * d_r + i]).sum::<f32>()
-                                / h_slots as f32
-                        })
-                        .collect();
-                    self.reasoning.w_o = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
-                }
-                // win is h_slots*d*d — average slots for CPU representation.
-                let d_r = self.config.d_r;
-                let h_slots = self.config.h_slots;
-                let mut win_avg = vec![0.0f32; d_r * d_r];
-                for s in 0..h_slots {
-                    let base = s * d_r * d_r;
-                    for i in 0..d_r * d_r {
-                        win_avg[i] += win[base + i];
+                            .collect();
+                        self.reasoning.w_v = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
                     }
-                }
-                let inv_slots = 1.0 / h_slots as f32;
-                for v in &mut win_avg {
-                    *v *= inv_slots;
-                }
-                self.reasoning.w_in = to_mat(win_avg);
-                self.reasoning.w_x = to_mat(wx);
-                self.reasoning.w_out = to_mat(wout);
-                {
-                    let h_slots = self.reasoning.config.h_slots;
-                    let d_r = self.reasoning.config.d_r;
-                    self.reasoning.a_log = nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
-                }
-                self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
-                {
-                    let d_r = self.reasoning.config.d_r;
-                    let h_slots = self.reasoning.config.h_slots;
-                    let hist = gpu.read_hist_params_full();
-                    let hist_mat_base = 0usize;
-                    let slot_scale_base = hist_mat_base + d_r * d_r;
-                    let hist_bias_base = slot_scale_base + h_slots * d_r;
-                    let hist_gate_base = hist_bias_base + h_slots * d_r;
-                    let slot_anchor_base = hist_gate_base + h_slots;
-                    let w_delta_base = slot_anchor_base + h_slots * d_r;
-                    let b_delta_base = w_delta_base + h_slots * d_r * d_r;
-                    let scalar_base = b_delta_base + d_r;
-                    let w_gate_hist_base = scalar_base + 21;
-                    let w_forget_base = w_gate_hist_base + h_slots * d_r;
-                    let b_forget_base = w_forget_base + h_slots * d_r;
-                    let hhist_gamma_base = b_forget_base + h_slots;
-                    let w_retain_up_base = hhist_gamma_base + h_slots;
-                    let w_retain_down_base = w_retain_up_base + h_slots * d_r * 32;
-                    let b_retain_base = w_retain_down_base + h_slots * 32 * d_r;
-                    let w_q_mem_base = b_retain_base + h_slots * d_r;
-                    let w_k_mem_base = w_q_mem_base + h_slots * d_r * 32;
+                    {
+                        let d_r = self.config.d_r;
+                        let h_slots = self.config.h_slots;
+                        // w_o is per-slot on GPU — average slots for CPU prototype (checkpoint only)
+                        let avg: Vec<f32> = (0..d_r * d_r)
+                            .map(|i| {
+                                (0..h_slots).map(|s| wo[s * d_r * d_r + i]).sum::<f32>()
+                                    / h_slots as f32
+                            })
+                            .collect();
+                        self.reasoning.w_o = nalgebra::DMatrix::from_column_slice(d_r, d_r, &avg);
+                    }
+                    // win is h_slots*d*d — average slots for CPU representation.
+                    let d_r = self.config.d_r;
+                    let h_slots = self.config.h_slots;
+                    let mut win_avg = vec![0.0f32; d_r * d_r];
+                    for s in 0..h_slots {
+                        let base = s * d_r * d_r;
+                        for i in 0..d_r * d_r {
+                            win_avg[i] += win[base + i];
+                        }
+                    }
+                    let inv_slots = 1.0 / h_slots as f32;
+                    for v in &mut win_avg {
+                        *v *= inv_slots;
+                    }
+                    self.reasoning.w_in = to_mat(win_avg);
+                    self.reasoning.w_x = to_mat(wx);
+                    self.reasoning.w_out = to_mat(wout);
+                    {
+                        let h_slots = self.reasoning.config.h_slots;
+                        let d_r = self.reasoning.config.d_r;
+                        self.reasoning.a_log =
+                            nalgebra::DMatrix::from_row_slice(h_slots, d_r, &alog);
+                    }
+                    self.reasoning.norm_scale = nalgebra::DVector::from_column_slice(&nscale);
+                    {
+                        let d_r = self.reasoning.config.d_r;
+                        let h_slots = self.reasoning.config.h_slots;
+                        let hist = gpu.read_hist_params_full();
+                        let hist_mat_base = 0usize;
+                        let slot_scale_base = hist_mat_base + d_r * d_r;
+                        let hist_bias_base = slot_scale_base + h_slots * d_r;
+                        let hist_gate_base = hist_bias_base + h_slots * d_r;
+                        let slot_anchor_base = hist_gate_base + h_slots;
+                        let w_delta_base = slot_anchor_base + h_slots * d_r;
+                        let b_delta_base = w_delta_base + h_slots * d_r * d_r;
+                        let scalar_base = b_delta_base + d_r;
+                        let w_gate_hist_base = scalar_base + 21;
+                        let w_forget_base = w_gate_hist_base + h_slots * d_r;
+                        let b_forget_base = w_forget_base + h_slots * d_r;
+                        let hhist_gamma_base = b_forget_base + h_slots;
+                        let w_retain_up_base = hhist_gamma_base + h_slots;
+                        let w_retain_down_base = w_retain_up_base + h_slots * d_r * 32;
+                        let b_retain_base = w_retain_down_base + h_slots * 32 * d_r;
+                        let w_q_mem_base = b_retain_base + h_slots * d_r;
+                        let w_k_mem_base = w_q_mem_base + h_slots * d_r * 32;
 
-                    self.reasoning.w_hist_shared = nalgebra::DMatrix::from_row_slice(
-                        d_r,
-                        d_r,
-                        &hist[hist_mat_base..slot_scale_base],
-                    );
-                    self.reasoning.hist_slot_scale = nalgebra::DMatrix::from_row_slice(
-                        h_slots,
-                        d_r,
-                        &hist[slot_scale_base..hist_bias_base],
-                    );
-                    self.reasoning.hist_slot_bias = nalgebra::DMatrix::from_row_slice(
-                        h_slots,
-                        d_r,
-                        &hist[hist_bias_base..hist_gate_base],
-                    );
-                    self.reasoning.hist_gate_logit =
-                        nalgebra::DVector::from_column_slice(&hist[hist_gate_base..slot_anchor_base]);
-                    self.reasoning.slot_anchor = nalgebra::DMatrix::from_row_slice(
-                        h_slots,
-                        d_r,
-                        &hist[slot_anchor_base..w_delta_base],
-                    );
-                    self.reasoning.w_delta = nalgebra::DMatrix::from_row_slice(
-                        h_slots * d_r,
-                        d_r,
-                        &hist[w_delta_base..b_delta_base],
-                    );
-                    self.reasoning.b_delta =
-                        nalgebra::DVector::from_column_slice(&hist[b_delta_base..scalar_base]);
-                    self.reasoning.w_gate_hist = nalgebra::DMatrix::from_row_slice(
-                        h_slots,
-                        d_r,
-                        &hist[w_gate_hist_base..w_forget_base],
-                    );
-                    self.reasoning.w_forget = nalgebra::DMatrix::from_row_slice(
-                        h_slots,
-                        d_r,
-                        &hist[w_forget_base..b_forget_base],
-                    );
-                    self.reasoning.b_forget =
-                        nalgebra::DVector::from_column_slice(&hist[b_forget_base..hhist_gamma_base]);
-                    self.reasoning.w_retain_up = hist[w_retain_up_base..w_retain_down_base]
-                        .chunks_exact(d_r * 32)
-                        .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
-                        .collect();
-                    self.reasoning.w_retain_down = hist[w_retain_down_base..b_retain_base]
-                        .chunks_exact(32 * d_r)
-                        .map(|chunk| nalgebra::DMatrix::from_row_slice(32, d_r, chunk))
-                        .collect();
-                    self.reasoning.b_retain = nalgebra::DMatrix::from_row_slice(
-                        h_slots,
-                        d_r,
-                        &hist[b_retain_base..w_q_mem_base],
-                    );
-                    self.reasoning.w_q_mem = hist[w_q_mem_base..w_k_mem_base]
-                        .chunks_exact(d_r * 32)
-                        .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
-                        .collect();
-                    self.reasoning.w_k_mem = hist[w_k_mem_base..]
-                        .chunks_exact(d_r * 32)
-                        .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
-                        .collect();
-                }
-                self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
-                self.gpu_cg_weights_uploaded = true;
+                        self.reasoning.w_hist_shared = nalgebra::DMatrix::from_row_slice(
+                            d_r,
+                            d_r,
+                            &hist[hist_mat_base..slot_scale_base],
+                        );
+                        self.reasoning.hist_slot_scale = nalgebra::DMatrix::from_row_slice(
+                            h_slots,
+                            d_r,
+                            &hist[slot_scale_base..hist_bias_base],
+                        );
+                        self.reasoning.hist_slot_bias = nalgebra::DMatrix::from_row_slice(
+                            h_slots,
+                            d_r,
+                            &hist[hist_bias_base..hist_gate_base],
+                        );
+                        self.reasoning.hist_gate_logit = nalgebra::DVector::from_column_slice(
+                            &hist[hist_gate_base..slot_anchor_base],
+                        );
+                        self.reasoning.slot_anchor = nalgebra::DMatrix::from_row_slice(
+                            h_slots,
+                            d_r,
+                            &hist[slot_anchor_base..w_delta_base],
+                        );
+                        self.reasoning.w_delta = nalgebra::DMatrix::from_row_slice(
+                            h_slots * d_r,
+                            d_r,
+                            &hist[w_delta_base..b_delta_base],
+                        );
+                        self.reasoning.b_delta =
+                            nalgebra::DVector::from_column_slice(&hist[b_delta_base..scalar_base]);
+                        self.reasoning.w_gate_hist = nalgebra::DMatrix::from_row_slice(
+                            h_slots,
+                            d_r,
+                            &hist[w_gate_hist_base..w_forget_base],
+                        );
+                        self.reasoning.w_forget = nalgebra::DMatrix::from_row_slice(
+                            h_slots,
+                            d_r,
+                            &hist[w_forget_base..b_forget_base],
+                        );
+                        self.reasoning.b_forget = nalgebra::DVector::from_column_slice(
+                            &hist[b_forget_base..hhist_gamma_base],
+                        );
+                        self.reasoning.w_retain_up = hist[w_retain_up_base..w_retain_down_base]
+                            .chunks_exact(d_r * 32)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                            .collect();
+                        self.reasoning.w_retain_down = hist[w_retain_down_base..b_retain_base]
+                            .chunks_exact(32 * d_r)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(32, d_r, chunk))
+                            .collect();
+                        self.reasoning.b_retain = nalgebra::DMatrix::from_row_slice(
+                            h_slots,
+                            d_r,
+                            &hist[b_retain_base..w_q_mem_base],
+                        );
+                        self.reasoning.w_q_mem = hist[w_q_mem_base..w_k_mem_base]
+                            .chunks_exact(d_r * 32)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                            .collect();
+                        self.reasoning.w_k_mem = hist[w_k_mem_base..]
+                            .chunks_exact(d_r * 32)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                            .collect();
+                    }
+                    self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
+                    self.gpu_cg_weights_uploaded = true;
                 }
             }
         }
@@ -4600,5 +4826,4 @@ mod tests {
         assert!(plain.is_finite());
         assert!(fixed.is_finite());
     }
-
 }

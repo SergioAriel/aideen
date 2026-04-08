@@ -84,6 +84,20 @@ pub struct GpuDeqBackend {
     fused_update_stage4_wk_pipeline: wgpu::ComputePipeline,
     fused_update_stage4_wv_pipeline: wgpu::ComputePipeline,
     fused_update_stage4_bias_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage0_scale_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage1_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage1b_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage2_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage3_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_signal_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_anchor_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_wo_win_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_wq_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_prep_wk_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_prep_wv_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_wk_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_wv_pipeline: wgpu::ComputePipeline,
+    slot_coord_update_stage4_bias_pipeline: wgpu::ComputePipeline,
     fused_update_hist_prep_pipeline: wgpu::ComputePipeline,
     fused_update_hist_mat_pipeline: wgpu::ComputePipeline,
     fused_update_hist_scale_pipeline: wgpu::ComputePipeline,
@@ -148,14 +162,7 @@ pub struct GpuDeqBackend {
     cfg_attn_out_mode: f32,
     cfg_attn_uniform: bool,
     cfg_attn_freeze: bool,
-    cfg_v_fixed: bool,
-    cfg_v_lag: bool,
-    cfg_v_scale: f32,
     cfg_signal_scale: f32,
-    cfg_v_gate_scale: f32,
-    cfg_v_gate_bias: f32,
-    cfg_v_norm: bool,
-    cfg_v_norm_scale: f32,
     cfg_hist_train_carrier: bool,
     cfg_hist_train_wx: bool,
     cfg_hist_train_wout: bool,
@@ -271,14 +278,15 @@ impl GpuDeqBackend {
         out.push(self.cfg_attn_out_mode);
         out.push(if self.cfg_attn_uniform { 1.0 } else { 0.0 });
         out.push(if self.cfg_attn_freeze { 1.0 } else { 0.0 });
-        out.push(if self.cfg_v_fixed { 1.0 } else { 0.0 });
-        out.push(if self.cfg_v_lag { 1.0 } else { 0.0 });
-        out.push(self.cfg_v_scale);
+        // Reserved legacy V-path slots kept at neutral values to preserve checkpoint/layout compatibility.
+        out.push(0.0);
+        out.push(0.0);
+        out.push(1.0);
         out.push(self.cfg_signal_scale);
-        out.push(self.cfg_v_gate_scale);
-        out.push(self.cfg_v_gate_bias);
-        out.push(if self.cfg_v_norm { 1.0 } else { 0.0 });
-        out.push(self.cfg_v_norm_scale);
+        out.push(0.0);
+        out.push(0.0);
+        out.push(0.0);
+        out.push(1.0);
         // W_gate_hist: h_slots × d_model dynamic gate query matrix (after 21 scalars)
         out.extend_from_slice(w_gate_hist);
         // Forget gate parameters: W_forget (h×d) and b_forget (h)
@@ -303,8 +311,14 @@ impl GpuDeqBackend {
         // base: (h+1)*d² + 5*h*d + 2*h + d + 21 + h(γ)
         // retain gate: W_up(h*d*r) + W_down(h*r*d) + b_retain(h*d)
         // memory read: W_q_mem(h*d*r) + W_k_mem(h*d*r)
-        (h + 1) * d * d + 5 * h * d + 2 * h + d + 21 + h
-            + 2 * h * d * RETAIN_RANK + h * d
+        (h + 1) * d * d
+            + 5 * h * d
+            + 2 * h
+            + d
+            + 21
+            + h
+            + 2 * h * d * RETAIN_RANK
+            + h * d
             + 2 * h * d * MEM_READ_RANK
     }
 
@@ -369,8 +383,8 @@ impl GpuDeqBackend {
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or_else(|| {
-                // Default now is the clean DEQ core: no slot-attention, no history in the solve.
-                -2.0
+                // Baseline runtime defaults to slot coordination enabled.
+                -1.0
             });
         alpha
     }
@@ -525,9 +539,20 @@ impl GpuDeqBackend {
         });
 
         // Fused Update Pipeline setup
+        let slot_coord_head_dim = std::env::var("AIDEEN_DEQ_SLOT_ATTN_HEAD_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(8, 32))
+            .unwrap_or(32);
         let update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fused DEQ Update Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fused_deq_update.wgsl").into()),
+        });
+        let slot_coord_update_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Slot Coordination Update Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/fused_slot_coord_update.wgsl").into(),
+            ),
         });
         let fpm_retain_bwd_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FPM Retain Gate Backward Shader"),
@@ -715,7 +740,6 @@ impl GpuDeqBackend {
                 },
             ],
         });
-
 
         // fpm_retain_bwd_bg0_layout: 6 bindings for the retain-gate backward kernel.
         // bindings 0-5: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients, tbptt_carry.
@@ -1011,6 +1035,201 @@ impl GpuDeqBackend {
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_bias_main"),
                 compilation_options: Default::default(),
+                cache: None,
+            });
+        let slot_coord_bias_mode = std::env::var("AIDEEN_SLOT_COORD_BIAS_MODE")
+            .unwrap_or_else(|_| "trainable".to_string());
+        let slot_coord_use_bias = !matches!(slot_coord_bias_mode.as_str(), "off" | "none" | "0");
+        let slot_coord_train_bias =
+            matches!(slot_coord_bias_mode.as_str(), "trainable" | "on" | "1");
+        let slot_coord_logit_gain = std::env::var("AIDEEN_SLOT_COORD_LOGIT_GAIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.1, 32.0);
+        let mut slot_coord_constants = std::collections::HashMap::new();
+        slot_coord_constants.insert(
+            "SLOT_COORD_HEAD_DIM".to_string(),
+            slot_coord_head_dim as f64,
+        );
+        slot_coord_constants.insert(
+            "SLOT_COORD_USE_BIAS".to_string(),
+            if slot_coord_use_bias { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "SLOT_COORD_TRAIN_BIAS".to_string(),
+            if slot_coord_train_bias { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "SLOT_COORD_LOGIT_GAIN".to_string(),
+            slot_coord_logit_gain as f64,
+        );
+        let slot_coord_update_stage0_scale_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage0 Scale Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage0_scale_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage1_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage1 Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage1_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage1b_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage1b Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage1b_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage2_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage2 Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage2_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage3_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage3 Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage3_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_signal_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Signal Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_signal_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_anchor_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Anchor Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_anchor_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_wo_win_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 WO/WIN Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_wo_win_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_wq_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 WQ Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_wq_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_prep_wk_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Prep WK Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_prep_wk_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_prep_wv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Prep WV Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_prep_wv_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_wk_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 WK Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_wk_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_wv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 WV Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_wv_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
+        let slot_coord_update_stage4_bias_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SlotCoord Update Stage4 Bias Pipeline"),
+                layout: Some(&pl),
+                module: &slot_coord_update_shader,
+                entry_point: Some("slot_coord_stage4_bias_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &slot_coord_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
                 cache: None,
             });
         let fused_update_hist_prep_pipeline =
@@ -1482,7 +1701,9 @@ impl GpuDeqBackend {
         let fused_gscore_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Gscore Buffer"),
             size: gscore_entries * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let fused_qgrad_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1921,22 +2142,13 @@ impl GpuDeqBackend {
             bool_flag("AIDEEN_DEQ_HIST_LOOP_FORCE_NOMAMBA").unwrap_or(false);
         let cfg_signal_zero = bool_flag("AIDEEN_DEQ_SIGNAL_ZERO").unwrap_or(false);
         let cfg_attn_out_mode = f32_flag("AIDEEN_DEQ_ATTN_OUT_MODE")
-            .unwrap_or(0.0)
+            .unwrap_or(1.0)
             .clamp(0.0, 2.0);
         let cfg_attn_uniform = bool_flag("AIDEEN_DEQ_ATTN_UNIFORM").unwrap_or(false);
         let cfg_attn_freeze = bool_flag("AIDEEN_DEQ_ATTN_FREEZE").unwrap_or(false);
-        let cfg_v_fixed = bool_flag("AIDEEN_DEQ_V_FIXED").unwrap_or(false);
-        let cfg_v_lag = bool_flag("AIDEEN_DEQ_V_LAG").unwrap_or(false);
-        let cfg_v_scale = f32_flag("AIDEEN_DEQ_V_SCALE")
-            .unwrap_or(1.0)
-            .clamp(0.01, 10.0);
         let cfg_signal_scale = f32_flag("AIDEEN_DEQ_SIGNAL_SCALE")
             .unwrap_or(1.0)
             .clamp(0.01, 10.0);
-        let cfg_v_gate_scale = f32_flag("AIDEEN_DEQ_V_GATE_SCALE").unwrap_or(0.0);
-        let cfg_v_gate_bias = f32_flag("AIDEEN_DEQ_V_GATE_BIAS").unwrap_or(0.0);
-        let cfg_v_norm = bool_flag("AIDEEN_DEQ_V_NORM").unwrap_or(false);
-        let cfg_v_norm_scale = f32_flag("AIDEEN_DEQ_V_NORM_SCALE").unwrap_or(1.0);
         let cfg_picard_profile = bool_flag("AIDEEN_PICARD_PROFILE").unwrap_or(false);
         let cfg_picard_stage_profile = bool_flag("AIDEEN_PICARD_STAGE_PROFILE").unwrap_or(false);
         let cfg_picard_accum_split = bool_flag("AIDEEN_PICARD_ACCUM_SPLIT")
@@ -1987,6 +2199,20 @@ impl GpuDeqBackend {
             fused_update_stage4_wk_pipeline,
             fused_update_stage4_wv_pipeline,
             fused_update_stage4_bias_pipeline,
+            slot_coord_update_stage0_scale_pipeline,
+            slot_coord_update_stage1_pipeline,
+            slot_coord_update_stage1b_pipeline,
+            slot_coord_update_stage2_pipeline,
+            slot_coord_update_stage3_pipeline,
+            slot_coord_update_stage4_signal_pipeline,
+            slot_coord_update_stage4_anchor_pipeline,
+            slot_coord_update_stage4_wo_win_pipeline,
+            slot_coord_update_stage4_wq_pipeline,
+            slot_coord_update_stage4_prep_wk_pipeline,
+            slot_coord_update_stage4_prep_wv_pipeline,
+            slot_coord_update_stage4_wk_pipeline,
+            slot_coord_update_stage4_wv_pipeline,
+            slot_coord_update_stage4_bias_pipeline,
             fused_update_hist_prep_pipeline,
             fused_update_hist_mat_pipeline,
             fused_update_hist_scale_pipeline,
@@ -2046,14 +2272,7 @@ impl GpuDeqBackend {
             cfg_attn_out_mode,
             cfg_attn_uniform,
             cfg_attn_freeze,
-            cfg_v_fixed,
-            cfg_v_lag,
-            cfg_v_scale,
             cfg_signal_scale,
-            cfg_v_gate_scale,
-            cfg_v_gate_bias,
-            cfg_v_norm,
-            cfg_v_norm_scale,
             cfg_hist_train_carrier,
             cfg_hist_train_wx,
             cfg_hist_train_wout,
@@ -2122,14 +2341,23 @@ impl GpuDeqBackend {
             // Clean-DEQ diagnostics only:
             // diag_zero_win != 0 => zero W_in injection
             // diag_one_iter != 0 => force single-iteration solve
-            diag_zero_win: if std::env::var("AIDEEN_DEQ_DIAG_ZERO_WIN").ok().as_deref() == Some("1") { 1 } else { 0 },
-            diag_one_iter: if std::env::var("AIDEEN_DEQ_DIAG_ONE_ITER").ok().as_deref() == Some("1") { 1 } else { 0 },
+            diag_zero_win: if std::env::var("AIDEEN_DEQ_DIAG_ZERO_WIN").ok().as_deref() == Some("1")
+            {
+                1
+            } else {
+                0
+            },
+            diag_one_iter: if std::env::var("AIDEEN_DEQ_DIAG_ONE_ITER").ok().as_deref() == Some("1")
+            {
+                1
+            } else {
+                0
+            },
             fpm_alpha_m: self.cached_fpm_alpha_m,
             fpm_tau: self.cached_fpm_tau,
             fpm_persist_beta: self.cached_fpm_persist_beta,
         }
     }
-
 
     // --- WEIGHTS ---
 
@@ -2562,7 +2790,16 @@ impl GpuDeqBackend {
         clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
-        if self.cached_residual_alpha <= -1.5 {
+        let deq_only_mode = self.cached_residual_alpha <= -1.5;
+        let slot_coord_mode =
+            self.cached_residual_alpha > -1.5 && self.cached_residual_alpha <= -0.9;
+        // The legacy staged adjoint assumes the pre-unified scratch contract
+        // (q/k/v/signal/history packed in a larger stride). The current
+        // DEQ_NO_MAMBA forward no longer writes that layout, so running the
+        // staged path here would train against stale/OOB activations. Route
+        // this mode through the clean adjoint until its dedicated backward is
+        // rewritten against the live forward contract.
+        if deq_only_mode || slot_coord_mode {
             return self.run_clean_adjoint_picard_no_readback(
                 seq_len,
                 damping,
@@ -2729,7 +2966,11 @@ impl GpuDeqBackend {
                             pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                         } else {
                             pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                            pass.dispatch_workgroups(
+                                d.div_ceil(16),
+                                n_entries.div_ceil(16).max(1),
+                                1,
+                            );
                         }
                     }
                     // Anderson: store current v_next into ring buffer, then mix.
@@ -2989,7 +3230,11 @@ impl GpuDeqBackend {
                     );
                 } else {
                     stage_accum_ms += run_stage(
-                        if self.config.d_r <= 512 { "Staged Picard Accum Opt" } else { "Staged Picard Accum" },
+                        if self.config.d_r <= 512 {
+                            "Staged Picard Accum Opt"
+                        } else {
+                            "Staged Picard Accum"
+                        },
                         if self.config.d_r <= 512 && self.config.h_slots == 8 {
                             &self.staged_picard_accum_opt_token8_pipeline
                         } else if self.config.d_r <= 512 {
@@ -3117,7 +3362,11 @@ impl GpuDeqBackend {
                             pass.dispatch_workgroups(entry_grid_x, entry_grid_y, 1);
                         } else {
                             pass.set_pipeline(&self.staged_picard_accum_pipeline);
-                            pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+                            pass.dispatch_workgroups(
+                                d.div_ceil(16),
+                                n_entries.div_ceil(16).max(1),
+                                1,
+                            );
                         }
                     }
                 }
@@ -3237,11 +3486,8 @@ impl GpuDeqBackend {
                     slots_per_segment: self.anderson_slots_per_segment,
                     _pad0: 0,
                 };
-                self.queue.write_buffer(
-                    &self.anderson_params_bufs[k],
-                    0,
-                    bytemuck::bytes_of(&ap),
-                );
+                self.queue
+                    .write_buffer(&self.anderson_params_bufs[k], 0, bytemuck::bytes_of(&ap));
             }
         }
 
@@ -3364,7 +3610,12 @@ impl GpuDeqBackend {
         let profile_fused = self.cfg_fused_profile;
         // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
         let deq_only = self.cached_residual_alpha <= -1.5;
-        let hist_gated = self.cfg_hist_gated && !deq_only && !self.bridge.fpm_enabled;
+        let slot_coord_mode =
+            self.cached_residual_alpha > -1.5 && self.cached_residual_alpha <= -0.9;
+        let hist_gated = self.cfg_hist_gated
+            && !deq_only
+            && !slot_coord_mode
+            && !self.bridge.fpm_enabled;
         let hist_selective = self.cfg_hist_selective;
         let hist_internal_probe = self.cfg_hist_internal_probe;
         if profile_fused {
@@ -3500,7 +3751,82 @@ impl GpuDeqBackend {
                     }
                 }
             }
-            if !deq_only {
+            if slot_coord_mode {
+                add_pass!(
+                    &self.slot_coord_update_stage0_scale_pipeline,
+                    n.div_ceil(64),
+                    1
+                );
+                add_pass_3d!(
+                    &self.slot_coord_update_stage1_pipeline,
+                    d.div_ceil(16),
+                    (batch_size * seq_len).div_ceil(16),
+                    hs
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage1b_pipeline,
+                    d.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage2_pipeline,
+                    hs.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage3_pipeline,
+                    d.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass_3d!(
+                    &self.slot_coord_update_stage4_wq_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_prep_wk_pipeline,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16)
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_prep_wv_pipeline,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16)
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_signal_pipeline,
+                    d.div_ceil(16),
+                    n.div_ceil(16)
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_anchor_pipeline,
+                    d.div_ceil(16),
+                    hs.div_ceil(16)
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_wo_win_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16)
+                );
+                add_pass_3d!(
+                    &self.slot_coord_update_stage4_wk_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs
+                );
+                add_pass_3d!(
+                    &self.slot_coord_update_stage4_wv_pipeline,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs
+                );
+                add_pass!(
+                    &self.slot_coord_update_stage4_bias_pipeline,
+                    d.div_ceil(64),
+                    1
+                );
+            } else if !deq_only {
                 add_pass_3d!(
                     &self.fused_update_stage1a_pipeline,
                     d.div_ceil(16),
@@ -3802,7 +4128,155 @@ impl GpuDeqBackend {
                     }
                 }
             }
-            if !deq_only {
+            if slot_coord_mode {
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage1",
+                    &self.slot_coord_update_stage1_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    (batch_size * seq_len).div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage1b",
+                    &self.slot_coord_update_stage1b_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage2",
+                    &self.slot_coord_update_stage2_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    hs.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage3",
+                    &self.slot_coord_update_stage3_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_wq",
+                    &self.slot_coord_update_stage4_wq_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_prep_wk",
+                    &self.slot_coord_update_stage4_prep_wk_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_prep_wv",
+                    &self.slot_coord_update_stage4_prep_wv_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    (batch_size * seq_len * hs).div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_signal",
+                    &self.slot_coord_update_stage4_signal_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    n.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_anchor",
+                    &self.slot_coord_update_stage4_anchor_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    hs.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_wo_win",
+                    &self.slot_coord_update_stage4_wo_win_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_wk",
+                    &self.slot_coord_update_stage4_wk_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage_3d(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_wv",
+                    &self.slot_coord_update_stage4_wv_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    hs,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "slot_coord_stage4_bias",
+                    &self.slot_coord_update_stage4_bias_pipeline,
+                    &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(64),
+                    1,
+                    profile_fused,
+                );
+            } else if !deq_only {
                 run_stage_3d(
                     &self.device,
                     &self.queue,
@@ -4009,17 +4483,19 @@ impl GpuDeqBackend {
 
     /// Spectral renormalization fully on GPU.
     pub fn renormalize_spectral(&self) -> Result<(), String> {
+        let slot_coord_mode =
+            self.cached_residual_alpha > -1.5 && self.cached_residual_alpha <= -0.9;
         let attn_threshold = Self::env_f32("AIDEEN_DEQ_ATTN_THRESHOLD")
-            .unwrap_or(0.10)
+            .unwrap_or(if slot_coord_mode { 0.30 } else { 0.10 })
             .max(0.01);
         let win_threshold = Self::env_f32("AIDEEN_DEQ_WIN_THRESHOLD")
             .unwrap_or(0.30)
             .max(0.05);
         let wv_threshold = Self::env_f32("AIDEEN_DEQ_WV_THRESHOLD")
-            .unwrap_or(0.50)
+            .unwrap_or(if slot_coord_mode { 0.30 } else { 0.50 })
             .max(0.01);
         let wo_threshold = Self::env_f32("AIDEEN_DEQ_WO_THRESHOLD")
-            .unwrap_or(0.50)
+            .unwrap_or(if slot_coord_mode { 0.30 } else { 0.50 })
             .max(0.01);
         self.bridge.renormalize_spectral(
             &self.device,
@@ -4336,6 +4812,15 @@ impl GpuDeqBackend {
         )
     }
 
+    pub fn read_slot_coord_q_forward(&self, seq_len: u32) -> Vec<f32> {
+        let n_floats = seq_len as usize * self.config.h_slots * self.config.d_r;
+        self.read_storage_buffer(
+            &self.fused_weighted_h_buf,
+            n_floats,
+            "SlotCoord Q Readback Staging",
+        )
+    }
+
     /// Reads the exact forward historical context `c_{t,k}` retained in Scratch.
     /// This matches the constant term injected into the DEQ loop, including the
     /// dynamic `hist_mod` scaling applied in the forward prelude.
@@ -4374,12 +4859,12 @@ impl GpuDeqBackend {
             .collect()
     }
 
-    pub fn read_hist_delta_signal(&self, seq_len: u32) -> Vec<f32> {
+    pub fn read_slot_coord_k_work(&self, seq_len: u32) -> Vec<f32> {
         let n_floats = seq_len as usize * self.config.h_slots * self.config.d_r;
         self.read_storage_buffer(
             &self.fused_hist_delta_buf,
             n_floats,
-            "Hist Selective GPre Readback Staging",
+            "SlotCoord K-Work Readback Staging",
         )
     }
 
@@ -4389,6 +4874,15 @@ impl GpuDeqBackend {
             &self.fused_qgrad_buf,
             n_floats,
             "Hist Selective QGrad Readback Staging",
+        )
+    }
+
+    pub fn read_slot_coord_gscore(&self, seq_len: u32) -> Vec<f32> {
+        let n_floats = seq_len as usize * self.config.h_slots * self.config.h_slots;
+        self.read_storage_buffer(
+            &self.fused_gscore_buf,
+            n_floats,
+            "SlotCoord GScore Readback Staging",
         )
     }
 

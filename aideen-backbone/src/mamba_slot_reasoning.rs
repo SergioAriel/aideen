@@ -119,7 +119,7 @@ pub struct MambaSlotReasoning {
     // replaces uniform fatigue decay with input-dependent selective forgetting
     // W_up: [h_slots × d_r × r], W_down: [h_slots × r × d_r], b_retain: [h_slots × d_r]
     #[cfg(feature = "lab")]
-    pub w_retain_up: Vec<DMatrix<f32>>,   // h_slots matrices of shape (d_r, r)
+    pub w_retain_up: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
     #[cfg(not(feature = "lab"))]
     pub(crate) w_retain_up: Vec<DMatrix<f32>>,
     #[cfg(feature = "lab")]
@@ -127,18 +127,18 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) w_retain_down: Vec<DMatrix<f32>>,
     #[cfg(feature = "lab")]
-    pub b_retain: DMatrix<f32>,           // [h_slots × d_r]
+    pub b_retain: DMatrix<f32>, // [h_slots × d_r]
     #[cfg(not(feature = "lab"))]
     pub(crate) b_retain: DMatrix<f32>,
     // ── Memory read projections (low-rank, r=32) ───────────────────────────
     // q_mem[s] = W_q_mem[s] · h_s, k_mem[s] = W_k_mem[s] · m_s
     // Used for cross-slot relational memory read over M_{t-1}.
     #[cfg(feature = "lab")]
-    pub w_q_mem: Vec<DMatrix<f32>>,       // h_slots matrices of shape (d_r, r)
+    pub w_q_mem: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
     #[cfg(not(feature = "lab"))]
     pub(crate) w_q_mem: Vec<DMatrix<f32>>,
     #[cfg(feature = "lab")]
-    pub w_k_mem: Vec<DMatrix<f32>>,       // h_slots matrices of shape (d_r, r)
+    pub w_k_mem: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
     #[cfg(not(feature = "lab"))]
     pub(crate) w_k_mem: Vec<DMatrix<f32>>,
 
@@ -193,11 +193,12 @@ impl MambaSlotReasoning {
         let h_slots = config.h_slots;
         let d_r = config.d_r;
         DMatrix::from_fn(h_slots, d_r, |slot, dim| {
-            // Deterministic slot identity basis. This breaks permutation symmetry in H0
-            // without injecting large energy that would destabilize the DEQ operator.
-            let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
-            let phase = (((slot + 1) * (dim + 3) * 17) % 2048) as f32 / 1024.0 - 1.0;
-            centered * 2.0e-4f32 + phase * 2.5e-5f32
+            // Equal-norm deterministic slot code: break permutation symmetry without giving
+            // edge slots larger amplitude than middle slots.
+            let theta = std::f32::consts::TAU * (slot as f32) / (h_slots.max(1) as f32);
+            let phi0 = 0.061 * dim as f32;
+            let phi1 = 0.113 * dim as f32;
+            1.0e-3f32 * (theta + phi0).sin() + 1.0e-3f32 * (theta + phi1).cos()
         })
     }
 
@@ -214,11 +215,30 @@ impl MambaSlotReasoning {
     fn new_with_rng<R: Rng + ?Sized>(config: ArchitectureConfig, rng: &mut R) -> Self {
         let d_r = config.d_r;
         let h_slots = config.h_slots;
+        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
         // Xavier Uniform initialization: range = sqrt(3 / fan_in)
         let xavier_range = (3.0 / d_r as f32).sqrt();
 
         let mut w_q = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
-        let mut w_k = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        let mut w_k = if slot_coord_mode {
+            // In slot coordination we want Q and K to start from the same global geometry so
+            // their per-slot specialization can become mutually legible in the logits. Two
+            // unrelated random bases can make Q/K separate in norm while still producing nearly
+            // tied dot products slot-to-slot.
+            let mut aligned = w_q.clone();
+            let noise = 0.05 * xavier_range;
+            for r in 0..d_r {
+                for c in 0..d_r {
+                    aligned[(r, c)] += rng.gen_range(-noise..noise);
+                }
+            }
+            aligned
+        } else {
+            Self::xavier_mat_with_rng(rng, d_r, xavier_range)
+        };
         let mut w_v = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_o = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_in = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
@@ -246,7 +266,7 @@ impl MambaSlotReasoning {
         // con Xavier estándar. Renormalizamos las matrices de atención a σ ≤ 0.10
         // para garantizar σ(J_attn) << 1 antes del primer token de entrenamiento.
         // residual_alpha=0.0 es necesario — incluso alpha=0.2 lleva contr→1.
-        let deq_threshold = 0.10_f32;
+        let deq_threshold = if slot_coord_mode { 0.30_f32 } else { 0.10_f32 };
         let win_threshold = 0.30_f32;
         let n_iter = 20;
         spectral_norm::normalize_if_needed(&mut w_q, deq_threshold, n_iter);
@@ -318,25 +338,54 @@ impl MambaSlotReasoning {
             // W_up: small random init (d_r × r), W_down: zeros (r × d_r)
             // → retain = σ(0 + b_retain) = σ(3.0) ≈ 0.95 at init (near-identity, like forget gate)
             // W_up small random breaks slot symmetry; W_down=zeros keeps gate near 1.0 initially.
-            w_retain_up: (0..h_slots).map(|_| {
-                DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32))
-            }).collect(),
+            w_retain_up: (0..h_slots)
+                .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
+                .collect(),
             w_retain_down: (0..h_slots).map(|_| DMatrix::zeros(32, d_r)).collect(),
             b_retain: DMatrix::from_element(h_slots, d_r, 3.0_f32),
             // Memory read projections: small random init preserves near-uniform read at step 0
             // while allowing slots to learn distinct memory queries/keys quickly.
-            w_q_mem: (0..h_slots).map(|_| {
-                DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32))
-            }).collect(),
-            w_k_mem: (0..h_slots).map(|_| {
-                DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32))
-            }).collect(),
+            w_q_mem: (0..h_slots)
+                .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
+                .collect(),
+            w_k_mem: (0..h_slots)
+                .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
+                .collect(),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
-            // Q/K per-slot bias: random init to immediately break slot symmetry.
-            // Zero init would give gscore=0 (uniform attn → zero gradient → saddle point forever).
-            // randn×0.2 gives distinct Q/K per slot from step 1 → attn_ent can fall below log(K).
-            q_bias: DMatrix::from_fn(h_slots, d_r, |_, _| rng.gen_range(-0.2_f32..0.2_f32)),
-            k_bias: DMatrix::from_fn(h_slots, d_r, |_, _| rng.gen_range(-0.2_f32..0.2_f32)),
+            // Q/K per-slot bias: break permutation symmetry with a *shared slot code*,
+            // not two independent random tables. If q_bias and k_bias are unrelated,
+            // q(slot_i) has no initial geometric reason to prefer k(slot_i) over k(slot_j),
+            // so slot attention can stay near-uniform and starve Q/K specialization.
+            q_bias: {
+                let mut slot_code = DMatrix::zeros(h_slots, d_r);
+                for slot in 0..h_slots {
+                    let theta = std::f32::consts::TAU * (slot as f32) / (h_slots.max(1) as f32);
+                    for dim in 0..d_r {
+                        let phi0 = 0.047 * dim as f32;
+                        let phi1 = 0.089 * dim as f32;
+                        slot_code[(slot, dim)] =
+                            0.08_f32 * (theta + phi0).sin()
+                            + 0.08_f32 * (theta + phi1).cos()
+                            + rng.gen_range(-0.005_f32..0.005_f32);
+                    }
+                }
+                slot_code
+            },
+            k_bias: {
+                let mut slot_code = DMatrix::zeros(h_slots, d_r);
+                for slot in 0..h_slots {
+                    let theta = std::f32::consts::TAU * (slot as f32) / (h_slots.max(1) as f32);
+                    for dim in 0..d_r {
+                        let phi0 = 0.047 * dim as f32;
+                        let phi1 = 0.089 * dim as f32;
+                        slot_code[(slot, dim)] =
+                            0.08_f32 * (theta + phi0).sin()
+                            + 0.08_f32 * (theta + phi1).cos()
+                            + rng.gen_range(-0.005_f32..0.005_f32);
+                    }
+                }
+                slot_code
+            },
             backend: RefCell::new(None),
             damping: 0.70_f32,
             residual_alpha: 0.0_f32,
@@ -417,7 +466,11 @@ impl MambaSlotReasoning {
     pub fn w_o_gpu_flat(&self) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let attn_t = 0.10_f32;
+        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        let attn_t = if slot_coord_mode { 0.30_f32 } else { 0.10_f32 };
         let n_iter = 20;
         let jitter_scale = std::env::var("AIDEEN_DEQ_WO_JITTER")
             .ok()
@@ -431,7 +484,8 @@ impl MambaSlotReasoning {
                 for c in 0..d {
                     // Slightly smaller jitter than W_q/W_k to keep output stable.
                     let i = r * d + c;
-                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin() * jitter_scale;
+                    let jitter = ((s * d * d + i) as f32 * 0.0001_f32 + s as f32 * 0.2_f32).sin()
+                        * jitter_scale;
                     mat[(r, c)] += jitter;
                 }
             }
@@ -481,7 +535,11 @@ impl MambaSlotReasoning {
         // Umbral 0.10 para matrices de atención — necesario para mantener σ(J_attn) < 1
         // durante el entrenamiento (no solo en la inicialización).
         // w_x y w_out (Mamba externo) usan umbral 0.70 — no afectan la contractividad del DEQ.
-        let attn_t = 0.10_f32;
+        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
+            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        let attn_t = if slot_coord_mode { 0.30_f32 } else { 0.10_f32 };
         let win_t = 0.30_f32;
         let mamba_t = 0.70_f32;
         let n = 20;
@@ -656,32 +714,40 @@ impl MambaSlotReasoning {
     pub fn history_params_gpu_layout(
         &self,
     ) -> (
-        Vec<f32>,  // w_hist_shared
-        Vec<f32>,  // hist_slot_scale
-        Vec<f32>,  // hist_slot_bias
-        Vec<f32>,  // hist_gate_logit
-        Vec<f32>,  // slot_anchor
-        Vec<f32>,  // w_delta
-        Vec<f32>,  // b_delta
-        Vec<f32>,  // w_gate_hist
-        Vec<f32>,  // w_forget
-        Vec<f32>,  // b_forget
-        Vec<f32>,  // w_retain_up  (h_slots × d_r × r, row-major per slot)
-        Vec<f32>,  // w_retain_down (h_slots × r × d_r, row-major per slot)
-        Vec<f32>,  // b_retain (h_slots × d_r, row-major)
-        Vec<f32>,  // w_q_mem (h_slots × d_r × r, row-major per slot)
-        Vec<f32>,  // w_k_mem (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // w_hist_shared
+        Vec<f32>, // hist_slot_scale
+        Vec<f32>, // hist_slot_bias
+        Vec<f32>, // hist_gate_logit
+        Vec<f32>, // slot_anchor
+        Vec<f32>, // w_delta
+        Vec<f32>, // b_delta
+        Vec<f32>, // w_gate_hist
+        Vec<f32>, // w_forget
+        Vec<f32>, // b_forget
+        Vec<f32>, // w_retain_up  (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // w_retain_down (h_slots × r × d_r, row-major per slot)
+        Vec<f32>, // b_retain (h_slots × d_r, row-major)
+        Vec<f32>, // w_q_mem (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // w_k_mem (h_slots × d_r × r, row-major per slot)
     ) {
-        let w_retain_up_flat: Vec<f32> = self.w_retain_up.iter()
+        let w_retain_up_flat: Vec<f32> = self
+            .w_retain_up
+            .iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
-        let w_retain_down_flat: Vec<f32> = self.w_retain_down.iter()
+        let w_retain_down_flat: Vec<f32> = self
+            .w_retain_down
+            .iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
-        let w_q_mem_flat: Vec<f32> = self.w_q_mem.iter()
+        let w_q_mem_flat: Vec<f32> = self
+            .w_q_mem
+            .iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
-        let w_k_mem_flat: Vec<f32> = self.w_k_mem.iter()
+        let w_k_mem_flat: Vec<f32> = self
+            .w_k_mem
+            .iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
         (
@@ -1009,11 +1075,19 @@ impl MambaSlotReasoning {
             k_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             w_forget: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             b_forget: nalgebra::DVector::from_element(config.h_slots, 3.0_f32),
-            w_retain_up: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
-            w_retain_down: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(32, config.d_r)).collect(),
+            w_retain_up: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
+                .collect(),
+            w_retain_down: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(32, config.d_r))
+                .collect(),
             b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 3.0_f32),
-            w_q_mem: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
-            w_k_mem: (0..config.h_slots).map(|_| nalgebra::DMatrix::zeros(config.d_r, 32)).collect(),
+            w_q_mem: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
+                .collect(),
+            w_k_mem: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
+                .collect(),
             backend: RefCell::new(None),
             damping,
             residual_alpha,
