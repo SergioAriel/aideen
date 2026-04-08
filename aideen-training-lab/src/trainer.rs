@@ -2038,7 +2038,10 @@ impl Trainer {
                     self.invalid_hi_streak = 0;
                 }
             }
-            if fresh_invalid_sample && self.invalid_hi_streak >= 3 {
+            // After the stale-snapshot fix, a fresh invalid sample already means the DEQ
+            // forward for that window is unreliable. Waiting for several additional windows
+            // only delays renorm/emergency while bad gradients keep landing.
+            if fresh_invalid_sample && self.invalid_hi_streak >= 1 {
                 if let Some(metrics) = cached_fpm_metrics {
                     eprintln!(
                         "    [DEQ-INVALID] step={} contr={:.3} status={} err_h={:.3e} z_avg={:.3e} max_h={:.3e} seq={:.0}",
