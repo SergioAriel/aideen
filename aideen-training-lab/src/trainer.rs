@@ -1326,14 +1326,26 @@ impl Trainer {
     }
 
     /// Crea un Trainer con un tokenizer pre-construido.
-    pub fn from_tokenizer(tokenizer: Tokenizer, lr: f32) -> Self {
+    fn from_tokenizer_seeded_internal(
+        tokenizer: Tokenizer,
+        lr: f32,
+        seed: Option<u64>,
+        _init_gpu: bool,
+    ) -> Self {
         let config = tokenizer.config.clone();
 
         #[cfg(feature = "wgpu")]
-        let gpu_deq = GpuDeqBackend::new_blocking(config.clone());
+        let gpu_deq = if _init_gpu {
+            GpuDeqBackend::new_blocking(config.clone())
+        } else {
+            None
+        };
 
         let mut trainer = Self {
-            reasoning: MambaSlotReasoning::new(config.clone()),
+            reasoning: match seed {
+                Some(seed) => MambaSlotReasoning::new_with_seed(config.clone(), seed),
+                None => MambaSlotReasoning::new(config.clone()),
+            },
             #[cfg(feature = "wgpu")]
             gpu_deq,
             #[cfg(feature = "wgpu")]
@@ -1478,157 +1490,20 @@ impl Trainer {
         trainer
     }
 
+    pub fn from_tokenizer(tokenizer: Tokenizer, lr: f32) -> Self {
+        Self::from_tokenizer_seeded_internal(tokenizer, lr, None, true)
+    }
+
     /// Igual que `from_tokenizer`, pero forzando inicialización determinística
     /// de los pesos de reasoning (DEQ core) para reproducibilidad por seed.
     pub fn from_tokenizer_seeded(tokenizer: Tokenizer, lr: f32, seed: u64) -> Self {
-        let config = tokenizer.config.clone();
+        Self::from_tokenizer_seeded_internal(tokenizer, lr, Some(seed), true)
+    }
 
-        #[cfg(feature = "wgpu")]
-        let gpu_deq = GpuDeqBackend::new_blocking(config.clone());
-
-        let mut trainer = Self {
-            reasoning: MambaSlotReasoning::new_with_seed(config.clone(), seed),
-            #[cfg(feature = "wgpu")]
-            gpu_deq,
-            #[cfg(feature = "wgpu")]
-            gpu_weights_uploaded: false,
-            #[cfg(feature = "wgpu")]
-            gpu_cg_weights_uploaded: false,
-            #[cfg(feature = "wgpu")]
-            gpu_lm: None,
-            #[cfg(feature = "wgpu")]
-            gpu_emb: None,
-            #[cfg(feature = "wgpu")]
-            gpu_lm_weights_uploaded: false,
-            #[cfg(feature = "wgpu")]
-            gpu_emb_weights_uploaded: false,
-            #[cfg(feature = "wgpu")]
-            lm_head_cpu_stale: false,
-            lm_head: LmHead::new(config.clone()),
-            tokenizer,
-            optimizer: Adam::new(lr),
-            training_config: TrainingConfig {
-                lr,
-                ..Default::default()
-            },
-            config,
-            frozen_deq: false,
-            frozen_emb: false,
-            frozen_lm: false,
-            eval_mode: false,
-            adaptive_max_iters: 12,
-            adaptive_damping: 0.85,
-            adaptive_adj_iters: 8,
-            hit_hi_streak: 0,
-            hit_lo_streak: 0,
-            cg_res_hi_streak: 0,
-            damping_boost_left: 0,
-            emergency_left: 0,
-            last_max_h: 0.0,
-            max_h_growth_streak: 0,
-            max_delta_hi_streak: 0,
-            invalid_hi_streak: 0,
-            contractivity_hi_streak: 0,
-            force_renorm_done: false,
-            completed_file_epochs: 0,
-            plateau_best_loss: None,
-            plateau_bad_epochs: 0,
-            plateau_cooldown_left: 0,
-            plateau_lr_cap: lr,
-            solve_stage_floor: 8,
-            solve_stage_cap: 12,
-            m_prev: None,
-            grad_accum_counter: 0,
-            debug_last_time: None,
-            debug_tokens_accum: 0,
-            cached_debug_buf: Vec::new(),
-            cached_debug_gen: 0,
-            invalid_eval_debug_gen: 0,
-            last_gpu_loss: 0.0,
-            fpm_alpha_m_current: 0.01,
-            fpm_tau_current: 0.5,
-            fpm_err_h_window: VecDeque::with_capacity(100),
-            fpm_last_err_h_avg: f32::INFINITY,
-            cfg_fwd_batch_size: std::env::var("AIDEEN_BATCH_SIZE")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1),
-            cfg_debug_sample_every: std::env::var("AIDEEN_DEBUG_SAMPLE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
-            cfg_solve_control_every: std::env::var("AIDEEN_SOLVE_CONTROL_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(10)
-                .max(1),
-            cfg_loss_readback_every: std::env::var("AIDEEN_LOSS_READBACK_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
-            cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
-            cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1),
-            cfg_hist_min_iters: std::env::var("AIDEEN_HIST_MIN_ITERS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or_else(Self::default_hist_min_iters)
-                .max(1),
-            cfg_val_every: std::env::var("AIDEEN_VAL_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
-            cfg_progress_every: std::env::var("AIDEEN_PROGRESS_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
-            cfg_wv_debug: Self::env_flag("AIDEEN_DEQ_WV_DEBUG"),
-            cfg_ssm_debug: Self::env_flag("AIDEEN_SSM_DEBUG"),
-            cfg_max_chunks: std::env::var("AIDEEN_MAX_CHUNKS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(usize::MAX),
-            cfg_adj_iters_override: std::env::var("AIDEEN_ADJ_ITERS_OVERRIDE")
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .or(Some(2)),
-            cfg_system_cost_audit: Self::env_flag("AIDEEN_SYSTEM_COST_AUDIT"),
-            cfg_slot_path_audit: Self::env_flag("AIDEEN_SLOT_PATH_AUDIT"),
-            cfg_system_cost_wait: Self::env_flag("AIDEEN_SYSTEM_COST_WAIT"),
-            cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
-            cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
-            cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
-            cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
-            cfg_lr_plateau_enable: !Self::env_flag("AIDEEN_LR_PLATEAU_DISABLE"),
-            cfg_lr_plateau_patience: std::env::var("AIDEEN_LR_PLATEAU_PATIENCE")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(2),
-            cfg_lr_plateau_cooldown: std::env::var("AIDEEN_LR_PLATEAU_COOLDOWN")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1),
-            cfg_lr_plateau_factor: std::env::var("AIDEEN_LR_PLATEAU_FACTOR")
-                .ok()
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .unwrap_or(0.5),
-            cfg_lr_plateau_min_rel_improvement: std::env::var(
-                "AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT",
-            )
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.005),
-            cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
-        };
-        trainer.apply_experimental_profile_from_env();
-        trainer
+    /// Variante explícitamente CPU para benches/diagnósticos que no deben disparar
+    /// inicialización de GPU ni mezclar paths de ejecución al medir relevancia.
+    pub fn from_tokenizer_seeded_cpu(tokenizer: Tokenizer, lr: f32, seed: u64) -> Self {
+        Self::from_tokenizer_seeded_internal(tokenizer, lr, Some(seed), false)
     }
 
     #[cfg(feature = "wgpu")]

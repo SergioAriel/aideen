@@ -53,11 +53,8 @@ fn make_cpu_trainer(seed: u64, cfg: &ArchitectureConfig) -> Trainer {
         (rng.gen::<f32>() - 0.5) * 0.02
     });
 
-    let mut t = Trainer::from_tokenizer_seeded(tok, 3e-4, seed);
+    let mut t = Trainer::from_tokenizer_seeded_cpu(tok, 3e-4, seed);
     t.config = cfg.clone();
-    t.gpu_deq = None;
-    t.gpu_lm = None;
-    t.gpu_emb = None;
     t
 }
 
