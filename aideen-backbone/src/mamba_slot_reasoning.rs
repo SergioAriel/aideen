@@ -100,22 +100,21 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) w_gate_hist: DMatrix<f32>,
 
-    // ── Forget gate for M state ───────────────────────────────────────────────
-    // f[s] = σ(b_f[s] + dot(W_f[s,:], H_curr) / √d)
-    // M_t = a * f[s] * m_prev + (1-a) * x_proj
-    // W_f zeros + b_f=3.0 → f≈0.95 (near-identity at init, ∂/∂h=0)
+    // ── Memory write gate prior ───────────────────────────────────────────────
+    // z[s] = σ(b_write[s] + dot(W_write[s,:], c) / √d)
+    // Controls how much new slot memory may be written from the current token state.
     #[cfg(feature = "lab")]
-    pub w_forget: DMatrix<f32>,
+    pub w_write_gate: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
-    pub(crate) w_forget: DMatrix<f32>,
+    pub(crate) w_write_gate: DMatrix<f32>,
     #[cfg(feature = "lab")]
-    pub b_forget: DVector<f32>,
+    pub b_write_mem: DVector<f32>,
     #[cfg(not(feature = "lab"))]
-    pub(crate) b_forget: DVector<f32>,
+    pub(crate) b_write_mem: DVector<f32>,
 
     // ── Retain gate (low-rank, r=32) ─────────────────────────────────────────
     // retain[s,d] = σ(W_down[s] · (W_up[s] · c) + b_retain[s,d])
-    // m_new = retain * m_old + z * tanh(W_delta * c)
+    // m_next = (I + W_out) * (a * m_prev + (1 - a) * (h_unit + W_x h_unit + write))
     // replaces uniform fatigue decay with input-dependent selective forgetting
     // W_up: [h_slots × d_r × r], W_down: [h_slots × r × d_r], b_retain: [h_slots × d_r]
     #[cfg(feature = "lab")]
@@ -141,6 +140,10 @@ pub struct MambaSlotReasoning {
     pub w_k_mem: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
     #[cfg(not(feature = "lab"))]
     pub(crate) w_k_mem: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    pub b_read_mem: DVector<f32>, // [h_slots], slot-wise read bias for FPM memory attention
+    #[cfg(not(feature = "lab"))]
+    pub(crate) b_read_mem: DVector<f32>,
 
     // ── LayerNorm por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
@@ -297,6 +300,23 @@ impl MambaSlotReasoning {
             let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
             base + centered * 0.02
         });
+        let mem_read_xavier = (3.0f32 / d_r.max(1) as f32).sqrt();
+        let mem_read_align_noise = 0.10 * mem_read_xavier;
+        let w_q_mem: Vec<DMatrix<f32>> = (0..h_slots)
+            .map(|_| {
+                DMatrix::from_fn(d_r, 32, |_, _| {
+                    rng.gen_range(-mem_read_xavier..mem_read_xavier)
+                })
+            })
+            .collect();
+        let w_k_mem: Vec<DMatrix<f32>> = w_q_mem
+            .iter()
+            .map(|base| {
+                DMatrix::from_fn(d_r, 32, |i, j| {
+                    base[(i, j)] + rng.gen_range(-mem_read_align_noise..mem_read_align_noise)
+                })
+            })
+            .collect();
         let slot_anchor = Self::default_slot_anchor(&config);
 
         Self {
@@ -330,27 +350,32 @@ impl MambaSlotReasoning {
             b_delta: DVector::zeros(d_r),
             // W_gate_hist: zeros init → hist_mod = 1+tanh(0) = 1 at step 0 (identity behavior).
             w_gate_hist: DMatrix::zeros(h_slots, d_r),
-            // Forget gate: W_f=zeros, b_f=3.0 → f≈0.95 (near-identity at init).
-            // Allows model to learn to forget selectively once training establishes gradients.
-            w_forget: DMatrix::zeros(h_slots, d_r),
-            b_forget: DVector::from_element(h_slots, 3.0_f32),
+            // Write gate prior: start conservative so cold-start memory does not immediately
+            // saturate writes before the slot has learned what is worth storing.
+            w_write_gate: DMatrix::zeros(h_slots, d_r),
+            b_write_mem: DVector::from_fn(h_slots, |slot, _| {
+                let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+                centered * 0.02
+            }),
             // Retain gate (low-rank r=32):
             // W_up: small random init (d_r × r), W_down: zeros (r × d_r)
-            // → retain = σ(0 + b_retain) = σ(3.0) ≈ 0.95 at init (near-identity, like forget gate)
-            // W_up small random breaks slot symmetry; W_down=zeros keeps gate near 1.0 initially.
+            // → retain = σ(0 + b_retain) = σ(2.0) ≈ 0.88 at init.
+            // This keeps retention as the prior, but avoids nearly freezing write budget
+            // before the low-rank gate has learned any slot-dependent structure.
             w_retain_up: (0..h_slots)
                 .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
                 .collect(),
             w_retain_down: (0..h_slots).map(|_| DMatrix::zeros(32, d_r)).collect(),
-            b_retain: DMatrix::from_element(h_slots, d_r, 3.0_f32),
-            // Memory read projections: small random init preserves near-uniform read at step 0
-            // while allowing slots to learn distinct memory queries/keys quickly.
-            w_q_mem: (0..h_slots)
-                .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
-                .collect(),
-            w_k_mem: (0..h_slots)
-                .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
-                .collect(),
+            b_retain: DMatrix::from_element(h_slots, d_r, 2.0_f32),
+            // Memory read projections: q/k start from the same base geometry so the content
+            // read has an immediately legible dot-product space, instead of two unrelated
+            // random subspaces that make the first reads effectively arbitrary.
+            w_q_mem,
+            w_k_mem,
+            b_read_mem: DVector::from_fn(h_slots, |slot, _| {
+                let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
+                centered * 0.02 + rng.gen_range(-5.0e-4f32..5.0e-4f32)
+            }),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: break permutation symmetry with a *shared slot code*,
             // not two independent random tables. If q_bias and k_bias are unrelated,
@@ -632,12 +657,12 @@ impl MambaSlotReasoning {
             Self::matrix_to_row_major(&self.w_gate_hist),
         );
         weights.insert(
-            "reasoning.w_forget".to_string(),
-            Self::matrix_to_row_major(&self.w_forget),
+            "reasoning.w_write_gate".to_string(),
+            Self::matrix_to_row_major(&self.w_write_gate),
         );
         weights.insert(
-            "reasoning.b_forget".to_string(),
-            self.b_forget.as_slice().to_vec(),
+            "reasoning.b_write_mem".to_string(),
+            self.b_write_mem.as_slice().to_vec(),
         );
         weights.insert(
             "reasoning.w_retain_up".to_string(),
@@ -672,6 +697,10 @@ impl MambaSlotReasoning {
                 .collect(),
         );
         weights.insert(
+            "reasoning.b_read_mem".to_string(),
+            self.b_read_mem.as_slice().to_vec(),
+        );
+        weights.insert(
             "reasoning.a_log".to_string(),
             Self::matrix_to_row_major(&self.a_log),
         );
@@ -699,13 +728,14 @@ impl MambaSlotReasoning {
         Vec<f32>, // w_delta
         Vec<f32>, // b_delta
         Vec<f32>, // w_gate_hist
-        Vec<f32>, // w_forget
-        Vec<f32>, // b_forget
+        Vec<f32>, // w_write_gate
+        Vec<f32>, // b_write_mem
         Vec<f32>, // w_retain_up  (h_slots × d_r × r, row-major per slot)
         Vec<f32>, // w_retain_down (h_slots × r × d_r, row-major per slot)
         Vec<f32>, // b_retain (h_slots × d_r, row-major)
         Vec<f32>, // w_q_mem (h_slots × d_r × r, row-major per slot)
         Vec<f32>, // w_k_mem (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // b_read_mem (h_slots)
     ) {
         let w_retain_up_flat: Vec<f32> = self
             .w_retain_up
@@ -736,13 +766,14 @@ impl MambaSlotReasoning {
             Self::matrix_to_row_major(&self.w_delta),
             self.b_delta.as_slice().to_vec(),
             Self::matrix_to_row_major(&self.w_gate_hist),
-            Self::matrix_to_row_major(&self.w_forget),
-            self.b_forget.as_slice().to_vec(),
+            Self::matrix_to_row_major(&self.w_write_gate),
+            self.b_write_mem.as_slice().to_vec(),
             w_retain_up_flat,
             w_retain_down_flat,
             Self::matrix_to_row_major(&self.b_retain),
             w_q_mem_flat,
             w_k_mem_flat,
+            self.b_read_mem.as_slice().to_vec(),
         )
     }
 
@@ -873,17 +904,26 @@ impl MambaSlotReasoning {
                 }
             }
         }
-        // w_forget / b_forget: optional — zeros + bias 3.0 for old checkpoints.
+        // Write gate params: prefer dedicated names; fall back to legacy forget-gate keys
+        // from earlier memory experiments for checkpoint compatibility.
         {
             let h_slots = self.config.h_slots;
-            if let Some(data) = weights.get("reasoning.w_forget") {
+            if let Some(data) = weights.get("reasoning.w_write_gate") {
                 if data.len() == h_slots * d_r {
-                    self.w_forget = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+                    self.w_write_gate = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
+                }
+            } else if let Some(data) = weights.get("reasoning.w_forget") {
+                if data.len() == h_slots * d_r {
+                    self.w_write_gate = nalgebra::DMatrix::from_row_slice(h_slots, d_r, data);
                 }
             }
-            if let Some(data) = weights.get("reasoning.b_forget") {
+            if let Some(data) = weights.get("reasoning.b_write_mem") {
                 if data.len() == h_slots {
-                    self.b_forget = nalgebra::DVector::from_vec(data.clone());
+                    self.b_write_mem = nalgebra::DVector::from_vec(data.clone());
+                }
+            } else if let Some(data) = weights.get("reasoning.b_forget") {
+                if data.len() == h_slots {
+                    self.b_write_mem = nalgebra::DVector::from_vec(data.clone());
                 }
             }
         }
@@ -955,6 +995,20 @@ impl MambaSlotReasoning {
                     .chunks_exact(d_r * RETAIN_RANK)
                     .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
                     .collect();
+            }
+            if let Some(data) = weights.get("reasoning.b_read_mem") {
+                if data.len() != h_slots {
+                    return Err(format!(
+                        "reasoning.b_read_mem size mismatch: expected {}, got {}",
+                        h_slots,
+                        data.len()
+                    ));
+                }
+                self.b_read_mem = nalgebra::DVector::from_vec(data.clone());
+            } else {
+                // Backward compatibility: old checkpoints reused hist_gate_logit as the
+                // read-bias prior. Keep that behavior only as import fallback.
+                self.b_read_mem = self.hist_gate_logit.clone();
             }
         }
 
@@ -1050,21 +1104,22 @@ impl MambaSlotReasoning {
             norm_scale,
             q_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             k_bias: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
-            w_forget: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
-            b_forget: nalgebra::DVector::from_element(config.h_slots, 3.0_f32),
+            w_write_gate: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
+            b_write_mem: nalgebra::DVector::zeros(config.h_slots),
             w_retain_up: (0..config.h_slots)
                 .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
                 .collect(),
             w_retain_down: (0..config.h_slots)
                 .map(|_| nalgebra::DMatrix::zeros(32, config.d_r))
                 .collect(),
-            b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 3.0_f32),
+            b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 2.0_f32),
             w_q_mem: (0..config.h_slots)
                 .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
                 .collect(),
             w_k_mem: (0..config.h_slots)
                 .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
                 .collect(),
+            b_read_mem: nalgebra::DVector::zeros(config.h_slots),
             backend: RefCell::new(None),
             damping,
             residual_alpha,

@@ -114,7 +114,10 @@ pub struct GpuDeqBackend {
     fused_update_hist_forget_pipeline: wgpu::ComputePipeline,
     fused_update_apply_grad_pipeline: wgpu::ComputePipeline,
     fpm_retain_bwd_pipeline: wgpu::ComputePipeline,
+    fpm_shared_wout_pipeline: wgpu::ComputePipeline,
+    fpm_shared_wx_pipeline: wgpu::ComputePipeline,
     fpm_retain_bwd_bg0: wgpu::BindGroup,
+    fpm_shared_bg0: wgpu::BindGroup,
     staged_picard_bg: wgpu::BindGroup,
     staged_picard_bg_alt: wgpu::BindGroup,
     staged_picard_bg1: wgpu::BindGroup,
@@ -128,6 +131,10 @@ pub struct GpuDeqBackend {
     fused_hist_delta_buf: wgpu::Buffer,
     fused_gscore_buf: wgpu::Buffer,
     fused_qgrad_buf: wgpu::Buffer,
+    _fpm_dm_buf: wgpu::Buffer,
+    _fpm_minner_buf: wgpu::Buffer,
+    _fpm_hunit_buf: wgpu::Buffer,
+    _fpm_gx_buf: wgpu::Buffer,
     staged_wq_t_buf: wgpu::Buffer,
     staged_wk_t_buf: wgpu::Buffer,
     staged_wv_t_buf: wgpu::Buffer,
@@ -149,7 +156,7 @@ pub struct GpuDeqBackend {
     pub cached_residual_alpha: f32,
     pub cached_fpm_alpha_m: f32,
     pub cached_fpm_tau: f32,
-    pub cached_fpm_persist_beta: f32,
+    pub cached_fpm_stage: u32,
     cfg_hist_gated: bool,
     cfg_hist_selective: bool,
     cfg_slot_anchor_zero: bool,
@@ -229,13 +236,14 @@ impl GpuDeqBackend {
         w_delta: &[f32],
         b_delta: &[f32],
         w_gate_hist: &[f32],
-        w_forget: &[f32],
-        b_forget: &[f32],
+        w_write_gate: &[f32],
+        b_write_mem: &[f32],
         w_retain_up: &[f32],
         w_retain_down: &[f32],
         b_retain: &[f32],
         w_q_mem: &[f32],
         w_k_mem: &[f32],
+        b_read_mem: &[f32],
     ) -> Vec<f32> {
         const MEM_READ_RANK: usize = 32;
         let d = self.config.d_r;
@@ -291,9 +299,9 @@ impl GpuDeqBackend {
         out.push(1.0);
         // W_gate_hist: h_slots × d_model dynamic gate query matrix (after 21 scalars)
         out.extend_from_slice(w_gate_hist);
-        // Forget gate parameters: W_forget (h×d) and b_forget (h)
-        out.extend_from_slice(w_forget);
-        out.extend_from_slice(b_forget);
+        // Memory write gate parameters: W_write_gate (h×d) and b_write_mem (h)
+        out.extend_from_slice(w_write_gate);
+        out.extend_from_slice(b_write_mem);
         out.extend(std::iter::repeat(hhist_gamma_raw_init).take(h));
         // Retain gate: W_up (h×d×r), W_down (h×r×d), b_retain (h×d)
         out.extend_from_slice(w_retain_up);
@@ -302,8 +310,10 @@ impl GpuDeqBackend {
         // Memory read projections: W_q_mem (h×d×r), W_k_mem (h×d×r)
         debug_assert_eq!(w_q_mem.len(), h * d * MEM_READ_RANK);
         debug_assert_eq!(w_k_mem.len(), h * d * MEM_READ_RANK);
+        debug_assert_eq!(b_read_mem.len(), h);
         out.extend_from_slice(w_q_mem);
         out.extend_from_slice(w_k_mem);
+        out.extend_from_slice(b_read_mem);
         out
     }
 
@@ -312,7 +322,7 @@ impl GpuDeqBackend {
         const MEM_READ_RANK: usize = 32;
         // base: (h+1)*d² + 5*h*d + 2*h + d + 21 + h(γ)
         // retain gate: W_up(h*d*r) + W_down(h*r*d) + b_retain(h*d)
-        // memory read: W_q_mem(h*d*r) + W_k_mem(h*d*r)
+        // memory read: W_q_mem(h*d*r) + W_k_mem(h*d*r) + b_read_mem(h)
         (h + 1) * d * d
             + 5 * h * d
             + 2 * h
@@ -322,6 +332,7 @@ impl GpuDeqBackend {
             + 2 * h * d * RETAIN_RANK
             + h * d
             + 2 * h * d * MEM_READ_RANK
+            + h
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -557,9 +568,15 @@ impl GpuDeqBackend {
             ),
         });
         let fpm_retain_bwd_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("FPM Retain Gate Backward Shader"),
+            label: Some("FPM Memory Backward Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/fused_fpm_retain_bwd.wgsl").into(),
+            ),
+        });
+        let fpm_shared_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FPM Shared Carrier Backward Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/fused_fpm_shared_update.wgsl").into(),
             ),
         });
         let staged_picard_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -743,11 +760,12 @@ impl GpuDeqBackend {
             ],
         });
 
-        // fpm_retain_bwd_bg0_layout: 6 bindings for the retain-gate backward kernel.
-        // bindings 0-5: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients, tbptt_carry.
+        // fpm_retain_bwd_bg0_layout: 9 bindings for the active FPM token-local backward.
+        // bindings 0-9: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients,
+        // tbptt_carry, dm_new staging, m_inner staging, h_unit staging, g_x staging.
         let fpm_retain_bwd_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("FPM Retain Bwd BG0 Layout"),
+                label: Some("FPM Memory Bwd BG0 Layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -804,6 +822,112 @@ impl GpuDeqBackend {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let fpm_shared_bg0_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FPM Shared Carrier BG0 Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -1354,16 +1478,39 @@ impl GpuDeqBackend {
                 cache: None,
             });
         let fpm_retain_bwd_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("FPM Retain Bwd PL"),
+            label: Some("FPM Memory Bwd PL"),
             bind_group_layouts: &[&fpm_retain_bwd_bg0_layout, &fused_update_bg1_layout],
             push_constant_ranges: &[],
         });
         let fpm_retain_bwd_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("FPM Retain Gate Backward Pipeline"),
+                label: Some("FPM Memory Backward Pipeline"),
                 layout: Some(&fpm_retain_bwd_pl),
                 module: &fpm_retain_bwd_shader,
                 entry_point: Some("fused_fpm_retain_bwd_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fpm_shared_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FPM Shared Carrier PL"),
+            bind_group_layouts: &[&fpm_shared_bg0_layout, &fused_update_bg1_layout],
+            push_constant_ranges: &[],
+        });
+        let fpm_shared_wout_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM Shared Wout Pipeline"),
+                layout: Some(&fpm_shared_pl),
+                module: &fpm_shared_shader,
+                entry_point: Some("fused_fpm_stage_wout_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fpm_shared_wx_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM Shared Wx Pipeline"),
+                layout: Some(&fpm_shared_pl),
+                module: &fpm_shared_shader,
+                entry_point: Some("fused_fpm_stage_wx_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1718,6 +1865,38 @@ impl GpuDeqBackend {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let fpm_dm_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FPM DM Buffer"),
+            size: attn_entries * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fpm_minner_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FPM MInner Buffer"),
+            size: attn_entries * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fpm_hunit_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FPM HUnit Buffer"),
+            size: attn_entries * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fpm_gx_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FPM GX Buffer"),
+            size: attn_entries * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let w_mat_bytes = (config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
         let wv_mat_bytes =
             (config.h_slots * config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
@@ -2065,9 +2244,10 @@ impl GpuDeqBackend {
                 resource: bridge.all_weights_buf.as_entire_binding(),
             }],
         });
-        // Retain bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients | tbptt_carry
+        // FPM memory bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients
+        // | tbptt_carry | dm_new | m_inner | h_unit | g_x
         let fpm_retain_bwd_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("FPM Retain Bwd BG0"),
+            label: Some("FPM Memory Bwd BG0"),
             layout: &fpm_retain_bwd_bg0_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -2094,6 +2274,52 @@ impl GpuDeqBackend {
                     binding: 5,
                     resource: tbptt_carry_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: fpm_dm_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: fpm_minner_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: fpm_hunit_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: fpm_gx_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let fpm_shared_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FPM Shared Carrier BG0"),
+            layout: &fpm_shared_bg0_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fused_update_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fpm_dm_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fpm_minner_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: fpm_hunit_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_gradients_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: fpm_gx_buf.as_entire_binding(),
+                },
             ],
         });
         // Parse all hot-path env vars once at construction.
@@ -2111,10 +2337,11 @@ impl GpuDeqBackend {
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .unwrap_or(0.5);
-        let cached_fpm_persist_beta = std::env::var("AIDEEN_FPM_PERSIST_BETA")
+        let cached_fpm_stage = std::env::var("AIDEEN_FPM_STAGE")
             .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.01);
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(3)
+            .clamp(0, 5);
         let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let cfg_hist_selective = Self::hist_selective_from_env();
         let bool_flag = |s: &str| -> Option<bool> {
@@ -2233,7 +2460,10 @@ impl GpuDeqBackend {
             fused_update_hist_forget_pipeline,
             fused_update_apply_grad_pipeline,
             fpm_retain_bwd_pipeline,
+            fpm_shared_wout_pipeline,
+            fpm_shared_wx_pipeline,
             fpm_retain_bwd_bg0,
+            fpm_shared_bg0,
             staged_picard_bg,
             staged_picard_bg_alt,
             staged_picard_bg1,
@@ -2247,6 +2477,10 @@ impl GpuDeqBackend {
             fused_hist_delta_buf,
             fused_gscore_buf,
             fused_qgrad_buf,
+            _fpm_dm_buf: fpm_dm_buf,
+            _fpm_minner_buf: fpm_minner_buf,
+            _fpm_hunit_buf: fpm_hunit_buf,
+            _fpm_gx_buf: fpm_gx_buf,
             staged_wq_t_buf,
             staged_wk_t_buf,
             staged_wv_t_buf,
@@ -2263,7 +2497,7 @@ impl GpuDeqBackend {
             cached_residual_alpha,
             cached_fpm_alpha_m,
             cached_fpm_tau,
-            cached_fpm_persist_beta,
+            cached_fpm_stage,
             cfg_hist_gated,
             cfg_hist_selective,
             cfg_slot_anchor_zero,
@@ -2359,9 +2593,9 @@ impl GpuDeqBackend {
             } else {
                 0
             },
+            fpm_stage: self.cached_fpm_stage,
             fpm_alpha_m: self.cached_fpm_alpha_m,
             fpm_tau: self.cached_fpm_tau,
-            fpm_persist_beta: self.cached_fpm_persist_beta,
         }
     }
 
@@ -2387,13 +2621,14 @@ impl GpuDeqBackend {
         w_delta: &[f32],
         b_delta: &[f32],
         w_gate_hist: &[f32],
-        w_forget: &[f32],
-        b_forget: &[f32],
+        w_write_gate: &[f32],
+        b_write_mem: &[f32],
         w_retain_up: &[f32],
         w_retain_down: &[f32],
         b_retain: &[f32],
         w_q_mem: &[f32],
         w_k_mem: &[f32],
+        b_read_mem: &[f32],
     ) {
         let d = self.config.d_r as u64;
         let h = self.config.h_slots as u64;
@@ -2448,13 +2683,14 @@ impl GpuDeqBackend {
             w_delta,
             b_delta,
             w_gate_hist,
-            w_forget,
-            b_forget,
+            w_write_gate,
+            b_write_mem,
             w_retain_up,
             w_retain_down,
             b_retain,
             w_q_mem,
             w_k_mem,
+            b_read_mem,
         );
         queue.write_buffer(
             &self.bridge.all_weights_buf,
@@ -3896,24 +4132,45 @@ impl GpuDeqBackend {
                 );
                 add_pass!(&self.fused_update_stage4_bias_pipeline, d.div_ceil(64), 1);
             }
-            if grad_accum_mode == 1 && apply_accum {
-                add_pass!(
-                    &self.fused_update_apply_grad_pipeline,
-                    n_total_weights.div_ceil(256),
-                    1
-                );
-            }
-            // FPM retain-gate backward: dispatch after all other update stages.
+            // FPM memory backward: dispatch after all other update stages and before any
+            // apply_grad pass so shared-parameter gradients participate in the same update.
             // One workgroup per slot, WG_SIZE=64. Uses separate bind groups.
             if self.bridge.fpm_enabled {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("FPM Retain Bwd"),
+                    label: Some("FPM Memory Bwd"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.fpm_retain_bwd_pipeline);
                 pass.set_bind_group(0, &self.fpm_retain_bwd_bg0, &[]);
                 pass.set_bind_group(1, &self.fused_update_bg1, &[]);
                 pass.dispatch_workgroups(hs, 1, 1);
+                drop(pass);
+
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("FPM Shared Wout"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.fpm_shared_wout_pipeline);
+                pass.set_bind_group(0, &self.fpm_shared_bg0, &[]);
+                pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                pass.dispatch_workgroups(d.div_ceil(16), d.div_ceil(16), 1);
+                drop(pass);
+
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("FPM Shared Wx"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.fpm_shared_wx_pipeline);
+                pass.set_bind_group(0, &self.fpm_shared_bg0, &[]);
+                pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                pass.dispatch_workgroups(d.div_ceil(64), 1, 1);
+            }
+            if grad_accum_mode == 1 && apply_accum {
+                add_pass!(
+                    &self.fused_update_apply_grad_pipeline,
+                    n_total_weights.div_ceil(256),
+                    1
+                );
             }
             self.queue.submit(Some(enc.finish()));
             // Non-blocking queue drain for long batched encoders. This preserves overlap while
@@ -4437,6 +4694,30 @@ impl GpuDeqBackend {
                     "stage4_bias",
                     &self.fused_update_stage4_bias_pipeline,
                     &self.fused_update_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(64),
+                    1,
+                    profile_fused,
+                );
+            }
+            if self.bridge.fpm_enabled {
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "fpm_shared_wout",
+                    &self.fpm_shared_wout_pipeline,
+                    &self.fpm_shared_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(16),
+                    d.div_ceil(16),
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "fpm_shared_wx",
+                    &self.fpm_shared_wx_pipeline,
+                    &self.fpm_shared_bg0,
                     &self.fused_update_bg1,
                     d.div_ceil(64),
                     1,

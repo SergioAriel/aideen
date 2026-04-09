@@ -157,17 +157,14 @@ fn main() {
 
     let load_start = Instant::now();
     let mut trainer = if is_full_path {
-        Trainer::load_full(&model_path).unwrap_or_else(|e| {
-            panic!("No se pudo cargar modelo {}: {}", model_path, e)
-        })
+        Trainer::load_full(&model_path)
+            .unwrap_or_else(|e| panic!("No se pudo cargar modelo {}: {}", model_path, e))
     } else if Path::new(&format!("{model_path}.aidn")).exists() {
-        Trainer::load_checkpoint(&model_path).unwrap_or_else(|e| {
-            panic!("No se pudo cargar checkpoint {}: {}", model_path, e)
-        })
+        Trainer::load_checkpoint(&model_path)
+            .unwrap_or_else(|e| panic!("No se pudo cargar checkpoint {}: {}", model_path, e))
     } else {
-        Trainer::load_full(&model_path).unwrap_or_else(|e| {
-            panic!("No se pudo cargar modelo {}: {}", model_path, e)
-        })
+        Trainer::load_full(&model_path)
+            .unwrap_or_else(|e| panic!("No se pudo cargar modelo {}: {}", model_path, e))
     };
     let load_elapsed = load_start.elapsed().as_secs_f32();
 
@@ -185,13 +182,14 @@ fn main() {
             _w_delta,
             _b_delta,
             _w_gate_hist,
-            _w_forget,
-            _b_forget,
+            _w_write_gate,
+            _b_write_mem,
             _w_retain_up,
             _w_retain_down,
             _b_retain,
             _w_q_mem,
             _w_k_mem,
+            _b_read_mem,
         ) = trainer.reasoning.history_params_gpu_layout();
         let (gate_min, gate_max) = min_max(&hist_gate_logit);
         let (slot_anchor_min, slot_anchor_max) = min_max(&slot_anchor);
@@ -271,14 +269,7 @@ fn main() {
             |chunk| print!("{}", chunk),
         )
     } else {
-        let out = trainer.generate(
-            &prompt,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            rep_penalty,
-        );
+        let out = trainer.generate(&prompt, max_tokens, temperature, top_p, top_k, rep_penalty);
         println!("{}", out);
         out
     };

@@ -520,13 +520,14 @@ impl Trainer {
             w_delta_rm,
             b_delta,
             w_gate_hist_rm,
-            w_forget_rm,
-            b_forget_rm,
+            w_write_gate_rm,
+            b_write_mem,
             w_retain_up_rm,
             w_retain_down_rm,
             b_retain_rm,
             w_q_mem_rm,
             w_k_mem_rm,
+            b_read_mem,
         ) = self.reasoning.history_params_gpu_layout();
         gpu.upload_weights(
             &gpu.queue,
@@ -547,13 +548,14 @@ impl Trainer {
             w_delta_rm.as_slice(),
             b_delta.as_slice(),
             w_gate_hist_rm.as_slice(),
-            w_forget_rm.as_slice(),
-            b_forget_rm.as_slice(),
+            w_write_gate_rm.as_slice(),
+            b_write_mem.as_slice(),
             w_retain_up_rm.as_slice(),
             w_retain_down_rm.as_slice(),
             b_retain_rm.as_slice(),
             w_q_mem_rm.as_slice(),
             w_k_mem_rm.as_slice(),
+            b_read_mem.as_slice(),
         );
     }
 
@@ -575,13 +577,14 @@ impl Trainer {
             _w_delta_rm,
             _b_delta,
             _w_gate_hist_rm,
-            _w_forget_rm,
-            _b_forget_rm,
+            _w_write_gate_rm,
+            _b_write_mem,
             _w_retain_up_rm,
             _w_retain_down_rm,
             _b_retain_rm,
             _w_q_mem_rm,
             _w_k_mem_rm,
+            _b_read_mem,
         ) = self.reasoning.history_params_gpu_layout();
         let hist_flat = hist_ctx.to_flat();
         let mut slot_anchor_eff = slot_anchor_rm;
@@ -652,6 +655,13 @@ impl Trainer {
 
     fn effective_fpm_enabled() -> bool {
         Self::baseline_fpm_enabled() && !Self::clean_deq_mode_active() && !Self::slot_coord_mode_active()
+    }
+
+    fn fpm_stage_from_env() -> u32 {
+        std::env::var("AIDEEN_FPM_STAGE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(3)
     }
 
     fn default_hist_min_iters() -> u32 {
@@ -1124,11 +1134,14 @@ impl Trainer {
         out
     }
 
-    fn decode_fpm_read_metrics(fw: &[f32], h_slots: usize) -> Vec<(f32, f32, f32, f32, f32, f32)> {
+    fn decode_fpm_read_metrics(
+        fw: &[f32],
+        h_slots: usize,
+    ) -> Vec<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
         let mut out = Vec::new();
         for slot in 0..h_slots {
-            let base = 520 + slot * 6;
-            if fw.len() <= base + 5 {
+            let base = 520 + slot * 14;
+            if fw.len() <= base + 13 {
                 break;
             }
             out.push((
@@ -1138,6 +1151,14 @@ impl Trainer {
                 fw[base + 3],
                 fw[base + 4],
                 fw[base + 5],
+                fw[base + 6],
+                fw[base + 7],
+                fw[base + 8],
+                fw[base + 9],
+                fw[base + 10],
+                fw[base + 11],
+                fw[base + 12],
+                fw[base + 13],
             ));
         }
         out
@@ -1193,6 +1214,7 @@ impl Trainer {
         max_h: f32,
         contractivity: f32,
         epsilon: f32,
+        model_a_mode: bool,
     ) -> SolveStatus {
         let null_h_floor = 1e-4;
         let null_z_floor = 1e-4;
@@ -1206,6 +1228,19 @@ impl Trainer {
             || !contractivity.is_finite()
         {
             return SolveStatus::NumericInvalid;
+        }
+
+        if model_a_mode {
+            if metrics.exit_err_h <= 0.15 {
+                if max_h <= null_h_floor && metrics.avg_z <= null_z_floor {
+                    return SolveStatus::TrivialConverged;
+                }
+                return SolveStatus::HealthyConverged;
+            }
+            if contractivity > 1.20 {
+                return SolveStatus::NumericInvalid;
+            }
+            return SolveStatus::Unconverged;
         }
 
         if contractivity > 1.20 {
@@ -1794,13 +1829,14 @@ impl Trainer {
                         w_delta_rm,
                         b_delta,
                         w_gate_hist_rm,
-                        w_forget_rm,
-                        b_forget_rm,
+                        w_write_gate_rm,
+                        b_write_mem,
                         w_retain_up_rm,
                         w_retain_down_rm,
                         b_retain_rm,
                         w_q_mem_rm,
                         w_k_mem_rm,
+                        b_read_mem,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
@@ -1821,13 +1857,14 @@ impl Trainer {
                         w_delta_rm.as_slice(),
                         b_delta.as_slice(),
                         w_gate_hist_rm.as_slice(),
-                        w_forget_rm.as_slice(),
-                        b_forget_rm.as_slice(),
+                        w_write_gate_rm.as_slice(),
+                        b_write_mem.as_slice(),
                         w_retain_up_rm.as_slice(),
                         w_retain_down_rm.as_slice(),
                         b_retain_rm.as_slice(),
                         w_q_mem_rm.as_slice(),
                         w_k_mem_rm.as_slice(),
+                        b_read_mem.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -2012,8 +2049,9 @@ impl Trainer {
             } else {
                 None
             };
+            let model_a_fpm = Self::fpm_stage_from_env() < 6;
             let cached_fpm_status = cached_fpm_metrics
-                .map(|m| Self::classify_fpm_solve(m, max_h_dbg, contractivity, epsilon));
+                .map(|m| Self::classify_fpm_solve(m, max_h_dbg, contractivity, epsilon, model_a_fpm));
             // Evaluate invalidity at most once per freshly captured debug snapshot.
             // Reusing the same cached sample for several training steps would turn one
             // bad window into an artificial streak of "consecutive" failures.
@@ -2276,9 +2314,16 @@ impl Trainer {
                 } else {
                     None
                 } {
-                    fpm_status = Self::classify_fpm_solve(metrics, max_h, contractivity, epsilon);
+                    let model_a_fpm = Self::fpm_stage_from_env() < 6;
+                    fpm_status = Self::classify_fpm_solve(
+                        metrics,
+                        max_h,
+                        contractivity,
+                        epsilon,
+                        model_a_fpm,
+                    );
                     fpm_step_diag = format!(
-                        " status={} err_h={:.3e} exit_err_h={:.3e} exit_iter={:.2} upd_M={:.3e} z_max={:.3} z_avg={:.3} u2v_max={:.3e} memctx_rms={:.3e} memctx/sig={:.3e} dead={:.0} sat={:.0} rescue={:.0}/{:.0} pre_rescue={:.0} eps={:.3e} a_m={:.3} tau={:.2}",
+                        " status={} err_h={:.3e} exit_err_h={:.3e} exit_iter={:.2} err_M={:.3e} z_max={:.3} z_avg={:.3} u2v_max={:.3e} memctx_rms={:.3e} memctx/sig={:.3e} dead={:.0} sat={:.0} rescue={:.0}/{:.0} pre_rescue={:.0} eps={:.3e} a_m={:.3} tau={:.2}",
                         fpm_status.label(),
                         metrics.max_err_h,
                         metrics.exit_err_h,
@@ -3120,7 +3165,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -3324,7 +3369,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -3818,6 +3863,22 @@ impl Trainer {
                 #[cfg(feature = "wgpu")]
                 {
                     let fpm_enabled = Self::effective_fpm_enabled();
+                    let debug_fpm = Self::env_flag("AIDEEN_DEBUG_FPM");
+                    if fpm_enabled && debug_fpm {
+                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                            let (wx_stats, wout_stats, alog_stats) =
+                                gpu.read_hist_carrier_param_stats();
+                            println!(
+                                "    [FPM-CARRIER] wx(mean={:.3e},max={:.3e}) wout(mean={:.3e},max={:.3e}) alog(mean={:.3e},max={:.3e})",
+                                wx_stats.0,
+                                wx_stats.1,
+                                wout_stats.0,
+                                wout_stats.1,
+                                alog_stats.0,
+                                alog_stats.1,
+                            );
+                        }
+                    }
                     let wdelta_audit = std::env::var("AIDEEN_WDELTA_AUDIT")
                         .ok()
                         .map(|v| {
@@ -3926,45 +3987,94 @@ impl Trainer {
                                 .join(",");
                             let read_rms = slot_read
                                 .iter()
-                                .map(|(rms, _, _, _, _, _)| format!("{rms:.3e}"))
+                                .map(|(rms, _, _, _, _, _, _, _, _, _, _, _, _, _)| format!("{rms:.3e}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let read_to_sig = slot_read
                                 .iter()
-                                .map(|(_, ratio, _, _, _, _)| format!("{ratio:.3e}"))
+                                .map(|(_, ratio, _, _, _, _, _, _, _, _, _, _, _, _)| format!("{ratio:.3e}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let retain_max = slot_read
                                 .iter()
-                                .map(|(_, _, mx, _, _, _)| format!("{mx:.3}"))
+                                .map(|(_, _, mx, _, _, _, _, _, _, _, _, _, _, _)| format!("{mx:.3}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let prop_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, pr, _)| format!("{pr:.3e}"))
+                                .map(|(_, _, _, _, pr, _, _, _, _, _, _, _, _, _)| format!("{pr:.3e}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let cand_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, cr)| format!("{cr:.3e}"))
+                                .map(|(_, _, _, _, _, cr, _, _, _, _, _, _, _, _)| format!("{cr:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let q_rms = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, q, _, _, _, _, _, _, _)| format!("{q:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let k_rms = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, k, _, _, _, _, _, _)| format!("{k:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let logit_gap = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, gap, _, _, _, _, _)| format!("{gap:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let confidence = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, conf, _, _, _, _)| format!("{conf:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let src_m_rms = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, _, m, _, _, _)| format!("{m:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let keyed_m_rms = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, _, _, km, _, _)| format!("{km:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let peak_w = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, _, _, _, peak, _)| format!("{peak:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let raw_gap = slot_read
+                                .iter()
+                                .map(|(_, _, _, _, _, _, _, _, _, _, _, _, _, rg)| format!("{rg:.3e}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
                             println!(
-                                "    [FPM-DIAG] err_h=[{}] exit_err_h=[{}] exit_iter=[{}] upd_M=[{}] z=[{}] rescue=[{}] dead=[{}] u2v=[{}] sat=[{}] read_rms=[{}] read2sig=[{}] retain_max=[{}] prop_rms=[{}] cand_rms=[{}] alpha_m={:.3} tau={:.2}",
-                                err_h,
-                                exit_err_h,
-                                exit_iter,
-                                err_m,
-                                z,
-                                rescue,
-                                dead,
-                                ratio,
-                                sat,
+                                "    [FPM-PATH] read(mem_rms=[{}],mem2sig=[{}],retain_max=[{}],src_m_rms=[{}],keyed_m_rms=[{}],q_rms=[{}],k_rms=[{}],raw_gap=[{}],gap=[{}],peak=[{}],conf=[{}]) solve(err_h=[{}],exit_err_h=[{}],exit_iter=[{}],dead=[{}],rescue=[{}]) write(err_M=[{}],z=[{}],u2v=[{}],sat=[{}],prop_rms=[{}],cand_rms=[{}]) knobs(stage={},alpha_m={:.3},tau={:.2})",
                                 read_rms,
                                 read_to_sig,
                                 retain_max,
+                                src_m_rms,
+                                keyed_m_rms,
+                                q_rms,
+                                k_rms,
+                                raw_gap,
+                                logit_gap,
+                                peak_w,
+                                confidence,
+                                err_h,
+                                exit_err_h,
+                                exit_iter,
+                                dead,
+                                rescue,
+                                err_m,
+                                z,
+                                ratio,
+                                sat,
                                 prop_rms,
                                 cand_rms,
+                                Self::fpm_stage_from_env(),
                                 self.fpm_alpha_m_current,
                                 self.fpm_tau_current
                             );
@@ -4656,14 +4766,15 @@ impl Trainer {
                         let b_delta_base = w_delta_base + h_slots * d_r * d_r;
                         let scalar_base = b_delta_base + d_r;
                         let w_gate_hist_base = scalar_base + 21;
-                        let w_forget_base = w_gate_hist_base + h_slots * d_r;
-                        let b_forget_base = w_forget_base + h_slots * d_r;
-                        let hhist_gamma_base = b_forget_base + h_slots;
+                        let w_write_gate_base = w_gate_hist_base + h_slots * d_r;
+                        let b_write_mem_base = w_write_gate_base + h_slots * d_r;
+                        let hhist_gamma_base = b_write_mem_base + h_slots;
                         let w_retain_up_base = hhist_gamma_base + h_slots;
                         let w_retain_down_base = w_retain_up_base + h_slots * d_r * 32;
                         let b_retain_base = w_retain_down_base + h_slots * 32 * d_r;
                         let w_q_mem_base = b_retain_base + h_slots * d_r;
                         let w_k_mem_base = w_q_mem_base + h_slots * d_r * 32;
+                        let b_read_mem_base = w_k_mem_base + h_slots * d_r * 32;
 
                         self.reasoning.w_hist_shared = nalgebra::DMatrix::from_row_slice(
                             d_r,
@@ -4698,15 +4809,15 @@ impl Trainer {
                         self.reasoning.w_gate_hist = nalgebra::DMatrix::from_row_slice(
                             h_slots,
                             d_r,
-                            &hist[w_gate_hist_base..w_forget_base],
+                            &hist[w_gate_hist_base..w_write_gate_base],
                         );
-                        self.reasoning.w_forget = nalgebra::DMatrix::from_row_slice(
+                        self.reasoning.w_write_gate = nalgebra::DMatrix::from_row_slice(
                             h_slots,
                             d_r,
-                            &hist[w_forget_base..b_forget_base],
+                            &hist[w_write_gate_base..b_write_mem_base],
                         );
-                        self.reasoning.b_forget = nalgebra::DVector::from_column_slice(
-                            &hist[b_forget_base..hhist_gamma_base],
+                        self.reasoning.b_write_mem = nalgebra::DVector::from_column_slice(
+                            &hist[b_write_mem_base..hhist_gamma_base],
                         );
                         self.reasoning.w_retain_up = hist[w_retain_up_base..w_retain_down_base]
                             .chunks_exact(d_r * 32)
@@ -4725,10 +4836,13 @@ impl Trainer {
                             .chunks_exact(d_r * 32)
                             .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
                             .collect();
-                        self.reasoning.w_k_mem = hist[w_k_mem_base..]
+                        self.reasoning.w_k_mem = hist[w_k_mem_base..b_read_mem_base]
                             .chunks_exact(d_r * 32)
                             .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
                             .collect();
+                        self.reasoning.b_read_mem = nalgebra::DVector::from_column_slice(
+                            &hist[b_read_mem_base..b_read_mem_base + h_slots],
+                        );
                     }
                     self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU
                     self.gpu_cg_weights_uploaded = true;

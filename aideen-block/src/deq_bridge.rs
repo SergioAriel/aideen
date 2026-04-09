@@ -15,9 +15,9 @@ pub struct DeqComputeShape {
     pub token_count: u32,
     pub diag_zero_win: u32,
     pub diag_one_iter: u32,
+    pub fpm_stage: u32,
     pub fpm_alpha_m: f32,
     pub fpm_tau: f32,
-    pub fpm_persist_beta: f32,
 }
 
 #[repr(C)]
@@ -519,7 +519,8 @@ impl RustDeqBridge {
             + h_slots  // γ per slot
             + 2u32 * h_slots * d_model * RETAIN_RANK  // W_retain_up + W_retain_down
             + h_slots * d_model                        // b_retain
-            + 2u32 * h_slots * d_model * MEM_READ_RANK; // W_q_mem + W_k_mem
+            + 2u32 * h_slots * d_model * MEM_READ_RANK // W_q_mem + W_k_mem
+            + h_slots; // b_read_mem
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
@@ -1398,22 +1399,11 @@ impl RustDeqBridge {
             label: Some("DEQ Forward GPU-Only Encoder"),
         });
 
-        let fpm_slot_stride = if self.fpm_enabled {
+        let fpm_stage = shape.fpm_stage;
+        let fpm_read_enabled = self.fpm_enabled && fpm_stage >= 2;
+        let fpm_persist_enabled = self.fpm_enabled && fpm_stage >= 5;
+        let fpm_slot_stride = if fpm_read_enabled {
             let slot_stride = (shape.h_slots as u64) * (shape.d_model as u64) * 4u64;
-            // FPM pre-dispatch: seed MState from h_hist_buf on the first chunk.
-            // For subsequent chunks MState is already set from the previous chunk's post-copy.
-            if shape.token_start == 0 {
-                for b in 0..shape.batch_size as u64 {
-                    let src_off = b * slot_stride;
-                    encoder.copy_buffer_to_buffer(
-                        &self.h_hist_buf,
-                        src_off,
-                        &self.mstate_buf,
-                        b * slot_stride,
-                        slot_stride,
-                    );
-                }
-            }
             Some(slot_stride)
         } else {
             None
@@ -1480,7 +1470,8 @@ impl RustDeqBridge {
         }
         // FPM post-dispatch: copy each batch element's LAST-token m_new → mstate_buf.
         // Executes after the compute pass (commands in one encoder are ordered).
-        if let Some(slot_stride) = fpm_slot_stride {
+        if fpm_persist_enabled {
+            let slot_stride = fpm_slot_stride.expect("persist requires read slot stride");
             let last_token = (shape.token_start + shape.token_count - 1) as u64;
             for b in 0..shape.batch_size as u64 {
                 let src_off = (b * shape.seq_len as u64 + last_token) * slot_stride;
