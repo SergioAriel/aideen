@@ -3736,10 +3736,11 @@ impl GpuDeqBackend {
                     d.div_ceil(16),
                     n.div_ceil(16)
                 );
-                add_pass!(
+                add_pass_3d!(
                     stage4_wo_win_pipeline,
                     d.div_ceil(16),
-                    d.div_ceil(16)
+                    d.div_ceil(16),
+                    hs
                 );
                 add_pass_3d!(
                     &self.fused_update_stage4_wq_pipeline,
@@ -4087,7 +4088,7 @@ impl GpuDeqBackend {
                     n.div_ceil(16),
                     profile_fused,
                 );
-                run_stage(
+                run_stage_3d(
                     &self.device,
                     &self.queue,
                     "stage4_wo_win",
@@ -4096,6 +4097,7 @@ impl GpuDeqBackend {
                     &self.fused_update_bg1,
                     d.div_ceil(16),
                     d.div_ceil(16),
+                    hs,
                     profile_fused,
                 );
                 run_stage_3d(

@@ -45,6 +45,18 @@ fn entry_base(entry: u32, d: u32) -> u32 {
     return entry * d;
 }
 
+fn v_next_entry_base(entry: u32, d: u32, h_slots: u32) -> u32 {
+    let token = entry / h_slots;
+    let slot = entry % h_slots;
+    let n_tokens = params.batch_size * params.seq_len;
+    return (slot * n_tokens + token) * d;
+}
+
+fn v_next_slot_base(token: u32, slot: u32, d: u32) -> u32 {
+    let n_tokens = params.batch_size * params.seq_len;
+    return (slot * n_tokens + token) * d;
+}
+
 fn entry_workgroup_index(wid: vec3<u32>) -> u32 {
     return wid.y * CLEAN_ENTRY_GRID_X + wid.x;
 }
@@ -138,7 +150,7 @@ fn picard_clean_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         slot_coord_mode(),
     );
     let rhs = b_in[token * d + dim] * rhs_scale;
-    v_next[entry_base(entry, d) + dim] = rhs;
+    v_next[v_next_entry_base(entry, d, h_slots) + dim] = rhs;
 }
 
 @compute
@@ -163,6 +175,7 @@ fn picard_clean_step_main(
     let anchor_base = slot_anchor_base(d, h_slots) + q_off;
     let attn_scale = select(1.0, slot_coord_attn_scale(token, slot, d, h_slots), slot_coord_mode_active);
     let off = entry_base(entry, d);
+    let v_off = v_next_entry_base(entry, d, h_slots);
     let inv_d = 1.0 / max(1.0, f32(d));
 
     var local_sumsq = 0.0;
@@ -215,7 +228,7 @@ fn picard_clean_step_main(
             - select(pre, slot_branch, slot_coord_mode_active) * coeff_scale
             + (1.0 - params.damping) * v_prev;
         let rhs = b_in[token * d + dim] * rhs_scale;
-        v_next[off + dim] = rhs + jac_term;
+        v_next[v_off + dim] = rhs + jac_term;
     }
 }
 const ACCUM_SHARED_D: u32 = 512u;
@@ -332,7 +345,7 @@ fn picard_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let rhs = b_in[t * d + dim] * w_s
         + rhs_slot_buf[legacy_entry_base(entry, d) + dim];
-    v_next[legacy_entry_base(entry, d) + dim] = rhs;
+    v_next[v_next_entry_base(entry, d, h_slots) + dim] = rhs;
 }
 
 @compute
@@ -585,7 +598,7 @@ fn picard_accum_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let b = b_in[t * d + dim] / max(1.0, f32(h_slots))
         + rhs_slot_buf[legacy_entry_base(entry, d) + dim];
-    v_next[t_off + target_off + dim] = jt_v + b;
+    v_next[v_next_slot_base(t, target_slot, d) + dim] = jt_v + b;
 }
 
 @compute
@@ -648,7 +661,7 @@ fn picard_accum_opt_main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
         let b = b_in[t * d + dim] / max(1.0, f32(h_slots))
             + rhs_slot_buf[legacy_entry_base(entry, d) + dim];
-        v_next[t_off + target_off + dim] = jt_v + b;
+        v_next[v_next_slot_base(t, target_slot, d) + dim] = jt_v + b;
     }
 }
 
@@ -716,7 +729,7 @@ fn picard_accum_opt_token8_main(@builtin(local_invocation_id) lid: vec3<u32>,
             let rhs_entry = token * h_slots + target_slot;
             let b = b_in[token * d + dim] / max(1.0, f32(h_slots))
                 + rhs_slot_buf[legacy_entry_base(rhs_entry, d) + dim];
-            v_next[t_off + target_slot * d + dim] = jt_v + b;
+            v_next[v_next_slot_base(token, target_slot, d) + dim] = jt_v + b;
         }
     }
 }
@@ -739,7 +752,7 @@ fn picard_accum_base_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = (1.0 - params.damping) * v_state[t_off + target_off + dim];
     let rhs = b_in[t * d + dim] / max(1.0, f32(h_slots))
         + rhs_slot_buf[legacy_entry_base(entry, d) + dim];
-    v_next[t_off + target_off + dim] = base + rhs;
+    v_next[v_next_slot_base(t, target_slot, d) + dim] = base + rhs;
 }
 
 @compute
@@ -772,7 +785,7 @@ fn picard_accum_v_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         v_path_acc = v_path_acc + alpha_qt * dot_v;
     }
-    v_next[t_off + target_off + dim] = v_next[t_off + target_off + dim] + v_path_acc;
+    v_next[v_next_slot_base(t, target_slot, d) + dim] = v_next[v_next_slot_base(t, target_slot, d) + dim] + v_path_acc;
 }
 
 @compute
@@ -805,7 +818,7 @@ fn picard_accum_k_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 + W_k[dim * d + qd] * (scale * g_score_t * Scratch[q_base + qs_off + qd]);
         }
     }
-    v_next[t_off + target_off + dim] = v_next[t_off + target_off + dim] + k_path_acc;
+    v_next[v_next_slot_base(t, target_slot, d) + dim] = v_next[v_next_slot_base(t, target_slot, d) + dim] + k_path_acc;
 }
 
 @compute
@@ -831,7 +844,7 @@ fn picard_accum_q_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var qd = 0u; qd < d; qd = qd + 1u) {
         q_path_acc = q_path_acc + W_q[dim * d + qd] * qgrad_buf[src_off + qd];
     }
-    v_next[t_off + target_off + dim] = v_next[t_off + target_off + dim] + q_path_acc;
+    v_next[v_next_slot_base(t, target_slot, d) + dim] = v_next[v_next_slot_base(t, target_slot, d) + dim] + q_path_acc;
 }
 
 // ============================================================
@@ -940,7 +953,7 @@ fn anderson_mix_main(
                 var dot = 0.0;
                 for (var e = 0u; e < h_slots; e = e + 1u) {
                     let entry = token * h_slots + e;
-                    let base  = entry * d;
+        let base  = v_next_entry_base(entry, d, h_slots);
                     for (var dim2 = 0u; dim2 < d; dim2 = dim2 + 1u) {
                         let da = legacy_anderson_read(si, attn_len, base + dim2)
                                - legacy_anderson_read(si1, attn_len, base + dim2);
@@ -1009,7 +1022,7 @@ fn anderson_mix_main(
                 let hi = (k + m - i) % m;
                 mixed = mixed + anderson_beta[i] * legacy_anderson_read(hi, attn_len, entry * d + dim2);
             }
-            v_next[entry * d + dim2] = mixed;
+            v_next[v_next_entry_base(entry, d, h_slots) + dim2] = mixed;
         }
     }
 }

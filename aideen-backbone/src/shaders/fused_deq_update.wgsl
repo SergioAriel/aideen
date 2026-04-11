@@ -52,6 +52,23 @@ fn entry_base(entry: u32, d: u32) -> u32 {
     return entry * d;
 }
 
+fn v_adjoint_base(token: u32, slot: u32, d: u32) -> u32 {
+    let n_tokens = params.batch_size * params.seq_len;
+    return (slot * n_tokens + token) * d;
+}
+
+fn hist_entry_base(entry: u32, d: u32, h_slots: u32) -> u32 {
+    let token = entry / h_slots;
+    let slot = entry % h_slots;
+    let n_tokens = params.batch_size * params.seq_len;
+    return (slot * n_tokens + token) * d;
+}
+
+fn hist_slot_base(token: u32, slot: u32, d: u32) -> u32 {
+    let n_tokens = params.batch_size * params.seq_len;
+    return (slot * n_tokens + token) * d;
+}
+
 fn scratch_stride(d: u32, h_slots: u32) -> u32 {
     return d * (h_slots * 8u) + h_slots * h_slots + h_slots;
 }
@@ -259,7 +276,7 @@ fn fused_attn_stage1a_main(
         let k_a = tile + local_col;
         if (k_a < d) {
             stage4_mat_a_tile[local_row * 16u + local_col] =
-                v_adjoint[token * h_slots * d + slot * d + k_a];
+                v_adjoint[v_adjoint_base(token, slot, d) + k_a];
         } else {
             stage4_mat_a_tile[local_row * 16u + local_col] = 0.0;
         }
@@ -398,56 +415,52 @@ fn fused_attn_stage3_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn fused_attn_stage4_wo_win_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let col = gid.x;
     let row = gid.y;
+    let slot = gid.z;
     let d = params.d_model;
-    if (row >= d || col >= d) { return; }
-
     let h_slots = params.h_slots;
-    let n_entries = params.batch_size * params.seq_len * h_slots;
+    if (row >= d || col >= d || slot >= h_slots) { return; }
+
+    let n_tokens = params.batch_size * params.seq_len;
+    let n_entries = n_tokens * h_slots;
     let idx = row * d + col;
     let lr = params.lr;
     let wd_factor = 1.0 - lr * params.weight_decay;
     let grad_scale = params.grad_scale;
 
-    var g_wo: array<f32, 16>;
-    var g_win: array<f32, 16>;
-
-    for (var entry = 0u; entry < n_entries; entry = entry + 1u) {
-        let t_abs = entry / h_slots;
-        let qs = entry % h_slots;
-        let q_off = qs * d;
+    var g_wo = 0.0;
+    var g_win = 0.0;
+    for (var token = 0u; token < n_tokens; token = token + 1u) {
+        let g_attn_col = v_adjoint[v_adjoint_base(token, slot, d) + col];
+        let entry = token * h_slots + slot;
         let off = entry_base(entry, d);
-        let g_attn_col = v_adjoint[t_abs * h_slots * d + q_off + col];
-        g_wo[qs] = g_wo[qs] + g_attn_col * mix_buf[off + row];
-        g_win[qs] = g_win[qs] + q_input[t_abs * d + row] * g_attn_col;
+        g_wo = g_wo + g_attn_col * mix_buf[off + row];
+        g_win = g_win + q_input[token * d + row] * g_attn_col;
     }
 
     let seq_scale = 1.0 / max(1.0, f32(n_entries));
     let clip = 0.5;
-    for (var s = 0u; s < h_slots; s = s + 1u) {
-        let raw_wo = lr * g_wo[s] * seq_scale * grad_scale;
-        let wo_idx = aw_wo_base(params.d_model, params.h_slots) + s * d * d + idx;
-        if (params.grad_accum_mode == 1u) {
-            AllGradients[wo_idx] += raw_wo;
-        } else {
-            AllWeights[wo_idx] = AllWeights[wo_idx] * wd_factor - clamp(raw_wo, -clip, clip);
-        }
+    let raw_wo = lr * g_wo * seq_scale * grad_scale;
+    let wo_idx = aw_wo_base(params.d_model, params.h_slots) + slot * d * d + idx;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[wo_idx] += raw_wo;
+    } else {
+        AllWeights[wo_idx] = AllWeights[wo_idx] * wd_factor - clamp(raw_wo, -clip, clip);
     }
 
-    for (var s = 0u; s < h_slots; s = s + 1u) {
-        let g_win_s = g_win[s] * seq_scale;
-        let raw_win = lr * g_win_s * grad_scale;
-        if (params.grad_accum_mode == 1u) {
-            AllGradients[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] += raw_win;
-        } else {
-            AllWeights[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] = AllWeights[aw_win_base(params.d_model, params.h_slots) +s * d * d + idx] * wd_factor - clamp(raw_win, -clip, clip);
-        }
+    let g_win_s = g_win * seq_scale;
+    let raw_win = lr * g_win_s * grad_scale;
+    let win_idx = aw_win_base(params.d_model, params.h_slots) + slot * d * d + idx;
+    if (params.grad_accum_mode == 1u) {
+        AllGradients[win_idx] += raw_win;
+    } else {
+        AllWeights[win_idx] = AllWeights[win_idx] * wd_factor - clamp(raw_win, -clip, clip);
     }
 
-    if (idx == 0u) {
+    if (idx == 0u && slot == 0u) {
         // Keep 8..18 reserved for the forward DEQ snapshot header.
         debug_log[1000] = 241.0;
-        debug_log[41] = g_wo[0];
-        debug_log[43] = g_win[0];
+        debug_log[41] = g_wo;
+        debug_log[43] = g_win;
     }
 }
 
@@ -546,7 +559,7 @@ fn fused_attn_stage4_prep_wk_main(@builtin(global_invocation_id) gid: vec3<u32>)
         coeff = coeff + scale * gscore_buf[entry * h_slots + ks]
             * Scratch[q_base + qs * d + dim];
     }
-    hist_delta_buf[entry_base(tk, d) + dim] = coeff;
+    hist_delta_buf[hist_entry_base(tk, d, h_slots) + dim] = coeff;
 }
 
 @compute
@@ -572,7 +585,7 @@ fn fused_attn_stage4_prep_wv_main(@builtin(global_invocation_id) gid: vec3<u32>)
             + Scratch[attn_weight_base_t + qs * h_slots + ks]
             * gmix_buf[entry_base(entry, d) + dim];
     }
-    hist_ctx_buf[entry_base(tk, d) + dim] = coeff;
+    hist_ctx_buf[hist_entry_base(tk, d, h_slots) + dim] = coeff;
 }
 
 @compute
@@ -602,7 +615,7 @@ fn fused_attn_stage4_wk_main(
         let token_a = tile + local_col;
         if (token_a < n_tokens) {
             stage4_mat_a_tile[local_row * 16u + local_col] =
-                hist_delta_buf[entry_base(token_a * h_slots + slot, d) + row];
+                hist_delta_buf[hist_slot_base(token_a, slot, d) + row];
         } else {
             stage4_mat_a_tile[local_row * 16u + local_col] = 0.0;
         }
@@ -683,7 +696,7 @@ fn fused_attn_stage4_wv_main(
         let token_b = tile + local_row;
         if (token_b < n_tokens) {
             stage4_mat_b_tile[local_row * 16u + local_col] =
-                hist_ctx_buf[entry_base(token_b * h_slots + slot, d) + col];
+                hist_ctx_buf[hist_slot_base(token_b, slot, d) + col];
         } else {
             stage4_mat_b_tile[local_row * 16u + local_col] = 0.0;
         }
@@ -790,6 +803,7 @@ fn fused_hist_stage_prep_main(
     let hist_scale = hist_scale_base(d, h_slots);
     let signal_base = token_signal_base(t_abs, d, h_slots);
     let hist_out = entry_base(entry, d);
+    let hist_ctx_out = hist_entry_base(entry, d, h_slots);
     let sample_t = select(0u, max(1u, params.seq_len / 2u), params.seq_len > 1u);
     let sample_entry = sample_t * h_slots;
     let selective = hist_selective_enabled(d, h_slots);
@@ -851,7 +865,7 @@ fn fused_hist_stage_prep_main(
         if (t > 0u) {
             prev_h = h_star[(t_abs - 1u) * h_slots * d + off + dim];
         }
-        qgrad_buf[hist_out + dim] = prev_h / prev_h_rms;
+    qgrad_buf[hist_out + dim] = prev_h / prev_h_rms;
     }
     hist_reduce_u[lane] = local_u_sumsq;
     hist_reduce_aux[lane] = local_inj_sumsq;
@@ -934,8 +948,8 @@ fn fused_hist_stage_prep_main(
                 delta_coeff = (prev_m_raw - x_proj) * gpre_factor;
             }
         }
-        hist_ctx_buf[hist_out + dim] = a_t;
-        hist_delta_buf[hist_out + dim] = delta_coeff;
+        hist_ctx_buf[hist_ctx_out + dim] = a_t;
+        hist_delta_buf[hist_ctx_out + dim] = delta_coeff;
     }
     workgroupBarrier();
 
@@ -1310,6 +1324,7 @@ fn fused_hist_stage_tbptt_main(
 
         let entry = t_abs * h_slots + slot;
         let hist_out = entry_base(entry, d);
+        let hist_ctx_out = hist_entry_base(entry, d, h_slots);
 
         for (var dim = lane; dim < d; dim = dim + 64u) {
             let total_gm = gmix_buf[hist_out + dim] + hist_carry_vec[dim];
@@ -1328,9 +1343,9 @@ fn fused_hist_stage_tbptt_main(
         workgroupBarrier();
 
         for (var dim = lane; dim < d; dim = dim + 64u) {
-            let a_t = hist_ctx_buf[hist_out + dim];
-            let g_pre = hist_ginner_vec[dim] * hist_delta_buf[hist_out + dim];
-            hist_delta_buf[hist_out + dim] = g_pre;
+            let a_t = hist_ctx_buf[hist_ctx_out + dim];
+            let g_pre = hist_ginner_vec[dim] * hist_delta_buf[hist_ctx_out + dim];
+            hist_delta_buf[hist_ctx_out + dim] = g_pre;
             hist_gx_vec[dim] = (1.0 - a_t) * hist_ginner_vec[dim];
             weighted_h_buf[hist_out + dim] = hist_gx_vec[dim];
             var g_h_unit = hist_gx_vec[dim];
@@ -1340,13 +1355,13 @@ fn fused_hist_stage_tbptt_main(
                 for (var out = 0u; out < d; out = out + 1u) {
                     g_h_unit = g_h_unit
                         + AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_delta_base(d, h_slots) + slot * d * d + dim * d + out]
-                        * hist_delta_buf[hist_out + out];
+                        * hist_delta_buf[hist_ctx_out + out];
                 }
             }
             hist_total_vec[dim] = g_h_unit;
         }
         for (var dim = lane; dim < d; dim = dim + 64u) {
-            let a_t = hist_ctx_buf[hist_out + dim];
+            let a_t = hist_ctx_buf[hist_ctx_out + dim];
             hist_carry_vec[dim] = a_t * hist_ginner_vec[dim];
         }
         workgroupBarrier();
@@ -1401,7 +1416,7 @@ fn fused_hist_stage_tbptt_main(
             var sum_gpre_mid = 0.0;
             for (var dim = 0u; dim < d; dim = dim + 1u) {
                 sum_ginner_mid = sum_ginner_mid + abs(hist_ginner_vec[dim]);
-                sum_gpre_mid = sum_gpre_mid + abs(hist_delta_buf[hist_out + dim]);
+                sum_gpre_mid = sum_gpre_mid + abs(hist_delta_buf[hist_ctx_out + dim]);
             }
             let inv_d = 1.0 / max(1.0, f32(d));
             debug_log[58] = sum_ginner_mid * inv_d;
@@ -1489,6 +1504,7 @@ fn fused_hist_stage_hrhs_main(
     let dst_entry = (t_abs - 1u) * h_slots + slot;
     let src_off = entry_base(entry, d);
     let dst_off = entry_base(dst_entry, d);
+    let hist_dst = hist_entry_base(dst_entry, d, h_slots);
     let prev_h_base = (t_abs - 1u) * h_slots * d + slot * d;
 
     var local_h_sumsq = 0.0;
@@ -1528,7 +1544,7 @@ fn fused_hist_stage_hrhs_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         let h_val = h_star[prev_h_base + dim];
         let g_h_unit = gmix_buf[dst_off + dim];
-        hist_ctx_buf[dst_off + dim] = (g_h_unit / h_rms)
+        hist_ctx_buf[hist_dst + dim] = (g_h_unit / h_rms)
             - (h_val * dot_gh_h / denom);
     }
 }
@@ -1651,7 +1667,7 @@ fn fused_hist_stage_wdelta_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let entry = t_abs * h_slots + slot;
                 grad = grad
                     + qgrad_buf[entry_base(entry, d) + row]
-                    * hist_delta_buf[entry_base(entry, d) + col];
+                    * hist_delta_buf[hist_entry_base(entry, d, h_slots) + col];
             }
         }
 
@@ -1692,7 +1708,7 @@ fn fused_hist_stage_bdelta_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let t_abs = b * params.seq_len + t;
             for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
                 let entry = t_abs * h_slots + slot;
-                grad = grad + hist_delta_buf[entry_base(entry, d) + dim];
+                grad = grad + hist_delta_buf[hist_entry_base(entry, d, h_slots) + dim];
             }
         }
     }
@@ -1749,7 +1765,7 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 let a_base = 1.0 / (1.0 + exp(AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim]));
                 if (selective) {
-                    let a_t = hist_ctx_buf[entry_base(entry, d) + dim];
+                    let a_t = hist_ctx_buf[hist_entry_base(entry, d, h_slots) + dim];
                     let a_floor = hist_alpha_min(d, h_slots);
                     if (a_t > a_floor + 1.0e-6) {
                         let log_a = log(max(a_base, 1.0e-6));
@@ -1873,7 +1889,7 @@ fn fused_hist_stage_forget_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // weighted_h_buf = (1-a_t) * hist_ginner, so weighted_h * a_t/(1-a_t) = a_t * hist_ginner.
             var g_scalar = 0.0;
             for (var dim = 0u; dim < d; dim = dim + 1u) {
-                let a_t = hist_ctx_buf[entry_base(entry, d) + dim];
+                let a_t = hist_ctx_buf[hist_entry_base(entry, d, h_slots) + dim];
                 let a_ratio = a_t / max(1.0 - a_t, 1.0e-6);
                 let m_prev = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
                 g_scalar += weighted_h_buf[entry_base(entry, d) + dim] * a_ratio * m_prev;
