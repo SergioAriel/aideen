@@ -1,0 +1,41 @@
+    Finished `release` profile [optimized] target(s) in 0.58s
+     Running `target/release/train --file corpus_tinystories_train_512kb.txt --epochs 1 --log-every 1`
+  Modo: archivo grande → corpus_tinystories_train_512kb.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Tokenizando corpus_tinystories_train_512kb.txt → corpus_tinystories_train_512kb.txt.tokens.bin ...
+  Tokenización con fronteras explícitas: 637 documentos, eos_token=50256
+  524288 chars → 125007 tokens, vocab=50257 → 0.48 MB
+  Fronteras de documento activas en .bin (eos_token=50256)
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  Backend: GPU (Metal) ✅ [Auto-managed]
+
+    [95m[progress][0m chunk   300  [92mloss=4.6015[0m  [96mtps_win=    91.0[0m  [94mtps_run=    91.0[0m  [90mtime=623.8s[0m
+    [95m[progress][0m chunk   700  [92mloss=4.3982[0m  [96mtps_win=    93.5[0m  [94mtps_run=    92.4[0m  [90mtime=1461.1s[0m
+    [95m[progress][0m chunk   750  [92mloss=4.1605[0m  [96mtps_win=    93.3[0m  [94mtps_run=    92.5[0m  [90mtime=1558.8s[0m
+    [95m[progress][0m chunk   800  [92mloss=4.1258[0m  [96mtps_win=    93.7[0m  [94mtps_run=    92.6[0m  [90mtime=1664.4s[0m
+  epoch    0/1  loss=3.9593  epoch_loss_avg=4.7288  gpu_loss_cached=3.9593  lr=0.000100  tps_epoch=    92.8  time=1997.36s  tokens=185335 
+
+  Tiempo total: 1997.4s
+  Spectral norms: [0.09870989, 0.09740358, 0.09794578, 0.09880578, 0.29654375, 0.3477996, 0.25282174, 0.25174212]
+
+── Checkpoint ──────────────────────────────────
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=7214.6118, v=3.516613e0
+    Embedding Moments Checksum: m=15.9646
+  model_large.aidn (214.66 MB) + model_large.opt
+
+── Generación ──────────────────────────────────
+[ComputeState] SUBGROUP supported.
+  "la inteligencia artificial" →
+    " expedition Towards electrical LinkMurray rainbow sugarourcingban nonpartisan EMP transgressMurray repaidifiesAnd Ke291 imposingMin Rin phosphateban(-Murraymissions Bildfield517 contrasting 1400And discussionsMurray fleeing laced Bild BookMurray EMP"
+  "cada neurona" →
+    "istical nonpartisan291 demonstrationsMurrayifies sugar Bookban discussionsengineering alphabetingle BildMinraise knotsmissionsRelban rainbow expeditionalty forefrontCAP Link galaxies phosphate laced(-� Book transgressisticalMurray forefrontttes Bild Carnage austerity"
+  "aideen es una red" →
+    "istical expedition nonpartisan BildAnd austerity517 electrical sugar rainbowmissionsourcing demonstrations forefront lacedRel repaid laced Book(-MurraymissionsMin Yamaha291 discussionsifies 1400 Submission(- austerityttes revenues EMP demonstrations forefrontippi Psych contrastingistical"
+  "el equilibrio profundo" →
+    " Linkingle291 fleeing sugar repaidban Psych expedition nonpartisan 1400raiseourcing knotsAndAnd Bild laced EMPalty latencyengineeringresaassmentCAP alphabet Rin revenues Bild phosphateMin austerity discussionsifies cared latency forefront291 Book�"
+  "la red neuronal distribuida" →
+    "And latencyalty electricalCAPistical Bookttes sugar291 demonstrationsalty repaid Carnage expedition phosphate austerity forefront Ke rainbow EMP nonpartisan Psychmissions Submission expedition(- latency imposingraiseAndourcing Linkassment Carnage contrasting austerity alphabet phosphatefield"
+
+✅ AIDEEN training completo.

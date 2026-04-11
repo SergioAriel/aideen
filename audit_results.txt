@@ -1,0 +1,8 @@
+  Modo: archivo grande → corpus_pg19_train.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Cache OK: reutilizando corpus_pg19_train.txt.tokens.bin (1079277 tokens, vocab=50257)
+  Resumiendo desde checkpoint: model_large
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  Backend: GPU (Metal) ✅ [Auto-managed]
+

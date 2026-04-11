@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.45s
+     Running `target/release/train --file corpus_pg19_train.txt --epochs 3 --log-every 1`
+  Modo: archivo grande → corpus_pg19_train.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Cache OK: reutilizando corpus_pg19_train.txt.tokens.bin (1079277 tokens, vocab=50257)
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  Backend: GPU (Metal) ✅ [Auto-managed]
+

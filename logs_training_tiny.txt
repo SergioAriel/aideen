@@ -1,0 +1,107 @@
+sergiosolis@MacBook-Pro-de-Sergio aideen % AIDEEN_CTX_LEN=512 AIDEEN_BATCH_SIZE=1 AIDEEN_PROGRESS_EVERY=50 AIDEEN_LOSS_READBACK_EVERY=50 \
+cargo run --features wgpu -p aideen-training --bin train --release -- \
+--file corpus_tinystories_train.txt --epochs 1 --log-every 1
+
+    Finished `release` profile [optimized] target(s) in 0.34s
+     Running `target/release/train --file corpus_tinystories_train.txt --epochs 1 --log-every 1`
+  Modo: archivo grande → corpus_tinystories_train.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Cache OK: reutilizando corpus_tinystories_train.txt.tokens.bin (9760743 tokens, vocab=50257)
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  Backend: GPU (Metal) ✅ [Auto-managed]
+
+    [progress] chunk   300  loss=4.6286  tps_win=    96.1  tps_run=    96.1  time=590.5s
+    [progress] chunk   700  loss=4.4338  tps_win=    96.7  tps_run=    96.5  time=1400.0s
+    [progress] chunk   750  loss=4.1800  tps_win=    96.5  tps_run=    96.5  time=1494.4s
+    [progress] chunk   800  loss=4.0667  tps_win=    97.0  tps_run=    96.5  time=1596.4s
+    [progress] chunk  1500  loss=4.7659  tps_win=    97.1  tps_run=    96.8  time=2981.9s
+    [auto-save] Guardando progreso (chunk 1500)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=6629.1357, v=4.816489e0
+    Embedding Moments Checksum: m=24.1993
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  1550  loss=4.2436  tps_win=    95.8  tps_run=    96.8  time=3077.0s
+    [progress] chunk  1600  loss=4.9803  tps_win=    97.5  tps_run=    96.8  time=3186.3s
+    [progress] chunk  1650  loss=4.5986  tps_win=    97.4  tps_run=    96.8  time=3287.9s
+    [progress] chunk  1700  loss=3.8861  tps_win=    97.9  tps_run=    96.8  time=3396.7s
+    [progress] chunk  1950  loss=2.9941  tps_win=    96.1  tps_run=    96.8  time=3854.9s
+    [progress] chunk  2200  loss=4.0262  tps_win=    96.8  tps_run=    96.8  time=4357.5s
+    [progress] chunk  2250  loss=3.3291  tps_win=    95.6  tps_run=    96.7  time=4444.7s
+    [progress] chunk  2350  loss=4.0796  tps_win=    96.3  tps_run=    96.7  time=4634.1s
+    [progress] chunk  2550  loss=4.5334  tps_win=    97.0  tps_run=    96.8  time=5041.6s
+    [auto-save] Guardando progreso (chunk 2550)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=4992.9077, v=7.005078e0
+    Embedding Moments Checksum: m=39.9787
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  3050  loss=3.1889  tps_win=    96.6  tps_run=    96.7  time=6048.8s
+    [progress] chunk  3200  loss=4.5745  tps_win=    96.3  tps_run=    96.7  time=6340.8s
+    [progress] chunk  3650  loss=4.0672  tps_win=    96.6  tps_run=    96.7  time=7238.1s
+    [auto-save] Guardando progreso (chunk 3650)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=4184.5186, v=8.963477e0
+    Embedding Moments Checksum: m=59.2501
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  4000  loss=3.0721  tps_win=    96.7  tps_run=    96.7  time=7953.9s
+    [progress] chunk  4150  loss=3.5969  tps_win=    96.2  tps_run=    96.7  time=8238.1s
+    [progress] chunk  4200  loss=4.0912  tps_win=    95.8  tps_run=    96.7  time=8333.3s
+    [progress] chunk  4400  loss=3.4895  tps_win=    96.1  tps_run=    96.6  time=8720.7s
+    [progress] chunk  4700  loss=3.6888  tps_win=    96.1  tps_run=    96.6  time=9297.8s
+    [auto-save] Guardando progreso (chunk 4700)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=3634.7686, v=1.047631e1
+    Embedding Moments Checksum: m=78.5344
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  5000  loss=3.5203  tps_win=    96.5  tps_run=    96.6  time=9904.5s
+    [progress] chunk  5100  loss=3.1164  tps_win=    96.8  tps_run=    96.6  time=10108.8s
+    [progress] chunk  5350  loss=1.5003  tps_win=    96.3  tps_run=    96.6  time=10590.0s
+    [progress] chunk  5450  loss=2.7805  tps_win=    96.6  tps_run=    96.6  time=10786.8s
+    [progress] chunk  5550  loss=3.4524  tps_win=    97.1  tps_run=    96.6  time=10990.6s
+    [progress] chunk  5600  loss=3.1569  tps_win=    95.9  tps_run=    96.6  time=11085.6s
+    [progress] chunk  5700  loss=3.9802  tps_win=    97.3  tps_run=    96.6  time=11296.9s
+    [auto-save] Guardando progreso (chunk 5700)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=3274.4114, v=1.174102e1
+    Embedding Moments Checksum: m=96.0065
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  6050  loss=3.4501  tps_win=    96.4  tps_run=    96.6  time=11982.7s
+    [progress] chunk  6550  loss=2.6916  tps_win=    96.6  tps_run=    96.6  time=12974.5s
+    [progress] chunk  7500  loss=0.4517  tps_win=    96.4  tps_run=    96.6  time=14834.8s
+    [auto-save] Guardando progreso (chunk 7500)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=2872.4812, v=1.392786e1
+    Embedding Moments Checksum: m=126.6443
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  7950  loss=2.6719  tps_win=    96.3  tps_run=    96.6  time=15719.1s
+    [progress] chunk  8350  loss=2.8817  tps_win=    96.2  tps_run=    96.5  time=16501.1s
+    [progress] chunk  8450  loss=3.6316  tps_win=    96.2  tps_run=    96.5  time=16698.6s
+    [auto-save] Guardando progreso (chunk 8450)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=2733.5518, v=1.490479e1
+    Embedding Moments Checksum: m=141.1169
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  8500  loss=2.8373  tps_win=    95.7  tps_run=    96.5  time=16801.9s
+    [progress] chunk  8550  loss=3.3372  tps_win=    95.2  tps_run=    96.5  time=16889.6s
+    [progress] chunk  8700  loss=4.3276  tps_win=    96.6  tps_run=    96.5  time=17196.6s
+    [progress] chunk  9150  loss=4.2143  tps_win=    96.2  tps_run=    96.5  time=18081.6s
+    [progress] chunk  9500  loss=3.7221  tps_win=    95.6  tps_run=    96.5  time=18757.1s
+    [auto-save] Guardando progreso (chunk 9500)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=2612.8821, v=1.587182e1
+    Embedding Moments Checksum: m=157.5600
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk  9700  loss=3.2019  tps_win=    95.8  tps_run=    96.5  time=19161.6s
+    [progress] chunk  9800  loss=2.2947  tps_win=    95.1  tps_run=    96.5  time=19345.2s
+    [progress] chunk 10150  loss=2.9843  tps_win=    96.3  tps_run=    96.5  time=20072.1s
+    [progress] chunk 10300  loss=1.9783  tps_win=    95.7  tps_run=    96.4  time=20366.1s
+    [progress] chunk 10650  loss=1.9370  tps_win=    95.7  tps_run=    96.4  time=21056.7s
+    [auto-save] Guardando progreso (chunk 10650)...
+[GPU-CHECK] Iniciando Checksum de VRAM antes de guardar...
+    LM Head Moments Checksum: m=2584.5798, v=1.695072e1
+    Embedding Moments Checksum: m=176.6341
+    [success] Checkpoint 'model_large' actualizado.
+    [progress] chunk 10950  loss=2.7130  tps_win=    94.9  tps_run=    96.4  time=21665.7s
+    [progress] chunk 11200  loss=2.2574  tps_win=    94.7  tps_run=    96.3  time=22179.4s
+^C
+sergiosolis@MacBook-Pro-de-Sergio aideen % 

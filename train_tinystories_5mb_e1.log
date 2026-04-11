@@ -1,0 +1,13 @@
+   Compiling aideen-training v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-training-lab)
+    Finished `release` profile [optimized] target(s) in 8.79s
+     Running `target/release/train --file corpus_tinystories_train_5mb.txt --epochs 1 --log-every 1`
+  Modo: archivo grande → corpus_tinystories_train_5mb.txt
+  Tokenizer: BPE (aideen-backbone/tokenizer.json) ✅
+  Tokenizando corpus_tinystories_train_5mb.txt → corpus_tinystories_train_5mb.txt.tokens.bin ...
+  Tokenización con fronteras explícitas: 6334 documentos, eos_token=50256
+  5242880 chars → 1249074 tokens, vocab=50257 → 4.76 MB
+  Fronteras de documento activas en .bin (eos_token=50256)
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  Backend: GPU (Metal) ✅ [Auto-managed]
+
