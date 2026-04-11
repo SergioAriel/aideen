@@ -1,4 +1,4 @@
-use crate::spectral_norm;
+use crate::{deq_mode::DeqRuntimeConfig, spectral_norm};
 use aideen_core::{
     block_backend::BlockBackend,
     compute::ComputeBackend,
@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
-/// MambaSlotReasoning — el bloque `f` real del DEQ.
-pub struct MambaSlotReasoning {
+/// FixedPointMemoryReasoning — el bloque `f` real del DEQ.
+pub struct FixedPointMemoryReasoning {
     pub config: ArchitectureConfig,
 
     // ── Cross-slot attention ─────────────────────────────────────────────────
@@ -72,7 +72,7 @@ pub struct MambaSlotReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) slot_anchor: DMatrix<f32>,
 
-    // ── Mamba SSM por slot ───────────────────────────────────────────────────
+    // ── Fixed-Point Memory SSM por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
     pub a_log: DMatrix<f32>, // [h_slots × d_r] row-major, per-slot decay
     #[cfg(not(feature = "lab"))]
@@ -161,7 +161,7 @@ pub struct MambaSlotReasoning {
     pub residual_alpha: f32,
 }
 
-impl MambaSlotReasoning {
+impl FixedPointMemoryReasoning {
     fn matrix_to_row_major(m: &DMatrix<f32>) -> Vec<f32> {
         let rows = m.nrows();
         let cols = m.ncols();
@@ -218,10 +218,7 @@ impl MambaSlotReasoning {
     fn new_with_rng<R: Rng + ?Sized>(config: ArchitectureConfig, rng: &mut R) -> Self {
         let d_r = config.d_r;
         let h_slots = config.h_slots;
-        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        let slot_coord_mode = DeqRuntimeConfig::from_env().has_explicit_slot_comparison();
         // Xavier Uniform initialization: range = sqrt(3 / fan_in)
         let xavier_range = (3.0 / d_r as f32).sqrt();
 
@@ -330,7 +327,7 @@ impl MambaSlotReasoning {
             hist_slot_bias,
             hist_gate_logit,
             slot_anchor,
-            // Mamba-style timescale prior: decay spread a ∈ [0.80, 0.999] across slots.
+            // Fixed-Point Memory-style timescale prior: decay spread a ∈ [0.80, 0.999] across slots.
             // Biased toward long-term memory so the forget gate has useful history to gate.
             // Gradient + forget gate can push individual slots faster if needed.
             a_log: DMatrix::from_fn(h_slots, d_r, |slot, _| {
@@ -488,10 +485,7 @@ impl MambaSlotReasoning {
     pub fn w_o_gpu_flat(&self) -> Vec<f32> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        let slot_coord_mode = DeqRuntimeConfig::from_env().has_explicit_slot_comparison();
         let attn_t = if slot_coord_mode { 0.30_f32 } else { 0.10_f32 };
         let n_iter = 20;
         let mut v = Vec::with_capacity(h * d * d);
@@ -536,14 +530,11 @@ impl MambaSlotReasoning {
     pub fn renormalize_weights(&mut self) {
         // Umbral 0.10 para matrices de atención — necesario para mantener σ(J_attn) < 1
         // durante el entrenamiento (no solo en la inicialización).
-        // w_x y w_out (Mamba externo) usan umbral 0.70 — no afectan la contractividad del DEQ.
-        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        // w_x y w_out (Fixed-Point Memory externo) usan umbral 0.70 — no afectan la contractividad del DEQ.
+        let slot_coord_mode = DeqRuntimeConfig::from_env().has_explicit_slot_comparison();
         let attn_t = if slot_coord_mode { 0.30_f32 } else { 0.10_f32 };
         let win_t = 0.30_f32;
-        let mamba_t = 0.70_f32;
+        let fpm_t = 0.70_f32;
         let n = 20;
         spectral_norm::normalize_if_needed(&mut self.w_q, attn_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_k, attn_t, n);
@@ -551,8 +542,8 @@ impl MambaSlotReasoning {
         spectral_norm::normalize_if_needed(&mut self.w_o, attn_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_in, win_t, n);
         spectral_norm::normalize_if_needed(&mut self.w_hist_shared, 1.5, n);
-        spectral_norm::normalize_if_needed(&mut self.w_x, mamba_t, n);
-        spectral_norm::normalize_if_needed(&mut self.w_out, mamba_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_x, fpm_t, n);
+        spectral_norm::normalize_if_needed(&mut self.w_out, fpm_t, n);
     }
 
     pub fn spectral_norms(&self) -> [f32; 8] {
@@ -1057,7 +1048,7 @@ impl MambaSlotReasoning {
         model.weights = self.export_weights();
         model
             .metadata
-            .insert("type".to_string(), "MambaSlotReasoning".to_string());
+            .insert("type".to_string(), "FixedPointMemoryReasoning".to_string());
 
         model.save(path.as_ref().to_str().ok_or("Invalid path")?)
     }
@@ -1254,7 +1245,7 @@ impl MambaSlotReasoning {
     }
 }
 
-impl Reasoning for MambaSlotReasoning {
+impl Reasoning for FixedPointMemoryReasoning {
     fn config(&self) -> &ArchitectureConfig {
         &self.config
     }
@@ -1331,7 +1322,7 @@ mod tests {
     #[test]
     fn step_is_sensitive_to_input() {
         let config = ArchitectureConfig::default();
-        let r = MambaSlotReasoning::new(config.clone());
+        let r = FixedPointMemoryReasoning::new(config.clone());
         let s_a = make_query(1.0, config.d_r);
         let s_b = make_query(2.0, config.d_r);
         let h0 = r.init(&s_a);
@@ -1349,7 +1340,7 @@ mod tests {
     #[test]
     fn step_is_stable_no_explosion() {
         let config = ArchitectureConfig::default();
-        let r = MambaSlotReasoning::new(config.clone());
+        let r = FixedPointMemoryReasoning::new(config.clone());
         let s = make_query(1.0, config.d_r);
         let mut h = r.init(&s);
         for _ in 0..30 {
@@ -1363,7 +1354,7 @@ mod tests {
     #[test]
     fn fixed_hist_ctx_is_zero_without_memory() {
         let config = ArchitectureConfig::default();
-        let r = MambaSlotReasoning::new(config.clone());
+        let r = FixedPointMemoryReasoning::new(config.clone());
         let s = make_query(1.0, config.d_r);
         let hist = r.fixed_hist_ctx(None, &s);
         assert!(
@@ -1375,7 +1366,7 @@ mod tests {
     #[test]
     fn zero_fixed_hist_ctx_matches_plain_step() {
         let config = ArchitectureConfig::default();
-        let r = MambaSlotReasoning::new(config.clone());
+        let r = FixedPointMemoryReasoning::new(config.clone());
         let s = make_query(1.0, config.d_r);
         let h0 = r.init(&s);
         let zero_hist = HSlots::zeros(&config);

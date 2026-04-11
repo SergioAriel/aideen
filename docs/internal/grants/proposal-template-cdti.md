@@ -8,7 +8,7 @@ Proyectos de I+D — Centro para el Desarrollo Tecnologico y la Innovacion (CDTI
 
 ## 1. Resumen Ejecutivo
 
-> [PLACEHOLDER: Un parrafo que resuma el proyecto. Debe cubrir: el problema (dependencia europea de proveedores de IA estadounidenses), la solucion propuesta (AIDEEN, motor de IA descentralizado basado en DEQ+Mamba, escrito en Rust), la diferenciacion tecnica (eficiencia parametrica O(1), inferencia en navegador via WebGPU, red P2P con gobernanza criptografica), y el resultado esperado (infraestructura de IA soberana, de codigo abierto, ejecutable en hardware de consumo).]
+> [PLACEHOLDER: Un parrafo que resuma el proyecto. Debe cubrir: el problema (dependencia europea de proveedores de IA estadounidenses), la solucion propuesta (AIDEEN, motor de IA descentralizado basado en DEQ+Fixed-Point Memory, escrito en Rust), la diferenciacion tecnica (eficiencia parametrica O(1), inferencia en navegador via WebGPU, red P2P con gobernanza criptografica), y el resultado esperado (infraestructura de IA soberana, de codigo abierto, ejecutable en hardware de consumo).]
 
 ---
 
@@ -44,7 +44,7 @@ Existe una ventana de oportunidad para desarrollar una arquitectura de IA fundam
 AIDEEN es un motor de inferencia y entrenamiento de IA desarrollado integramente en Rust. Reemplaza la arquitectura transformer dominante por una combinacion de:
 
 - **Deep Equilibrium Models (DEQ)**: Un unico bloque computacional que itera hasta convergencia (punto fijo), en lugar de 24-96 capas apiladas. Complejidad parametrica O(1) frente a O(N).
-- **Mamba State Space Models (SSM)**: Memoria temporal selectiva integrada en el bloque DEQ, con atencion cruzada entre slots de razonamiento.
+- **Fixed-Point Memory State Space Models (SSM)**: Memoria temporal selectiva integrada en el bloque DEQ, con atencion cruzada entre slots de razonamiento.
 - **Iteracion de Picard con normalizacion espectral**: Garantia matematica de convergencia del punto fijo.
 
 ### 3.2 Arquitectura de red
@@ -73,7 +73,7 @@ AIDEEN es un motor de inferencia y entrenamiento de IA desarrollado integramente
 | Llama 3 (Meta) | Transformer | 8B-405B | 16-810 GB VRAM | No |
 | Mistral (Mistral AI) | Transformer MoE | 7B-8x22B | 14-176 GB VRAM | No |
 | Phi-3 (Microsoft) | Transformer | 3.8B-14B | 8-28 GB VRAM | No |
-| **AIDEEN** | **DEQ + Mamba SSM** | **O(1) reusable** | **iGPU / navegador** | **Si** |
+| **AIDEEN** | **DEQ + Fixed-Point Memory SSM** | **O(1) reusable** | **iGPU / navegador** | **Si** |
 
 ### 4.2 Diferenciacion tecnica
 
@@ -86,7 +86,7 @@ AIDEEN es un motor de inferencia y entrenamiento de IA desarrollado integramente
 ### 4.3 Publicaciones relevantes
 
 - Bai et al., "Deep Equilibrium Models" (NeurIPS 2019)
-- Gu & Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (2023)
+- Gu & Dao, "Fixed-Point Memory: Linear-Time Sequence Modeling with Selective State Spaces" (2023)
 - Bai et al., "Stabilizing Equilibrium Models by Jacobian Regularization" (ICML 2021)
 
 ---
@@ -98,7 +98,7 @@ AIDEEN es un motor de inferencia y entrenamiento de IA desarrollado integramente
 | Tarea | Descripcion | Entregable |
 |-------|-------------|------------|
 | T1.1 | Finalizacion del pipeline de entrenamiento de 4 fases (Decomposer, Backbone, Expertos Federados, Destilacion) | Pipeline funcional end-to-end |
-| T1.2 | Entrenamiento del backbone DEQ+Mamba con corpus multilingual (BPE 64K) | Pesos del backbone validados |
+| T1.2 | Entrenamiento del backbone DEQ+Fixed-Point Memory con corpus multilingual (BPE 64K) | Pesos del backbone validados |
 | T1.3 | Entrenamiento de al menos 6 dominios expertos (math, code, logic, NLP, science, creative) | Pesos de expertos + metricas de calidad |
 | T1.4 | Validacion contra benchmarks estandar (perplexity, downstream tasks) | Informe comparativo vs Llama/Mistral iso-parametro |
 
@@ -170,7 +170,7 @@ Ambos desarrolladores tienen dominio completo de Rust, lo que permite contribuci
 
 ### 8.3 Contribucion al ecosistema open-source
 
-- Publicacion de una arquitectura novedosa (DEQ+Mamba) completamente en Rust.
+- Publicacion de una arquitectura novedosa (DEQ+Fixed-Point Memory) completamente en Rust.
 - Protocolo abierto y versionado para redes de IA descentralizadas.
 - Benchmark reproducible que compara DEQ vs Transformer en condiciones controladas.
 - Articulo cientifico revisado por pares.

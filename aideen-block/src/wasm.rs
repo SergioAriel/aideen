@@ -78,7 +78,7 @@ pub struct AideenEngine {
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
     device_name: String,
-    /// GPU buffers keyed by tensor name (e.g. "layers.0.mamba.A_log")
+    /// GPU buffers keyed by tensor name (e.g. "layers.0.fpm.A_log")
     weight_buffers: std::collections::HashMap<String, wgpu::Buffer>,
 }
 

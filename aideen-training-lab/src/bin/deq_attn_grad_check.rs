@@ -1,4 +1,4 @@
-use aideen_backbone::mamba_slot_reasoning::MambaSlotReasoning;
+use aideen_backbone::fixed_point_memory_reasoning::FixedPointMemoryReasoning;
 use aideen_core::reasoning::Reasoning;
 use aideen_core::state::{ArchitectureConfig, HSlots};
 use nalgebra::{DMatrix, DVector};
@@ -76,7 +76,7 @@ fn loss_from_attn(
 }
 
 fn analytical_grads(
-    r: &MambaSlotReasoning,
+    r: &FixedPointMemoryReasoning,
     h: &HSlots,
     upstream: &HSlots,
 ) -> (DMatrix<f32>, DMatrix<f32>, DMatrix<f32>, DMatrix<f32>) {
@@ -217,7 +217,7 @@ fn main() {
 
     let seed = env_u64("AIDEEN_GRADCHECK_SEED", 42);
     let eps = env_f32("AIDEEN_GRADCHECK_EPS", 1e-3);
-    let r = MambaSlotReasoning::new_with_seed(cfg.clone(), seed);
+    let r = FixedPointMemoryReasoning::new_with_seed(cfg.clone(), seed);
 
     let mut h = HSlots::zeros(&cfg);
     let mut upstream = HSlots::zeros(&cfg);

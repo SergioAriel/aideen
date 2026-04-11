@@ -26,7 +26,7 @@ cargo test --release --features wgpu -p aideen-backbone
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete technical specification of the DEQ+Mamba architecture, buffer layouts, and backward pass derivation.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete technical specification of the DEQ+Fixed-Point Memory architecture, buffer layouts, and backward pass derivation.
 
 ## Code Organization
 

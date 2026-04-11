@@ -30,6 +30,9 @@ use aideen_training::trainer::Trainer;
 
 use std::{env, fs};
 
+const DOC_MARKER: &str = "<|endoftext|>";
+const BPE_EOS_TOKEN: u32 = 50256;
+
 fn env_u64(name: &str) -> Option<u64> {
     env::var(name)
         .ok()
@@ -47,6 +50,40 @@ fn setup_gpu(trainer: &mut Trainer) {
     }
     #[cfg(not(feature = "wgpu"))]
     println!("  Backend: CPU (compile with --features wgpu for GPU)");
+}
+
+fn encode_training_corpus(tok: &Tokenizer, corpus: &str) -> (Vec<u32>, u32) {
+    if tok.hf_tokenizer.is_none() || !corpus.contains(DOC_MARKER) {
+        return (tok.encode(corpus), 0);
+    }
+
+    let mut tokens = Vec::new();
+    let mut docs_written = 0usize;
+    for doc in corpus.split(DOC_MARKER) {
+        let doc = doc.trim();
+        if doc.is_empty() {
+            continue;
+        }
+        let encoded = tok.encode(doc);
+        if encoded.is_empty() {
+            continue;
+        }
+        if !tokens.is_empty() {
+            tokens.push(BPE_EOS_TOKEN);
+        }
+        tokens.extend_from_slice(&encoded);
+        docs_written += 1;
+    }
+
+    if docs_written == 0 {
+        return (tok.encode(corpus), 0);
+    }
+
+    println!(
+        "  Tokenización con fronteras explícitas: {} documentos, eos_token={}",
+        docs_written, BPE_EOS_TOKEN
+    );
+    (tokens, BPE_EOS_TOKEN)
 }
 
 fn main() {
@@ -161,7 +198,9 @@ fn run_large_file(
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
     } else {
-        let corpus = corpus.as_ref().expect("Tokenizer char-level requiere corpus en memoria.");
+        let corpus = corpus
+            .as_ref()
+            .expect("Tokenizer char-level requiere corpus en memoria.");
         println!("  Tokenizer: Char-level — escaneando vocab...");
         Tokenizer::from_text(corpus, config_default.clone())
     };
@@ -196,11 +235,13 @@ fn run_large_file(
             tokens_len, vocab_size
         );
     } else {
-        let corpus = corpus.as_ref().expect("Corpus en memoria requerido para tokenizar.");
+        let corpus = corpus
+            .as_ref()
+            .expect("Corpus en memoria requerido para tokenizar.");
         println!("  Tokenizando {txt_path} → {bin_path} ...");
         {
             use std::io::Write;
-            let tokens = tok.encode(corpus);
+            let (tokens, doc_eos_token) = encode_training_corpus(&tok, corpus);
             let byte_data: &[u8] = bytemuck::cast_slice(&tokens);
 
             // Asegurar que el directorio padre existe
@@ -219,6 +260,9 @@ fn run_large_file(
                 vocab_size,
                 byte_data.len() as f64 / 1_048_576.0
             );
+            if doc_eos_token != 0 {
+                println!("  Fronteras de documento activas en .bin (eos_token={doc_eos_token})");
+            }
         }
     }
 
@@ -276,11 +320,21 @@ fn run_large_file(
     }
     println!();
 
-    // EOS token:
-    // En este pipeline no inyectamos un token EOS explícito en el stream de training.
-    // Usar 2 para BPE fragmentaba por un token común (p.ej. '#') y anulaba la pérdida.
-    // 0 desactiva el split por EOS en train_on_file.
-    let eos_token: u32 = 0;
+    // Si el corpus contiene marcadores explícitos de documento, los convertimos a EOS
+    // reales durante la tokenización. En ese caso el training debe resetear estado ahí.
+    let eos_token: u32 = if tok_path.is_some() {
+        if let Ok(corpus_text) = fs::read_to_string(&txt_path) {
+            if corpus_text.contains(DOC_MARKER) {
+                BPE_EOS_TOKEN
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
 
     let t0 = std::time::Instant::now();
     trainer

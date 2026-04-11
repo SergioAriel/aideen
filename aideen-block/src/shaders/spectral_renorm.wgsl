@@ -8,7 +8,7 @@ struct SpectralParams {
     n_iters:   u32,
     attn_threshold: f32,
     win_threshold: f32,
-    mamba_threshold: f32,
+    fpm_threshold: f32,
     wv_threshold: f32,
     wo_threshold: f32,
     h_slots:   u32,
@@ -170,7 +170,7 @@ fn spectral_renorm_main(
     // 2h..(3h-1): W_v uses wv_threshold
     // 3h..(4h-1): W_o uses wo_threshold
     // 4h..(5h-1): W_in slots use win_threshold
-    // 5h..: W_x/W_out use mamba_threshold
+    // 5h..: W_x/W_out use fpm_threshold
     var threshold = params.attn_threshold;
     if (mat_idx >= 2u * params.h_slots && mat_idx < 3u * params.h_slots) {
         threshold = params.wv_threshold;
@@ -179,7 +179,7 @@ fn spectral_renorm_main(
     } else if (mat_idx >= 4u * params.h_slots && mat_idx < 5u * params.h_slots) {
         threshold = params.win_threshold;
     } else if (mat_idx >= 5u * params.h_slots) {
-        threshold = params.mamba_threshold;
+        threshold = params.fpm_threshold;
     }
     if (sigma > threshold) {
         let scale = threshold / sigma;

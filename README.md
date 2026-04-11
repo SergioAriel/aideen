@@ -1,6 +1,6 @@
 # AIDEEN — Decentralized AI Engine for Consumer Hardware
 
-Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Mamba-style selective state memory (SSM)** instead of stacked transformer layers — achieving comparable quality with significantly fewer parameters.
+Open-source AI inference and training engine built entirely in Rust. Uses **Deep Equilibrium Models (DEQ)** combined with **Fixed-Point Memory-style selective state memory (SSM)** instead of stacked transformer layers — achieving comparable quality with significantly fewer parameters.
 
 Designed to run on consumer GPUs (AMD, Intel, NVIDIA) via [wgpu](https://wgpu.rs/) / WebGPU, without dependence on CUDA or cloud providers.
 
@@ -10,12 +10,12 @@ Designed to run on consumer GPUs (AMD, Intel, NVIDIA) via [wgpu](https://wgpu.rs
 
 ## Architecture
 
-AIDEEN uses a single reusable parameter block refined via Picard iteration (fixed-point solving), instead of stacking 16-96 transformer layers. The Mamba SSM provides temporal memory across tokens but operates **outside** the DEQ convergence loop — a key design decision that preserves the contractivity required for stable fixed-point convergence.
+AIDEEN uses a single reusable parameter block refined via Picard iteration (fixed-point solving), instead of stacking 16-96 transformer layers. The Fixed-Point Memory SSM provides temporal memory across tokens but operates **outside** the DEQ convergence loop — a key design decision that preserves the contractivity required for stable fixed-point convergence.
 
 Key components:
 - **DEQ fixed-point solver** with Picard iteration and spectral normalization
 - **Multi-slot attention** (h_slots parallel reasoning heads with per-slot Q/K/V/W_in)
-- **Mamba SSM** with selective state (input-dependent decay), forget gate, and dynamic history gating
+- **Fixed-Point Memory SSM** with selective state (input-dependent decay), forget gate, and dynamic history gating
 - **Picard adjoint** backward pass via implicit differentiation (O(1) memory)
 - **29 WGSL GPU compute shaders** for training and inference
 
@@ -34,7 +34,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
 | Crate | Purpose |
 |-------|---------|
 | `aideen-core` | Public contracts, cryptographic types, sealed protocol constants |
-| `aideen-backbone` | Model architecture (DEQ + Mamba composition), tokenizer, generation |
+| `aideen-backbone` | Model architecture (DEQ + Fixed-Point Memory composition), tokenizer, generation |
 | `aideen-block` | GPU compute block (wgpu shaders for forward/backward/update) |
 | `aideen-training-lab` | Training pipeline, optimizer, checkpointing |
 | `aideen-engine` | GPU compute runtime |
@@ -73,12 +73,12 @@ cargo run --release --features wgpu -p aideen-training --bin chat -- --model mod
 
 ## Project History
 
-Development began in early 2025 as a private research project exploring DEQ architectures for efficient AI. The repository was migrated to GitHub in February 2026 for open-source release. Prior work included iterative prototyping of the DEQ solver, Mamba integration experiments, and the transition from Conjugate Gradient to Picard Adjoint for the backward pass. The current codebase (~15,000 lines of Rust + 5,679 lines of WGSL) represents approximately one year of cumulative R&D by two developers.
+Development began in early 2025 as a private research project exploring DEQ architectures for efficient AI. The repository was migrated to GitHub in February 2026 for open-source release. Prior work included iterative prototyping of the DEQ solver, Fixed-Point Memory integration experiments, and the transition from Conjugate Gradient to Picard Adjoint for the backward pass. The current codebase (~15,000 lines of Rust + 5,679 lines of WGSL) represents approximately one year of cumulative R&D by two developers.
 
 ## Team
 
 - **Juan Patricio Marchetto** ([@JuanMarchetto](https://github.com/JuanMarchetto)) — System architect, training infrastructure. Italian citizen.
-- **Sergio Ariel Solis** ([@SergioAriel](https://github.com/SergioAriel)) — GPU compute, mathematical innovations (Mamba-outside-DEQ, Picard adjoint).
+- **Sergio Ariel Solis** ([@SergioAriel](https://github.com/SergioAriel)) — GPU compute, mathematical innovations (Fixed-Point Memory-outside-DEQ, Picard adjoint).
 
 ## Funding
 

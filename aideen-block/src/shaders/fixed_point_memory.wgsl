@@ -32,7 +32,7 @@ var<workgroup> s_Bx: array<f32, TILE_SIZE>;
 
 @compute
 @workgroup_size(256, 1, 1) // 256 threads working on a sequence chunk
-fn mamba_parallel_scan(
+fn fpm_parallel_scan(
     @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) group_id: vec3<u32>

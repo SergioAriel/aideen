@@ -215,7 +215,7 @@ fn run_current(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
     summarize("current_deq", &rows)
 }
 
-fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
+fn run_pure_plus_external_fpm(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
     let mut m_state = DVector::zeros(trainer.config.d_r);
     let mut rows = Vec::<TokenMetrics>::new();
 
@@ -224,7 +224,7 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
         let target = tokens[t + 1];
         let q = trainer.tokenizer.embed_context(ctx, trainer.config.ctx_len);
 
-        // h0 initialized from external Mamba memory state (broadcast to slots)
+        // h0 initialized from external Fixed-Point Memory memory state (broadcast to slots)
         let h0 = HSlots::from_broadcast(&m_state, &trainer.config);
         let (h_star, iters, max_delta, contr) = run_picard_pure(trainer, &h0, &q);
 
@@ -239,7 +239,7 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
             loss,
         });
 
-        // External Mamba state update across tokens: m_t = a*m_{t-1} + (1-a)*W_x*h_pool
+        // External Fixed-Point Memory state update across tokens: m_t = a*m_{t-1} + (1-a)*W_x*h_pool
         // Use slot-0 decay (single shared state, legacy diagnostic mode).
         let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
             1.0 / (1.0 + trainer.reasoning.a_log[(0, d)].exp())
@@ -250,7 +250,7 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
         m_state = &trainer.reasoning.w_out * m_state;
     }
 
-    summarize("pure_deq_ext_mamba", &rows)
+    summarize("pure_deq_ext_fpm", &rows)
 }
 
 fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
@@ -263,7 +263,7 @@ fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
         let target = tokens[t + 1];
         let q = trainer.tokenizer.embed_context(ctx, trainer.config.ctx_len);
 
-        // h0: cada slot arranca desde su propio estado Mamba cross-token
+        // h0: cada slot arranca desde su propio estado Fixed-Point Memory cross-token
         let mut h0 = HSlots::zeros(&trainer.config);
         for k in 0..h_slots {
             h0.set_slot(k, &m_states[k]);
@@ -281,7 +281,7 @@ fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
             loss,
         });
 
-        // Actualizar cada estado Mamba por slot independientemente
+        // Actualizar cada estado Fixed-Point Memory por slot independientemente
         for k in 0..h_slots {
             let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
                 1.0 / (1.0 + trainer.reasoning.a_log[(k, d)].exp())
@@ -303,7 +303,7 @@ fn run_sweep(trainer: &mut Trainer, tokens: &[u32]) {
     let iters_list: &[usize] = &[12, 16, 20];
 
     println!();
-    println!("SWEEP: residual_alpha × damping × max_iters  (pure_deq + ext_mamba per_slot)");
+    println!("SWEEP: residual_alpha × damping × max_iters  (pure_deq + ext_fpm per_slot)");
     println!(
         "{:<8} {:<6} {:<6}  {:<8} {:<10} {:<8} {:<8}",
         "alpha", "damp", "iters", "loss", "maxΔ", "contr", "conv%"
@@ -419,7 +419,7 @@ fn main() {
     let tokens = synth_tokens(512, cfg.vocab_size);
 
     let cur = run_current(&trainer, &tokens);
-    let pure = run_pure_plus_external_mamba(&trainer, &tokens);
+    let pure = run_pure_plus_external_fpm(&trainer, &tokens);
     let per_slot = run_pure_per_slot(&trainer, &tokens);
 
     println!();

@@ -4,8 +4,8 @@ use aideen_core::{
 };
 use nalgebra::{DMatrix, DVector};
 
-/// MambaDecoder — decodificador autoregresivo ligero condicionado por H*.
-pub struct MambaDecoder {
+/// FixedPointMemoryDecoder — decodificador autoregresivo ligero condicionado por H*.
+pub struct FixedPointMemoryDecoder {
     pub config: ArchitectureConfig,
     /// d_model del decoder (puede ser distinto de config.d_r del DEQ)
     pub d_model: usize,
@@ -20,7 +20,7 @@ pub struct MambaDecoder {
     pub eos_token: u32,
 }
 
-impl MambaDecoder {
+impl FixedPointMemoryDecoder {
     /// Construye un decoder con pesos random pequeños.
     pub fn new(n_layers: usize, config: ArchitectureConfig) -> Self {
         let d_model = config.d_r;
@@ -93,9 +93,9 @@ impl MambaDecoder {
         (scale, bias)
     }
 
-    // ── Mamba step ───────────────────────────────────────────────────────────
+    // ── Fixed-Point Memory step ───────────────────────────────────────────────────────────
 
-    fn mamba_layer_step(
+    fn fpm_layer_step(
         &self,
         layer: usize,
         h: &DVector<f32>,
@@ -142,7 +142,7 @@ impl MambaDecoder {
                 let embed = self.embedding.row(tok as usize).transpose();
                 hidden += embed * 0.1;
                 for l in 0..self.n_layers {
-                    hidden = self.mamba_layer_step(l, &hidden, &film[l].0, &film[l].1);
+                    hidden = self.fpm_layer_step(l, &hidden, &film[l].0, &film[l].1);
                 }
             }
         }
@@ -167,7 +167,7 @@ impl MambaDecoder {
                 let embed = self.embedding.row(next_token as usize).transpose();
                 hidden += embed * 0.1;
                 for l in 0..self.n_layers {
-                    hidden = self.mamba_layer_step(l, &hidden, &film[l].0, &film[l].1);
+                    hidden = self.fpm_layer_step(l, &hidden, &film[l].0, &film[l].1);
                 }
             }
         }
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn generate_produces_tokens() {
         let config = ArchitectureConfig::default();
-        let decoder = MambaDecoder::new(4, config.clone());
+        let decoder = FixedPointMemoryDecoder::new(4, config.clone());
         let h_star = make_h_star(&config, 1.0);
         let tokens = decoder.generate(&h_star, &[], 10);
         assert!(!tokens.is_empty());

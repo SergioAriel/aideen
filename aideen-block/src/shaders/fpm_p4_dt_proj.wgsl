@@ -1,4 +1,4 @@
-// Loxi V8 — Mamba Pass 4: dt_proj + softplus → delta
+// Loxi V8 — Fpm Pass 4: dt_proj + softplus → delta
 //
 // Computes:
 //   delta_raw = proj_bcd[0:dt_rank]
@@ -11,11 +11,11 @@
 //
 // Dispatch: ceil(d_inner / 256) workgroups × 256 threads
 
-struct MambaShape {
+struct FpmShape {
     D: u32, d_inner: u32, d_state: u32, d_conv: u32, dt_rank: u32,
 };
 
-@group(0) @binding(0) var<uniform>             shape:      MambaShape;
+@group(0) @binding(0) var<uniform>             shape:      FpmShape;
 @group(0) @binding(1) var<storage, read>       proj_bcd:   array<f32>; // [dt_rank+2*d_state] — only [0:dt_rank] used
 @group(0) @binding(2) var<storage, read>       dt_proj_w:  array<f32>; // [d_inner * dt_rank] row-major
 @group(0) @binding(3) var<storage, read>       dt_proj_b:  array<f32>; // [d_inner]

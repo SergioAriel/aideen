@@ -15,7 +15,7 @@
 
 ## Resumen
 
-Se implementará una memoria temporal fuerte, inspirada en Mamba, pero integrada de forma compatible con el fixed-point del DEQ.
+Se implementará una memoria temporal fuerte, inspirada en Fixed-Point Memory, pero integrada de forma compatible con el fixed-point del DEQ.
 
 La estrategia productiva será:
 
@@ -32,7 +32,7 @@ Este plan es la ruta productiva. La integración interna de memoria dentro del D
 
 ## Nota de nomenclatura (evitar ambigüedad)
 
-En este plan y en los flags actuales, “**mamba**” significa **memoria temporal externa / canal histórico** (el contexto `c_{t,k}` o la inicialización histórica), **no** un “mamba interno” dentro del DEQ.
+En este plan y en los flags actuales, “**Fixed-Point Memory**” significa **memoria temporal externa / canal histórico** (el contexto `c_{t,k}` o la inicialización histórica), **no** un “mamba interno” dentro del DEQ.
 
 Referencia histórica de flags:
 - `AIDEEN_DEQ_ONLY=1` → DEQ sin atención ni historia.
@@ -451,7 +451,7 @@ Se evita el impuesto de bandwidth y cache de un stride mayor.
 
 ## 7. Cambios por archivo
 
-## 7.1 `mamba_slot_reasoning.rs`
+## 7.1 `fixed_point_memory_reasoning.rs`
 
 Agregar:
 - `w_hist_shared: DMatrix<f32>`
@@ -525,7 +525,7 @@ Fase selectiva:
 ## 7.6 `trainer.rs`
 
 Agregar stage:
-- `AttnHistMamba`
+- `AttnHistFixed-Point Memory`
 
 Orden de ejecución:
 1. LM backward

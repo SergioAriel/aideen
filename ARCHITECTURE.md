@@ -198,7 +198,7 @@ Contractivity (ratio of consecutive deltas) only measured when
 
 ---
 
-## 4. Post-Convergence: Mamba Temporal Update
+## 4. Post-Convergence: Fixed-Point Memory Temporal Update
 
 After the loop exits (h* found), for each slot `s`:
 
@@ -295,8 +295,8 @@ Accumulates gradients over all `seq_len * h_slots` entries, then applies SGD wit
 | `W_o` | shared | `d × d` | Attention output projection |
 | `W_in[s]` | **per-slot** | `d × d` each | Input injection, h_slots copies |
 | `W_hist` | shared | `d × d` | History projection (in HistParams) |
-| `W_x` | shared | `d × d` | Mamba input projection |
-| `W_out` | shared | `d × d` | Mamba output projection |
+| `W_x` | shared | `d × d` | Fixed-Point Memory input projection |
+| `W_out` | shared | `d × d` | Fixed-Point Memory output projection |
 | `slot_anchor[s]` | per-slot | `d` each | Per-slot identity bias |
 | `NormScale` | shared | `d` | RMSNorm per-channel scale |
 | `W_lm` | shared | `vocab × d` | LM head (AdamW) |
@@ -309,7 +309,7 @@ Gradient clipping: per-element clip to `[-0.5, +0.5] * lr * grad_scale`
 
 ## 9. HistParams Buffer Layout
 
-**File:** `aideen-backbone/src/mamba_slot_reasoning.rs`, serialized in `trainer.rs`
+**File:** `aideen-backbone/src/fixed_point_memory_reasoning.rs`, serialized in `trainer.rs`
 
 Starting offset 0:
 
@@ -418,7 +418,7 @@ S_in[batch, seq_len, d_model]
     │    │    h_next_s = β*h_new_s + (1-β)*h_curr_s           │
     │    │    [converged?] → exit loop                         │
     │    │                                                      │
-    │    │  Mamba update (post-convergence):                   │
+    │    │  Fixed-Point Memory update (post-convergence):                   │
     │    │    x_proj_s = (I + W_x) × RMSUnit(h*)              │
     │    │    M_t_s = (I+W_out)(a*M_{t-1} + (1-a)*x_proj)     │
     │    │                                                      │

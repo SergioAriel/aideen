@@ -32,7 +32,7 @@ Secuencia de hasta K=8 tokens
 
 ```
 H* ──FiLM──► scale/bias por capa
-<bos> → Mamba layer 0..N → LmHead → tokens
+<bos> → Fixed-Point Memory layer 0..N → LmHead → tokens
 ```
 
 - ✅ Sequencias de largo arbitrario
@@ -118,7 +118,7 @@ Cambiar en `aideen-core/src/state.rs`.
 
 ---
 
-## ADR-003: Spectral Normalization en MambaSlotReasoning
+## ADR-003: Spectral Normalization en FixedPointMemoryReasoning
 
 **Estado:** PENDIENTE
 

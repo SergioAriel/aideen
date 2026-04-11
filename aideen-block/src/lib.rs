@@ -1,6 +1,6 @@
 pub mod async_bridge;
 pub mod deq_bridge;
-pub mod mamba;
+pub mod fixed_point_memory;
 pub mod model;
 pub mod moe;
 pub mod router;

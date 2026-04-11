@@ -1,12 +1,12 @@
 /// `BlockBackend` — contrato para un backend de cómputo capaz de ejecutar
-/// un paso completo del SSM de Mamba sobre slices de f32.
+/// un paso completo del SSM de Fixed-Point Memory sobre slices de f32.
 ///
 /// Separado de `ComputeBackend` para no contaminar el contrato genérico
-/// con tipos específicos de Mamba. Implementado por:
+/// con tipos específicos de Fixed-Point Memory. Implementado por:
 ///   - `CpuBlockBackend`   (nalgebra, siempre disponible, fallback)
 ///   - `WgpuBlockBackend` (wgpu + WGSL shaders de aideen-block, feature "wgpu")
 ///
-/// ## Convención de buffers para `mamba_batch_step`
+/// ## Convención de buffers para `fpm_batch_step`
 /// ```text
 /// Input :  x   [d_model]          — estado/activación de entrada
 ///          dt  [d_model]          — timescale por canal (delta)
@@ -20,7 +20,7 @@
 ///   2. Ejecutar el kernel (único paso de secuencia, seq_len=1)
 ///   3. Retornar y como Vec<f32>
 pub trait BlockBackend: Send {
-    fn mamba_batch_step(
+    fn fpm_batch_step(
         &mut self,
         x: &[f32],  // [d_model]
         dt: &[f32], // [d_model]

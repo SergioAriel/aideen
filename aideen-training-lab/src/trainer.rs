@@ -19,7 +19,8 @@ use std::io::Write;
 
 use crate::optimizer::Adam;
 use aideen_backbone::{
-    lm_head::LmHead, mamba_slot_reasoning::MambaSlotReasoning, tokenizer::Tokenizer,
+    deq_mode::DeqRuntimeConfig, lm_head::LmHead, fixed_point_memory_reasoning::FixedPointMemoryReasoning,
+    tokenizer::Tokenizer,
 };
 
 #[cfg(feature = "wgpu")]
@@ -101,7 +102,7 @@ impl SolveStatus {
 pub struct Trainer {
     pub config: ArchitectureConfig,
     pub training_config: TrainingConfig,
-    pub reasoning: MambaSlotReasoning,
+    pub reasoning: FixedPointMemoryReasoning,
     #[cfg(feature = "wgpu")]
     pub gpu_deq: Option<GpuDeqBackend>,
     #[cfg(feature = "wgpu")]
@@ -622,18 +623,12 @@ impl Trainer {
         bytes / (1024.0 * 1024.0 * 1024.0)
     }
 
+    fn deq_runtime_config() -> DeqRuntimeConfig {
+        DeqRuntimeConfig::from_env()
+    }
+
     fn clean_deq_mode_active() -> bool {
-        if Self::env_flag("AIDEEN_DEQ_ONLY") {
-            return true;
-        }
-        if std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok()
-        {
-            return false;
-        }
-        false
+        Self::deq_runtime_config().is_deq_only()
     }
 
     fn baseline_fpm_enabled() -> bool {
@@ -647,21 +642,18 @@ impl Trainer {
     }
 
     fn slot_coord_mode_active() -> bool {
-        std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok()
+        Self::deq_runtime_config().has_explicit_slot_comparison()
     }
 
     fn effective_fpm_enabled() -> bool {
-        Self::baseline_fpm_enabled() && !Self::clean_deq_mode_active() && !Self::slot_coord_mode_active()
+        Self::baseline_fpm_enabled() && !Self::clean_deq_mode_active()
     }
 
     fn fpm_stage_from_env() -> u32 {
         std::env::var("AIDEEN_FPM_STAGE")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(3)
+            .unwrap_or(4)
     }
 
     fn default_hist_min_iters() -> u32 {
@@ -690,11 +682,9 @@ impl Trainer {
         let t = seq_len as f64;
         let f32_bytes = std::mem::size_of::<f32>() as f64;
         let _ = max_iters;
-        let deq_only = Self::env_flag("AIDEEN_DEQ_ONLY");
-        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_INIT_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_FIXED_MAMBA").is_ok()
-            || std::env::var("AIDEEN_DEQ_RESIDUAL_ALPHA").is_ok();
+        let runtime_cfg = Self::deq_runtime_config();
+        let deq_only = runtime_cfg.is_deq_only();
+        let slot_coord_mode = runtime_cfg.has_explicit_slot_comparison();
         let fpm_enabled = Self::effective_fpm_enabled();
         if deq_only {
             let win_bytes = b * t * (h * d * d * f32_bytes);
@@ -786,6 +776,29 @@ impl Trainer {
             out.push((fw[base], fw[base + 1], fw[base + 2]));
         }
         out
+    }
+
+    fn decode_slot_max_a_delta_metrics(fw: &[f32], h_slots: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for slot in 0..h_slots {
+            let idx = 384 + slot;
+            if fw.len() <= idx {
+                break;
+            }
+            out.push(fw[idx]);
+        }
+        out
+    }
+
+    fn decode_debug_snapshot_header(fw: &[f32]) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
+        if fw.len() <= 18 {
+            return None;
+        }
+        Some((fw[8], fw[9], fw[10], fw[11], fw[12], fw[13], fw[14]))
+    }
+
+    fn valid_debug_snapshot(fw: &[f32]) -> bool {
+        fw.len() > 11 && fw[8] == 901.0 && fw[10].is_finite() && fw[10] > 0.0
     }
 
     #[cfg(feature = "wgpu")]
@@ -1164,7 +1177,32 @@ impl Trainer {
         out
     }
 
+    fn decode_fpm_write_branch_metrics(
+        fw: &[f32],
+        h_slots: usize,
+    ) -> Vec<(f32, f32, f32, f32, f32, f32)> {
+        let mut out = Vec::new();
+        for slot in 0..h_slots {
+            let base = 640 + slot * 6;
+            if fw.len() <= base + 5 {
+                break;
+            }
+            out.push((
+                fw[base],
+                fw[base + 1],
+                fw[base + 2],
+                fw[base + 3],
+                fw[base + 4],
+                fw[base + 5],
+            ));
+        }
+        out
+    }
+
     fn decode_fpm_health_metrics(fw: &[f32], h_slots: usize) -> Option<FpmHealthMetrics> {
+        if !Self::valid_debug_snapshot(fw) {
+            return None;
+        }
         let slot_diag = Self::decode_fpm_diag_metrics(fw, h_slots);
         if slot_diag.is_empty() {
             return None;
@@ -1343,8 +1381,8 @@ impl Trainer {
 
         let mut trainer = Self {
             reasoning: match seed {
-                Some(seed) => MambaSlotReasoning::new_with_seed(config.clone(), seed),
-                None => MambaSlotReasoning::new(config.clone()),
+                Some(seed) => FixedPointMemoryReasoning::new_with_seed(config.clone(), seed),
+                None => FixedPointMemoryReasoning::new(config.clone()),
             },
             #[cfg(feature = "wgpu")]
             gpu_deq,
@@ -1560,7 +1598,7 @@ impl Trainer {
 
     /// Reinicia los estados cognitivos (slots) tanto en CPU como en GPU.
     pub fn reset_state(&mut self) {
-        // MambaSlotReasoning es stateless entre llamadas: el DEQ recomputa h* desde cero
+        // FixedPointMemoryReasoning es stateless entre llamadas: el DEQ recomputa h* desde cero
         // en cada forward pass, por lo que no hay estado oculto persistente que limpiar.
         // reset_state sirve para forzar que la próxima secuencia no comparta contexto.
         self.m_prev = None;
@@ -1893,6 +1931,20 @@ impl Trainer {
             // 2. DEQ Forward (GPU-Only) - v13.1 Adaptive
             let debug_every = self.cfg_debug_sample_every;
             let debug_enable = debug_every != 0 && (self.optimizer.step_count() % debug_every == 0);
+            let debug_fpm = Self::env_flag("AIDEEN_DEBUG_FPM");
+            let mut strict_debug_snapshot: Option<Vec<f32>> = None;
+            if debug_enable && debug_fpm {
+                println!(
+                    "    \x1b[90m[STEP-SHAPE] step={} ctx_tokens={} target_tokens={} batch={} per_seq={} query_dim={} single_query={}\x1b[0m",
+                    self.optimizer.step_count(),
+                    context.len(),
+                    num_tokens,
+                    fwd_batch_size,
+                    per_seq_len,
+                    query.len(),
+                    if query.len() == self.config.d_r && num_tokens == 1 { 1 } else { 0 }
+                );
+            }
             let forward_t0 = std::time::Instant::now();
             let _ = gpu.run_forward(
                 fwd_batch_size,
@@ -1908,6 +1960,51 @@ impl Trainer {
             }
             if audit_cost {
                 audit_forward_ms += forward_t0.elapsed().as_secs_f64() * 1e3;
+            }
+            if debug_enable && debug_fpm {
+                let fw_mid = gpu.read_debug_buffer();
+                strict_debug_snapshot = Some(fw_mid.clone());
+                let h_mid = gpu.read_hpooled();
+                let h_mid_abs_mean = if h_mid.is_empty() {
+                    0.0
+                } else {
+                    h_mid.iter().map(|v| v.abs()).sum::<f32>() / h_mid.len() as f32
+                };
+                let h_mid_abs_max = h_mid.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                if Self::valid_debug_snapshot(&fw_mid) {
+                    println!(
+                        "    \x1b[90m[DEBUG-BUF-MID] valid=1 sig={:.0} eps={:.3e} tokens={:.0} slots={:.0} hpool(mean={:.3e},max={:.3e})\x1b[0m",
+                        fw_mid.get(8).copied().unwrap_or(0.0),
+                        fw_mid.get(9).copied().unwrap_or(0.0),
+                        fw_mid.get(10).copied().unwrap_or(0.0),
+                        fw_mid.get(11).copied().unwrap_or(0.0),
+                        h_mid_abs_mean,
+                        h_mid_abs_max
+                    );
+                } else if let Some((sig, eps, tokens, slots, aux0, aux1, aux2)) =
+                    Self::decode_debug_snapshot_header(&fw_mid)
+                {
+                    println!(
+                        "    \x1b[90m[DEBUG-BUF-MID] valid=0 sig={:.3e} eps={:.3e} tokens={:.3e} slots={:.3e} aux=[{:.3e},{:.3e},{:.3e}] len={} hpool(mean={:.3e},max={:.3e})\x1b[0m",
+                        sig,
+                        eps,
+                        tokens,
+                        slots,
+                        aux0,
+                        aux1,
+                        aux2,
+                        fw_mid.len(),
+                        h_mid_abs_mean,
+                        h_mid_abs_max
+                    );
+                } else {
+                    println!(
+                        "    \x1b[90m[DEBUG-BUF-MID] valid=0 len={} header=short hpool(mean={:.3e},max={:.3e})\x1b[0m",
+                        fw_mid.len(),
+                        h_mid_abs_mean,
+                        h_mid_abs_max
+                    );
+                }
             }
             // Use cached debug buffer — refresh deferred to end of step (after GPU is idle).
             // The DEQ-INVALID streak check needs 3 consecutive failures, so 1-step lag is safe.
@@ -2139,14 +2236,34 @@ impl Trainer {
             let debug_due = debug_every != 0 && step % debug_every == 0;
             let control_due = step % control_every == 0;
             let mut metrics_refreshed = false;
-            if control_due || debug_due {
+            if let Some(fw_mid) = strict_debug_snapshot.take() {
+                if Self::valid_debug_snapshot(&fw_mid) {
+                    self.cached_debug_buf = fw_mid;
+                    self.cached_debug_gen = self.cached_debug_gen.wrapping_add(1);
+                    metrics_refreshed = true;
+                }
+            }
+            if !metrics_refreshed && (control_due || debug_due) {
                 let sync_t0 = std::time::Instant::now();
-                self.cached_debug_buf = gpu.read_debug_buffer();
-                self.cached_debug_gen = self.cached_debug_gen.wrapping_add(1);
+                let fw_now = gpu.read_debug_buffer();
+                if Self::valid_debug_snapshot(&fw_now) {
+                    self.cached_debug_buf = fw_now;
+                    self.cached_debug_gen = self.cached_debug_gen.wrapping_add(1);
+                    metrics_refreshed = true;
+                } else {
+                    // The debug shader writes intermediate sentinels (e.g. 186) before the
+                    // final 901 commit marker. Only promote completed snapshots into the
+                    // control cache; otherwise the controller reacts to in-flight data.
+                    let fw_retry = gpu.read_debug_buffer();
+                    if Self::valid_debug_snapshot(&fw_retry) {
+                        self.cached_debug_buf = fw_retry;
+                        self.cached_debug_gen = self.cached_debug_gen.wrapping_add(1);
+                        metrics_refreshed = true;
+                    }
+                }
                 if audit_cost {
                     audit_sync_ms += sync_t0.elapsed().as_secs_f64() * 1e3;
                 }
-                metrics_refreshed = true;
             }
             if metrics_refreshed && !self.cached_debug_buf.is_empty() {
                 self.update_fpm_runtime_schedule();
@@ -2157,6 +2274,7 @@ impl Trainer {
                 let (heartbeat, max_h, avg_iters, hit_count, max_delta, contractivity, hit_den) =
                     Self::decode_forward_debug_metrics(fw, self.config.h_slots);
                 let debug_v901 = fw.len() > 18 && fw[8] == 901.0;
+                let debug_fpm = Self::env_flag("AIDEEN_DEBUG_FPM");
                 let _last_delta = if fw.len() > 17 { fw[17] } else { 0.0 };
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
                 let total_elems = if fw.len() > 19 { fw[19] } else { 0.0 };
@@ -2168,7 +2286,20 @@ impl Trainer {
                 let nscale_abs_dbg = if debug_v901 && fw.len() > 16 { fw[16] } else { 0.0 };
                 let pre2h_dbg = if debug_v901 && fw.len() > 17 { fw[17] } else { 0.0 };
                 let fh2h_dbg = if debug_v901 && fw.len() > 18 { fw[18] } else { 0.0 };
-                let mamba_rms = if !debug_v901 && fw.len() > 25 { fw[25] } else { 0.0 };
+                let attn_rms_dbg = if debug_v901 && fw.len() > 19 { fw[19] } else { 0.0 };
+                let attn2sig_dbg = if debug_v901 && fw.len() > 20 { fw[20] } else { 0.0 };
+                let attn_scale_dbg = if debug_v901 && fw.len() > 21 { fw[21] } else { 0.0 };
+                let iter0_err_h_dbg = if debug_v901 && fw.len() > 22 { fw[22] } else { 0.0 };
+                let iter1_err_h_dbg = if debug_v901 && fw.len() > 23 { fw[23] } else { 0.0 };
+                let iter0_attn2sig_dbg = if debug_v901 && fw.len() > 24 { fw[24] } else { 0.0 };
+                let iter1_attn2sig_dbg = if debug_v901 && fw.len() > 25 { fw[25] } else { 0.0 };
+                let iter0_attn_scale_dbg = if debug_v901 && fw.len() > 26 { fw[26] } else { 0.0 };
+                let iter1_attn_scale_dbg = if debug_v901 && fw.len() > 27 { fw[27] } else { 0.0 };
+                let iter_max_err_dbg = if debug_v901 && fw.len() > 28 { fw[28] } else { 0.0 };
+                let iter_max_attn_dbg = if debug_v901 && fw.len() > 29 { fw[29] } else { 0.0 };
+                let token_max_err_dbg = if debug_v901 && fw.len() > 30 { fw[30] } else { 0.0 };
+                let token_max_attn_dbg = if debug_v901 && fw.len() > 31 { fw[31] } else { 0.0 };
+                let fpm_rms = if !debug_v901 && fw.len() > 25 { fw[25] } else { 0.0 };
                 let hist0 = if fw.len() > 100 { fw[100] } else { 0.0 };
                 let hist1 = if fw.len() > 101 { fw[101] } else { 0.0 };
                 let hist2 = if fw.len() > 102 { fw[102] } else { 0.0 };
@@ -2178,9 +2309,9 @@ impl Trainer {
                 let hist_contr_floor = if fw.len() > 106 { fw[106] } else { 0.0 };
                 let hist_inject = if fw.len() > 107 { fw[107] } else { 0.0 };
                 let hist_minner_zero = if fw.len() > 108 { fw[108] } else { 0.0 };
-                let hist_force_nomamba = if fw.len() > 109 { fw[109] } else { 0.0 };
+                let hist_force_nofpm = if fw.len() > 109 { fw[109] } else { 0.0 };
                 let hist_prelude_skip = if fw.len() > 110 { fw[110] } else { 0.0 };
-                let hist_loop_force_nomamba = if fw.len() > 111 { fw[111] } else { 0.0 };
+                let hist_loop_force_nofpm = if fw.len() > 111 { fw[111] } else { 0.0 };
                 let fpm_enabled = Self::effective_fpm_enabled();
                 let mut fpm_status = SolveStatus::Unconverged;
                 let mut fpm_step_diag = String::new();
@@ -2450,9 +2581,31 @@ impl Trainer {
                 };
                 let hit_i = hit.round() as i32;
                 if debug_due {
+                    if debug_fpm && !debug_v901 {
+                        if let Some((sig, eps, tokens, slots, aux0, aux1, aux2)) =
+                            Self::decode_debug_snapshot_header(fw)
+                        {
+                            println!(
+                                "    \x1b[90m[DEBUG-BUF] valid=0 sig={:.3e} eps={:.3e} tokens={:.3e} slots={:.3e} aux=[{:.3e},{:.3e},{:.3e}] len={}\x1b[0m",
+                                sig,
+                                eps,
+                                tokens,
+                                slots,
+                                aux0,
+                                aux1,
+                                aux2,
+                                fw.len()
+                            );
+                        } else {
+                            println!(
+                                "    \x1b[90m[DEBUG-BUF] valid=0 len={} header=short\x1b[0m",
+                                fw.len()
+                            );
+                        }
+                    }
                     if debug_v901 {
                         println!(
-                            "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} solve={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} sig/pre/fh/h={:.3e}/{:.3e}/{:.3e}/{:.3e} nscale_max={:.3e} pre/h={:.3e} fh/h={:.3e}\x1b[0m",
+                            "    \x1b[90m[GPU-DEBUG] Step {:>2}: hit={:>3}/{:.0} ({:>5.1}%) contr={:.3} solve={:.3e} rs_cg={:.1e} iters={:.1} cap={} damp={:.2} mode={} conv={} tps={:.1} max_h={:.6} sig/pre/fh/h={:.3e}/{:.3e}/{:.3e}/{:.3e} attn={:.3e} attn/sig={:.3e} attn_scale={:.3e} i0_err={:.3e} i1_err={:.3e} i0_a/s={:.3e} i1_a/s={:.3e} i0_sc={:.3e} i1_sc={:.3e} imax_err={:.0}@tok={:.0} imax_a={:.0}@tok={:.0} nscale_max={:.3e} pre/h={:.3e} fh/h={:.3e}\x1b[0m",
                             self.optimizer.step_count() % 100,
                             hit_i,
                             hit_den,
@@ -2471,6 +2624,19 @@ impl Trainer {
                             pre_rms_dbg,
                             fh_rms_dbg,
                             hprev_rms_dbg,
+                            attn_rms_dbg,
+                            attn2sig_dbg,
+                            attn_scale_dbg,
+                            iter0_err_h_dbg,
+                            iter1_err_h_dbg,
+                            iter0_attn2sig_dbg,
+                            iter1_attn2sig_dbg,
+                            iter0_attn_scale_dbg,
+                            iter1_attn_scale_dbg,
+                            iter_max_err_dbg,
+                            token_max_err_dbg,
+                            iter_max_attn_dbg,
+                            token_max_attn_dbg,
                             nscale_abs_dbg,
                             pre2h_dbg,
                             fh2h_dbg
@@ -2501,9 +2667,9 @@ impl Trainer {
                             hist_contr_floor,
                             hist_inject,
                             hist_minner_zero,
-                            hist_force_nomamba,
+                            hist_force_nofpm,
                             hist_prelude_skip,
-                            hist_loop_force_nomamba,
+                            hist_loop_force_nofpm,
                             trunc_str,
                             total_elems
                         );
@@ -2559,11 +2725,11 @@ impl Trainer {
                                 .join(",")
                         };
                         println!(
-                            "    \x1b[90m[GPU-SSM] Step {}: a_mean=[{}] a_spread=[{}] mamba_rms={:.3e}\x1b[0m",
+                            "    \x1b[90m[GPU-SSM] Step {}: a_mean=[{}] a_spread=[{}] fpm_rms={:.3e}\x1b[0m",
                             self.optimizer.step_count() % 100,
                             fmt_vec(&a_means),
                             fmt_vec(&a_spreads),
-                            mamba_rms,
+                            fpm_rms,
                         );
                     }
                 }
@@ -3761,8 +3927,34 @@ impl Trainer {
                             vl == "1" || vl == "true" || vl == "yes"
                         })
                         .unwrap_or(false);
-                    if fpm_enabled && !self.cached_debug_buf.is_empty() {
+                    if debug_fpm && !self.cached_debug_buf.is_empty() && !Self::valid_debug_snapshot(&self.cached_debug_buf) {
+                        if let Some((sig, eps, tokens, slots, aux0, aux1, aux2)) =
+                            Self::decode_debug_snapshot_header(&self.cached_debug_buf)
+                        {
+                            println!(
+                                "    [DEBUG-BUF] valid=0 sig={:.3e} eps={:.3e} tokens={:.3e} slots={:.3e} aux=[{:.3e},{:.3e},{:.3e}] len={}",
+                                sig,
+                                eps,
+                                tokens,
+                                slots,
+                                aux0,
+                                aux1,
+                                aux2,
+                                self.cached_debug_buf.len()
+                            );
+                        } else {
+                            println!(
+                                "    [DEBUG-BUF] valid=0 len={} header=short",
+                                self.cached_debug_buf.len()
+                            );
+                        }
+                    }
+                    if fpm_enabled && Self::valid_debug_snapshot(&self.cached_debug_buf) {
                         let slot_obs = Self::decode_slot_observability_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
+                        let slot_a_delta = Self::decode_slot_max_a_delta_metrics(
                             &self.cached_debug_buf,
                             self.config.h_slots,
                         );
@@ -3771,6 +3963,10 @@ impl Trainer {
                             self.config.h_slots,
                         );
                         let slot_read = Self::decode_fpm_read_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
+                        let slot_write_branches = Self::decode_fpm_write_branch_metrics(
                             &self.cached_debug_buf,
                             self.config.h_slots,
                         );
@@ -3792,9 +3988,14 @@ impl Trainer {
                                 .map(|(_, _, mov)| format!("{mov:.3e}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
+                            let a_delta = slot_a_delta
+                                .iter()
+                                .map(|v| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
                             println!(
-                                "    [FPM-SLOTS] self_assign=[{}] entropy=[{}] move=[{}]",
-                                assign, entropy, movement
+                                "    [FPM-SLOTS] self_assign=[{}] entropy=[{}] move=[{}] a_delta_max=[{}]",
+                                assign, entropy, movement, a_delta
                             );
                         }
                         if !slot_diag.is_empty() {
@@ -3875,6 +4076,11 @@ impl Trainer {
                                 .map(|(_, _, mx, _, _, _, _, _, _, _, _, _, _, _)| format!("{mx:.3}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
+                            let retain_avg = slot_read
+                                .iter()
+                                .map(|(_, _, _, avg, _, _, _, _, _, _, _, _, _, _)| format!("{avg:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
                             let prop_rms = slot_read
                                 .iter()
                                 .map(|(_, _, _, _, pr, _, _, _, _, _, _, _, _, _)| format!("{pr:.3e}"))
@@ -3925,11 +4131,42 @@ impl Trainer {
                                 .map(|(_, _, _, _, _, _, _, _, _, _, _, _, _, rg)| format!("{rg:.3e}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
+                            let write_h_unit = slot_write_branches
+                                .iter()
+                                .map(|(v, _, _, _, _, _)| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let write_wx = slot_write_branches
+                                .iter()
+                                .map(|(_, v, _, _, _, _)| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let write_inj = slot_write_branches
+                                .iter()
+                                .map(|(_, _, v, _, _, _)| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let write_inner = slot_write_branches
+                                .iter()
+                                .map(|(_, _, _, v, _, _)| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let write_out = slot_write_branches
+                                .iter()
+                                .map(|(_, _, _, _, v, _)| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let write_cand = slot_write_branches
+                                .iter()
+                                .map(|(_, _, _, _, _, v)| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
                             println!(
-                                "    [FPM-PATH] read(mem_rms=[{}],mem2sig=[{}],retain_max=[{}],src_m_rms=[{}],keyed_m_rms=[{}],q_rms=[{}],k_rms=[{}],raw_gap=[{}],gap=[{}],peak=[{}],conf=[{}]) solve(err_h=[{}],exit_err_h=[{}],exit_iter=[{}],dead=[{}],rescue=[{}]) write(err_M=[{}],z=[{}],u2v=[{}],sat=[{}],prop_rms=[{}],cand_rms=[{}]) knobs(stage={},alpha_m={:.3},tau={:.2})",
+                                "    [FPM-PATH] read(mem_rms=[{}],mem2sig=[{}],retain_max=[{}],retain_avg=[{}],src_m_rms=[{}],keyed_m_rms=[{}],q_rms=[{}],k_rms=[{}],raw_gap=[{}],gap=[{}],peak=[{}],conf=[{}]) solve(err_h=[{}],exit_err_h=[{}],exit_iter=[{}],dead=[{}],rescue=[{}]) write(err_M=[{}],z=[{}],u2v=[{}],sat=[{}],prop_rms=[{}],cand_rms=[{}]) knobs(stage={},alpha_m={:.3},tau={:.2})",
                                 read_rms,
                                 read_to_sig,
                                 retain_max,
+                                retain_avg,
                                 src_m_rms,
                                 keyed_m_rms,
                                 q_rms,
@@ -3953,6 +4190,17 @@ impl Trainer {
                                 self.fpm_alpha_m_current,
                                 self.fpm_tau_current
                             );
+                            if !slot_write_branches.is_empty() {
+                                println!(
+                                    "    [FPM-WRITE] h_unit=[{}] wx_h=[{}] write=[{}] m_inner=[{}] wout=[{}] cand=[{}]",
+                                    write_h_unit,
+                                    write_wx,
+                                    write_inj,
+                                    write_inner,
+                                    write_out,
+                                    write_cand
+                                );
+                            }
                             /*
                              * rescue tuple semantics:
                              *   entered-during-loop / recovered-after-rescue / rescue-entered-count / converged-before-rescue
@@ -3960,7 +4208,7 @@ impl Trainer {
                         }
                     }
                     // Slot-coord diagnostics (slot attention, active in DEQ_NO_MAMBA mode)
-                    if Self::slot_coord_mode_active() && !self.cached_debug_buf.is_empty() {
+                    if Self::slot_coord_mode_active() && Self::valid_debug_snapshot(&self.cached_debug_buf) {
                         let slot_obs = Self::decode_slot_observability_metrics(
                             &self.cached_debug_buf,
                             self.config.h_slots,
@@ -4206,7 +4454,11 @@ impl Trainer {
                 let sum_vw: f32 = v_w.iter().map(|x| x.abs()).sum();
 
                 // VRAM Checksum: Si los momentos son exactamente cero, algo falló en el mapeo
-                if sum_mw == 0.0 && sum_vw == 0.0 && self.optimizer.step_count() > 10 {
+                if !self.frozen_lm
+                    && sum_mw == 0.0
+                    && sum_vw == 0.0
+                    && self.optimizer.step_count() > 10
+                {
                     panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Checksum de VRAM falló (Momentos LM=0). Abortando para proteger checkpoint.");
                 }
 
@@ -4232,7 +4484,7 @@ impl Trainer {
         if let Some(gpu_emb) = self.gpu_emb.as_ref() {
             if let Ok((m_emb, v_emb)) = gpu_emb.read_moments(&gpu.device, &gpu.queue) {
                 let sum_me: f32 = m_emb.iter().map(|x| x.abs()).sum();
-                if sum_me == 0.0 && self.optimizer.step_count() > 10 {
+                if !self.frozen_emb && sum_me == 0.0 && self.optimizer.step_count() > 10 {
                     panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Checksum de VRAM falló (Momentos EMB=0). Abortando.");
                 }
                 println!("    Embedding Moments Checksum: m={:.4}", sum_me);

@@ -12,8 +12,8 @@ struct ComputeShape {
 
 @group(0) @binding(0) var<uniform> shape: ComputeShape;
 
-// Token inputs (embeddings processed by Mamba)
-@group(0) @binding(1) var<storage, read> Mamba_Out: array<f32>;
+// Token inputs (embeddings processed by Fpm)
+@group(0) @binding(1) var<storage, read> Fpm_Out: array<f32>;
 
 // The Router's Heavy Weights (NUM_EXPERTS x D_MODEL)
 @group(0) @binding(2) var<storage, read> Router_Weights: array<f32>;
@@ -51,7 +51,7 @@ fn calculate_routing(
         let token_offset = token_idx * d_model;
         
         for (var d: u32 = 0u; d < d_model; d = d + 1u) {
-            dot_product = dot_product + (Mamba_Out[token_offset + d] * Router_Weights[weight_row_offset + d]);
+            dot_product = dot_product + (Fpm_Out[token_offset + d] * Router_Weights[weight_row_offset + d]);
         }
         
         logits[e] = dot_product;

@@ -1,8 +1,8 @@
-// Loxi V8 — Mamba Pass 6: out_proj GEMV + residual
+// Loxi V8 — Fpm Pass 6: out_proj GEMV + residual
 //
 // Computes: output[i] = sum_d( out_proj_w[i, d] * y_inner[d] ) + x_in[i]
 //
-// The x_in residual connection completes the Mamba block:
+// The x_in residual connection completes the Fpm block:
 //   output = out_proj(y_inner) + x_in
 // This matches the Python reference:
 //   return self.out_proj(y) + residual
@@ -12,11 +12,11 @@
 //
 // Dispatch: ceil(D / 256) workgroups × 256 threads. Each thread computes one output[i].
 
-struct MambaShape {
+struct FpmShape {
     D: u32, d_inner: u32, d_state: u32, d_conv: u32, dt_rank: u32,
 };
 
-@group(0) @binding(0) var<uniform>             shape:       MambaShape;
+@group(0) @binding(0) var<uniform>             shape:       FpmShape;
 @group(0) @binding(1) var<storage, read>       y_inner:     array<f32>; // [d_inner]
 @group(0) @binding(2) var<storage, read>       out_proj_w:  array<f32>; // [D * d_inner] row-major
 @group(0) @binding(3) var<storage, read>       x_in:        array<f32>; // [D]

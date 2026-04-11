@@ -1,4 +1,4 @@
-// Loxi V8 — Mamba Pass 1: RMSNorm + in_proj
+// Loxi V8 — Fpm Pass 1: RMSNorm + in_proj
 //
 // Computes: xz = RMSNorm(x) @ in_proj.weight^T
 // Input:  x[D]
@@ -7,7 +7,7 @@
 // Dispatch: ceil(2*d_inner / 256) workgroups × 256 threads
 // Thread gid.x computes xz[gid.x]
 
-struct MambaShape {
+struct FpmShape {
     D:       u32,  // input dimension
     d_inner: u32,  // D * expand
     d_state: u32,
@@ -15,7 +15,7 @@ struct MambaShape {
     dt_rank: u32,
 };
 
-@group(0) @binding(0) var<uniform>             shape:     MambaShape;
+@group(0) @binding(0) var<uniform>             shape:     FpmShape;
 @group(0) @binding(1) var<storage, read>       x_in:      array<f32>; // [D]
 @group(0) @binding(2) var<storage, read>       norm_w:    array<f32>; // [D]
 @group(0) @binding(3) var<storage, read>       in_proj_w: array<f32>; // [2*d_inner * D] row-major

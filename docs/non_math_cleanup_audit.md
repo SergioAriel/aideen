@@ -28,7 +28,7 @@ Removed because it was not referenced by the compiled training path or tests:
   - dead local `d_parts` declarations
 - `Trainer`
   - `env_u32()`
-- `mamba_slot_reasoning`
+- `fixed_point_memory_reasoning`
   - `identity_like_mat_with_rng()`
 - `train` CLI
   - `print_banner()`

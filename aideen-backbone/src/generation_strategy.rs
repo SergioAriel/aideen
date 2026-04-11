@@ -6,7 +6,7 @@ use nalgebra::DVector;
 use std::time::Instant;
 
 use crate::lm_head::LmHead;
-use crate::mamba_decoder::MambaDecoder;
+use crate::fixed_point_memory_decoder::FixedPointMemoryDecoder;
 
 // ── Tipos auxiliares ──────────────────────────────────────────────────────────
 
@@ -70,17 +70,17 @@ impl SlotDirectStrategy {
 
 // ── Estrategia B: Decoder ─────────────────────────────────────────────────────
 
-/// Decoder Mamba de N capas condicionado por H* via FiLM.
+/// Decoder Fixed-Point Memory de N capas condicionado por H* via FiLM.
 /// Autoregresivo a nivel de tokens. Largo arbitrario.
 pub struct DecoderStrategy {
     pub config: ArchitectureConfig,
-    pub decoder: MambaDecoder,
+    pub decoder: FixedPointMemoryDecoder,
 }
 
 impl DecoderStrategy {
     pub fn new(n_layers: usize, config: ArchitectureConfig) -> Self {
         Self {
-            decoder: MambaDecoder::new(n_layers, config.clone()),
+            decoder: FixedPointMemoryDecoder::new(n_layers, config.clone()),
             config,
         }
     }
@@ -218,7 +218,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mamba_slot_reasoning::MambaSlotReasoning;
+    use crate::fixed_point_memory_reasoning::FixedPointMemoryReasoning;
 
     fn make_h_star(config: &ArchitectureConfig, seed: f32) -> HSlots {
         let mut h = HSlots::zeros(config);
@@ -328,7 +328,7 @@ mod tests {
             vocab_size: VOCAB,
             ..Default::default()
         };
-        let reasoning = MambaSlotReasoning::new(config.clone());
+        let reasoning = FixedPointMemoryReasoning::new(config.clone());
         let q = make_query(&config, 1.0);
         let strat = DeqAutoRegStrategy::new(config);
         let r = strat.generate(&reasoning, &q, 5);
@@ -342,7 +342,7 @@ mod tests {
             vocab_size: VOCAB,
             ..Default::default()
         };
-        let reasoning = MambaSlotReasoning::new(config.clone());
+        let reasoning = FixedPointMemoryReasoning::new(config.clone());
         let strat = DeqAutoRegStrategy::new(config.clone());
         let r_a = strat.generate(&reasoning, &make_query(&config, 1.0), 5);
         let r_b = strat.generate(&reasoning, &make_query(&config, 3.0), 5);
@@ -362,7 +362,7 @@ mod tests {
         };
         let h = make_h_star(&config, 1.5);
         let q = make_query(&config, 1.5);
-        let reasoning = MambaSlotReasoning::new(config.clone());
+        let reasoning = FixedPointMemoryReasoning::new(config.clone());
 
         let results = benchmark_strategies(&h, &q, &reasoning, VOCAB, 8, config);
 

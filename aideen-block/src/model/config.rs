@@ -5,10 +5,10 @@
 ///   full_v8 — 40 layers, D=256→512→1024→2048, production scale
 ///
 /// Progressive dimensionality across 4 blocks:
-///   Block A: Mamba only
-///   Block B: Mamba + 2D-Attn (light+heavy)
-///   Block C: Mamba + 2D-Attn (medium)
-///   Block D: Mamba + 2D-Attn (full) + MoE
+///   Block A: Fixed-Point Memory only
+///   Block B: Fixed-Point Memory + 2D-Attn (light+heavy)
+///   Block C: Fixed-Point Memory + 2D-Attn (medium)
+///   Block D: Fixed-Point Memory + 2D-Attn (full) + MoE
 
 /// Block-level configuration.
 #[derive(Debug, Clone)]
@@ -24,9 +24,9 @@ pub struct BlockConfig {
 pub struct AideenConfig {
     pub vocab_size: usize,
     pub blocks: Vec<BlockConfig>, // A, B, C, D in order
-    pub d_state: usize,           // Mamba SSM state dimension
-    pub d_conv: usize,            // Mamba 1D conv width
-    pub expand: usize,            // Mamba inner expand factor
+    pub d_state: usize,           // Fixed-Point Memory SSM state dimension
+    pub d_conv: usize,            // Fixed-Point Memory 1D conv width
+    pub expand: usize,            // Fixed-Point Memory inner expand factor
     pub num_local_experts: usize,
     pub num_total_experts: usize,
     pub k_min: usize,

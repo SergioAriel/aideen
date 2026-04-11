@@ -108,20 +108,20 @@ fn hist_minner_zero_base(d: u32, h_slots: u32) -> u32 {
     return hist_inject_flag_base(d, h_slots) + 1u;
 }
 
-fn hist_force_nomamba_base(d: u32, h_slots: u32) -> u32 {
+fn hist_force_nofpm_base(d: u32, h_slots: u32) -> u32 {
     return hist_minner_zero_base(d, h_slots) + 1u;
 }
 
 fn hist_prelude_skip_base(d: u32, h_slots: u32) -> u32 {
-    return hist_force_nomamba_base(d, h_slots) + 1u;
+    return hist_force_nofpm_base(d, h_slots) + 1u;
 }
 
-fn hist_loop_force_nomamba_base(d: u32, h_slots: u32) -> u32 {
+fn hist_loop_force_nofpm_base(d: u32, h_slots: u32) -> u32 {
     return hist_prelude_skip_base(d, h_slots) + 1u;
 }
 
 fn signal_zero_base(d: u32, h_slots: u32) -> u32 {
-    return hist_loop_force_nomamba_base(d, h_slots) + 1u;
+    return hist_loop_force_nofpm_base(d, h_slots) + 1u;
 }
 
 fn attn_out_mode_base(d: u32, h_slots: u32) -> u32 {
@@ -213,12 +213,12 @@ fn token_scratch_base(t: u32, d: u32, h_slots: u32) -> u32 {
     return t * scratch_stride(d, h_slots);
 }
 
-fn token_mamba_base(t: u32, d: u32, h_slots: u32) -> u32 {
+fn token_fpm_base(t: u32, d: u32, h_slots: u32) -> u32 {
     return token_scratch_base(t, d, h_slots) + h_slots * 4u * d;
 }
 
 fn token_signal_base(t: u32, d: u32, h_slots: u32) -> u32 {
-    return token_mamba_base(t, d, h_slots) + h_slots * d;
+    return token_fpm_base(t, d, h_slots) + h_slots * d;
 }
 
 fn token_minner_base(t: u32, d: u32, h_slots: u32) -> u32 {
@@ -444,11 +444,13 @@ fn fused_attn_stage4_wo_win_main(@builtin(global_invocation_id) gid: vec3<u32>) 
     }
 
     if (idx == 0u) {
-        debug_log[8] = 241.0;
+        // Keep 8..18 reserved for the forward DEQ snapshot header.
+        debug_log[1000] = 241.0;
         debug_log[41] = g_wo[0];
         debug_log[43] = g_win[0];
     }
 }
+
 
 @compute
 @workgroup_size(16, 16, 1)
@@ -515,7 +517,8 @@ fn fused_attn_stage4_wq_main(
     }
 
     if (idx == 0u && slot == 0u) {
-        debug_log[8] = 246.0;
+        // Keep 8..18 reserved for the forward DEQ snapshot header.
+        debug_log[1000] = 246.0;
         debug_log[40] = g_wq;
     }
 }
@@ -636,7 +639,8 @@ fn fused_attn_stage4_wk_main(
     }
 
     if (idx == 0u && slot == 0u) {
-        debug_log[8] = 247.0;
+        // Keep 8..18 reserved for the forward DEQ snapshot header.
+        debug_log[1000] = 247.0;
         debug_log[44] = g_wk;
     }
 }
@@ -706,7 +710,8 @@ fn fused_attn_stage4_wv_main(
     }
 
     if (idx == 0u && slot == 0u) {
-        debug_log[8] = 248.0;
+        // Keep 8..18 reserved for the forward DEQ snapshot header.
+        debug_log[1000] = 248.0;
         debug_log[42] = g_wv;
     }
 }
@@ -758,7 +763,8 @@ fn fused_attn_stage4_bias_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if (col == 0u) {
-        debug_log[8] = 243.0;
+        // Keep 8..18 reserved for the forward DEQ snapshot header.
+        debug_log[1000] = 243.0;
     }
 }
 
@@ -793,7 +799,7 @@ fn fused_hist_stage_prep_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         local_prev_sumsq = local_prev_sumsq + prev_m * prev_m;
         var prev_h = 0.0;
@@ -824,7 +830,7 @@ fn fused_hist_stage_prep_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim] / prev_rms;
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim] / prev_rms;
         }
         // The production historical interface is carrier-only: no additive per-slot bias.
         // Otherwise the DEQ sees "history" even when M_{t-1}=0, which breaks the intended
@@ -833,7 +839,7 @@ fn fused_hist_stage_prep_main(
         for (var j = 0u; j < d; j = j + 1u) {
             var prev_j = 0.0;
             if (t > 0u) {
-                prev_j = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + j];
+                prev_j = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + j];
             }
             u = u + AllWeights[aw_hist_base(params.d_model, params.h_slots) +dim * d + j] * prev_j;
         }
@@ -921,7 +927,7 @@ fn fused_hist_stage_prep_main(
                 let x_proj = x_unit + wx * x_unit;
                 let prev_m_raw = select(
                     0.0,
-                    Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim],
+                    Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim],
                     t > 0u
                 );
                 let gpre_factor = a_core * log_a * 0.5 * (1.0 - tanh(delta_pre) * tanh(delta_pre));
@@ -952,7 +958,7 @@ fn fused_hist_stage_prep_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         local_prev_dot = local_prev_dot + prev_m * gmix_buf[hist_out + dim];
     }
@@ -968,7 +974,7 @@ fn fused_hist_stage_prep_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         let g_m_unit = gmix_buf[hist_out + dim];
         gmix_buf[hist_out + dim] = (g_m_unit / prev_rms)
@@ -1026,7 +1032,7 @@ fn fused_hist_stage_mat_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let slot = entry % h_slots;
         let off = slot * d;
         let inv_prev_rms = gscore_buf[entry];
-        let prev_val = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + col] * inv_prev_rms;
+        let prev_val = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + col] * inv_prev_rms;
         grad = grad + weighted_h_buf[entry_base(entry, d) + row] * prev_val;
     }
 
@@ -1071,7 +1077,7 @@ fn fused_hist_stage_scale_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let entry = t_abs * h_slots + slot;
             let off = slot * d;
             let inv_prev_rms = gscore_buf[entry];
-            let prev_val = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim] * inv_prev_rms;
+            let prev_val = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim] * inv_prev_rms;
             grad = grad + weighted_h_buf[entry_base(entry, d) + dim] * prev_val;
         }
     }
@@ -1189,7 +1195,7 @@ fn fused_hist_stage_mprev_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         local_prev_sumsq = local_prev_sumsq + prev_m * prev_m;
     }
@@ -1215,7 +1221,7 @@ fn fused_hist_stage_mprev_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         local_dot = local_dot + prev_m * gmix_buf[hist_out + dim];
     }
@@ -1231,7 +1237,7 @@ fn fused_hist_stage_mprev_main(
     for (var dim = lane; dim < d; dim = dim + 64u) {
         var prev_m = 0.0;
         if (t > 0u) {
-            prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+            prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
         }
         let g_m_unit = gmix_buf[hist_out + dim];
         gmix_buf[hist_out + dim] = (g_m_unit / prev_rms)
@@ -1359,7 +1365,7 @@ fn fused_hist_stage_tbptt_main(
                 var x_proj = qgrad_buf[hist_out + dim];
                 let wx = hist_wx_max() * tanh(AllWeights[aw_wx_base(params.d_model, params.h_slots) +dim * d + dim]);
                 x_proj = x_proj + wx * qgrad_buf[hist_out + dim];
-                let prev_m = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+                let prev_m = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
                 var delta_pre = AllWeights[aw_hist_base(params.d_model, params.h_slots) +hist_delta_bias_base(d, h_slots) + dim];
                 for (var j = 0u; j < d; j = j + 1u) {
                     delta_pre = delta_pre
@@ -1738,7 +1744,7 @@ fn fused_hist_stage_alog_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 var m_prev = 0.0;
                 if (t > 1u) {
-                    m_prev = Scratch[token_mamba_base(t_abs - 2u, d, h_slots) + off + dim];
+                    m_prev = Scratch[token_fpm_base(t_abs - 2u, d, h_slots) + off + dim];
                 }
 
                 let a_base = 1.0 / (1.0 + exp(AllWeights[aw_alog_base(params.d_model, params.h_slots) +slot * d + dim]));
@@ -1869,7 +1875,7 @@ fn fused_hist_stage_forget_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var dim = 0u; dim < d; dim = dim + 1u) {
                 let a_t = hist_ctx_buf[entry_base(entry, d) + dim];
                 let a_ratio = a_t / max(1.0 - a_t, 1.0e-6);
-                let m_prev = Scratch[token_mamba_base(t_abs - 1u, d, h_slots) + off + dim];
+                let m_prev = Scratch[token_fpm_base(t_abs - 1u, d, h_slots) + off + dim];
                 g_scalar += weighted_h_buf[entry_base(entry, d) + dim] * a_ratio * m_prev;
             }
 

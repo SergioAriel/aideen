@@ -8,7 +8,7 @@ NGI Search / NGI Zero / NGI Commons — Next Generation Internet initiative, fun
 
 ## 1. Executive Summary
 
-> [PLACEHOLDER: One paragraph summarizing the project. Should cover: the problem (European dependency on centralized US AI infrastructure, exclusion of most users from advanced AI due to hardware requirements), the proposed solution (AIDEEN, a decentralized AI engine built in Rust using DEQ+Mamba architecture with P2P networking and browser-based inference), alignment with NGI goals (open-source infrastructure, decentralized technology, privacy-preserving design, internet commons), and expected outcome (sovereign, accessible AI inference that runs in any browser with zero data leaving the user's device).]
+> [PLACEHOLDER: One paragraph summarizing the project. Should cover: the problem (European dependency on centralized US AI infrastructure, exclusion of most users from advanced AI due to hardware requirements), the proposed solution (AIDEEN, a decentralized AI engine built in Rust using DEQ+Fixed-Point Memory architecture with P2P networking and browser-based inference), alignment with NGI goals (open-source infrastructure, decentralized technology, privacy-preserving design, internet commons), and expected outcome (sovereign, accessible AI inference that runs in any browser with zero data leaving the user's device).]
 
 ---
 
@@ -49,12 +49,12 @@ AIDEEN is a decentralized AI inference and training engine written entirely in R
 
 ### 3.2 Technical Architecture
 
-AIDEEN replaces the transformer architecture with **Deep Equilibrium Models (DEQ)** combined with **Mamba State Space Models (SSM)**:
+AIDEEN replaces the transformer architecture with **Deep Equilibrium Models (DEQ)** combined with **Fixed-Point Memory State Space Models (SSM)**:
 
 ```
 User Query --> Tokenizer --> Embedding --> DEQ (Picard iteration) --> LmHead --> Response
                                             ^ |
-                                       MambaSlotReasoning
+                                       FixedPointMemoryReasoning
                                        (cross-slot attention
                                         + SSM memory
                                         + spectral normalization)
@@ -118,7 +118,7 @@ This is an architectural invariant, not a policy choice. It ensures that any dep
 ### Relevant Publications
 
 - Bai et al., "Deep Equilibrium Models" (NeurIPS 2019)
-- Gu & Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (2023)
+- Gu & Dao, "Fixed-Point Memory: Linear-Time Sequence Modeling with Selective State Spaces" (2023)
 - Bai et al., "Stabilizing Equilibrium Models by Jacobian Regularization" (ICML 2021)
 
 ---
@@ -130,7 +130,7 @@ This is an architectural invariant, not a policy choice. It ensures that any dep
 | Task | Description | Deliverable |
 |------|-------------|-------------|
 | T1.1 | Complete the 4-phase training pipeline (Decomposer, Backbone, Federated Experts, Distillation) | End-to-end training pipeline |
-| T1.2 | Train DEQ+Mamba backbone on multilingual corpus (BPE 64K tokenizer) | Validated backbone weights |
+| T1.2 | Train DEQ+Fixed-Point Memory backbone on multilingual corpus (BPE 64K tokenizer) | Validated backbone weights |
 | T1.3 | Train at least 6 domain experts (math, code, logic, NLP, science, creative) | Expert weights + quality metrics |
 | T1.4 | Benchmark against standard evaluation suites (perplexity, downstream tasks) | Comparative report vs iso-parameter transformers |
 

@@ -2,7 +2,7 @@
 
 ## What Is AIDEEN?
 
-AIDEEN is a decentralized, open-source AI inference and training engine written entirely in Rust. It replaces the dominant transformer architecture with a fundamentally more efficient design: **Deep Equilibrium Models (DEQ)** combined with **Mamba State Space Models (SSM)**.
+AIDEEN is a decentralized, open-source AI inference and training engine written entirely in Rust. It replaces the dominant transformer architecture with a fundamentally more efficient design: **Deep Equilibrium Models (DEQ)** combined with **Fixed-Point Memory State Space Models (SSM)**.
 
 In a standard transformer (GPT-4, Llama, Mistral), a user query passes through 24 to 96 stacked layers, each with its own parameters. AIDEEN replaces this tower with a **single reusable computation block** that iterates to a mathematical fixed point via Picard iteration. The result is equivalent representational power with a fraction of the parameters.
 
@@ -34,7 +34,7 @@ AIDEEN addresses both problems simultaneously:
 | Training memory | Stores all activations (O(N)) | Implicit differentiation (O(1)) |
 | Convergence guarantee | N/A (fixed depth) | Picard iteration with spectral normalization |
 
-The DEQ block contains a **MambaSlotReasoning** module that combines cross-slot attention, Mamba SSM memory, and spectral normalization. Multiple reasoning slots (K=8-16) operate in parallel, each maintaining independent state that converges to a shared fixed point.
+The DEQ block contains a **FixedPointMemoryReasoning** module that combines cross-slot attention, Fixed-Point Memory SSM memory, and spectral normalization. Multiple reasoning slots (K=8-16) operate in parallel, each maintaining independent state that converges to a shared fixed point.
 
 ### Implicit Differentiation
 
@@ -60,7 +60,7 @@ A non-trainable safety module applied to all model outputs. It is loaded at runt
 ```
 User Query --> Tokenizer --> Embedding --> DEQ (Picard iteration) --> LmHead --> Response
                                             ^ |
-                                       MambaSlotReasoning
+                                       FixedPointMemoryReasoning
                                        (cross-slot attention
                                         + SSM memory
                                         + spectral normalization)
@@ -71,8 +71,8 @@ User Query --> Tokenizer --> Embedding --> DEQ (Picard iteration) --> LmHead -->
 | Crate | Role |
 |-------|------|
 | `aideen-core` | Public contracts, sealed protocol constants |
-| `aideen-reasoning` | Trainable reasoning engine (DEQ + Mamba) |
-| `aideen-block` | Mamba + Attention + MoE computation block |
+| `aideen-reasoning` | Trainable reasoning engine (DEQ + Fixed-Point Memory) |
+| `aideen-block` | Fixed-Point Memory + Attention + MoE computation block |
 | `aideen-engine` | GPU compute runtime (wgpu, WGSL shaders) |
 | `aideen-backbone` | Model architecture, generation strategies |
 | `aideen-node` | P2P network node (QUIC, WebTransport) |

@@ -12,7 +12,7 @@ Large language models have transformed natural language processing, yet their
 deployment remains gated by enormous compute requirements and dependence on
 centralized cloud providers. This paper introduces AIDEEN, a hybrid architecture
 that replaces deep transformer stacking with a Deep Equilibrium (DEQ) formulation
-over structured state-space layers (Mamba), enabling high-quality language modeling
+over structured state-space layers (Fixed-Point Memory), enabling high-quality language modeling
 at a fraction of the parameter and memory cost. By solving for a fixed-point
 representation through Picard iteration rather than propagating through dozens of
 explicit layers, AIDEEN achieves adaptive computation depth at inference time
@@ -54,7 +54,7 @@ count fixed. Crucially, gradients through the fixed point can be computed via
 implicit differentiation, avoiding the need to store intermediate activations for
 all iterations and dramatically reducing memory consumption during training.
 
-By combining DEQ fixed-point solving with Mamba-style structured state-space
+By combining DEQ fixed-point solving with Fixed-Point Memory-style structured state-space
 layers, AIDEEN inherits the efficient linear-time sequence processing of SSMs
 while gaining the adaptive-depth benefits of equilibrium models. The architecture
 further introduces a slot-based reasoning mechanism that maintains K parallel
@@ -104,7 +104,7 @@ Spectral normalization of the layer parameters ensures contractivity of f_theta,
 guaranteeing convergence of the fixed-point iteration and stability of the
 implicit gradient computation.
 
-### 2.2 State Space Models and Mamba
+### 2.2 State Space Models and Fixed-Point Memory
 
 Structured State Space Models (S4; Gu et al., 2021) parameterize sequence-to-
 sequence transformations via a continuous-time linear dynamical system discretized
@@ -117,7 +117,7 @@ where A_d, B_d are structured (diagonal or low-rank) matrices derived from a
 continuous parameterization. This formulation admits both a recurrent mode
 (O(1) per step for inference) and a convolutional mode (O(N log N) for training).
 
-Mamba (Gu and Dao, 2023) extends S4 with a selective mechanism: the matrices B, C,
+Fixed-Point Memory (Gu and Dao, 2023) extends S4 with a selective mechanism: the matrices B, C,
 and the discretization step Delta become input-dependent, allowing the model to
 selectively propagate or forget information along the sequence. This selectivity
 restores content-based reasoning capabilities that pure linear recurrences lack,
@@ -164,10 +164,10 @@ parameters in f_theta itself.
 
 [TODO: Architecture diagram — Figure 1]
 
-### 3.2 Mamba SSM Integration
+### 3.2 Fixed-Point Memory SSM Integration
 
 Within each Picard iteration, the function f_theta processes the current slot
-states through a Mamba-based SSM layer. The Mamba block provides:
+states through a Fixed-Point Memory-based SSM layer. The Fixed-Point Memory block provides:
 
 - **Temporal memory:** The structured recurrence maintains a compressed summary of
   the input sequence, enabling long-range dependency modeling without attention.
@@ -229,7 +229,7 @@ starting from the previous fixed point reduces the required iterations to 2-4.
 
 **Model configurations.** We evaluate AIDEEN at three parameter scales: 10M, 30M,
 and 80M parameters. The primary comparison point is the 30M configuration, which
-targets consumer hardware deployment. All models use K=4 reasoning slots, Mamba
+targets consumer hardware deployment. All models use K=4 reasoning slots, Fixed-Point Memory
 SSM dimension d=512, and are trained with a context length of 1024 tokens.
 
 **Dataset.** [TBD — likely a subset of The Pile, RedPajama, or a curated open
@@ -241,7 +241,7 @@ hardware matrix described in Section 4.4.
 **Baselines.** We compare against:
 - A parameter-matched transformer (same total parameter count, standard
   multi-head attention + FFN blocks)
-- A parameter-matched Mamba model (same architecture without DEQ wrapping)
+- A parameter-matched Fixed-Point Memory model (same architecture without DEQ wrapping)
 - Published results for similarly-sized models where available
 
 ### 4.2 Iso-Parameter Comparison
@@ -255,7 +255,7 @@ formulation.
 |-------|--------|-----------|---------------------|-----------------|----------------------|
 | AIDEEN DEQ-30M | 30M | [TBD] | [TBD] | [TBD] | [TBD] |
 | Transformer-30M | 30M | [TBD] | [TBD] | [TBD] | [TBD] |
-| Mamba-30M | 30M | [TBD] | [TBD] | [TBD] | [TBD] |
+| Fixed-Point Memory-30M | 30M | [TBD] | [TBD] | [TBD] | [TBD] |
 | AIDEEN DEQ-10M | 10M | [TBD] | [TBD] | [TBD] | [TBD] |
 | AIDEEN DEQ-80M | 80M | [TBD] | [TBD] | [TBD] | [TBD] |
 
@@ -317,8 +317,8 @@ introducing slot-based parallel reasoning.
 **State Space Models.** The S4 family (Gu et al., 2021) demonstrated that
 structured state-space models could handle extremely long-range dependencies.
 Subsequent architectures including S5 (Smith et al., 2023), H3 (Fu et al., 2023),
-and Mamba (Gu and Dao, 2023) progressively improved quality and efficiency.
-Mamba's selective mechanism is particularly relevant to AIDEEN, as it provides
+and Fixed-Point Memory (Gu and Dao, 2023) progressively improved quality and efficiency.
+Fixed-Point Memory's selective mechanism is particularly relevant to AIDEEN, as it provides
 content-based filtering within the linear-time recurrence framework. AIDEEN is,
 to our knowledge, the first architecture to combine DEQ fixed-point solving with
 selective state-space layers.
@@ -410,7 +410,7 @@ permission.
 
 5. Gu, A., Goel, K., & Re, C. (2021). Efficiently Modeling Long Sequences with Structured State Spaces. *ICLR 2022*.
 
-6. Gu, A., & Dao, T. (2023). Mamba: Linear-Time Sequence Modeling with Selective State Spaces. *arXiv preprint arXiv:2312.00752*.
+6. Gu, A., & Dao, T. (2023). Fixed-Point Memory: Linear-Time Sequence Modeling with Selective State Spaces. *arXiv preprint arXiv:2312.00752*.
 
 7. Smith, J. T. H., Warrington, A., & Linderman, S. W. (2023). Simplified State Space Layers for Sequence Modeling. *ICLR 2023*.
 

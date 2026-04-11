@@ -1,6 +1,6 @@
 #![cfg(feature = "wgpu")]
 
-use aideen_backbone::{gpu_deq::GpuDeqBackend, MambaSlotReasoning};
+use aideen_backbone::{gpu_deq::GpuDeqBackend, FixedPointMemoryReasoning};
 use aideen_core::state::ArchitectureConfig;
 use std::sync::{Mutex, OnceLock};
 
@@ -142,7 +142,7 @@ fn cpu_signal(s_in: &[f32], w_in: &[f32], d: usize) -> Vec<f32> {
     out
 }
 
-fn cpu_forward_map_no_mamba(
+fn cpu_forward_map_no_fpm(
     h: &[f32],
     s_in: &[f32],
     w_q: &[f32],
@@ -237,7 +237,7 @@ fn cpu_forward_map_no_mamba(
     out
 }
 
-fn numeric_jt_v_no_mamba(
+fn numeric_jt_v_no_fpm(
     h_star: &[f32],
     v: &[f32],
     s_in: &[f32],
@@ -258,10 +258,10 @@ fn numeric_jt_v_no_mamba(
         let mut h_minus = h_star.to_vec();
         h_plus[idx] += eps;
         h_minus[idx] -= eps;
-        let f_plus = cpu_forward_map_no_mamba(
+        let f_plus = cpu_forward_map_no_fpm(
             &h_plus, s_in, w_q, w_k, w_v, w_o, w_in, norm, damping, h_slots, d,
         );
-        let f_minus = cpu_forward_map_no_mamba(
+        let f_minus = cpu_forward_map_no_fpm(
             &h_minus, s_in, w_q, w_k, w_v, w_o, w_in, norm, damping, h_slots, d,
         );
         let mut phi_plus = 0.0;
@@ -278,7 +278,7 @@ fn numeric_jt_v_no_mamba(
 }
 
 #[test]
-fn test_hist_gated_forward_uses_prev_mamba_carrier() {
+fn test_hist_gated_forward_uses_prev_fpm_carrier() {
     let _guard = env_test_lock();
     std::env::set_var("AIDEEN_DEQ_HIST_GATED", "1");
 
@@ -426,7 +426,7 @@ fn test_hist_gated_forward_uses_prev_mamba_carrier() {
 }
 
 #[test]
-fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
+fn test_hist_gated_starts_near_no_fpm_with_real_initialized_weights() {
     let _guard = env_test_lock();
     let mut config = ArchitectureConfig::default();
     config.d_r = 16;
@@ -434,7 +434,7 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
     config.ctx_len = 3;
     config.max_deq_iters = 2;
 
-    let reasoning = MambaSlotReasoning::new_with_seed(config.clone(), 42);
+    let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), 42);
     let weights = reasoning.export_weights();
     let w_q = weights.get("reasoning.w_q").expect("w_q missing");
     let w_k = weights.get("reasoning.w_k").expect("w_k missing");
@@ -505,7 +505,7 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
         &b_forget_init,
     );
 
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
+    std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
     gpu.reset_state();
     gpu.run_forward_deq_no_readback(
         1,
@@ -525,9 +525,9 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
         norm,
         false,
     )
-    .expect("GPU no-mamba forward failed");
-    let no_mamba = gpu.read_hnext_seq(seq_len);
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
+    .expect("GPU no-fpm forward failed");
+    let no_fpm = gpu.read_hnext_seq(seq_len);
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
 
     std::env::set_var("AIDEEN_DEQ_HIST_GATED", "1");
     gpu.reset_state();
@@ -553,20 +553,20 @@ fn test_hist_gated_starts_near_no_mamba_with_real_initialized_weights() {
     let hist_gated = gpu.read_hnext_seq(seq_len);
     std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
 
-    let token2_no_mamba = &no_mamba[2 * h * d..3 * h * d];
+    let token2_no_fpm = &no_fpm[2 * h * d..3 * h * d];
     let token2_hist = &hist_gated[2 * h * d..3 * h * d];
-    let diff = max_abs_diff(token2_no_mamba, token2_hist);
+    let diff = max_abs_diff(token2_no_fpm, token2_hist);
 
     assert!(
         diff < 1e-4,
-        "hist_gated should start near no-mamba under neutral interface init: diff={diff}"
+        "hist_gated should start near no-fpm under neutral interface init: diff={diff}"
     );
 }
 
 #[test]
-#[ignore = "Numeric reference for staged Picard no-mamba attention adjoint."]
-fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
+#[ignore = "Numeric reference for staged Picard no-fpm attention adjoint."]
+fn test_staged_picard_matches_numeric_reference_no_fpm_small() {
+    std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
 
     let mut config = ArchitectureConfig::default();
     config.d_r = 16;
@@ -624,7 +624,7 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
     let mut v_ref = vec![0.05f32 / h as f32; h * d];
     let b_rep = v_ref.clone();
     for _ in 0..8 {
-        let jt_v = numeric_jt_v_no_mamba(
+        let jt_v = numeric_jt_v_no_fpm(
             &h_star, &v_ref, &s_in, &w_q, &w_k, &w_v, &w_o, &w_in, &norm, damping, h, d,
         );
         for i in 0..v_ref.len() {
@@ -635,16 +635,16 @@ fn test_staged_picard_matches_numeric_reference_no_mamba_small() {
     let cos = cosine(&v_picard, &v_ref);
     assert!(
         cos > 0.80,
-        "Staged Picard/numeric cosine too low for no-mamba small case: {cos}"
+        "Staged Picard/numeric cosine too low for no-fpm small case: {cos}"
     );
 
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
 }
 
 #[test]
 #[ignore = "Performance smoke for staged Picard only."]
-fn test_staged_picard_only_perf_smoke_no_mamba() {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
+fn test_staged_picard_only_perf_smoke_no_fpm() {
+    std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
 
     let mut config = ArchitectureConfig::default();
     config.d_r = 512;
@@ -704,11 +704,11 @@ fn test_staged_picard_only_perf_smoke_no_mamba() {
         seq_len, d, config.h_slots, staged_ms
     );
 
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
 }
 
 fn run_staged_picard_perf_case(seq_len: u32, d: usize, h_slots: usize, iters: u32) -> u128 {
-    std::env::set_var("AIDEEN_DEQ_NO_MAMBA", "1");
+    std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
 
     let mut config = ArchitectureConfig::default();
     config.d_r = d;
@@ -761,13 +761,13 @@ fn run_staged_picard_perf_case(seq_len: u32, d: usize, h_slots: usize, iters: u3
         .expect("Staged Picard failed");
     let elapsed = t0.elapsed().as_millis();
 
-    std::env::remove_var("AIDEEN_DEQ_NO_MAMBA");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
     elapsed
 }
 
 #[test]
 #[ignore = "Sweep staged Picard runtime against sequence length."]
-fn test_staged_picard_seq_len_sweep_no_mamba() {
+fn test_staged_picard_seq_len_sweep_no_fpm() {
     let d = 512usize;
     let h_slots = 8usize;
     let iters = 8u32;
@@ -783,7 +783,7 @@ fn test_staged_picard_seq_len_sweep_no_mamba() {
 
 #[test]
 #[ignore = "Exact staged Picard perf case matching trainer fused profile."]
-fn test_staged_picard_exact_trainer_case_no_mamba() {
+fn test_staged_picard_exact_trainer_case_no_fpm() {
     let ms = run_staged_picard_perf_case(98, 512, 8, 6);
     eprintln!(
         "[PICARD-TRAINER-CASE] seq_len=98 d=512 h_slots=8 iters=6 staged_ms={}",
@@ -793,7 +793,7 @@ fn test_staged_picard_exact_trainer_case_no_mamba() {
 
 #[test]
 #[ignore = "Single-iteration staged Picard perf case matching trainer geometry."]
-fn test_staged_picard_exact_trainer_case_one_iter_no_mamba() {
+fn test_staged_picard_exact_trainer_case_one_iter_no_fpm() {
     let ms = run_staged_picard_perf_case(98, 512, 8, 1);
     eprintln!(
         "[PICARD-TRAINER-CASE-1] seq_len=98 d=512 h_slots=8 iters=1 staged_ms={}",

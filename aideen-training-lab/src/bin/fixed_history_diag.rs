@@ -61,7 +61,12 @@ fn run_case(name: &str, text: &str, seed: u64, epochs: usize) {
     let fixed_ctx1 = eval_with_flag(&trainer, &tokens, true);
     trainer.config.ctx_len = saved_ctx;
 
-    println!("  default_ctx plain={:.6} fixed={:.6} delta={:.6}", plain, fixed, fixed - plain);
+    println!(
+        "  default_ctx plain={:.6} fixed={:.6} delta={:.6}",
+        plain,
+        fixed,
+        fixed - plain
+    );
     println!(
         "  ctx_len=1   plain={:.6} fixed={:.6} delta={:.6}",
         plain_ctx1,

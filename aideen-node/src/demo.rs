@@ -9,9 +9,9 @@
 //! El nodo consulta un experto en el mismo proceso a través de
 //! `InProcessChannel`. El Critic actualiza reputación tras cada respuesta.
 //!
-//! ## Modo 3: Full Pipeline (DEQ → H* → MambaDecoder → texto)
+//! ## Modo 3: Full Pipeline (DEQ → H* → FixedPointMemoryDecoder → texto)
 //! Ejecuta el pipeline completo:
-//!   query → encoder → DEQ (MambaSlotReasoning) → H* → MambaDecoder → tokens
+//!   query → encoder → DEQ (FixedPointMemoryReasoning) → H* → FixedPointMemoryDecoder → tokens
 //!
 //! ## Ejecución
 //! ```
@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use aideen_backbone::{MambaDecoder, MambaSlotReasoning};
+use aideen_backbone::{FixedPointMemoryDecoder, FixedPointMemoryReasoning};
 use aideen_core::{
     compute::{ComputeBackend, TensorId},
     reasoning::Reasoning,
@@ -257,25 +257,25 @@ fn run_expert_mode(queries: &[&str]) {
     println!("Top-1 experto por reputación: {:?}", critic.top_k(1));
 }
 
-// ── MODO 3: Full Pipeline (DEQ → H* → MambaDecoder → texto) ──────────────────
+// ── MODO 3: Full Pipeline (DEQ → H* → FixedPointMemoryDecoder → texto) ──────────────────
 
 fn run_full_mode(queries: &[&str]) {
     println!("\n╔══════════════════════════════════════════════════════╗");
-    println!("║   MODO 3: Full Pipeline  DEQ → H* → MambaDecoder   ║");
+    println!("║   MODO 3: Full Pipeline  DEQ → H* → FixedPointMemoryDecoder   ║");
     println!("╚══════════════════════════════════════════════════════╝");
     println!("Nota: pesos random — los tokens son sin sentido semántico.");
     println!("      El objetivo es validar que el PIPELINE FUNCIONA.\n");
 
-    // MambaSlotReasoning como f del DEQ (cross-slot attn + Mamba SSM)
+    // FixedPointMemoryReasoning como f del DEQ (cross-slot attn + FPM SSM)
     let config = ArchitectureConfig::default();
-    let mut reasoning = MambaSlotReasoning::new(config.clone());
+    let mut reasoning = FixedPointMemoryReasoning::new(config.clone());
     let mut backend = DemoBackend;
 
     // Vocabulario pequeño para demo (ASCII printable)
     let vocab_size = 128usize;
     let mut dec_config = config.clone();
     dec_config.vocab_size = vocab_size;
-    let decoder = MambaDecoder::new(4, dec_config);
+    let decoder = FixedPointMemoryDecoder::new(4, dec_config);
 
     let cfg = InferenceConfig {
         max_iters: 30,
@@ -286,7 +286,7 @@ fn run_full_mode(queries: &[&str]) {
     for (i, query) in queries.iter().enumerate() {
         let t0 = Instant::now();
 
-        // ① DEQ loop con MambaSlotReasoning → H*
+        // ① DEQ loop con FixedPointMemoryReasoning → H*
         let result = inference_run(query, &mut reasoning, &mut backend, None, &cfg);
         let deq_ms = t0.elapsed().as_millis();
 
@@ -306,7 +306,7 @@ fn run_full_mode(queries: &[&str]) {
             }
         };
 
-        // ② MambaDecoder: H* → tokens
+        // ② FixedPointMemoryDecoder: H* → tokens
         let prompt_tokens = tokenize(query, vocab_size);
         let t1 = Instant::now();
         let generated = decoder.generate(&h_star, &prompt_tokens[..prompt_tokens.len().min(8)], 20);

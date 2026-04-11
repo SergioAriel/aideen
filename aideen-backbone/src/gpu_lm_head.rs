@@ -60,7 +60,9 @@ impl GpuLmHeadTrainer {
         // MAX_SHADER_SAMPLES must match s_indices_cache and s_logits array sizes in lm_train.wgsl.
         // Exceeding this causes OOB writes to workgroup memory, corrupting probs and gradients.
         const MAX_SHADER_SAMPLES: usize = 2048;
-        let desired = self.config.num_samples
+        let desired = self
+            .config
+            .num_samples
             .max(targets.len())
             .min(self.sample_capacity)
             .min(MAX_SHADER_SAMPLES);

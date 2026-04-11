@@ -4,19 +4,19 @@
 //!   Funciona sin GPU, útil para tests y fallback.
 //!
 //! - `WgpuBlockBackend`: implementación wgpu+WGSL (feature "wgpu").
-//!   Usa el shader `mamba.wgsl` de `aideen-block` para correr el SSM
+//!   Usa el shader `fixed_point_memory.wgsl` de `aideen-block` para correr el SSM
 //!   en GPU (Metal/Vulkan/WebGPU). Sincronización vía pollster::block_on.
 
 use aideen_core::block_backend::BlockBackend;
 
 // ── CPU Fallback ──────────────────────────────────────────────────────────────
 
-/// Backend CPU puro. Implementa el mismo ZOH que MambaSlotReasoning
+/// Backend CPU puro. Implementa el mismo ZOH que FixedPointMemoryReasoning
 /// pero como backend swappable. Útil para tests y despliegue sin GPU.
 pub struct CpuBlockBackend;
 
 impl BlockBackend for CpuBlockBackend {
-    fn mamba_batch_step(
+    fn fpm_batch_step(
         &mut self,
         x: &[f32],
         dt: &[f32],
@@ -57,21 +57,21 @@ impl BlockBackend for CpuBlockBackend {
 
 // ── GPU Backend (feature = "wgpu") ────────────────────────────────────────────
 
-/// Backend wgpu: ejecuta el kernel `mamba_parallel_scan` de aideen-block
+/// Backend wgpu: ejecuta el kernel `fpm_parallel_scan` de aideen-block
 /// en GPU mediante sincronización bloqueante con `pollster`.
 ///
 /// ## Uso
 /// ```ignore
 /// let gpu = WgpuBlockBackend::new_blocking();
 /// if let Some(mut backend) = gpu {
-///     let y = backend.mamba_batch_step(&x, &dt, &a, &b, &c)?;
+///     let y = backend.fpm_batch_step(&x, &dt, &a, &b, &c)?;
 /// }
 /// ```
 #[cfg(feature = "wgpu")]
 pub struct WgpuBlockBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    bridge: aideen_block::mamba::RustMambaBridge,
+    bridge: aideen_block::fixed_point_memory::FixedPointMemoryBridge,
 }
 
 #[cfg(feature = "wgpu")]
@@ -83,9 +83,9 @@ impl WgpuBlockBackend {
     }
 
     async fn new_async() -> Option<Self> {
-        use aideen_block::{mamba::RustMambaBridge, ComputeState};
+        use aideen_block::{fixed_point_memory::FixedPointMemoryBridge, ComputeState};
         let state = ComputeState::new().await?;
-        let bridge = RustMambaBridge::new(&state.device);
+        let bridge = FixedPointMemoryBridge::new(&state.device);
         Some(Self {
             device: state.device,
             queue: state.queue,
@@ -96,7 +96,7 @@ impl WgpuBlockBackend {
 
 #[cfg(feature = "wgpu")]
 impl BlockBackend for WgpuBlockBackend {
-    fn mamba_batch_step(
+    fn fpm_batch_step(
         &mut self,
         x: &[f32],
         dt: &[f32],
@@ -170,7 +170,7 @@ impl BlockBackend for WgpuBlockBackend {
         let b_buf = make_storage_ro(b);
         let c_buf = make_storage_ro(c);
 
-        // Bind group acorde al layout de RustMambaBridge
+        // Bind group acorde al layout de FixedPointMemoryBridge
         // (shape, X_in, dt, A, B, C, Y_out)
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,

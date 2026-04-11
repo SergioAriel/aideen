@@ -9,7 +9,7 @@ use rand::{Rng, SeedableRng};
 #[derive(Clone, Copy, Debug)]
 enum AblationStage {
     InputOnly,
-    InputMamba,
+    InputFpm,
     InputAttn,
     Full,
 }
@@ -24,7 +24,7 @@ struct StageResult {
     non_inc_ratio: f32,
     jac_gain: f32,
     attn_norm: f32,
-    mamba_norm: f32,
+    fpm_norm: f32,
     input_norm: f32,
     resid_norm: f32,
 }
@@ -72,7 +72,7 @@ fn apply_stage(trainer: &mut Trainer, stage: AblationStage) {
             zero_mat(&mut trainer.reasoning.w_x);
             zero_mat(&mut trainer.reasoning.w_out);
         }
-        AblationStage::InputMamba => {
+        AblationStage::InputFpm => {
             zero_mat(&mut trainer.reasoning.w_q);
             zero_mat(&mut trainer.reasoning.w_k);
             zero_mat(&mut trainer.reasoning.w_v);
@@ -210,7 +210,7 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
         attn_total += out.dot(&out);
     }
 
-    let mut mamba_total = 0.0f32;
+    let mut fpm_total = 0.0f32;
     for k in 0..h_slots {
         let a_bar = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
             1.0 / (1.0 + trainer.reasoning.a_log[(k, d)].exp())
@@ -220,7 +220,7 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
         let x_proj = &trainer.reasoning.w_x * &hs;
         let y = a_bar.zip_map(&hs, |a, hv| a * hv) + b_bar.zip_map(&x_proj, |b, xv| b * xv);
         let out = &trainer.reasoning.w_out * y;
-        mamba_total += out.dot(&out);
+        fpm_total += out.dot(&out);
     }
 
     let input = &trainer.reasoning.w_in * s;
@@ -234,7 +234,7 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
 
     (
         attn_total.sqrt(),
-        mamba_total.sqrt(),
+        fpm_total.sqrt(),
         input_total.sqrt(),
         resid_total.sqrt(),
     )
@@ -243,7 +243,7 @@ fn component_norms(trainer: &Trainer, h: &HSlots, s: &DVector<f32>) -> (f32, f32
 fn stage_label(stage: AblationStage) -> &'static str {
     match stage {
         AblationStage::InputOnly => "input_only",
-        AblationStage::InputMamba => "input_mamba",
+        AblationStage::InputFpm => "input_fpm",
         AblationStage::InputAttn => "input_attn",
         AblationStage::Full => "full",
     }
@@ -267,7 +267,7 @@ fn run_stage(cfg: &ArchitectureConfig, stage: AblationStage) -> StageResult {
     let (h2, _, _, _, _) = run_picard(&trainer, &s2, cfg.max_deq_iters.max(2));
 
     let jac_gain = estimate_local_jac_gain(&trainer, &hslots_last, &s1, 8, 1e-3, 777);
-    let (attn_n, mamba_n, input_n, resid_n) = component_norms(&trainer, &hslots_last, &s1);
+    let (attn_n, fpm_n, input_n, resid_n) = component_norms(&trainer, &hslots_last, &s1);
 
     StageResult {
         stage: stage_label(stage),
@@ -278,7 +278,7 @@ fn run_stage(cfg: &ArchitectureConfig, stage: AblationStage) -> StageResult {
         non_inc_ratio,
         jac_gain,
         attn_norm: attn_n,
-        mamba_norm: mamba_n,
+        fpm_norm: fpm_n,
         input_norm: input_n,
         resid_norm: resid_n,
     }
@@ -288,7 +288,7 @@ fn main() {
     let cfg = make_config();
     let stages = [
         AblationStage::InputOnly,
-        AblationStage::InputMamba,
+        AblationStage::InputFpm,
         AblationStage::InputAttn,
         AblationStage::Full,
     ];
@@ -316,7 +316,7 @@ fn main() {
         "non_inc",
         "jac_gain",
         "attn_norm",
-        "mamba_norm",
+        "fpm_norm",
         "input_norm",
         "resid_norm"
     );
@@ -332,7 +332,7 @@ fn main() {
             r.non_inc_ratio,
             r.jac_gain,
             r.attn_norm,
-            r.mamba_norm,
+            r.fpm_norm,
             r.input_norm,
             r.resid_norm
         );

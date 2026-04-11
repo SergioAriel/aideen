@@ -38,7 +38,7 @@ struct SpectralParams {
     n_iters: u32,
     attn_threshold: f32,
     win_threshold: f32,
-    mamba_threshold: f32,
+    fpm_threshold: f32,
     wv_threshold: f32,
     wo_threshold: f32,
     h_slots: u32,
@@ -245,7 +245,7 @@ impl RustDeqBridge {
             })
             .unwrap_or(true);
         let deq_only_mode = std::env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1");
-        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1");
+        let slot_coord_mode = std::env::var("AIDEEN_DEQ_NO_FPM").ok().as_deref() == Some("1");
         // Comparison modes must disable FPM at the bridge/shader contract level.
         // Otherwise DEQ_ONLY/slot_coord still compile and run with FPM memory enabled,
         // contaminating both behavior and telemetry.
@@ -579,7 +579,7 @@ impl RustDeqBridge {
         });
         // Clean DEQ core scratch layout per (batch, token):
         //   signal [h*d]
-        // The old full-DEQ layout reserved q/k/v/attn/mamba/history regions that the clean
+        // The old full-DEQ layout reserved q/k/v/attn/fpm/history regions that the clean
         // solve no longer touches.
         let scratch_stride = Self::clean_scratch_stride(d_model, h_slots);
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1023,7 +1023,7 @@ impl RustDeqBridge {
         d_model: u32,
         attn_threshold: f32,
         win_threshold: f32,
-        mamba_threshold: f32,
+        fpm_threshold: f32,
         wv_threshold: f32,
         wo_threshold: f32,
         n_iters: u32,
@@ -1037,7 +1037,7 @@ impl RustDeqBridge {
                 n_iters,
                 attn_threshold,
                 win_threshold,
-                mamba_threshold,
+                fpm_threshold,
                 wv_threshold,
                 wo_threshold,
                 h_slots,
