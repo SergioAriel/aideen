@@ -25,7 +25,11 @@ struct UpdateUniforms {
     n_total_weights: u32, // total AllWeights elements (for apply_grad_update_main)
     batch_size: u32,      // number of sequences processed in parallel
     apply_accum: u32,     // 1=apply accumulated gradients (apply_grad_update_main)
-    _pad0: u32,
+    /// Softmax backward bypass factor for Wq/Wk gradient computation.
+    /// 0.0 = exact gradient (mean-subtraction fully applied, dies at uniform init).
+    /// 1.0 = straight-through / STE (mean-subtraction removed, gradient always non-zero).
+    /// Interpolates between both extremes. Env: AIDEEN_ATTN_GRAD_BYPASS.
+    attn_grad_bypass: f32,
 }
 
 #[repr(C)]
@@ -41,6 +45,44 @@ struct AndersonParams {
 pub struct AdjointBuffers {
     pub b_dl: wgpu::Buffer, // ∂L/∂h input for the Picard adjoint (size: ctx_len × d_model)
     pub b_v_out: wgpu::Buffer, // adjoint state v output       (size: ctx_len × h_slots × d_model)
+}
+
+/// Snapshot of raw gradient magnitudes for the cross-slot attention matrices.
+/// Written by fused_deq_update.wgsl into debug_buf after each weight update.
+/// Values are the single-element gradient (slot=0, idx=0) before clipping/lr-scaling.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttnGradSnapshot {
+    // Weight gradient magnitudes (debug_buf[40..44])
+    pub g_wq:  f32,  // Wq gradient
+    pub g_wo:  f32,  // Wo gradient
+    pub g_wv:  f32,  // Wv gradient
+    pub g_win: f32,  // Win gradient
+    pub g_wk:  f32,  // Wk gradient
+    // Gradient chain intermediates (debug_buf[90..94]) — pinpoint where signal dies
+    pub gmix_sample: f32,  // gmix_buf[0]: upstream adjoint signal (v_adjoint·Wo)
+    pub g_alpha:     f32,  // dot(gmix, V_ks): g_alpha before softmax Jacobian
+    pub alpha_dot_g: f32,  // weighted mean across slots: the cancellation term
+    pub gscore:      f32,  // final gscore after bypass: what feeds into gq/Wq
+    pub attn_weight: f32,  // α[qs=0,ks=0]: attention weight (should be ~1/h_slots at init)
+    // Update magnitude (debug_buf[45,46]) — unbiased by sign cancellation
+    pub raw_wq_abs:  f32,  // |raw_wq| at element [0,0,slot=0]: single-element update size
+    pub wq_frob_sq:  f32,  // Σ raw_wq²: Frobenius norm² proxy of the full Wq update step
+}
+
+impl AttnGradSnapshot {
+    /// Ratio |g_wq| / |g_wo|. Close to 1.0 → similar signal, <<1 → Wq starved.
+    pub fn wq_wo_ratio(&self) -> f32 {
+        self.g_wq.abs() / (self.g_wo.abs().max(1e-12))
+    }
+    /// Ratio |g_wk| / |g_wo|.
+    pub fn wk_wo_ratio(&self) -> f32 {
+        self.g_wk.abs() / (self.g_wo.abs().max(1e-12))
+    }
+    /// Ratio |gscore| / |g_alpha|: how much the softmax Jacobian preserves the gradient.
+    /// Near 1.0 = no cancellation, near 0 = full cancellation (uniform attention).
+    pub fn softmax_retention(&self) -> f32 {
+        self.gscore.abs() / (self.g_alpha.abs().max(1e-30))
+    }
 }
 
 /// Abstracción del DEQ vía GPU (WGPU).
@@ -173,6 +215,21 @@ pub struct GpuDeqBackend {
     cfg_picard_accum_split: bool,
     cfg_picard_internal_probe: bool,
     cfg_picard_gscore_fused: bool,
+    /// Warm-start mode for the adjoint Picard solver.
+    /// 0 = baseline (cold start, current default)
+    /// 1 = Variant A: v0 = rhs + v_prev  (reutilizar adjunto previo)
+    /// 2 = Variant B: v0 = rhs + beta * H_star  (heuristica con forward fixed point)
+    /// 3 = Variant C: v0 = rhs + alpha * v_prev + beta * H_star
+    /// Controlled via AIDEEN_ADJOINT_WARMSTART env var.
+    cfg_adjoint_warmstart: u32,
+    /// Alpha scale for Variant A / C (default 1.0)
+    cfg_adjoint_warmstart_alpha: f32,
+    /// Beta scale for Variant B / C (default 0.5)
+    cfg_adjoint_warmstart_beta: f32,
+    /// Bypass factor for the softmax backward mean-subtraction in Wq/Wk gradient.
+    /// 0.0 = exact gradient (cancels at uniform init). 1.0 = STE (always non-zero).
+    /// AIDEEN_ATTN_GRAD_BYPASS env var. Default: 0.0.
+    cfg_attn_grad_bypass: f32,
 }
 
 impl GpuDeqBackend {
@@ -2325,6 +2382,26 @@ impl GpuDeqBackend {
             cfg_picard_accum_split,
             cfg_picard_internal_probe,
             cfg_picard_gscore_fused,
+            cfg_adjoint_warmstart: std::env::var("AIDEEN_ADJOINT_WARMSTART")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+                .clamp(0, 3),
+            cfg_adjoint_warmstart_alpha: std::env::var("AIDEEN_ADJOINT_WARMSTART_ALPHA")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
+            cfg_adjoint_warmstart_beta: std::env::var("AIDEEN_ADJOINT_WARMSTART_BETA")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            cfg_attn_grad_bypass: std::env::var("AIDEEN_ATTN_GRAD_BYPASS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
         })
     }
 
@@ -2871,7 +2948,7 @@ impl GpuDeqBackend {
             n_total_weights: 0,
             batch_size,
             apply_accum: 0,
-            _pad0: 0,
+            attn_grad_bypass: self.cfg_attn_grad_bypass,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3497,7 +3574,7 @@ impl GpuDeqBackend {
             n_total_weights: 0,
             batch_size,
             apply_accum: 0,
-            _pad0: 0,
+            attn_grad_bypass: self.cfg_attn_grad_bypass,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3640,7 +3717,7 @@ impl GpuDeqBackend {
             n_total_weights,
             batch_size,
             apply_accum: if apply_accum { 1 } else { 0 },
-            _pad0: 0,
+            attn_grad_bypass: self.cfg_attn_grad_bypass,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -4364,7 +4441,7 @@ impl GpuDeqBackend {
             n_total_weights,
             batch_size: 1,
             apply_accum: 0,
-            _pad0: 0,
+            attn_grad_bypass: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -4647,6 +4724,44 @@ impl GpuDeqBackend {
         (mean, max, nz)
     }
 
+    /// Downloads Wq (slot 0) from GPU and computes its spectral norm on CPU.
+    /// Layout (from shader): aw_wq_base=0, per-slot d×d matrices, then d biases per slot.
+    /// Slot 0 starts at byte 0.
+    ///
+    /// If sigma(Wq) grows across training steps → Wq IS being updated.
+    /// If sigma(Wq) stays fixed → gradient flow to Wq is broken.
+    pub fn read_wq_spectral_norm(&self) -> f32 {
+        let d = self.config.d_r;
+        // Slot 0 of Wq is at the very start of all_weights_buf (aw_wq_base = 0).
+        let floats = self.read_storage_buffer_at(
+            &self.bridge.all_weights_buf,
+            0,        // byte offset 0
+            d * d,    // slot 0 matrix: d×d floats
+            "Wq Slot0 Spectral Norm",
+        );
+        if floats.len() < d * d { return 0.0; }
+        let wq = nalgebra::DMatrix::from_row_slice(d, d, &floats[..d * d]);
+        crate::spectral_norm::spectral_norm(&wq, 20)
+    }
+
+    /// Downloads Wk (slot 0) from GPU and computes its spectral norm on CPU.
+    /// aw_wk_base = h*d*d + h*d  (after all Wq matrices + their per-slot biases).
+    pub fn read_wk_spectral_norm(&self) -> f32 {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        // aw_wk_base in floats = h*d*d + h*d; slot 0 starts there.
+        let byte_offset = ((h * d * d + h * d) * 4) as u64;
+        let floats = self.read_storage_buffer_at(
+            &self.bridge.all_weights_buf,
+            byte_offset,
+            d * d,
+            "Wk Slot0 Spectral Norm",
+        );
+        if floats.len() < d * d { return 0.0; }
+        let wk = nalgebra::DMatrix::from_row_slice(d, d, &floats[..d * d]);
+        crate::spectral_norm::spectral_norm(&wk, 20)
+    }
+
     pub fn read_adj_v_out(&self, seq_len: u32) -> Vec<f32> {
         let n_floats = seq_len as usize * self.config.h_slots * self.config.d_r;
         self.read_storage_buffer(&self.adj_bufs.b_v_out, n_floats, "Adjoint V_out Readback")
@@ -4655,6 +4770,57 @@ impl GpuDeqBackend {
     pub fn read_dl_dh(&self, seq_len: u32) -> Vec<f32> {
         let n_floats = seq_len as usize * self.config.d_r;
         self.read_storage_buffer(&self.adj_bufs.b_dl, n_floats, "dl_dh Readback")
+    }
+
+    /// Reads gradient magnitude snapshot from debug_buf written by the fused update shaders.
+    /// Returns a named struct with the raw gradient values (pre-clipping, pre-lr-scale)
+    /// for the attention weight matrices to diagnose whether slot_attn is receiving signal.
+    ///
+    /// Indices in debug_buf (from fused_deq_update.wgsl):
+    ///   [40] = g_wq  (Wq gradient, slot 0, idx 0)
+    ///   [41] = g_wo  (Wo gradient)
+    ///   [42] = g_wv  (Wv gradient)
+    ///   [43] = g_win (Win gradient)
+    ///   [44] = g_wk  (Wk gradient)
+    ///   [90] = gmix_buf[0]   (upstream adjoint signal sample before stage2)
+    ///   [91] = g_alpha       (dot(gmix, V_ks) — the pre-subtraction score gradient)
+    ///   [92] = alpha_dot_g   (weighted mean over slots — the term that cancels g_alpha)
+    ///   [93] = gscore        (final score gradient after bypass)
+    ///   [94] = attn_weight   (α[qs=0, ks=0] — should be ~1/h_slots at init)
+    pub fn read_attn_grad_snapshot(&self) -> AttnGradSnapshot {
+        // Read [40..44] for weight gradients (5 floats at byte offset 160).
+        let wg = self.read_storage_buffer_at(
+            &self.bridge.debug_buf,
+            160,  // 40 * 4 bytes
+            5,
+            "AttnGrad Weights",
+        );
+        // Read [90..94] for gradient chain intermediates (5 floats at byte offset 360).
+        let chain = self.read_storage_buffer_at(
+            &self.bridge.debug_buf,
+            360,  // 90 * 4 bytes
+            5,
+            "AttnGrad Chain",
+        );
+        AttnGradSnapshot {
+            g_wq:         wg.first().copied().unwrap_or(0.0),
+            g_wo:         wg.get(1).copied().unwrap_or(0.0),
+            g_wv:         wg.get(2).copied().unwrap_or(0.0),
+            g_win:        wg.get(3).copied().unwrap_or(0.0),
+            g_wk:         wg.get(4).copied().unwrap_or(0.0),
+            gmix_sample:  chain.first().copied().unwrap_or(0.0),
+            g_alpha:      chain.get(1).copied().unwrap_or(0.0),
+            alpha_dot_g:  chain.get(2).copied().unwrap_or(0.0),
+            gscore:       chain.get(3).copied().unwrap_or(0.0),
+            attn_weight:  chain.get(4).copied().unwrap_or(0.0),
+            // Read update magnitude: debug_buf[45] = |raw_wq|[0,0], [46] = Σraw_wq²
+            raw_wq_abs: self.read_storage_buffer_at(
+                &self.bridge.debug_buf, 180, 1, "AttnGrad raw_wq_abs",
+            ).first().copied().unwrap_or(0.0),  // 45 * 4 = 180 bytes
+            wq_frob_sq: self.read_storage_buffer_at(
+                &self.bridge.debug_buf, 184, 1, "AttnGrad wq_frob_sq",
+            ).first().copied().unwrap_or(0.0),  // 46 * 4 = 184 bytes
+        }
     }
 
     /// Reads h_star (hnext_buf) from GPU for the first batch sample.

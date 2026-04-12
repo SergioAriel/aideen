@@ -2975,6 +2975,31 @@ impl Trainer {
                         num_chunks, current_loss_disp, window_tps, epoch_tps, epoch_elapsed
                     );
 
+                    // Attention gradient diagnostics (opt-in: AIDEEN_ATTN_GRAD_LOG=1).
+                    // Shows g_wq/g_wk relative to g_wo to detect gradient starvation.
+                    #[cfg(feature = "wgpu")]
+                    if std::env::var("AIDEEN_ATTN_GRAD_LOG").ok().as_deref() == Some("1") {
+                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                            let s = gpu.read_attn_grad_snapshot();
+                            // Definitive learning check: spectral norm of Wq/Wk from GPU weights.
+                            let sigma_wq = gpu.read_wq_spectral_norm();
+                            let sigma_wk = gpu.read_wk_spectral_norm();
+                            println!(
+                                "    \x1b[90m[attn-grad] g_wq={:>10.4e}  g_wk={:>10.4e}  g_wo={:>10.4e}  g_win={:>10.4e}  ratio_wq/wo={:.4}\x1b[0m",
+                                s.g_wq, s.g_wk, s.g_wo, s.g_win, s.wq_wo_ratio()
+                            );
+                            println!(
+                                "    \x1b[33m[attn-sigma] σ(Wq)={:.6e}  σ(Wk)={:.6e}  [growing→learning, fixed→dead]\x1b[0m",
+                                sigma_wq, sigma_wk
+                            );
+                            println!(
+                                "    \x1b[90m[attn-chain] gmix={:>10.4e}  g_alpha={:>10.4e}  gscore={:>10.4e}  α={:.5}  ret={:.6}  |Δwq|={:>10.4e}  frob²={:>10.4e}\x1b[0m",
+                                s.gmix_sample, s.g_alpha, s.gscore,
+                                s.attn_weight, s.softmax_retention(), s.raw_wq_abs, s.wq_frob_sq
+                            );
+                        }
+                    }
+
                     // Reset interval timers
                     interval_start = std::time::Instant::now();
                     interval_tokens = 0;
@@ -3784,9 +3809,10 @@ impl Trainer {
                     break; // EOF
                 }
 
-                // Mini-log cada 10 chunks para ver progreso en tiempo real
+                // Mini-log cuando el contador progresó suficiente desde el último log.
+                // Usamos >= en lugar de % para que el early-stop (cfg_max_chunks) no se salte el log.
                 if self.cfg_progress_every != 0
-                    && num_chunks % self.cfg_progress_every == 0
+                    && num_chunks >= last_progress_chunk_logged + self.cfg_progress_every
                     && num_chunks > 0
                     && num_chunks != last_progress_chunk_logged
                 {
@@ -3810,6 +3836,26 @@ impl Trainer {
                         "    \x1b[95m[progress]\x1b[0m chunk {:>5}  \x1b[92mloss={}\x1b[0m  \x1b[96mtps_win={:>8.1}\x1b[0m  \x1b[94mtps_run={:>8.1}\x1b[0m  \x1b[90mtime={:.1}s\x1b[0m",
                         num_chunks, current_loss, tps_win, tps_run, elapsed
                     );
+
+                    // Attention gradient diagnostics (opt-in via AIDEEN_ATTN_GRAD_LOG=1).
+                    // Reads g_wq, g_wk, g_wo, g_wv, g_win from the GPU debug buffer and
+                    // prints their ratios to detect if slot_attn is gradient-starved.
+                    #[cfg(feature = "wgpu")]
+                    if std::env::var("AIDEEN_ATTN_GRAD_LOG").ok().as_deref() == Some("1") {
+                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                            let s = gpu.read_attn_grad_snapshot();
+                            println!(
+                                "    \x1b[90m[attn-grad] g_wq={:>10.4e}  g_wk={:>10.4e}  g_wo={:>10.4e}  g_win={:>10.4e}  ratio_wq/wo={:.4}\x1b[0m",
+                                s.g_wq, s.g_wk, s.g_wo, s.g_win, s.wq_wo_ratio()
+                            );
+                            println!(
+                                "    \x1b[90m[attn-chain] gmix={:>10.4e}  g_alpha={:>10.4e}  gscore={:>10.4e}  α={:.5}  ret={:.6}  |Δwq|={:>10.4e}  frob²={:>10.4e}\x1b[0m",
+                                s.gmix_sample, s.g_alpha, s.gscore,
+                                s.attn_weight, s.softmax_retention(), s.raw_wq_abs, s.wq_frob_sq
+                            );
+                        }
+                    }
+
                     last_progress_chunk_logged = num_chunks;
                     interval_start = std::time::Instant::now();
                     interval_tokens = 0;

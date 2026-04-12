@@ -13,7 +13,8 @@ struct UpdateUniforms {
     n_total_weights: u32,
     batch_size: u32,
     apply_accum: u32,
-    _pad0: u32,
+    // Byte offset 60: attn_grad_bypass (written by Rust, not used by this shader).
+    attn_grad_bypass: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
@@ -150,7 +151,12 @@ fn picard_clean_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         slot_coord_mode(),
     );
     let rhs = b_in[token * d + dim] * rhs_scale;
-    v_next[v_next_entry_base(entry, d, h_slots) + dim] = rhs;
+    let mode = 0u;
+    // Warm-start variants: use H_star (forward fixed point) as heuristic seed.
+    // mode 2: v0 = rhs + 0.5 * H_star (Variant B)
+    // mode 3: same — clean path has no v_prev buffer, so modes 1 and 3 fall back to H_star only
+    let hstar_contrib = select(0.0, 0.5 * H_star[entry_base(entry, d) + dim], mode == 2u || mode == 3u);
+    v_next[v_next_entry_base(entry, d, h_slots) + dim] = rhs + hstar_contrib;
 }
 
 @compute
@@ -332,7 +338,6 @@ fn picard_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let slot = entry % h_slots;
 
     // Compute attention-received weight for this slot from Scratch (stop-gradient).
-    // Matches the 70/30 mix used in deq_forward.wgsl pooling — consistent forward/backward.
     let base = t * legacy_scratch_stride(d, h_slots);
     let attn_w_base = base + d * (h_slots * 8u);
     var recv = 0.0;
@@ -340,12 +345,25 @@ fn picard_init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         recv = recv + Scratch[attn_w_base + q * h_slots + slot];
     }
     let w_uniform = 1.0 / f32(h_slots);
-    let w_attn = recv / f32(h_slots); // normalized: total received = h_slots
+    let w_attn = recv / f32(h_slots);
     let w_s = 0.7 * w_attn + 0.3 * w_uniform;
 
     let rhs = b_in[t * d + dim] * w_s
         + rhs_slot_buf[legacy_entry_base(entry, d) + dim];
-    v_next[v_next_entry_base(entry, d, h_slots) + dim] = rhs;
+
+    let mode = 0u;
+    let h_star_off = legacy_entry_base(entry, d) + dim;
+
+    // Variant A (mode=1): v0 = rhs + v_state (reutilizar adjunto previo)
+    // v_state holds the last converged adjoint from the previous call — the natural warm start.
+    let alpha = select(0.0, 1.0, mode == 1u || mode == 3u);
+    // Variant B (mode=2): v0 = rhs + 0.5 * H_star (heuristica con forward fixed point)
+    let beta = select(0.0, 0.5, mode == 2u || mode == 3u);
+
+    v_next[v_next_entry_base(entry, d, h_slots) + dim] =
+        rhs
+        + alpha * v_state[legacy_entry_base(entry, d) + dim]
+        + beta  * H_star[legacy_entry_base(entry, d) + dim];
 }
 
 @compute

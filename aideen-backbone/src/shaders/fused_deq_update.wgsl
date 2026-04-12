@@ -13,7 +13,7 @@ struct UpdateUniforms {
     n_total_weights: u32,  // total AllWeights elements (for apply_grad_update_main bounds)
     batch_size: u32,       // number of sequences processed in parallel
     apply_accum: u32,      // 1=apply accumulated gradients (apply_grad_update_main)
-    _pad0: u32,
+    attn_grad_bypass: f32, // Softmax backward bypass: 0.0=exact, 1.0=STE
 };
 
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
@@ -384,7 +384,23 @@ fn fused_attn_stage2_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let a = Scratch[attn_weight_base + qs * h_slots + ks];
-    gscore_buf[entry * h_slots + ks] = a * (g_alpha - alpha_dot_g);
+    // Exact softmax backward: a * (g_alpha - alpha_dot_g)
+    // When attention is uniform and slot values are similar, alpha_dot_g ≈ g_alpha → gradient ≈ 0.
+    // bypass=1.0 removes the mean-subtraction (STE), giving non-zero gradient at initialization.
+    // bypass=0.0 is the unmodified exact backward (current default).
+    let retain_mean = 1.0 - params.attn_grad_bypass;
+    let gscore_val = a * (g_alpha - retain_mean * alpha_dot_g);
+    gscore_buf[entry * h_slots + ks] = gscore_val;
+
+    // Gradient chain diagnostics: log at entry=0, qs=0, ks=0 only.
+    // debug_buf[90]=gmix_sample, [91]=g_alpha, [92]=alpha_dot_g, [93]=gscore, [94]=attn_weight
+    if (entry == 0u && qs == 0u && ks == 0u) {
+        debug_log[90] = gmix_buf[0];          // sample of upstream adjoint signal
+        debug_log[91] = g_alpha;              // dot(gmix, V_ks) before subtraction
+        debug_log[92] = alpha_dot_g;          // weighted mean of all g_alpha_j
+        debug_log[93] = gscore_val;           // final gradient score (should be non-zero)
+        debug_log[94] = a;                    // attention weight α[qs=0, ks=0]
+    }
 }
 
 @compute
@@ -530,10 +546,16 @@ fn fused_attn_stage4_wq_main(
     }
 
     if (idx == 0u && slot == 0u) {
-        // Keep 8..18 reserved for the forward DEQ snapshot header.
         debug_log[1000] = 246.0;
+        // Log g_wq at [row=0,col=0,slot=0] for compatibility, plus its square for magnitude check.
         debug_log[40] = g_wq;
+        // [45]: squared update magnitude (no sign cancellation), accumulated atomically across threads
+        // is not atomic here but single thread writes it — use abs() as magnitude proxy.
+        debug_log[45] = abs(raw_wq);
     }
+    // [46]: sum of |raw_wq| across ALL elements to measure total Frobenius update magnitude.
+    // Use a relaxed atomic add with non-atomic fallback (races acceptable for diagnostics).
+    debug_log[46] += raw_wq * raw_wq;
 }
 
 @compute

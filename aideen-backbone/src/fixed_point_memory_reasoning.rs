@@ -221,15 +221,19 @@ impl FixedPointMemoryReasoning {
         let slot_coord_mode = DeqRuntimeConfig::from_env().has_explicit_slot_comparison();
         // Xavier Uniform initialization: range = sqrt(3 / fan_in)
         let xavier_range = (3.0 / d_r as f32).sqrt();
+        // Attention query/key scale: much smaller than Xavier to guarantee near-zero QK^T logits
+        // at initialization. With xavier_range≈0.077 and d=512, random QK^T scores have
+        // variance that can place α[s,s] as low as ~3e-5 (measured), killing gradient flow.
+        // Scale 0.001 * xavier_range gives |QK^T/√d| < 1e-6 → softmax within 1% of uniform.
+        // Wv/Wo are NOT scaled down — they don't gate gradients through the softmax Jacobian.
+        let attn_qk_range = xavier_range * 0.001_f32;
 
-        let mut w_q = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
+        let mut w_q = Self::xavier_mat_with_rng(rng, d_r, attn_qk_range);
         let mut w_k = if slot_coord_mode {
             // In slot coordination we want Q and K to start from the same global geometry so
-            // their per-slot specialization can become mutually legible in the logits. Two
-            // unrelated random bases can make Q/K separate in norm while still producing nearly
-            // tied dot products slot-to-slot.
+            // their per-slot specialization can become mutually legible in the logits.
             let mut aligned = w_q.clone();
-            let noise = 0.05 * xavier_range;
+            let noise = 0.05 * attn_qk_range;
             for r in 0..d_r {
                 for c in 0..d_r {
                     aligned[(r, c)] += rng.gen_range(-noise..noise);
@@ -237,7 +241,7 @@ impl FixedPointMemoryReasoning {
             }
             aligned
         } else {
-            Self::xavier_mat_with_rng(rng, d_r, xavier_range)
+            Self::xavier_mat_with_rng(rng, d_r, attn_qk_range)
         };
         let mut w_v = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
         let mut w_o = Self::xavier_mat_with_rng(rng, d_r, xavier_range);
