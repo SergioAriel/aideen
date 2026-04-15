@@ -85,10 +85,19 @@ pub struct FixedPointMemoryReasoning {
     pub w_out: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
     pub(crate) w_out: DMatrix<f32>,
+    // Write path: factored k×v (replaces full-rank W_delta h*d² → 2*h*d*r).
+    // w_k_write[s]: (d_r × RETAIN_RANK) projects c to write bottleneck.
+    // w_v_write[s]: (RETAIN_RANK × d_r) expands bottleneck to proposal.
+    // Stored as (h_slots * d_r) × RETAIN_RANK and (h_slots * RETAIN_RANK) × d_r matrices
+    // so slice(s*d_r, d_r) / slice(s*r, r) extracts per-slot blocks.
     #[cfg(feature = "lab")]
-    pub w_delta: DMatrix<f32>,
+    pub w_k_write: DMatrix<f32>,
     #[cfg(not(feature = "lab"))]
-    pub(crate) w_delta: DMatrix<f32>,
+    pub(crate) w_k_write: DMatrix<f32>,
+    #[cfg(feature = "lab")]
+    pub w_v_write: DMatrix<f32>,
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_v_write: DMatrix<f32>,
     #[cfg(feature = "lab")]
     pub b_delta: DVector<f32>,
     #[cfg(not(feature = "lab"))]
@@ -253,11 +262,14 @@ impl FixedPointMemoryReasoning {
         // the carrier alive by construction while still allowing learned deviations later.
         let w_x = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.0f32, 0.01f32);
         let w_out = Self::scaled_identity_like_mat_with_rng(rng, d_r, 0.0f32, 0.01f32);
-        // Per-slot W_delta: random small init to break slot symmetry.
-        // zeros would give delta_input[s]=W_delta[s]*M=0 for all slots → identical M trajectories
-        // → identical A_log gradients → slots never specialize regardless of training length.
-        // Small random noise gives distinct delta_input per slot from token 2 onward.
-        let w_delta = DMatrix::from_fn(h_slots * d_r, d_r, |_, _| {
+        // Factored k×v write: W_k_write projects c to a RETAIN_RANK bottleneck,
+        // W_v_write expands the bottleneck to the proposal vector.
+        // Small random init to break slot symmetry (same rationale as old W_delta).
+        const RETAIN_RANK: usize = 32;
+        let w_k_write = DMatrix::from_fn(h_slots * d_r, RETAIN_RANK, |_, _| {
+            rng.gen_range(-0.01_f32..0.01_f32)
+        });
+        let w_v_write = DMatrix::from_fn(h_slots * RETAIN_RANK, d_r, |_, _| {
             rng.gen_range(-0.01_f32..0.01_f32)
         });
 
@@ -343,7 +355,8 @@ impl FixedPointMemoryReasoning {
             }),
             w_x,
             w_out,
-            w_delta,
+            w_k_write,
+            w_v_write,
             b_delta: DVector::zeros(d_r),
             // W_gate_hist: zeros init → hist_mod = 1+tanh(0) = 1 at step 0 (identity behavior).
             w_gate_hist: DMatrix::zeros(h_slots, d_r),
@@ -636,8 +649,12 @@ impl FixedPointMemoryReasoning {
             Self::matrix_to_row_major(&self.w_out),
         );
         weights.insert(
-            "reasoning.w_delta".to_string(),
-            Self::matrix_to_row_major(&self.w_delta),
+            "reasoning.w_k_write".to_string(),
+            Self::matrix_to_row_major(&self.w_k_write),
+        );
+        weights.insert(
+            "reasoning.w_v_write".to_string(),
+            Self::matrix_to_row_major(&self.w_v_write),
         );
         weights.insert(
             "reasoning.b_delta".to_string(),
@@ -716,7 +733,7 @@ impl FixedPointMemoryReasoning {
         Vec<f32>, // hist_slot_bias
         Vec<f32>, // hist_gate_logit
         Vec<f32>, // slot_anchor
-        Vec<f32>, // w_delta
+        Vec<f32>, // w_kv_write  (W_k_write then W_v_write, all slots)
         Vec<f32>, // b_delta
         Vec<f32>, // w_gate_hist
         Vec<f32>, // w_write_gate
@@ -754,7 +771,12 @@ impl FixedPointMemoryReasoning {
             Self::matrix_to_row_major(&self.hist_slot_bias),
             self.hist_gate_logit.as_slice().to_vec(),
             Self::matrix_to_row_major(&self.slot_anchor),
-            Self::matrix_to_row_major(&self.w_delta),
+            {
+                // Pack W_k_write (h*d × r) then W_v_write (h*r × d) contiguously.
+                let mut kv = Self::matrix_to_row_major(&self.w_k_write);
+                kv.extend(Self::matrix_to_row_major(&self.w_v_write));
+                kv
+            },
             self.b_delta.as_slice().to_vec(),
             Self::matrix_to_row_major(&self.w_gate_hist),
             Self::matrix_to_row_major(&self.w_write_gate),
@@ -858,27 +880,37 @@ impl FixedPointMemoryReasoning {
         self.w_x = get_mat("reasoning.w_x")?;
         self.w_out = get_mat("reasoning.w_out")?;
         {
+            const RETAIN_RANK: usize = 32;
             let h_slots = self.config.h_slots;
-            let data = weights
-                .get("reasoning.w_delta")
-                .ok_or("reasoning.w_delta not found")?;
-            self.w_delta = if data.len() == d_r * d_r {
-                // Legacy checkpoint: broadcast single matrix to all slots.
-                let base = nalgebra::DMatrix::from_row_slice(d_r, d_r, data);
-                let flat: Vec<f32> = (0..h_slots)
-                    .flat_map(|_| Self::matrix_to_row_major(&base))
-                    .collect();
-                nalgebra::DMatrix::from_row_slice(h_slots * d_r, d_r, &flat)
-            } else if data.len() == h_slots * d_r * d_r {
-                nalgebra::DMatrix::from_row_slice(h_slots * d_r, d_r, data)
+            // Load w_k_write (h*d × r) and w_v_write (h*r × d).
+            // Graceful fallback: if checkpoint has old w_delta, initialize k/v from zeros.
+            if let Some(data) = weights.get("reasoning.w_k_write") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_k_write size mismatch: expected {}, got {}",
+                        expected, data.len()
+                    ));
+                }
+                self.w_k_write =
+                    nalgebra::DMatrix::from_row_slice(h_slots * d_r, RETAIN_RANK, data);
             } else {
-                return Err(format!(
-                    "reasoning.w_delta size mismatch: expected {} or {}, got {}",
-                    d_r * d_r,
-                    h_slots * d_r * d_r,
-                    data.len()
-                ));
-            };
+                // Legacy checkpoint (old w_delta format) — initialize from zeros.
+                self.w_k_write = nalgebra::DMatrix::zeros(h_slots * d_r, RETAIN_RANK);
+            }
+            if let Some(data) = weights.get("reasoning.w_v_write") {
+                let expected = h_slots * RETAIN_RANK * d_r;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_v_write size mismatch: expected {}, got {}",
+                        expected, data.len()
+                    ));
+                }
+                self.w_v_write =
+                    nalgebra::DMatrix::from_row_slice(h_slots * RETAIN_RANK, d_r, data);
+            } else {
+                self.w_v_write = nalgebra::DMatrix::zeros(h_slots * RETAIN_RANK, d_r);
+            }
         }
         self.b_delta = nalgebra::DVector::from_vec(
             weights
@@ -1068,7 +1100,8 @@ impl FixedPointMemoryReasoning {
         slot_anchor: nalgebra::DMatrix<f32>,
         w_x: nalgebra::DMatrix<f32>,
         w_out: nalgebra::DMatrix<f32>,
-        w_delta: nalgebra::DMatrix<f32>,
+        w_k_write: nalgebra::DMatrix<f32>,
+        w_v_write: nalgebra::DMatrix<f32>,
         b_delta: nalgebra::DVector<f32>,
         a_log: nalgebra::DMatrix<f32>,
         norm_scale: nalgebra::DVector<f32>,
@@ -1088,7 +1121,8 @@ impl FixedPointMemoryReasoning {
             slot_anchor,
             w_x,
             w_out,
-            w_delta,
+            w_k_write,
+            w_v_write,
             b_delta,
             w_gate_hist: nalgebra::DMatrix::zeros(config.h_slots, config.d_r),
             a_log,

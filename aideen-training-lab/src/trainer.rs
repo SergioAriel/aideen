@@ -210,7 +210,9 @@ impl Trainer {
         h_slots: usize,
         d_r: usize,
     ) -> Option<(String, String, String)> {
-        if h_slots == 0 || d_r == 0 || w_delta.nrows() != h_slots * d_r || w_delta.ncols() != d_r {
+        // Now analyses W_k_write (h*d_r × RETAIN_RANK) per slot.
+        let retain_rank = w_delta.ncols();
+        if h_slots == 0 || d_r == 0 || retain_rank == 0 || w_delta.nrows() != h_slots * d_r {
             return None;
         }
         let mut stable_ranks = Vec::with_capacity(h_slots);
@@ -518,7 +520,7 @@ impl Trainer {
             hist_slot_bias_rm,
             hist_gate_logit,
             _slot_anchor_base_rm,
-            w_delta_rm,
+            w_kv_write_rm,
             b_delta,
             w_gate_hist_rm,
             w_write_gate_rm,
@@ -546,7 +548,7 @@ impl Trainer {
             hist_slot_bias_rm.as_slice(),
             hist_gate_logit.as_slice(),
             slot_anchor_rm,
-            w_delta_rm.as_slice(),
+            w_kv_write_rm.as_slice(),
             b_delta.as_slice(),
             w_gate_hist_rm.as_slice(),
             w_write_gate_rm.as_slice(),
@@ -575,7 +577,7 @@ impl Trainer {
             _hist_slot_bias_rm,
             _hist_gate_logit,
             slot_anchor_rm,
-            _w_delta_rm,
+            _w_kv_write_rm,
             _b_delta,
             _w_gate_hist_rm,
             _w_write_gate_rm,
@@ -1751,7 +1753,7 @@ impl Trainer {
                         hist_slot_bias_rm,
                         hist_gate_logit,
                         slot_anchor_rm,
-                        w_delta_rm,
+                        w_kv_write_rm,
                         b_delta,
                         w_gate_hist_rm,
                         w_write_gate_rm,
@@ -1779,7 +1781,7 @@ impl Trainer {
                         hist_slot_bias_rm.as_slice(),
                         hist_gate_logit.as_slice(),
                         slot_anchor_rm.as_slice(),
-                        w_delta_rm.as_slice(),
+                        w_kv_write_rm.as_slice(),
                         b_delta.as_slice(),
                         w_gate_hist_rm.as_slice(),
                         w_write_gate_rm.as_slice(),
@@ -4320,7 +4322,7 @@ impl Trainer {
                             );
                         }
                         if let Some((stable_rank, top8, top32)) = Self::w_delta_rank_summary(
-                            &self.reasoning.w_delta,
+                            &self.reasoning.w_k_write,
                             self.config.h_slots,
                             self.config.d_r,
                         ) {
@@ -4896,13 +4898,14 @@ impl Trainer {
                         let d_r = self.reasoning.config.d_r;
                         let h_slots = self.reasoning.config.h_slots;
                         let hist = gpu.read_hist_params_full();
+                        const RETAIN_RANK: usize = 32;
                         let hist_mat_base = 0usize;
                         let slot_scale_base = hist_mat_base + d_r * d_r;
                         let hist_bias_base = slot_scale_base + h_slots * d_r;
                         let hist_gate_base = hist_bias_base + h_slots * d_r;
                         let slot_anchor_base = hist_gate_base + h_slots;
-                        let w_delta_base = slot_anchor_base + h_slots * d_r;
-                        let b_delta_base = w_delta_base + h_slots * d_r * d_r;
+                        let w_kv_write_base = slot_anchor_base + h_slots * d_r;
+                        let b_delta_base = w_kv_write_base + 2 * h_slots * d_r * RETAIN_RANK;
                         let scalar_base = b_delta_base + d_r;
                         let w_gate_hist_base = scalar_base + 21;
                         let w_write_gate_base = w_gate_hist_base + h_slots * d_r;
@@ -4936,12 +4939,17 @@ impl Trainer {
                         self.reasoning.slot_anchor = nalgebra::DMatrix::from_row_slice(
                             h_slots,
                             d_r,
-                            &hist[slot_anchor_base..w_delta_base],
+                            &hist[slot_anchor_base..w_kv_write_base],
                         );
-                        self.reasoning.w_delta = nalgebra::DMatrix::from_row_slice(
+                        self.reasoning.w_k_write = nalgebra::DMatrix::from_row_slice(
                             h_slots * d_r,
+                            RETAIN_RANK,
+                            &hist[w_kv_write_base..w_kv_write_base + h_slots * d_r * RETAIN_RANK],
+                        );
+                        self.reasoning.w_v_write = nalgebra::DMatrix::from_row_slice(
+                            h_slots * RETAIN_RANK,
                             d_r,
-                            &hist[w_delta_base..b_delta_base],
+                            &hist[w_kv_write_base + h_slots * d_r * RETAIN_RANK..b_delta_base],
                         );
                         self.reasoning.b_delta =
                             nalgebra::DVector::from_column_slice(&hist[b_delta_base..scalar_base]);

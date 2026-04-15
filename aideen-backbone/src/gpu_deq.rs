@@ -222,7 +222,7 @@ impl GpuDeqBackend {
         hist_slot_bias: &[f32],
         hist_gate_logit: &[f32],
         slot_anchor: &[f32],
-        w_delta: &[f32],
+        w_kv_write: &[f32],   // W_k_write (h*d×r) then W_v_write (h*r×d) packed together
         b_delta: &[f32],
         w_gate_hist: &[f32],
         w_write_gate: &[f32],
@@ -253,7 +253,7 @@ impl GpuDeqBackend {
         } else {
             out.extend_from_slice(slot_anchor);
         }
-        out.extend_from_slice(w_delta);
+        out.extend_from_slice(w_kv_write);
         out.extend_from_slice(b_delta);
         out.push(if self.cfg_hist_selective { 1.0 } else { 0.0 });
         // Warmup factor for alpha_min (0..1). Default to 1.0 so inference is unaffected.
@@ -309,25 +309,36 @@ impl GpuDeqBackend {
     fn history_params_len(d: usize, h: usize) -> usize {
         const RETAIN_RANK: usize = 32;
         const MEM_READ_RANK: usize = 32;
-        // base: (h+1)*d² + 5*h*d + 2*h + d + 21 + h(γ)
+        // hist_mat: 1*d²
+        // slot_anchor, hist_scale, hist_bias, hist_gate_query, w_write_gate: 5*h*d
+        // hist_gate, b_write_mem: 2*h
+        // b_delta(shared): d
+        // flags: 21
+        // γ per slot: h
+        // w_k_write(h*d*r) + w_v_write(h*r*d): 2*h*d*RETAIN_RANK  (replaces old h*d²)
         // retain gate: W_up(h*d*r) + W_down(h*r*d) + b_retain(h*d)
         // memory read: W_q_mem(h*d*r) + W_k_mem(h*d*r) + b_read_mem(h)
-        (h + 1) * d * d
-            + 5 * h * d
-            + 2 * h
-            + d
-            + 21
-            + h
-            + 2 * h * d * RETAIN_RANK
-            + h * d
-            + 2 * h * d * MEM_READ_RANK
-            + h
+        d * d                           // hist_mat
+            + 5 * h * d                 // slot_anchor + hist_scale/bias + hist_gate_query + w_write_gate
+            + 2 * h                     // hist_gate + b_write_mem
+            + d                         // b_delta
+            + 21                        // flags
+            + h                         // γ per slot
+            + 2 * h * d * RETAIN_RANK   // W_k_write + W_v_write (factored write path)
+            + 2 * h * d * RETAIN_RANK   // W_retain_up + W_retain_down
+            + h * d                     // b_retain
+            + 2 * h * d * MEM_READ_RANK // W_q_mem + W_k_mem
+            + h                         // b_read_mem
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
         let d = self.config.d_r;
         let h = self.config.h_slots;
-        let base = (h + 1) * d * d + 3 * h * d + h + d;
+        // Offset to hist_delta_bias (= b_delta) in the new factored-write layout:
+        // d² + 3*h*d + h (slot_anchor/scale/bias/gate) + 2*h*d*32 (W_k_write+W_v_write)
+        // then +d to reach hist_selective_flag.
+        const RETAIN_RANK: usize = 32;
+        let base = d * d + 3 * h * d + h + 2 * h * d * RETAIN_RANK + d;
         let idx = base + 1; // warmup is the second scalar after hist_selective flag
         let d64 = d as u64;
         let h64 = h as u64;
@@ -2453,7 +2464,7 @@ impl GpuDeqBackend {
         hist_slot_bias: &[f32],
         hist_gate_logit: &[f32],
         slot_anchor: &[f32],
-        w_delta: &[f32],
+        w_kv_write: &[f32],   // W_k_write (h*d×r) then W_v_write (h*r×d) packed together
         b_delta: &[f32],
         w_gate_hist: &[f32],
         w_write_gate: &[f32],
@@ -2515,7 +2526,7 @@ impl GpuDeqBackend {
             hist_slot_bias,
             hist_gate_logit,
             slot_anchor,
-            w_delta,
+            w_kv_write,
             b_delta,
             w_gate_hist,
             w_write_gate,
@@ -4825,14 +4836,16 @@ impl GpuDeqBackend {
         let d = self.config.d_r;
         let h_slots = self.config.h_slots;
         let hist_params = self.read_hist_params_full();
+        const RETAIN_RANK: usize = 32;
         let hist_mat_base = 0usize;
         let hist_mat_len = d * d;
         let slot_scale_base = hist_mat_base + hist_mat_len;
         let hist_bias_base = slot_scale_base + h_slots * d;
         let hist_gate_base = hist_bias_base + h_slots * d;
         let slot_anchor_base = hist_gate_base + h_slots;
-        let w_delta_base = slot_anchor_base + h_slots * d;
-        let b_delta_base = w_delta_base + h_slots * d * d;
+        // Factored k×v write replaces full-rank W_delta (h*d²) with 2*h*d*RETAIN_RANK.
+        let w_kv_write_base = slot_anchor_base + h_slots * d;
+        let b_delta_base = w_kv_write_base + 2 * h_slots * d * RETAIN_RANK;
         let stats = |slice: &[f32]| -> (f32, f32) {
             if slice.is_empty() {
                 return (0.0, 0.0);
@@ -4842,9 +4855,9 @@ impl GpuDeqBackend {
             (mean_abs, max_abs)
         };
         let w_hist_stats = stats(&hist_params[hist_mat_base..slot_scale_base]);
-        let w_delta_stats = stats(&hist_params[w_delta_base..b_delta_base]);
+        let w_kv_stats = stats(&hist_params[w_kv_write_base..b_delta_base]);
         let b_delta_stats = stats(&hist_params[b_delta_base..b_delta_base + d]);
-        (w_hist_stats, w_delta_stats, b_delta_stats)
+        (w_hist_stats, w_kv_stats, b_delta_stats)
     }
 
     pub fn read_hist_carrier_params_full(&self) -> Vec<f32> {
@@ -4923,8 +4936,10 @@ impl GpuDeqBackend {
         let hist_bias_base = slot_scale_base + h_slots * d;
         let hist_gate_base = hist_bias_base + h_slots * d;
         let slot_anchor_base = hist_gate_base + h_slots;
-        let w_delta_base = slot_anchor_base + h_slots * d;
-        let b_delta_base = w_delta_base + h_slots * d * d;
+        const RETAIN_RANK: usize = 32;
+        let w_kv_write_base = slot_anchor_base + h_slots * d;
+        let w_v_write_section = w_kv_write_base + h_slots * d * RETAIN_RANK;
+        let b_delta_base = w_v_write_section + h_slots * RETAIN_RANK * d;
 
         let mut delta_sum = 0.0f32;
         let mut delta_max = 0.0f32;
@@ -4942,11 +4957,20 @@ impl GpuDeqBackend {
                     h_sumsq += h * h;
                 }
                 let h_rms = (h_sumsq / d.max(1) as f32 + 1e-6).sqrt();
+                // Factored write: compute k_write bottleneck once per (t, slot)
+                let wkw_base = w_kv_write_base + slot * d * RETAIN_RANK;
+                let wvw_base = w_v_write_section + slot * RETAIN_RANK * d;
+                let mut bottleneck = [0.0f32; RETAIN_RANK];
+                for j in 0..d {
+                    let h_norm_j = h_seq[base + j] / h_rms;
+                    for r in 0..RETAIN_RANK {
+                        bottleneck[r] += hist_params[wkw_base + j * RETAIN_RANK + r] * h_norm_j;
+                    }
+                }
                 for dim in 0..d {
                     let mut delta_pre = hist_params[b_delta_base + dim];
-                    for j in 0..d {
-                        delta_pre += hist_params[w_delta_base + slot * d * d + j * d + dim]
-                            * (h_seq[base + j] / h_rms);
+                    for r in 0..RETAIN_RANK {
+                        delta_pre += hist_params[wvw_base + r * d + dim] * bottleneck[r];
                     }
                     let delta = (1.0 + delta_pre.exp()).ln();
                     let delta_abs = delta.abs();

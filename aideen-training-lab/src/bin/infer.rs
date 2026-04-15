@@ -179,7 +179,7 @@ fn main() {
             hist_slot_bias,
             hist_gate_logit,
             slot_anchor,
-            _w_delta,
+            _w_kv_write,
             _b_delta,
             _w_gate_hist,
             _w_write_gate,

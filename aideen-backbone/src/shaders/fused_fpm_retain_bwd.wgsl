@@ -72,8 +72,9 @@ fn aw_hist_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) + d; }
 
 fn hist_gate_base(d: u32, h: u32) -> u32 { return d * d + 2u * h * d; }
 fn slot_anchor_base(d: u32, h: u32) -> u32 { return hist_gate_base(d, h) + h; }
-fn hist_delta_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
-fn hist_delta_bias_base(d: u32, h: u32) -> u32 { return hist_delta_base(d, h) + h * d * d; }
+fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
+fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * RETAIN_RANK; }
+fn hist_delta_bias_base(d: u32, h: u32) -> u32 { return w_v_write_base(d, h) + h * RETAIN_RANK * d; }
 fn hist_gate_query_base(d: u32, h: u32) -> u32 { return hist_delta_bias_base(d, h) + d + 21u; }
 fn w_write_gate_base(d: u32, h: u32) -> u32 { return hist_gate_query_base(d, h) + h * d; }
 fn b_write_mem_base(d: u32, h: u32) -> u32 { return w_write_gate_base(d, h) + h * d; }
@@ -98,8 +99,9 @@ const WG_SIZE: u32 = 64u;
 const FPM_RESIDUAL_SCALE: f32 = 0.1;
 const FPM_GATE_BIAS: f32 = -1.5;
 
-var<workgroup> shared_up: array<f32, 32>;
-var<workgroup> shared_dup: array<f32, 32>;
+var<workgroup> shared_up: array<f32, 32>;   // retain-gate up activations (W_retain_up · c)
+var<workgroup> shared_kw: array<f32, 32>;   // k-write bottleneck (W_k_write · c)
+var<workgroup> shared_dup: array<f32, 32>;  // ∂L/∂up or ∂L/∂bottleneck (reused)
 var<workgroup> shared_vec: array<f32, 512>;
 var<workgroup> shared_red: array<f32, 64>;
 
@@ -135,8 +137,9 @@ fn fused_fpm_retain_bwd_main(
     let inv_sqrt_d = inverseSqrt(max(1.0, f32(d)));
 
     let hist_base = aw_hist_base(d, h);
-    let wd_base = hist_base + hist_delta_base(d, h) + slot * d * d;
-    let bd_base = hist_base + hist_delta_bias_base(d, h);
+    let wkw_base = hist_base + w_k_write_base(d, h) + slot * d * RETAIN_RANK;
+    let wvw_base = hist_base + w_v_write_base(d, h) + slot * RETAIN_RANK * d;
+    let bd_base  = hist_base + hist_delta_bias_base(d, h);
     let wf_base = hist_base + w_write_gate_base(d, h) + slot * d;
     let bwrite_idx = hist_base + b_write_mem_base(d, h) + slot;
     let alog_base = aw_alog_base(d, h) + slot * d;
@@ -217,9 +220,8 @@ fn fused_fpm_retain_bwd_main(
             }
             workgroupBarrier();
 
+            // Phase 1: gate_partial + retain gate using shared_up (W_retain_up · c)
             var gate_partial = 0.0;
-            var local_prop_sq = 0.0;
-            var local_prev_sq = 0.0;
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                 let dim = lane * dims_per_lane + k;
                 gate_partial = gate_partial + AllWeights[wf_base + dim] * c[k];
@@ -228,10 +230,26 @@ fn fused_fpm_retain_bwd_main(
                     pre = pre + AllWeights[wdown_base + r * d + dim] * shared_up[r];
                 }
                 retain[k] = 1.0 / (1.0 + exp(-pre));
-                var delta = AllWeights[bd_base + dim];
+            }
+            // Phase 2: k-write bottleneck (W_k_write · c) → shared_kw
+            workgroupBarrier();
+            if (lane < RETAIN_RANK) {
+                var kw_acc = 0.0;
                 for (var j = 0u; j < d; j = j + 1u) {
                     let c_j = 0.5 * (h_star[h_base + j] + Scratch[sig_base + j]);
-                    delta = delta + AllWeights[wd_base + dim * d + j] * c_j;
+                    kw_acc = kw_acc + AllWeights[wkw_base + j * RETAIN_RANK + lane] * c_j;
+                }
+                shared_kw[lane] = kw_acc;
+            }
+            workgroupBarrier();
+            // Phase 3: proposal = tanh(W_v_write · shared_kw + b_delta)
+            var local_prop_sq = 0.0;
+            var local_prev_sq = 0.0;
+            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                let dim = lane * dims_per_lane + k;
+                var delta = AllWeights[bd_base + dim];
+                for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
+                    delta = delta + AllWeights[wvw_base + r * d + dim] * shared_kw[r];
                 }
                 proposal_pre[k] = delta;
                 proposal[k] = tanh(delta);
@@ -320,31 +338,25 @@ fn fused_fpm_retain_bwd_main(
                 } else {
                     AllWeights[bd_base + dim] -= clamp(step_bdelta, -clip, clip);
                 }
-                for (var j = 0u; j < d; j = j + 1u) {
-                    let c_j = 0.5 * (h_star[h_base + j] + Scratch[sig_base + j]);
-                    let step_wd = lr_scaled * g_delta * c_j / n_norm;
-                    if (params.grad_accum_mode == 1u) {
-                        AllGradients[wd_base + dim * d + j] += step_wd;
-                    } else {
-                        AllWeights[wd_base + dim * d + j] -= clamp(step_wd, -clip, clip);
-                    }
-                }
+                // Store g_delta for factored W_v / W_k gradient computation below.
+                // g_retain for W_down / W_up handled in the retain-gate backward block.
                 let step_bret = lr_scaled * g_pre[k] / n_norm;
                 if (params.grad_accum_mode == 1u) {
                     AllGradients[bret_base + dim] += step_bret;
                 } else {
                     AllWeights[bret_base + dim] -= clamp(step_bret, -clip, clip);
                 }
-                shared_vec[dim] = g_pre[k];
+                shared_vec[dim] = g_pre[k];   // used by retain-gate W_down backward
             }
             workgroupBarrier();
 
+            // ── Retain-gate backward (W_down, W_up) ─────────────────────────────────
             if (lane < RETAIN_RANK) {
                 var dup = 0.0;
                 for (var j = 0u; j < d; j = j + 1u) {
                     dup = dup + AllWeights[wdown_base + lane * d + j] * shared_vec[j];
                 }
-                shared_dup[lane] = dup;
+                shared_dup[lane] = dup;  // ∂L/∂up_r
             }
             workgroupBarrier();
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
@@ -367,6 +379,43 @@ fn fused_fpm_retain_bwd_main(
                     AllWeights[wf_base + dim] -= clamp(step_wg, -clip, clip);
                 }
                 dm_new[k] = g_prev[k];
+            }
+
+            // ── Factored k×v write backward (W_v_write, W_k_write) ───────────────────
+            // g_delta values are in registers; store in shared_vec for bottleneck backprop.
+            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                let dim = lane * dims_per_lane + k;
+                let g_prop = (1.0 - a[k]) * g_m_inner[k] * (1.0 - retain[k]) * z * FPM_RESIDUAL_SCALE
+                    + g_nov * (prev_norm / (denom * denom)) * (proposal[k] / max(proposal_norm, 1.0e-6));
+                let g_delta_val = g_prop * (1.0 - proposal[k] * proposal[k]);
+                shared_vec[dim] = g_delta_val;
+            }
+            workgroupBarrier();
+            // g_bottleneck[r] = Σ_dim W_v_write[r,dim] * g_delta[dim]
+            if (lane < RETAIN_RANK) {
+                var g_bot = 0.0;
+                for (var j = 0u; j < d; j = j + 1u) {
+                    g_bot = g_bot + AllWeights[wvw_base + lane * d + j] * shared_vec[j];
+                }
+                shared_dup[lane] = g_bot;  // reuse shared_dup: now ∂L/∂bottleneck_r
+            }
+            workgroupBarrier();
+            // W_v_write[r,dim] += g_delta[dim] * bottleneck[r]  (outer product)
+            // W_k_write[j,r]   += g_bottleneck[r] * c_j         (outer product, one c_j per lane)
+            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                let dim = lane * dims_per_lane + k;
+                let g_delta_val = shared_vec[dim];
+                for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
+                    let step_wvw = lr_scaled * g_delta_val * shared_kw[r] / n_norm;
+                    let step_wkw = lr_scaled * shared_dup[r] * c[k] / n_norm;
+                    if (params.grad_accum_mode == 1u) {
+                        AllGradients[wvw_base + r * d + dim] += step_wvw;
+                        AllGradients[wkw_base + dim * RETAIN_RANK + r] += step_wkw;
+                    } else {
+                        AllWeights[wvw_base + r * d + dim] -= clamp(step_wvw, -clip, clip);
+                        AllWeights[wkw_base + dim * RETAIN_RANK + r] -= clamp(step_wkw, -clip, clip);
+                    }
+                }
             }
             if (lane == 0u) {
                 let step_bg = lr_scaled * g_raw_z / n_norm;

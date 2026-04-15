@@ -94,8 +94,12 @@ fn hist_scale_base(d: u32, h_slots: u32) -> u32 { return hist_mat_len(d); }
 fn hist_bias_base(d: u32, h_slots: u32) -> u32 { return hist_scale_base(d, h_slots) + h_slots * d; }
 fn hist_gate_base(d: u32, h_slots: u32) -> u32 { return hist_bias_base(d, h_slots) + h_slots * d; }
 fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_slots) + h_slots; }
-fn hist_delta_base(d: u32, h_slots: u32) -> u32 { return slot_anchor_base(d, h_slots) + h_slots * d; }
-fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return hist_delta_base(d, h_slots) + h_slots * d * d; }
+// Write path: factored k×v (replaces full-rank W_delta h*d² with 2*h*d*r)
+// W_k_write[slot]: d×RETAIN_RANK  — projects c to write bottleneck
+// W_v_write[slot]: RETAIN_RANK×d  — expands bottleneck to proposal
+fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
+fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * RETAIN_RANK; }
+fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return w_v_write_base(d, h_slots) + h_slots * RETAIN_RANK * d; }
 fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d; }
 fn hist_alpha_warmup_factor_base(d: u32, h_slots: u32) -> u32 { return hist_selective_flag_base(d, h_slots) + 1u; }
 fn hist_rms_floor_base(d: u32, h_slots: u32) -> u32 { return hist_alpha_warmup_factor_base(d, h_slots) + 1u; }
@@ -1362,14 +1366,26 @@ fn deq_slot_coord_unified_main(
             let gate_bias = AllWeights[hist_base + b_write_mem_base(d_model, h_slots) + slot_idx]
                 + FPM_GATE_BIAS;
             let raw_z = 1.0 / (1.0 + exp(-(shared_vals[0] * inverseSqrt(max(1.0, f32(d_model))) + gate_bias)));
-            let wd_base = hist_base + hist_delta_base(d_model, h_slots) + slot_idx * d_model * d_model;
-            let bd_base = hist_base + hist_delta_bias_base(d_model, h_slots);
+            // Factored k×v write proposal: bottleneck = W_k_write·c  (d→r), proposal = tanh(W_v_write·bottleneck + b)
+            let wkw_base = hist_base + w_k_write_base(d_model, h_slots) + slot_idx * d_model * RETAIN_RANK;
+            let wvw_base = hist_base + w_v_write_base(d_model, h_slots) + slot_idx * RETAIN_RANK * d_model;
+            let bd_base  = hist_base + hist_delta_bias_base(d_model, h_slots);
+            // Step 1: bottleneck[r] = Σ_j W_k_write[j,r] * c_j  (RETAIN_RANK lanes)
+            if (tid < RETAIN_RANK) {
+                var kw_acc = 0.0;
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let c_j = 0.5 * (H_curr[h_base + slot_offset + j] + Scratch[signal_base + j]);
+                    kw_acc = kw_acc + AllWeights[wkw_base + j * RETAIN_RANK + tid] * c_j;
+                }
+                shared_vals[tid] = kw_acc;
+            }
+            workgroupBarrier();
+            // Step 2: proposal[d] = tanh(Σ_r W_v_write[r,d] * bottleneck[r] + b_delta[d])
             var delta_in0 = AllWeights[bd_base + d0];
             var delta_in1 = AllWeights[bd_base + d1];
-            for (var j = 0u; j < d_model; j = j + 1u) {
-                let c_j = 0.5 * (H_curr[h_base + slot_offset + j] + Scratch[signal_base + j]);
-                delta_in0 = delta_in0 + AllWeights[wd_base + d0 * d_model + j] * c_j;
-                delta_in1 = delta_in1 + AllWeights[wd_base + d1 * d_model + j] * c_j;
+            for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
+                delta_in0 = delta_in0 + AllWeights[wvw_base + r * d_model + d0] * shared_vals[r];
+                delta_in1 = delta_in1 + AllWeights[wvw_base + r * d_model + d1] * shared_vals[r];
             }
             let proposal0 = tanh(delta_in0);
             let proposal1 = tanh(delta_in1);
