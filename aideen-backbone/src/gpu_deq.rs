@@ -101,6 +101,10 @@ pub struct GpuDeqBackend {
     fpm_retain_bwd_pipeline: wgpu::ComputePipeline,
     fpm_shared_wout_pipeline: wgpu::ComputePipeline,
     fpm_shared_wx_pipeline: wgpu::ComputePipeline,
+    fpm_minner_colsum_pipeline: wgpu::ComputePipeline,
+    fpm_wout_factored_pipeline: wgpu::ComputePipeline,
+    fpm_shared_wx_partial_pipeline: wgpu::ComputePipeline,
+    fpm_shared_wx_reduce_pipeline: wgpu::ComputePipeline,
     fpm_retain_bwd_bg0: wgpu::BindGroup,
     fpm_shared_bg0: wgpu::BindGroup,
     staged_picard_bg: wgpu::BindGroup,
@@ -873,6 +877,28 @@ impl GpuDeqBackend {
                         },
                         count: None,
                     },
+                    // binding 6: fpm_wout_partial (read_write scratch for factored W_out grad)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // binding 7: fpm_wx_partial (read_write scratch for factored W_x grad)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -1254,6 +1280,44 @@ impl GpuDeqBackend {
                 layout: Some(&fpm_shared_pl),
                 module: &fpm_shared_shader,
                 entry_point: Some("fused_fpm_stage_wx_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        // Factorized W_out gradient: step1 = minner column sums, step2 = outer product.
+        let fpm_minner_colsum_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM MInner ColSum Pipeline"),
+                layout: Some(&fpm_shared_pl),
+                module: &fpm_shared_shader,
+                entry_point: Some("fpm_minner_colsum_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fpm_wout_factored_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM Wout Factored Pipeline"),
+                layout: Some(&fpm_shared_pl),
+                module: &fpm_shared_shader,
+                entry_point: Some("fpm_wout_factored_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        // Factorized W_x gradient: partial + reduce.
+        let fpm_shared_wx_partial_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM Shared Wx Partial Pipeline"),
+                layout: Some(&fpm_shared_pl),
+                module: &fpm_shared_shader,
+                entry_point: Some("fused_fpm_stage_wx_partial_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let fpm_shared_wx_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FPM Shared Wx Reduce Pipeline"),
+                layout: Some(&fpm_shared_pl),
+                module: &fpm_shared_shader,
+                entry_point: Some("fused_fpm_stage_wx_reduce_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -1640,7 +1704,39 @@ impl GpuDeqBackend {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        // Scratch buffers for the factorized W_out / W_x gradient kernels.
+        // fpm_wout_partial: holds minner column sums (h*d) for the factored path,
+        //   or n_blocks * d² for the fallback partial+reduce path (whichever is larger).
+        // fpm_wx_partial: holds n_blocks * d partial accumulators for W_x.
         let w_mat_bytes = (config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
+        let fpm_wout_partial_buf = {
+            let fpm_block = 64u64;
+            let reduce_entries =
+                (forward_batch_cap as u64) * (config.ctx_len.max(1) as u64) * (config.h_slots as u64);
+            let fpm_blocks = (reduce_entries + fpm_block - 1) / fpm_block;
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("FPM Wout Partial Buffer"),
+                size: fpm_blocks * w_mat_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let fpm_wx_partial_buf = {
+            let fpm_block = 64u64;
+            let reduce_entries =
+                (forward_batch_cap as u64) * (config.ctx_len.max(1) as u64) * (config.h_slots as u64);
+            let fpm_blocks = (reduce_entries + fpm_block - 1) / fpm_block;
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("FPM Wx Partial Buffer"),
+                size: fpm_blocks * (config.d_r as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
         let wv_mat_bytes =
             (config.h_slots * config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
         let staged_wq_t_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2063,6 +2159,14 @@ impl GpuDeqBackend {
                     binding: 5,
                     resource: fpm_gx_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: fpm_wout_partial_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: fpm_wx_partial_buf.as_entire_binding(),
+                },
             ],
         });
         // Parse all hot-path env vars once at construction.
@@ -2189,6 +2293,10 @@ impl GpuDeqBackend {
             fpm_retain_bwd_pipeline,
             fpm_shared_wout_pipeline,
             fpm_shared_wx_pipeline,
+            fpm_minner_colsum_pipeline,
+            fpm_wout_factored_pipeline,
+            fpm_shared_wx_partial_pipeline,
+            fpm_shared_wx_reduce_pipeline,
             fpm_retain_bwd_bg0,
             fpm_shared_bg0,
             staged_picard_bg,
@@ -4169,25 +4277,54 @@ impl GpuDeqBackend {
                 );
             }
             if self.bridge.fpm_enabled {
+                // W_out gradient — factorized path (eliminates 135× read amplification):
+                //   Step 1: sum fpm_minner_buf over tokens for each (slot, col).
+                //   Step 2: outer product dm_const × minner_sum → dW_out.
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "fpm_shared_wout",
-                    &self.fpm_shared_wout_pipeline,
+                    "fpm_minner_colsum",
+                    &self.fpm_minner_colsum_pipeline,
                     &self.fpm_shared_bg0,
                     &self.fused_update_bg1,
-                    d.div_ceil(16),
-                    d.div_ceil(16),
+                    h as u32,
+                    d.div_ceil(64) as u32,
                     profile_fused,
                 );
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "fpm_shared_wx",
-                    &self.fpm_shared_wx_pipeline,
+                    "fpm_wout_factored",
+                    &self.fpm_wout_factored_pipeline,
                     &self.fpm_shared_bg0,
                     &self.fused_update_bg1,
-                    d.div_ceil(64),
+                    d.div_ceil(16) as u32,
+                    d.div_ceil(16) as u32,
+                    profile_fused,
+                );
+                // W_x gradient — partial + reduce path.
+                let fpm_block = 64u32;
+                let n_entries = batch_size * seq_len * h as u32;
+                let n_blocks = n_entries.div_ceil(fpm_block);
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "fpm_shared_wx_partial",
+                    &self.fpm_shared_wx_partial_pipeline,
+                    &self.fpm_shared_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(64) as u32,
+                    n_blocks,
+                    profile_fused,
+                );
+                run_stage(
+                    &self.device,
+                    &self.queue,
+                    "fpm_shared_wx_reduce",
+                    &self.fpm_shared_wx_reduce_pipeline,
+                    &self.fpm_shared_bg0,
+                    &self.fused_update_bg1,
+                    d.div_ceil(64) as u32,
                     1,
                     profile_fused,
                 );

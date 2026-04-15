@@ -1525,6 +1525,18 @@ impl Trainer {
             cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
         };
         trainer.apply_experimental_profile_from_env();
+
+        #[cfg(feature = "wgpu")]
+        if trainer.cfg_fwd_batch_size > 4 {
+            eprintln!(
+                "\x1b[33m[AIDEEN] WARNING: AIDEEN_BATCH_SIZE={} may cause thermal overload on \
+                 integrated GPUs (Apple Silicon, iGPU). Use AIDEEN_BATCH_SIZE=1 \
+                 AIDEEN_GRAD_ACCUM={} instead.\x1b[0m",
+                trainer.cfg_fwd_batch_size,
+                trainer.cfg_fwd_batch_size,
+            );
+        }
+
         trainer
     }
 

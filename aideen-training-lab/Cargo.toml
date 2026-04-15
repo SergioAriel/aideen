@@ -20,6 +20,10 @@ name = "benchmark"
 path = "src/bin/benchmark.rs"
 
 [[bin]]
+name = "assoc_recall"
+path = "src/bin/assoc_recall.rs"
+
+[[bin]]
 name = "chat"
 path = "src/bin/chat.rs"
 
