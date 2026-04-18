@@ -1079,7 +1079,7 @@ fn deq_slot_coord_unified_main(
                             let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
                             let occupied_prior = log(max(bank_usage, 1.0e-4));
                             shared_vals[3u * ASSOC_RANK + bank] =
-                                ASSOC_READ_BETA * address_score + occupied_prior;
+                                clamp(ASSOC_READ_BETA * address_score + occupied_prior, -25.0, 25.0);
                         }
                         workgroupBarrier();
                     }
@@ -1193,8 +1193,12 @@ fn deq_slot_coord_unified_main(
                             }
                         }
                     }
-                    fpm_ctx0 = fpm_ctx0 + alpha_assoc * assoc_ctx0;
-                    fpm_ctx1 = fpm_ctx1 + alpha_assoc * assoc_ctx1;
+                    workgroupBarrier();
+                    let assoc_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)));
+                    let assoc_scale = 1.0 / max(assoc_rms, 0.1); // Soft normalization floor
+                    
+                    fpm_ctx0 = fpm_ctx0 + alpha_assoc * assoc_ctx0 * assoc_scale;
+                    fpm_ctx1 = fpm_ctx1 + alpha_assoc * assoc_ctx1 * assoc_scale;
                 }
                 workgroupBarrier();
             }

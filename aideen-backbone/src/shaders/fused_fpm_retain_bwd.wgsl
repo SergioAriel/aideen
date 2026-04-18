@@ -79,7 +79,7 @@ override ENABLE_ASSOC_SLOT_STRIPE: bool = false;
 override ENABLE_ASSOC_TIE_QK: bool = false;
 override ENABLE_ASSOC_CONF_READ: bool = false;
 override ENABLE_ASSOC_EVENT_GATE: bool = false;
-override ASSOC_EVENT_L1: f32 = 0.0;
+override ASSOC_EVENT_L1: f32 = 0.001;
 
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h * d * d + h * d; }
@@ -150,7 +150,7 @@ const FPM_DIRECT_WRITE_SCALE: f32 = 200.0;
 // d_model × rank while scalar alpha receives a reduced sum. This fan-in
 // compensation is temporary until these parameters use the same normalized
 // optimizer path as the rest of the model.
-const ASSOC_ADDR_GRAD_SCALE: f32 = 4096.0;
+const ASSOC_ADDR_GRAD_SCALE: f32 = 1024.0;
 
 var<workgroup> shared_up: array<f32, 32>;   // retain-gate up activations (W_retain_up · c)
 var<workgroup> shared_kw: array<f32, 32>;   // k-write bottleneck (W_k_write · c)
@@ -729,7 +729,7 @@ fn fused_fpm_retain_bwd_main(
                     let q_norm = shared_vec[16u];
                     let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
                     shared_dup[bank] =
-                        ASSOC_READ_BETA * address_score + log(max(bank_usage, 1.0e-4));
+                        clamp(ASSOC_READ_BETA * address_score + log(max(bank_usage, 1.0e-4)), -25.0, 25.0);
                     shared_vec[20u + bank * 2u] = dot_score;
                     shared_vec[20u + bank * 2u + 1u] = key_norm;
                 }
@@ -758,10 +758,30 @@ fn fused_fpm_retain_bwd_main(
             workgroupBarrier();
             let assoc_read_conf = shared_vec[17u];
 
+            // Calculate context magnitude for backward normalization scaling.
+            var local_ctx_sq = 0.0;
+            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                let dim = lane * dims_per_lane + k;
+                var ctx_dim = 0.0;
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    let bank_base = bank * assoc_bank_stride;
+                    ctx_dim = ctx_dim + shared_dup[bank] * assoc_b_state[bank_base + RETAIN_RANK + dim];
+                }
+                local_ctx_sq = local_ctx_sq + ctx_dim * ctx_dim;
+            }
+            // Reuse lane reduction
+            let total_ctx_sq = reduce_sum(lane, local_ctx_sq);
+            if (lane == 0u) {
+                shared_vec[18u] = total_ctx_sq;
+            }
+            workgroupBarrier();
+            let assoc_rms = sqrt(shared_vec[18u] / max(1.0, f32(d)));
+            let assoc_scale = 1.0 / max(assoc_rms, 0.1); 
+
             // Read backward: ctx_dim = alpha * Σ_b match_b * bank_value_b[dim].
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                 let dim = lane * dims_per_lane + k;
-                let g_ctx = v_state[vs_base + dim];
+                let g_ctx = v_state[vs_base + dim] * assoc_scale;
                 var ctx_dim = 0.0;
                 for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                     let bank_base = bank * assoc_bank_stride;
@@ -780,7 +800,7 @@ fn fused_fpm_retain_bwd_main(
                 var local_match_grad = 0.0;
                 for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                     let dim = lane * dims_per_lane + k;
-                    let g_ctx = v_state[vs_base + dim];
+                    let g_ctx = v_state[vs_base + dim] * assoc_scale;
                     local_match_grad = local_match_grad
                         + alpha_assoc * assoc_read_conf * g_ctx * assoc_b_state[bank_base + RETAIN_RANK + dim];
                     assoc_gb[bank_base + RETAIN_RANK + dim] =
