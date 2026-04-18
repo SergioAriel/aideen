@@ -79,7 +79,7 @@ override ENABLE_ASSOC_SLOT_STRIPE: bool = false;
 override ENABLE_ASSOC_TIE_QK: bool = false;
 override ENABLE_ASSOC_CONF_READ: bool = false;
 override ENABLE_ASSOC_EVENT_GATE: bool = false;
-override ASSOC_EVENT_L1: f32 = 0.005;
+override ASSOC_EVENT_L1: f32 = 0.0;
 
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h * d * d + h * d; }
