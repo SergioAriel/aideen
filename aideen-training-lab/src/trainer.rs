@@ -178,7 +178,7 @@ pub struct Trainer {
     cfg_fwd_batch_size: u32,       // AIDEEN_BATCH_SIZE (for forward dispatch)
     cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
     cfg_solve_control_every: usize, // AIDEEN_SOLVE_CONTROL_EVERY
-    cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
+    pub cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
     cfg_tps_sync_every: usize,     // AIDEEN_TPS_SYNC_EVERY
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
     cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
@@ -204,6 +204,11 @@ pub struct Trainer {
 }
 
 impl Trainer {
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after assoc recall gradient/forward path is localized.
+    pub fn enable_temporary_assoc_debug_sampling(&mut self, every: usize) {
+        self.cfg_debug_sample_every = every;
+    }
+
     #[cfg(feature = "wgpu")]
     fn w_delta_rank_summary(
         w_delta: &nalgebra::DMatrix<f32>,
@@ -531,6 +536,10 @@ impl Trainer {
             w_q_mem_rm,
             w_k_mem_rm,
             b_read_mem,
+            w_k_assoc_rm,
+            w_v_assoc_rm,
+            w_q_assoc_rm,
+            alpha_assoc,
         ) = self.reasoning.history_params_gpu_layout();
         gpu.upload_weights(
             &gpu.queue,
@@ -559,6 +568,10 @@ impl Trainer {
             w_q_mem_rm.as_slice(),
             w_k_mem_rm.as_slice(),
             b_read_mem.as_slice(),
+            w_k_assoc_rm.as_slice(),
+            w_v_assoc_rm.as_slice(),
+            w_q_assoc_rm.as_slice(),
+            alpha_assoc.as_slice(),
         );
     }
 
@@ -588,6 +601,10 @@ impl Trainer {
             _w_q_mem_rm,
             _w_k_mem_rm,
             _b_read_mem,
+            _w_k_assoc_rm,
+            _w_v_assoc_rm,
+            _w_q_assoc_rm,
+            _alpha_assoc,
         ) = self.reasoning.history_params_gpu_layout();
         let hist_flat = hist_ctx.to_flat();
         let mut slot_anchor_eff = slot_anchor_rm;
@@ -719,6 +736,7 @@ impl Trainer {
             let seq = fw[10].max(1.0);
             let slot_count = fw[11].max(1.0).min(h_slots as f32).round() as usize;
             let mut max_delta = 0.0f32;
+            let mut max_exit_delta = 0.0f32;
             let mut hit_count = 0.0f32;
             let mut avg_iters_sum = 0.0f32;
             let mut contractivity = 0.0f32;
@@ -733,6 +751,13 @@ impl Trainer {
                 avg_iters_sum += fw[base + 2];
                 contractivity = contractivity.max(fw[base + 3]);
                 max_h = max_h.max(fw[base + 4]);
+                let diag_base = 400 + slot * 12;
+                if fw.len() > diag_base + 8 {
+                    let exit_delta = fw[diag_base + 8];
+                    if exit_delta.is_finite() {
+                        max_exit_delta = max_exit_delta.max(exit_delta);
+                    }
+                }
             }
             let avg_iters = if slot_count > 0 {
                 avg_iters_sum / slot_count as f32
@@ -740,12 +765,17 @@ impl Trainer {
                 0.0
             };
             let hit_den = seq * slot_count.max(1) as f32;
+            let solve_delta = if max_exit_delta > 0.0 {
+                max_exit_delta
+            } else {
+                max_delta
+            };
             return (
                 seq,
                 max_h,
                 avg_iters,
                 hit_count,
-                max_delta,
+                solve_delta,
                 contractivity,
                 hit_den,
             );
@@ -1300,7 +1330,18 @@ impl Trainer {
 
     #[cfg(feature = "wgpu")]
     fn configure_fpm_runtime_controls(&mut self, gpu: &mut GpuDeqBackend) {
-        gpu.cached_fpm_alpha_m = self.fpm_alpha_m_current.clamp(0.01, 0.1);
+        if std::env::var("AR_ASSOC_ONLY").ok().as_deref() == Some("1") {
+            gpu.cached_fpm_alpha_m = 0.0;
+            gpu.cached_fpm_stage = gpu.cached_fpm_stage.max(4);
+            return;
+        }
+        // Allow AIDEEN_FPM_ALPHA_M to set any value; default curriculum still ramps to 0.05
+        // but won't be capped below the env var value.
+        let alpha_env_max = std::env::var("AIDEEN_FPM_ALPHA_M")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.1);
+        gpu.cached_fpm_alpha_m = self.fpm_alpha_m_current.clamp(0.001, alpha_env_max);
         gpu.cached_fpm_tau = self.fpm_tau_current.max(0.5);
     }
 
@@ -1341,7 +1382,11 @@ impl Trainer {
             let mean = self.fpm_err_h_window.iter().copied().sum::<f32>() / 100.0;
             let stable = mean < 0.08 && (mean - self.fpm_last_err_h_avg).abs() < 0.01;
             if stable {
-                self.fpm_alpha_m_current = (self.fpm_alpha_m_current + 0.002).min(0.05);
+                let alpha_env_max = std::env::var("AIDEEN_FPM_ALPHA_M")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(0.05);
+                self.fpm_alpha_m_current = (self.fpm_alpha_m_current + 0.002).min(alpha_env_max);
             }
             self.fpm_last_err_h_avg = mean;
         }
@@ -1444,7 +1489,10 @@ impl Trainer {
             cached_debug_gen: 0,
             invalid_eval_debug_gen: 0,
             last_gpu_loss: 0.0,
-            fpm_alpha_m_current: 0.01,
+            fpm_alpha_m_current: std::env::var("AIDEEN_FPM_ALPHA_M")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.01),
             fpm_tau_current: 0.5,
             fpm_err_h_window: VecDeque::with_capacity(100),
             fpm_last_err_h_avg: f32::INFINITY,
@@ -1649,12 +1697,17 @@ impl Trainer {
                     };
 
                     let emb_needs_upload = !self.gpu_emb_weights_uploaded;
+                    let emb_upload = if emb_needs_upload {
+                        Some(self.tokenizer.embeddings_row_major())
+                    } else {
+                        None
+                    };
                     let (_s_sequence, query_vec) = match gpu_emb.prepare_sequence_and_query(
                         &gpu.device,
                         &gpu.queue,
                         context,
                         self.config.ctx_len,
-                        self.tokenizer.embeddings.as_slice(),
+                        emb_upload.as_deref().unwrap_or(&[]),
                         emb_needs_upload,
                     ) {
                         Ok(v) => {
@@ -1764,6 +1817,10 @@ impl Trainer {
                         w_q_mem_rm,
                         w_k_mem_rm,
                         b_read_mem,
+                        w_k_assoc_rm,
+                        w_v_assoc_rm,
+                        w_q_assoc_rm,
+                        alpha_assoc,
                     ) = self.reasoning.history_params_gpu_layout();
                     gpu.upload_weights(
                         &gpu.queue,
@@ -1792,6 +1849,10 @@ impl Trainer {
                         w_q_mem_rm.as_slice(),
                         w_k_mem_rm.as_slice(),
                         b_read_mem.as_slice(),
+                        w_k_assoc_rm.as_slice(),
+                        w_v_assoc_rm.as_slice(),
+                        w_q_assoc_rm.as_slice(),
+                        alpha_assoc.as_slice(),
                     );
                     self.gpu_weights_uploaded = true;
                     self.gpu_cg_weights_uploaded = true;
@@ -1837,6 +1898,42 @@ impl Trainer {
         } else {
             loss_sum / count as f32
         }
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn eval_cached_hpooled_token_loss(&mut self, token_index: usize, target: u32) -> f32 {
+        let step_t = self.optimizer.step_count() as u32;
+        let ternary = self.training_config.ternary;
+        let d = self.config.d_r;
+        let Some(gpu) = self.gpu_deq.as_ref() else {
+            return f32::NAN;
+        };
+        let Some(gpu_lm) = self.gpu_lm.as_mut() else {
+            return f32::NAN;
+        };
+        let h_offset = (token_index * d * std::mem::size_of::<f32>()) as u64;
+        match gpu_lm.train_step_no_readback(
+            &gpu.device,
+            &gpu.queue,
+            &gpu.bridge.hpooled_buf,
+            h_offset,
+            &[target],
+            0.0,
+            step_t,
+            ternary,
+            true,
+        ) {
+            Ok(loss) => {
+                self.last_gpu_loss = loss;
+                loss
+            }
+            Err(_) => f32::NAN,
+        }
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn eval_cached_hpooled_token_loss(&mut self, _token_index: usize, _target: u32) -> f32 {
+        f32::NAN
     }
 
     #[cfg(feature = "wgpu")]
@@ -1926,11 +2023,16 @@ impl Trainer {
                 // train_sequence path: use token sequence embeddings.
                 let gather_t0 = std::time::Instant::now();
                 let emb_needs_upload = !self.gpu_emb_weights_uploaded;
+                let emb_upload = if emb_needs_upload {
+                    Some(self.tokenizer.embeddings_row_major())
+                } else {
+                    None
+                };
                 let _ = gpu_emb.gather_only_to_sbuf(
                     &gpu.queue,
                     &gpu.device,
                     context,
-                    self.tokenizer.embeddings.as_slice(),
+                    emb_upload.as_deref().unwrap_or(&[]),
                     emb_needs_upload,
                     &gpu.bridge.s_buf,
                 );
@@ -2698,14 +2800,26 @@ impl Trainer {
                                 if fw.len() <= base + 4 {
                                     return None;
                                 }
+                                let exit_base = 688 + slot * 4;
+                                let strict = fw.get(exit_base).copied().unwrap_or(0.0);
+                                let homeo = fw.get(exit_base + 1).copied().unwrap_or(0.0);
+                                let fail = fw.get(exit_base + 2).copied().unwrap_or(0.0);
+                                let homeo_band = fw.get(exit_base + 3).copied().unwrap_or(0.0);
+                                let diag_base = 400 + slot * 12;
+                                let exit_err = fw.get(diag_base + 8).copied().unwrap_or(0.0);
                                 Some(format!(
-                                    "s{}:Δ={:.2e},hit={:.0},it={:.1},c={:.2},h={:.2e}",
+                                    "s{}:Δ={:.2e},exit_err={:.2e},hit={:.0},it={:.1},c={:.2},h={:.2e},exit={:.0}/{:.0}/{:.0},band={:.1e}",
                                     slot,
                                     fw[base],
+                                    exit_err,
                                     fw[base + 1],
                                     fw[base + 2],
                                     fw[base + 3],
-                                    fw[base + 4]
+                                    fw[base + 4],
+                                    strict,
+                                    homeo,
+                                    fail,
+                                    homeo_band
                                 ))
                             })
                             .collect::<Vec<_>>()
@@ -3126,12 +3240,17 @@ impl Trainer {
                     continue;
                 };
                 let emb_needs_upload = !self.gpu_emb_weights_uploaded;
+                let emb_upload = if emb_needs_upload {
+                    Some(self.tokenizer.embeddings_row_major())
+                } else {
+                    None
+                };
                 let (s_sequence, _) = match gpu_emb.prepare_sequence_and_query(
                     &gpu.device,
                     &gpu.queue,
                     context,
                     self.config.ctx_len,
-                    self.tokenizer.embeddings.as_slice(),
+                    emb_upload.as_deref().unwrap_or(&[]),
                     emb_needs_upload,
                 ) {
                     Ok(v) => {
@@ -3220,7 +3339,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -3316,12 +3435,17 @@ impl Trainer {
                     continue;
                 };
                 let emb_needs_upload = !self.gpu_emb_weights_uploaded;
+                let emb_upload = if emb_needs_upload {
+                    Some(self.tokenizer.embeddings_row_major())
+                } else {
+                    None
+                };
                 let (s_sequence, _) = match gpu_emb.prepare_sequence_and_query(
                     &gpu.device,
                     &gpu.queue,
                     context,
                     self.config.ctx_len,
-                    self.tokenizer.embeddings.as_slice(),
+                    emb_upload.as_deref().unwrap_or(&[]),
                     emb_needs_upload,
                 ) {
                     Ok(v) => {
@@ -3424,7 +3548,7 @@ impl Trainer {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
             if let Some(gpu) = self.gpu_deq.as_ref() {
-                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _) =
+                let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
                 self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
@@ -4917,6 +5041,10 @@ impl Trainer {
                         let w_q_mem_base = b_retain_base + h_slots * d_r;
                         let w_k_mem_base = w_q_mem_base + h_slots * d_r * 32;
                         let b_read_mem_base = w_k_mem_base + h_slots * d_r * 32;
+                        let w_k_assoc_base = b_read_mem_base + h_slots;
+                        let w_v_assoc_base = w_k_assoc_base + h_slots * d_r * 32;
+                        let w_q_assoc_base = w_v_assoc_base + h_slots * d_r * 32;
+                        let alpha_assoc_base = w_q_assoc_base + h_slots * d_r * 32;
 
                         self.reasoning.w_hist_shared = nalgebra::DMatrix::from_row_slice(
                             d_r,
@@ -4989,6 +5117,21 @@ impl Trainer {
                             .collect();
                         self.reasoning.b_read_mem = nalgebra::DVector::from_column_slice(
                             &hist[b_read_mem_base..b_read_mem_base + h_slots],
+                        );
+                        self.reasoning.w_k_assoc = hist[w_k_assoc_base..w_v_assoc_base]
+                            .chunks_exact(d_r * 32)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                            .collect();
+                        self.reasoning.w_v_assoc = hist[w_v_assoc_base..w_q_assoc_base]
+                            .chunks_exact(d_r * 32)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                            .collect();
+                        self.reasoning.w_q_assoc = hist[w_q_assoc_base..alpha_assoc_base]
+                            .chunks_exact(d_r * 32)
+                            .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, 32, chunk))
+                            .collect();
+                        self.reasoning.alpha_assoc = nalgebra::DVector::from_column_slice(
+                            &hist[alpha_assoc_base..alpha_assoc_base + h_slots],
                         );
                     }
                     self.gpu_weights_uploaded = true; // Weights are still on GPU, just synced to CPU

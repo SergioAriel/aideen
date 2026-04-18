@@ -39,6 +39,7 @@ struct UpdateUniforms {
 @group(1) @binding(9) var<storage, read_write> HistParams: array<f32>;
 
 const CLEAN_ENTRY_GRID_X: u32 = 65535u;
+const H_SELF_FEEDBACK: f32 = 1.0;
 var<workgroup> shared_sumsq: array<f32, 64>;
 var<workgroup> shared_coeff: array<f32, 64>;
 
@@ -68,11 +69,10 @@ fn slot_coord_mode() -> bool {
 
 fn scratch_stride(d: u32, h_slots: u32) -> u32 {
     let signal_span = d * h_slots;
-    // slot_coord forward stores [signal | attn | alpha] plus the h_slots² attention matrix.
-    // The adjoint must use the same per-token stride or it will read the next token with a
-    // shifted base after t=0, silently training against the wrong scratch blocks.
-    let coord_span = signal_span * 3u + h_slots * h_slots;
-    return select(signal_span, coord_span, slot_coord_mode());
+    // Unified forward always stores [signal | attn | alpha | slot_scores].
+    // Using the old signal-only stride shifts every token after t=0 and trains
+    // the adjoint against the wrong scratch block.
+    return signal_span * 3u + h_slots * h_slots;
 }
 
 fn hist_mat_len(d: u32) -> u32 {
@@ -192,9 +192,9 @@ fn picard_clean_step_main(
             Scratch[signal_base + dim] + Scratch[attn_base + dim] * attn_scale + HistParams[anchor_base + dim],
             slot_coord_mode_active,
         );
-        let pre = slot_branch + H_star[off + dim];
+        let pre = slot_branch + H_SELF_FEEDBACK * H_star[off + dim];
         let up = params.damping * v_state[off + dim];
-        let rms_term = select(pre, slot_branch, slot_coord_mode_active);
+        let rms_term = pre;
         local_sumsq = local_sumsq + rms_term * rms_term;
         local_coeff = local_coeff + up * NormScale[dim] * pre;
     }
@@ -227,11 +227,13 @@ fn picard_clean_step_main(
             Scratch[signal_base + dim] + Scratch[attn_base + dim] * attn_scale + HistParams[anchor_base + dim],
             slot_coord_mode_active,
         );
-        let pre = slot_branch + H_star[off + dim];
+        let pre = slot_branch + H_SELF_FEEDBACK * H_star[off + dim];
         let v_prev = v_state[off + dim];
-        let jac_term =
+        let norm_grad =
             (NormScale[dim] * inv_rms) * (params.damping * v_prev)
-            - select(pre, slot_branch, slot_coord_mode_active) * coeff_scale
+            - pre * coeff_scale;
+        let jac_term =
+            H_SELF_FEEDBACK * norm_grad
             + (1.0 - params.damping) * v_prev;
         let rhs = b_in[token * d + dim] * rhs_scale;
         v_next[v_off + dim] = rhs + jac_term;

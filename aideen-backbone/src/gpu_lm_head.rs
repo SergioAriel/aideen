@@ -14,7 +14,7 @@ struct TrainParams {
     eps_bits: u32,
     ternary_flag: u32,
     num_samples: u32,
-    _pad1: u32,
+    active_targets: u32,
     _pad2: u32,
 }
 
@@ -56,6 +56,16 @@ pub struct GpuLmHeadTrainer {
 }
 
 impl GpuLmHeadTrainer {
+    pub const IGNORE_TARGET: u32 = u32::MAX;
+
+    fn active_target_count(&self, targets: &[u32]) -> u32 {
+        targets
+            .iter()
+            .filter(|&&t| t < self.vocab_size as u32)
+            .count()
+            .max(1) as u32
+    }
+
     fn build_sampled_indices(&mut self, targets: &[u32]) -> u32 {
         // MAX_SHADER_SAMPLES must match s_indices_cache and s_logits array sizes in lm_train.wgsl.
         // Exceeding this causes OOB writes to workgroup memory, corrupting probs and gradients.
@@ -64,10 +74,16 @@ impl GpuLmHeadTrainer {
             .config
             .num_samples
             .max(targets.len())
+            .min(self.vocab_size)
             .min(self.sample_capacity)
             .min(MAX_SHADER_SAMPLES);
         self.sampled_indices_reuse.clear();
-        self.sampled_indices_reuse.extend_from_slice(targets);
+        self.sampled_indices_reuse.extend(
+            targets
+                .iter()
+                .copied()
+                .filter(|&t| t < self.vocab_size as u32),
+        );
         self.sampled_indices_reuse.sort_unstable();
         self.sampled_indices_reuse.dedup();
 
@@ -705,7 +721,7 @@ impl GpuLmHeadTrainer {
             eps_bits: 1e-8f32.to_bits(),
             ternary_flag: if ternary { 1 } else { 0 },
             num_samples: actual_num_samples,
-            _pad1: 0,
+            active_targets: self.active_target_count(targets),
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -877,7 +893,7 @@ impl GpuLmHeadTrainer {
             eps_bits: 1e-8f32.to_bits(),
             ternary_flag: if ternary { 1 } else { 0 },
             num_samples: actual_num_samples,
-            _pad1: 0,
+            active_targets: self.active_target_count(targets),
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -1050,7 +1066,7 @@ impl GpuLmHeadTrainer {
             eps_bits: 1e-8f32.to_bits(),
             ternary_flag: if ternary { 1 } else { 0 },
             num_samples: actual_num_samples,
-            _pad1: 0,
+            active_targets: self.active_target_count(targets),
             _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));

@@ -15,6 +15,7 @@ struct RunUniforms {
     fpm_stage: u32,
     fpm_alpha_m: f32,
     fpm_tau: f32,
+    fpm_read_gate_min: f32,
 }
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
@@ -26,11 +27,23 @@ struct RunUniforms {
 @group(0) @binding(7) var<storage, read_write> DebugLog: array<f32>;
 @group(0) @binding(8) var<storage, read_write> HistCtx: array<f32>;
 @group(0) @binding(9) var<storage, read_write> MState: array<f32>;
+// Previous associative source: normalized token identity signal, optionally
+// shifted by the slot anchor. FPM/DEQ controls write strength separately.
+@group(0) @binding(12) var<storage, read_write> PrevHStarBuf: array<f32>;
+@group(0) @binding(13) var<storage, read_write> AssocBuf: array<f32>;
+@group(0) @binding(14) var<storage, read_write> AssocHist: array<f32>;
 
 override SLOT_ATTN_HEAD_DIM: u32 = 32u;
 override ENABLE_TOKEN_CARRY: bool = true;
 override ENABLE_H_HIST: bool = false;
 override ENABLE_HIST_CTX: bool = false;
+override ENABLE_ASSOC_TRANSITION_GATE: bool = false;
+override ENABLE_ASSOC_SLOT_ANCHOR: bool = false;
+override ENABLE_ASSOC_REUSE_MATCH: bool = false;
+override ENABLE_ASSOC_SLOT_STRIPE: bool = false;
+override ENABLE_ASSOC_TIE_QK: bool = false;
+override ENABLE_ASSOC_CONF_READ: bool = false;
+override ENABLE_ASSOC_EVENT_GATE: bool = false;
 const SLOT_COORD_USE_BIAS: bool = true;
 const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
 const WG_SIZE: u32 = 256u;
@@ -38,9 +51,21 @@ const FPM_CACHE_CAP: u32 = 512u;
 const MAX_SLOTS: u32 = 8u;
 const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
 const SLOT_HEAD_CAP: u32 = MAX_SLOTS * MAX_SLOT_ATTN_HEAD_DIM;
+const ASSOC_RANK: u32 = 32u;
+override ASSOC_BANKS: u32 = 1u;
+const ASSOC_WRITE_CAP: f32 = 0.95;
+const ASSOC_ALLOC_THRESHOLD: f32 = 0.05;
+const ASSOC_USAGE_DECAY: f32 = 0.999;
+const ASSOC_TO_FPM_SCALE: f32 = 0.02;
+// Experimental multi-bank addressing strength. With ASSOC_BANKS=1 this is
+// behaviorally inactive because the read softmax has a single candidate.
+const ASSOC_READ_BETA: f32 = 4.0;
+const H_SELF_FEEDBACK: f32 = 1.0;
 
 var<workgroup> slot_coord_weights: array<f32, MAX_SLOTS>;
-var<workgroup> shared_vals: array<f32, WG_SIZE>;
+// Needs WG_SIZE lanes for reductions plus associative read/write scratch
+// at indices 3*ASSOC_RANK..3*ASSOC_RANK+ASSOC_BANKS+1.
+var<workgroup> shared_vals: array<f32, 128>;
 var<workgroup> q_self: array<f32, MAX_SLOT_ATTN_HEAD_DIM>;
 var<workgroup> k_cache: array<f32, SLOT_HEAD_CAP>;
 var<workgroup> v_cache: array<f32, SLOT_HEAD_CAP>;
@@ -130,6 +155,12 @@ fn b_retain_base(d: u32, h: u32) -> u32 { return w_retain_down_base(d, h) + h * 
 fn w_q_mem_base(d: u32, h: u32) -> u32 { return b_retain_base(d, h) + h * d; }
 fn w_k_mem_base(d: u32, h: u32) -> u32 { return w_q_mem_base(d, h) + h * d * RETAIN_RANK; }
 fn b_read_mem_base(d: u32, h: u32) -> u32 { return w_k_mem_base(d, h) + h * d * RETAIN_RANK; }
+fn w_k_assoc_base(d: u32, h: u32) -> u32 { return b_read_mem_base(d, h) + h; }
+fn w_v_assoc_base(d: u32, h: u32) -> u32 { return w_k_assoc_base(d, h) + h * d * ASSOC_RANK; }
+fn w_q_assoc_base(d: u32, h: u32) -> u32 { return w_v_assoc_base(d, h) + h * d * ASSOC_RANK; }
+fn alpha_assoc_base(d: u32, h: u32) -> u32 { return w_q_assoc_base(d, h) + h * d * ASSOC_RANK; }
+fn w_event_assoc_base(d: u32, h: u32) -> u32 { return alpha_assoc_base(d, h) + h; }
+fn b_event_assoc_base(d: u32, h: u32) -> u32 { return w_event_assoc_base(d, h) + h * d; }
 
 @group(0) @binding(11) var<storage, read_write> H_hist: array<f32>;
 
@@ -398,6 +429,10 @@ fn deq_slot_coord_unified_main(
     let total_elements = h_slots * d_model;
     let slot_offset = slot_idx * d_model;
     let h_base = batch_idx * total_elements;
+    let prev_hstar_base = h_base + slot_offset;
+    let assoc_bank_stride = ASSOC_RANK + d_model + 1u;
+    let assoc_slot_stride = ASSOC_BANKS * assoc_bank_stride;
+    let assoc_slot_base = (batch_idx * h_slots + slot_idx) * assoc_slot_stride;
     let signal_span = d_model * h_slots;
     let scratch_stride = signal_span * 3u + h_slots * h_slots;
     let wq_mat_base = aw_wq_base(d_model, h_slots) + slot_idx * d_model * d_model;
@@ -408,6 +443,7 @@ fn deq_slot_coord_unified_main(
     let slot_anchor_mat_base = aw_hist_base(d_model, h_slots) + slot_anchor_base(d_model, h_slots) + slot_offset;
     let nscale_base = aw_nscale_base(d_model, h_slots);
     let inv_d_model = 1.0 / max(1.0, f32(d_model));
+    let inv_sqrt_d_model = sqrt(inv_d_model);
     let zero_win_diag = shape.diag_zero_win != 0u;
     let iter_limit = select(shape.max_iters, 1u, shape.diag_one_iter != 0u);
     let enable_slot_coord = shape.residual_alpha > -1.5;
@@ -420,6 +456,11 @@ fn deq_slot_coord_unified_main(
     let fpm_persist_enabled = ENABLE_FPM && shape.fpm_stage >= 5u;
     let recurrent_slot_attn_enabled = fpm_policy_enabled;
     let model_a_memory_bootstrap = fpm_inject_enabled && !fpm_policy_enabled;
+    // Associative memory needs write support before read can carry information.
+    // Reading at stage 3 while writes are still off leaves B identically zero and
+    // makes the branch structurally dead.
+    let assoc_write_enabled = fpm_write_enabled;
+    let assoc_read_enabled = assoc_write_enabled;
 
     if (tid == 0u) {
         max_delta_seen = 0.0;
@@ -464,6 +505,34 @@ fn deq_slot_coord_unified_main(
         DebugLog[slot_write_base + 3u] = 0.0;
         DebugLog[slot_write_base + 4u] = 0.0;
         DebugLog[slot_write_base + 5u] = 0.0;
+        // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove DebugLog[760..] after root-cause closure.
+        let assoc_diag_base = 760u + slot_idx * 10u;
+        DebugLog[assoc_diag_base + 0u] = 0.0;
+        DebugLog[assoc_diag_base + 1u] = 0.0;
+        DebugLog[assoc_diag_base + 2u] = 0.0;
+        DebugLog[assoc_diag_base + 3u] = 0.0;
+        DebugLog[assoc_diag_base + 4u] = 0.0;
+        DebugLog[assoc_diag_base + 5u] = 0.0;
+        DebugLog[assoc_diag_base + 6u] = -1.0e30;
+        DebugLog[assoc_diag_base + 7u] = 1.0e30;
+        DebugLog[assoc_diag_base + 8u] = 0.0;
+        DebugLog[assoc_diag_base + 9u] = 0.0;
+        // TEMPORARY ASSOCIATIVE DIAGNOSTIC: final-token/query-only read telemetry.
+        let assoc_query_diag_base = 820u + slot_idx * 8u;
+        DebugLog[assoc_query_diag_base + 0u] = 0.0;
+        DebugLog[assoc_query_diag_base + 1u] = 0.0;
+        DebugLog[assoc_query_diag_base + 2u] = 0.0;
+        DebugLog[assoc_query_diag_base + 3u] = 0.0;
+        DebugLog[assoc_query_diag_base + 4u] = 0.0;
+        DebugLog[assoc_query_diag_base + 5u] = 0.0;
+        DebugLog[assoc_query_diag_base + 6u] = 0.0;
+        DebugLog[assoc_query_diag_base + 7u] = 0.0;
+        // TEMPORARY ASSOCIATIVE DIAGNOSTIC: h*(t-1) vs h*(t) separability before key projection.
+        let assoc_h_diag_base = 860u + slot_idx * 4u;
+        DebugLog[assoc_h_diag_base + 0u] = 0.0;
+        DebugLog[assoc_h_diag_base + 1u] = 0.0;
+        DebugLog[assoc_h_diag_base + 2u] = 1.0e30;
+        DebugLog[assoc_h_diag_base + 3u] = 0.0;
     }
     workgroupBarrier();
 
@@ -472,6 +541,12 @@ fn deq_slot_coord_unified_main(
     var exit_iter_sum = 0.0;
     var rescue_entered_sum = 0.0;
     var pre_rescue_converged_sum = 0.0;
+    // TEMPORARY SOLVE DIAGNOSTIC: split strict epsilon exits from homeostatic
+    // plateau exits while auditing H convergence. Remove after root-cause closure.
+    var strict_converged_sum = 0.0;
+    var homeostatic_converged_sum = 0.0;
+    var failed_converged_sum = 0.0;
+    var max_homeo_band_seen = 0.0;
     var solve_signal_rms_seen = 0.0;
     var solve_pre_rms_seen = 0.0;
     var solve_fh_rms_seen = 0.0;
@@ -521,11 +596,10 @@ fn deq_slot_coord_unified_main(
         let alpha_base = batch_scratch_t + signal_span * 2u;
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
         let use_prev_token_mem = global_t > 0u;
-        let prev_hist_base_t = select(
-            0u,
-            (batch_idx * shape.seq_len + (global_t - 1u)) * total_elements,
-            use_prev_token_mem,
-        );
+        var prev_hist_base_t = 0u;
+        if (use_prev_token_mem) {
+            prev_hist_base_t = (batch_idx * shape.seq_len + (global_t - 1u)) * total_elements;
+        }
 
         if (d_model == WG_SIZE * 2u) {
             let d0 = tid;
@@ -616,11 +690,10 @@ fn deq_slot_coord_unified_main(
                 let bias_base = hist_base + hist_bias_base(d_model, h_slots) + ms * d_model;
                 var key_acc = 0.0;
                 for (var j = 0u; j < d_model; j = j + 1u) {
-                    let m_j = select(
-                        MState[mem_off + j],
-                        HistCtx[prev_hist_base_t + ms * d_model + j],
-                        use_prev_token_mem,
-                    );
+                    var m_j = MState[mem_off + j];
+                    if (use_prev_token_mem) {
+                        m_j = HistCtx[prev_hist_base_t + ms * d_model + j];
+                    }
                         let keyed_m_j =
                             m_j
                             + AllWeights[scale_base + j] * tanh(m_j)
@@ -703,6 +776,8 @@ fn deq_slot_coord_unified_main(
         var converged_before_rescue = false;
         var prev_err_h = 1.0;
         var last_finite_err_h = 1.0;
+        var token_strict_converged = false;
+        var token_homeostatic_converged = false;
         let total_iter_limit = iter_limit + select(0u, FPM_RESCUE_TAIL, fpm_policy_enabled);
         while (iter < total_iter_limit && !converged) {
             if (tid == 0u) {
@@ -761,11 +836,10 @@ fn deq_slot_coord_unified_main(
                     let bias_base_kfix  = hist_base_kfix + hist_bias_base(d_model, h_slots)  + ms * d_model;
                     var key_acc = 0.0;
                     for (var j = 0u; j < d_model; j = j + 1u) {
-                        let m_j = select(
-                            MState[mem_off + j],
-                            HistCtx[prev_hist_base_t + ms * d_model + j],
-                            use_prev_token_mem,
-                        );
+                        var m_j = MState[mem_off + j];
+                        if (use_prev_token_mem) {
+                            m_j = HistCtx[prev_hist_base_t + ms * d_model + j];
+                        }
                         let keyed_m_j = m_j
                             + AllWeights[scale_base_kfix + j] * tanh(m_j)
                             + AllWeights[bias_base_kfix  + j];
@@ -821,11 +895,10 @@ fn deq_slot_coord_unified_main(
                             k_sq = k_sq + kval * kval;
                         }
                         for (var j = 0u; j < d_model; j = j + 1u) {
-                            let m_j = select(
-                                MState[mem_off + j],
-                                HistCtx[prev_hist_base_t + ms * d_model + j],
-                                use_prev_token_mem,
-                            );
+                            var m_j = MState[mem_off + j];
+                            if (use_prev_token_mem) {
+                                m_j = HistCtx[prev_hist_base_t + ms * d_model + j];
+                            }
                             let keyed_m_j =
                                 m_j
                                 + AllWeights[scale_base + j] * tanh(m_j)
@@ -892,7 +965,8 @@ fn deq_slot_coord_unified_main(
                     // Model A should read more strongly when the content lookup is selective.
                     // Uniform reads are low-confidence and should not inject a full residual
                     // branch into the solve.
-                    shared_vals[0] = sqrt(confidence);
+                    // fpm_read_gate_min: override floor (0.0 = default curriculum, 1.0 = always full gate).
+                    shared_vals[0] = max(sqrt(confidence), shape.fpm_read_gate_min);
                 }
                 workgroupBarrier();
                 var mem_raw0 = 0.0;
@@ -900,16 +974,12 @@ fn deq_slot_coord_unified_main(
                 for (var ms = 0u; ms < h_slots; ms = ms + 1u) {
                     let mem_off = h_base + ms * d_model;
                     let hist_slot_off = prev_hist_base_t + ms * d_model;
-                    let m0 = select(
-                        MState[mem_off + tid],
-                        HistCtx[hist_slot_off + tid],
-                        use_prev_token_mem,
-                    );
-                    let m1 = select(
-                        MState[mem_off + tid + WG_SIZE],
-                        HistCtx[hist_slot_off + tid + WG_SIZE],
-                        use_prev_token_mem,
-                    );
+                    var m0 = MState[mem_off + tid];
+                    var m1 = MState[mem_off + tid + WG_SIZE];
+                    if (use_prev_token_mem) {
+                        m0 = HistCtx[hist_slot_off + tid];
+                        m1 = HistCtx[hist_slot_off + tid + WG_SIZE];
+                    }
                     let w = slot_coord_prev[ms];
                     mem_raw0 = mem_raw0 + w * m0;
                     mem_raw1 = mem_raw1 + w * m1;
@@ -944,7 +1014,7 @@ fn deq_slot_coord_unified_main(
                 // Memory read is a residual branch into the solve. Model A expects this
                 // coupling to start small and become useful through learned content and
                 // training, not through a hidden fixed residual scale that bypasses alpha_m.
-                let alpha_m = clamp(shape.fpm_alpha_m, 0.01, 0.1);
+                let alpha_m = max(shape.fpm_alpha_m, 0.001);
                 let read_residual_scale = select(alpha_m, min(alpha_m, FPM_RESCUE_RESIDUAL_SCALE), rescue_active);
                 let mem_to_signal = signal_norm * read_residual_scale / max(mem_unit_norm, 1e-6);
                 fpm_ctx0 = mem_unit0 * mem_to_signal * read_gate;
@@ -959,6 +1029,173 @@ fn deq_slot_coord_unified_main(
                         memctx_rms / max(signal_rms, 1e-6),
                     );
                 }
+                if (assoc_read_enabled) {
+                    let d0 = tid;
+                    let d1 = tid + WG_SIZE;
+                    // Default coupled path: associative addressing shares the FPM write-key
+                    // encoder, so binding lookup uses the same learned event geometry as FPM.
+                    let wq_assoc = hist_base
+                        + w_k_write_base(d_model, h_slots)
+                        + slot_idx * d_model * ASSOC_RANK;
+                    let alpha_assoc = AllWeights[hist_base + alpha_assoc_base(d_model, h_slots) + slot_idx];
+                    // Layout per bank: [bank_key | bank_value | usage].
+                    // Query the durable bank with the previous associative source. The source
+                    // keeps token identity; FPM/DEQ gates control whether it is consolidated.
+                    if (tid < ASSOC_RANK) {
+                        var q_acc = 0.0;
+                        for (var j = 0u; j < d_model; j = j + 1u) {
+                            q_acc = q_acc
+                                + AllWeights[wq_assoc + j * ASSOC_RANK + tid]
+                                * PrevHStarBuf[prev_hstar_base + j];
+                        }
+                        shared_vals[tid] = tanh(q_acc * inv_sqrt_d_model);
+                    }
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var q_norm = 0.0;
+                        for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                            q_norm = q_norm + shared_vals[r] * shared_vals[r];
+                        }
+                        shared_vals[3u * ASSOC_RANK + ASSOC_BANKS] = q_norm;
+                    }
+                    workgroupBarrier();
+                    for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                        let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                        let bank_key_base = bank_base;
+                        let bank_usage = AssocBuf[bank_base + ASSOC_RANK + d_model];
+                        if (tid < ASSOC_RANK) {
+                            shared_vals[ASSOC_RANK + tid] = AssocBuf[bank_key_base + tid] * shared_vals[tid];
+                        }
+                        workgroupBarrier();
+                        if (tid == 0u) {
+                            var dot_score = 0.0;
+                            var key_norm = 0.0;
+                            for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                                let key_r = AssocBuf[bank_key_base + r];
+                                dot_score = dot_score + shared_vals[ASSOC_RANK + r];
+                                key_norm = key_norm + key_r * key_r;
+                            }
+                            let q_norm = shared_vals[3u * ASSOC_RANK + ASSOC_BANKS];
+                            let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
+                            let occupied_prior = log(max(bank_usage, 1.0e-4));
+                            shared_vals[3u * ASSOC_RANK + bank] =
+                                ASSOC_READ_BETA * address_score + occupied_prior;
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        var max_score = -1.0e30;
+                        var min_score = 1.0e30;
+                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                            max_score = max(max_score, shared_vals[3u * ASSOC_RANK + bank]);
+                            min_score = min(min_score, shared_vals[3u * ASSOC_RANK + bank]);
+                        }
+                        var bank_key_cos = 0.0;
+                        if (ASSOC_BANKS >= 2u) {
+                            let bank0_base = assoc_slot_base;
+                            let bank1_base = assoc_slot_base + assoc_bank_stride;
+                            var key_dot = 0.0;
+                            var key0_norm = 0.0;
+                            var key1_norm = 0.0;
+                            for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                                let k0 = AssocBuf[bank0_base + r];
+                                let k1 = AssocBuf[bank1_base + r];
+                                key_dot = key_dot + k0 * k1;
+                                key0_norm = key0_norm + k0 * k0;
+                                key1_norm = key1_norm + k1 * k1;
+                            }
+                            bank_key_cos = key_dot * inverseSqrt(max(key0_norm * key1_norm, 1.0e-12));
+                        }
+                        var denom = 0.0;
+                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                            let e = exp(shared_vals[3u * ASSOC_RANK + bank] - max_score);
+                            shared_vals[3u * ASSOC_RANK + bank] = e;
+                            denom = denom + e;
+                        }
+                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                            shared_vals[3u * ASSOC_RANK + bank] =
+                                shared_vals[3u * ASSOC_RANK + bank] / max(denom, 1.0e-6);
+                        }
+                        // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read competition/occupancy telemetry.
+                        var read_entropy = 0.0;
+                        var read_max_prob = 0.0;
+                        var read_usage = 0.0;
+                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                            let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                            let p = shared_vals[3u * ASSOC_RANK + bank];
+                            read_entropy = read_entropy - p * log(max(p, 1.0e-8));
+                            read_max_prob = max(read_max_prob, p);
+                            read_usage = read_usage + AssocBuf[bank_base + ASSOC_RANK + d_model];
+                        }
+                        shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 1u] = read_max_prob;
+                        if (debug_on) {
+                            let assoc_diag_base = 760u + slot_idx * 10u;
+                            DebugLog[assoc_diag_base + 0u] =
+                                DebugLog[assoc_diag_base + 0u] + read_entropy;
+                            DebugLog[assoc_diag_base + 1u] =
+                                max(DebugLog[assoc_diag_base + 1u], read_max_prob);
+                            DebugLog[assoc_diag_base + 3u] =
+                                DebugLog[assoc_diag_base + 3u] + read_usage / max(1.0, f32(ASSOC_BANKS));
+                            DebugLog[assoc_diag_base + 8u] = DebugLog[assoc_diag_base + 8u] + 1.0;
+                            if (t + 1u == shape.token_count) {
+                                let assoc_query_diag_base = 820u + slot_idx * 8u;
+                                DebugLog[assoc_query_diag_base + 0u] =
+                                    DebugLog[assoc_query_diag_base + 0u] + read_entropy;
+                                DebugLog[assoc_query_diag_base + 1u] =
+                                    max(DebugLog[assoc_query_diag_base + 1u], read_max_prob);
+                                DebugLog[assoc_query_diag_base + 3u] =
+                                    DebugLog[assoc_query_diag_base + 3u] + read_usage / max(1.0, f32(ASSOC_BANKS));
+                                DebugLog[assoc_query_diag_base + 4u] =
+                                    max(DebugLog[assoc_query_diag_base + 4u], max_score - min_score);
+                                DebugLog[assoc_query_diag_base + 5u] =
+                                    max(DebugLog[assoc_query_diag_base + 5u], bank_key_cos);
+                                DebugLog[assoc_query_diag_base + 6u] = DebugLog[assoc_query_diag_base + 6u] + 1.0;
+                                DebugLog[assoc_query_diag_base + 7u] =
+                                    DebugLog[assoc_query_diag_base + 7u]
+                                    + sqrt(shared_vals[3u * ASSOC_RANK + ASSOC_BANKS] / max(1.0, f32(ASSOC_RANK)));
+                            }
+                        }
+                    }
+                    workgroupBarrier();
+                    let assoc_read_conf =
+                        select(1.0, shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 1u], ENABLE_ASSOC_CONF_READ);
+                    var assoc_ctx0 = 0.0;
+                    var assoc_ctx1 = 0.0;
+                    for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                        let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                        let bank_value_base = bank_base + ASSOC_RANK;
+                        let assoc_match = assoc_read_conf * shared_vals[3u * ASSOC_RANK + bank];
+                        assoc_ctx0 = assoc_ctx0 + assoc_match * AssocBuf[bank_value_base + d0];
+                        assoc_ctx1 = assoc_ctx1 + assoc_match * AssocBuf[bank_value_base + d1];
+                    }
+                    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: measure injected assoc context magnitude.
+                    shared_vals[tid] = assoc_ctx0 * assoc_ctx0 + assoc_ctx1 * assoc_ctx1;
+                    workgroupBarrier();
+                    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                        if (tid < stride) {
+                            shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                        }
+                        workgroupBarrier();
+                    }
+                    if (tid == 0u) {
+                        if (debug_on) {
+                            let assoc_diag_base = 760u + slot_idx * 10u;
+                            DebugLog[assoc_diag_base + 2u] = max(
+                                DebugLog[assoc_diag_base + 2u],
+                                sqrt(shared_vals[0] / max(1.0, f32(d_model))),
+                            );
+                            if (t + 1u == shape.token_count) {
+                                let assoc_query_diag_base = 820u + slot_idx * 8u;
+                                DebugLog[assoc_query_diag_base + 2u] = max(
+                                    DebugLog[assoc_query_diag_base + 2u],
+                                    sqrt(shared_vals[0] / max(1.0, f32(d_model))),
+                                );
+                            }
+                        }
+                    }
+                    fpm_ctx0 = fpm_ctx0 + alpha_assoc * assoc_ctx0;
+                    fpm_ctx1 = fpm_ctx1 + alpha_assoc * assoc_ctx1;
+                }
                 workgroupBarrier();
             }
 
@@ -972,9 +1209,9 @@ fn deq_slot_coord_unified_main(
                 let h_prev1 = H_curr[h_base + slot_offset + d1];
                 let attn0 = select(0.0, Scratch[attn_base + d0] * slot_attn_scale, recurrent_slot_attn_enabled || iter == 0u);
                 let attn1 = select(0.0, Scratch[attn_base + d1] * slot_attn_scale, recurrent_slot_attn_enabled || iter == 0u);
-                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + attn0
+                let h_dep0 = Scratch[signal_base + d0] + H_SELF_FEEDBACK * h_prev0 + attn0
                            + AllWeights[slot_anchor_mat_base + d0];
-                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + attn1
+                let h_dep1 = Scratch[signal_base + d1] + H_SELF_FEEDBACK * h_prev1 + attn1
                            + AllWeights[slot_anchor_mat_base + d1];
                 H_next[h_base_t + slot_offset + d0] = h_dep0 + hhist_gamma_wg * h_hist0;
                 H_next[h_base_t + slot_offset + d1] = h_dep1 + hhist_gamma_wg * h_hist1;
@@ -997,12 +1234,14 @@ fn deq_slot_coord_unified_main(
                     Scratch[attn_base + d1] * slot_attn_scale,
                     recurrent_slot_attn_enabled || iter == 0u,
                 );
-                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + attn0
+                let h_dep0 = Scratch[signal_base + d0] + H_SELF_FEEDBACK * h_prev0 + attn0
                            + AllWeights[slot_anchor_mat_base + d0];
-                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + attn1
+                let h_dep1 = Scratch[signal_base + d1] + H_SELF_FEEDBACK * h_prev1 + attn1
                            + AllWeights[slot_anchor_mat_base + d1];
-                H_next[h_base_t + slot_offset + d0] = h_dep0 + fpm_ctx0;
-                H_next[h_base_t + slot_offset + d1] = h_dep1 + fpm_ctx1;
+                let pre0 = h_dep0 + fpm_ctx0;
+                let pre1 = h_dep1 + fpm_ctx1;
+                H_next[h_base_t + slot_offset + d0] = pre0;
+                H_next[h_base_t + slot_offset + d1] = pre1;
                 local_sumsq = h_dep0 * h_dep0 + h_dep1 * h_dep1;
             } else if (ENABLE_HIST_CTX && d_model == WG_SIZE * 2u) {
                 let d0 = tid;
@@ -1011,9 +1250,9 @@ fn deq_slot_coord_unified_main(
                 let h_prev1 = H_curr[h_base + slot_offset + d1];
                 let attn0 = select(0.0, Scratch[attn_base + d0] * slot_attn_scale, recurrent_slot_attn_enabled || iter == 0u);
                 let attn1 = select(0.0, Scratch[attn_base + d1] * slot_attn_scale, recurrent_slot_attn_enabled || iter == 0u);
-                let h_dep0 = Scratch[signal_base + d0] + h_prev0 + attn0
+                let h_dep0 = Scratch[signal_base + d0] + H_SELF_FEEDBACK * h_prev0 + attn0
                            + AllWeights[slot_anchor_mat_base + d0] + hist_mem0;
-                let h_dep1 = Scratch[signal_base + d1] + h_prev1 + attn1
+                let h_dep1 = Scratch[signal_base + d1] + H_SELF_FEEDBACK * h_prev1 + attn1
                            + AllWeights[slot_anchor_mat_base + d1] + hist_mem1;
                 H_next[h_base_t + slot_offset + d0] = h_dep0;
                 H_next[h_base_t + slot_offset + d1] = h_dep1;
@@ -1023,7 +1262,7 @@ fn deq_slot_coord_unified_main(
                     let h_prev = H_curr[h_base + slot_offset + d];
                     let attn = select(0.0, Scratch[attn_base + d] * slot_attn_scale, recurrent_slot_attn_enabled || iter == 0u);
                     let pre = Scratch[signal_base + d]
-                        + h_prev
+                        + H_SELF_FEEDBACK * h_prev
                         + attn
                         + AllWeights[slot_anchor_mat_base + d];
                     H_next[h_base_t + slot_offset + d] = pre;
@@ -1175,12 +1414,18 @@ fn deq_slot_coord_unified_main(
             let stop_err_h = shared_vals[0];
             let homeo_band = max(shape.epsilon, FPM_HOMEO_ALPHA_ERR_SCALE * alpha_h);
             let plateau_ratio = abs(stop_err_h - prev_err_h) / max(prev_err_h, shape.epsilon);
+            let strict_converged = stop_err_h < shape.epsilon;
             let homeostatic_converged =
                 iter + 1u >= FPM_HOMEO_MIN_ITERS
                 && stop_err_h <= homeo_band
                 && plateau_ratio <= FPM_HOMEO_PLATEAU_TOL;
-            if (tid == 0u && (stop_err_h < shape.epsilon || homeostatic_converged)) {
+            if (tid == 0u && (strict_converged || homeostatic_converged)) {
                 converged_flag_wg = 1u;
+                if (strict_converged) {
+                    token_strict_converged = true;
+                } else {
+                    token_homeostatic_converged = true;
+                }
                 if (!rescue_active) {
                     converged_before_rescue = true;
                 }
@@ -1229,6 +1474,7 @@ fn deq_slot_coord_unified_main(
                 solve_attn_rms_seen = max(solve_attn_rms_seen, attn_rms);
                 solve_attn_to_signal_seen = max(solve_attn_to_signal_seen, attn_to_signal);
                 solve_attn_scale_seen = max(solve_attn_scale_seen, abs(slot_attn_scale));
+                max_homeo_band_seen = max(max_homeo_band_seen, homeo_band);
                 if (iter == 0u) {
                     iter0_err_h_seen = max(iter0_err_h_seen, stop_err_h);
                     iter0_attn_to_signal_seen = max(
@@ -1289,6 +1535,13 @@ fn deq_slot_coord_unified_main(
             if (converged_before_rescue) {
                 pre_rescue_converged_sum = pre_rescue_converged_sum + 1.0;
             }
+            if (token_strict_converged) {
+                strict_converged_sum = strict_converged_sum + 1.0;
+            } else if (token_homeostatic_converged) {
+                homeostatic_converged_sum = homeostatic_converged_sum + 1.0;
+            } else {
+                failed_converged_sum = failed_converged_sum + 1.0;
+            }
             if (!converged) {
                 failed_hits_seen = failed_hits_seen + 1u;
             }
@@ -1322,6 +1575,7 @@ fn deq_slot_coord_unified_main(
         // The base state therefore follows the same slot-wise temporal dynamics as the CPU
         // reference path (a_log / w_x / w_out), while retain/z/proposal modulate the novelty
         // injected into that carrier.
+        var assoc_write_gate_token = 1.0;
         if (fpm_write_enabled && d_model == WG_SIZE * 2u) {
             let d0 = tid;
             let d1 = tid + WG_SIZE;
@@ -1409,10 +1663,21 @@ fn deq_slot_coord_unified_main(
                 workgroupBarrier();
             }
             let prev_norm = sqrt(max(shared_vals[0], 1e-6));
-            // Structural novelty gate: write strength scales with how much the proposal differs
-            // from the carried memory, rather than saturating at a fixed global clamp.
-            let novelty = proposal_norm / (proposal_norm + prev_norm + 1e-6);
-            let z = clamp(raw_z * novelty, 0.0, 1.0);
+            let diff0 = proposal0 - m_prev0;
+            let diff1 = proposal1 - m_prev1;
+            shared_vals[tid] = diff0 * diff0 + diff1 * diff1;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            // Structural novelty measures actual disagreement between the candidate write
+            // and the carried memory, not just the magnitude of the candidate.
+            let diff_norm = sqrt(max(shared_vals[0], 1e-6));
+            let novelty = diff_norm / (diff_norm + prev_norm + 1e-6);
+            let z = clamp(raw_z, 0.0, 1.0);
             // Retain gate (low-rank r=32): retain = σ(W_down · (W_up · c) + b_retain)
             // Replaces uniform fatigue decay with input-dependent selective forgetting.
             let hist_base_r = aw_hist_base(d_model, h_slots);
@@ -1437,27 +1702,31 @@ fn deq_slot_coord_unified_main(
                 down_acc0 = down_acc0 + AllWeights[wdown_base + r * d_model + d0] * shared_vals[r];
                 down_acc1 = down_acc1 + AllWeights[wdown_base + r * d_model + d1] * shared_vals[r];
             }
-            let retain0 = 1.0 / (1.0 + exp(-down_acc0));
-            let retain1 = 1.0 / (1.0 + exp(-down_acc1));
-            // Structural update budget: write magnitude is coupled to the amount of forgetting.
-            // If retain≈1, the slot is choosing to preserve its memory and must not inject
-            // a full-strength write on top of that same retained state.
+            let retain_raw0 = 1.0 / (1.0 + exp(-down_acc0));
+            let retain_raw1 = 1.0 / (1.0 + exp(-down_acc1));
+            // Retain is now a true preservation gate:
+            // when novelty is low, preserve memory regardless of local write preference;
+            // when novelty is high, the learned retain gate decides which dimensions stay fixed.
+            let retain0 = 1.0 - novelty * (1.0 - retain_raw0);
+            let retain1 = 1.0 - novelty * (1.0 - retain_raw1);
             let write_budget0 = (1.0 - retain0) * z;
             let write_budget1 = (1.0 - retain1) * z;
-            let write0 = write_budget0 * (residual_scale * proposal0);
-            let write1 = write_budget1 * (residual_scale * proposal1);
+            let write0 = z * (residual_scale * proposal0);
+            let write1 = z * (residual_scale * proposal1);
             let wx0 = 0.5 * tanh(AllWeights[wx_base + d0 * d_model + d0]);
             let wx1 = 0.5 * tanh(AllWeights[wx_base + d1 * d_model + d1]);
             let wx_term0 = wx0 * h_unit0;
             let wx_term1 = wx1 * h_unit1;
-            let h_write0 = sqrt(max(write_budget0, 1.0e-6)) * h_unit0;
-            let h_write1 = sqrt(max(write_budget1, 1.0e-6)) * h_unit1;
+            let h_write0 = sqrt(max(z, 1.0e-6)) * h_unit0;
+            let h_write1 = sqrt(max(z, 1.0e-6)) * h_unit1;
             let x_proj0 = h_write0 + wx_term0 + write0;
             let x_proj1 = h_write1 + wx_term1 + write1;
             let a0 = 1.0 / (1.0 + exp(AllWeights[alog_off + d0]));
             let a1 = 1.0 / (1.0 + exp(AllWeights[alog_off + d1]));
-            let m_inner0 = a0 * m_prev0 + (1.0 - a0) * x_proj0;
-            let m_inner1 = a1 * m_prev1 + (1.0 - a1) * x_proj1;
+            let base_inner0 = a0 * m_prev0 + (1.0 - a0) * x_proj0;
+            let base_inner1 = a1 * m_prev1 + (1.0 - a1) * x_proj1;
+            let m_inner0 = retain0 * m_prev0 + (1.0 - retain0) * base_inner0;
+            let m_inner1 = retain1 * m_prev1 + (1.0 - retain1) * base_inner1;
             H_next[h_base_t + slot_offset + d0] = m_inner0;
             H_next[h_base_t + slot_offset + d1] = m_inner1;
             workgroupBarrier();
@@ -1468,6 +1737,10 @@ fn deq_slot_coord_unified_main(
                 out_acc0 = out_acc0 + AllWeights[wout_base + d0 * d_model + j] * m_inner_j;
                 out_acc1 = out_acc1 + AllWeights[wout_base + d1 * d_model + j] * m_inner_j;
             }
+            // W_out remains observable as a readout/refinement term, but the recurrent
+            // FPM state itself is m_inner. Recirculating (I + W_out)m_inner as memory made
+            // the state semantics depend on a readout transform and became unstable when
+            // FPM was given enough alpha to matter.
             let m_candidate0 = out_acc0;
             let m_candidate1 = out_acc1;
             let wout_term0 = m_candidate0 - m_inner0;
@@ -1534,8 +1807,8 @@ fn deq_slot_coord_unified_main(
                 workgroupBarrier();
             }
             // Diagnostics: replicate the same reductions as the original per-iter block.
-            var local_delta_m_num_p = (m_candidate0 - m_prev0) * (m_candidate0 - m_prev0)
-                                    + (m_candidate1 - m_prev1) * (m_candidate1 - m_prev1);
+            var local_delta_m_num_p = (m_inner0 - m_prev0) * (m_inner0 - m_prev0)
+                                    + (m_inner1 - m_prev1) * (m_inner1 - m_prev1);
             shared_vals[tid] = local_delta_m_num_p;
             workgroupBarrier();
             for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
@@ -1555,7 +1828,7 @@ fn deq_slot_coord_unified_main(
                 workgroupBarrier();
             }
             let delta_m_prev_den_p = shared_vals[0];
-            let local_delta_m_cand_den_p = m_candidate0 * m_candidate0 + m_candidate1 * m_candidate1;
+            let local_delta_m_cand_den_p = m_inner0 * m_inner0 + m_inner1 * m_inner1;
             shared_vals[tid] = local_delta_m_cand_den_p;
             workgroupBarrier();
             for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
@@ -1566,7 +1839,7 @@ fn deq_slot_coord_unified_main(
             }
             let delta_m_cand_den_p = shared_vals[0];
             let err_m_p = sqrt(delta_m_num_p / max(max(delta_m_prev_den_p, delta_m_cand_den_p), FPM_EPS));
-            let local_max_delta_m_p = max(abs(m_candidate0 - m_prev0), abs(m_candidate1 - m_prev1));
+            let local_max_delta_m_p = max(abs(m_inner0 - m_prev0), abs(m_inner1 - m_prev1));
             shared_vals[tid] = local_max_delta_m_p;
             workgroupBarrier();
             for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
@@ -1579,6 +1852,16 @@ fn deq_slot_coord_unified_main(
             let upd_num_p = write0 * write0 + write1 * write1;
             let upd_den_p = m_prev0 * m_prev0 + m_prev1 * m_prev1;
             let update_ratio_p = sqrt(upd_num_p / (upd_den_p + FPM_EPS));
+            let local_assoc_write_budget = write_budget0 + write_budget1;
+            shared_vals[tid] = local_assoc_write_budget;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            assoc_write_gate_token = ASSOC_WRITE_CAP * raw_z;
             if (tid == 0u) {
                 max_m_delta_seen = max(max_m_delta_seen, iter_max_delta_m_p);
                 max_err_m_seen = max(max_err_m_seen, err_m_p);
@@ -1594,8 +1877,8 @@ fn deq_slot_coord_unified_main(
                 DebugLog[slot_probe_base + 4u] = max(DebugLog[slot_probe_base + 4u], proposal_rms_p);
                 DebugLog[slot_probe_base + 5u] = max(DebugLog[slot_probe_base + 5u], candidate_rms_p);
             }
-            fpm_m_cache[d0] = m_candidate0;
-            fpm_m_cache[d1] = m_candidate1;
+            fpm_m_cache[d0] = m_inner0;
+            fpm_m_cache[d1] = m_inner1;
             workgroupBarrier();
         }
         if (debug_on && slot_idx == 0u && tid == 0u && t == 0u) {
@@ -1604,15 +1887,255 @@ fn deq_slot_coord_unified_main(
         workgroupBarrier();
 
         // Model A token-local history: once write is enabled, each token materializes its
-        // converged working memory into HistCtx so the next token in the same chunk can read it.
+        // internal FPM state into HistCtx so the next token in the same chunk can read it.
         // Inter-chunk persistence remains a separate stage handled by the bridge via MState.
         if (fpm_write_enabled && d_model == WG_SIZE * 2u) {
             let working0 = fpm_m_cache[tid];
             let working1 = fpm_m_cache[tid + WG_SIZE];
             // Per-token storage for the causal history snapshot and retain-gate backward.
-            // Stage 5 promotes the last token of the chunk into MState for inter-chunk carry.
+            // The bridge Rust-side copies HistCtx[last_token] → MState after each chunk (stage>=4).
             HistCtx[h_base_t + slot_offset + tid] = working0;
             HistCtx[h_base_t + slot_offset + tid + WG_SIZE] = working1;
+        }
+        if (assoc_write_enabled && d_model == WG_SIZE * 2u) {
+            let d0 = tid;
+            let d1 = tid + WG_SIZE;
+            let hist_base = aw_hist_base(d_model, h_slots);
+            // Default coupled path: write keys come from the FPM write-key encoder.
+            let wk_assoc = hist_base + w_k_write_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
+            let wv_assoc = hist_base + w_v_assoc_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
+            let wevent_assoc = hist_base + w_event_assoc_base(d_model, h_slots) + slot_offset;
+            let bevent_assoc = hist_base + b_event_assoc_base(d_model, h_slots) + slot_idx;
+            let assoc_anchor_base = hist_base + slot_anchor_base(d_model, h_slots) + slot_offset;
+            // Layout per bank: [bank_key | bank_value | usage].
+            let assoc_hist_base =
+                ((batch_idx * shape.token_count + t) * h_slots + slot_idx) * assoc_slot_stride;
+            for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                let hist_bank_base = assoc_hist_base + bank * assoc_bank_stride;
+                if (tid < ASSOC_RANK) {
+                    AssocHist[hist_bank_base + tid] = AssocBuf[bank_base + tid];
+                }
+                AssocHist[hist_bank_base + ASSOC_RANK + d0] =
+                    AssocBuf[bank_base + ASSOC_RANK + d0];
+                AssocHist[hist_bank_base + ASSOC_RANK + d1] =
+                    AssocBuf[bank_base + ASSOC_RANK + d1];
+                if (tid == 0u) {
+                    AssocHist[hist_bank_base + ASSOC_RANK + d_model] =
+                        AssocBuf[bank_base + ASSOC_RANK + d_model];
+                }
+            }
+            workgroupBarrier();
+            let assoc_raw0 =
+                Scratch[signal_base + d0]
+                + select(0.0, AllWeights[assoc_anchor_base + d0], ENABLE_ASSOC_SLOT_ANCHOR);
+            let assoc_raw1 =
+                Scratch[signal_base + d1]
+                + select(0.0, AllWeights[assoc_anchor_base + d1], ENABLE_ASSOC_SLOT_ANCHOR);
+            shared_vals[tid] = assoc_raw0 * assoc_raw0 + assoc_raw1 * assoc_raw1;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let assoc_signal_rms = sqrt(shared_vals[0] * inv_d_model + 1.0e-6);
+            let assoc_src0 = assoc_raw0 / max(assoc_signal_rms, 1.0e-6);
+            let assoc_src1 = assoc_raw1 / max(assoc_signal_rms, 1.0e-6);
+            let has_prev_hstar = select(0.0, 1.0, global_t > 0u);
+            // Event gate is a learned transition classifier over prev_source → curr_source.
+            // It prevents capacity from being consumed by arbitrary adjacent-token transitions.
+            shared_vals[tid] =
+                AllWeights[wevent_assoc + d0] * (PrevHStarBuf[prev_hstar_base + d0] + assoc_src0)
+                + AllWeights[wevent_assoc + d1] * (PrevHStarBuf[prev_hstar_base + d1] + assoc_src1);
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let learned_event_gate = 1.0 / (
+                1.0 + exp(-(shared_vals[0] * inv_sqrt_d_model + AllWeights[bevent_assoc]))
+            );
+            let event_gate = select(1.0, learned_event_gate, ENABLE_ASSOC_EVENT_GATE);
+            let bind_gate = clamp(assoc_write_gate_token, 0.0, ASSOC_WRITE_CAP) * event_gate * has_prev_hstar;
+            // Durable binding update:
+            //   bank_key   <- (1-g) bank_key   + g * W_k(h*_{t-1})
+            //   bank_value <- (1-g) bank_value + g * h*_t
+            // This lets FPM govern consolidation strength while the binding branch stores
+            // the actual association instead of overwriting a short FIFO.
+            if (tid < ASSOC_RANK) {
+                var k_acc = 0.0;
+                var v_acc = 0.0;
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let prev_sig_j = PrevHStarBuf[prev_hstar_base + j]; // associative source at t-1
+                    k_acc = k_acc + AllWeights[wk_assoc + j * ASSOC_RANK + tid] * prev_sig_j;
+                    let curr_sig_j =
+                        (Scratch[signal_base + j]
+                            + select(0.0, AllWeights[assoc_anchor_base + j], ENABLE_ASSOC_SLOT_ANCHOR))
+                        / max(assoc_signal_rms, 1.0e-6);
+                    v_acc = v_acc + AllWeights[wv_assoc + j * ASSOC_RANK + tid] * curr_sig_j;
+                }
+                shared_vals[tid] = tanh(k_acc * inv_sqrt_d_model);
+                shared_vals[ASSOC_RANK + tid] = tanh(v_acc * inv_sqrt_d_model);
+            }
+            workgroupBarrier();
+            if (tid == 0u) {
+                var chosen_bank = 0u;
+                var found_empty = false;
+                var empty_bank = 0u;
+                var best_cos = -1.0e30;
+                var best_bank = 0u;
+                var min_usage = 1.0e30;
+                var min_usage_bank = 0u;
+                var allow_write = 0.0;
+                var new_key_norm = 0.0;
+                for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                    new_key_norm = new_key_norm + shared_vals[r] * shared_vals[r];
+                }
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                    var key_norm = 0.0;
+                    var score = 0.0;
+                    for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                        let key_r = AssocBuf[bank_base + r];
+                        key_norm = key_norm + key_r * key_r;
+                        score = score + key_r * shared_vals[r];
+                    }
+                    let bank_usage = AssocBuf[bank_base + ASSOC_RANK + d_model];
+                    if (bank_usage < min_usage) {
+                        min_usage = bank_usage;
+                        min_usage_bank = bank;
+                    }
+                    if (!found_empty && (key_norm < 1.0e-8 || bank_usage < 1.0e-4)) {
+                        empty_bank = bank;
+                        found_empty = true;
+                    }
+                    let cos = score / sqrt(max(key_norm * new_key_norm, 1.0e-12));
+                    if (cos > best_cos) {
+                        best_cos = cos;
+                        best_bank = bank;
+                    }
+                }
+                if (ENABLE_ASSOC_REUSE_MATCH && best_cos > 0.80) {
+                    chosen_bank = best_bank;
+                    allow_write = 1.0;
+                } else if (found_empty) {
+                    chosen_bank = empty_bank;
+                    allow_write = 1.0;
+                } else if (best_cos <= 0.80 && min_usage < ASSOC_ALLOC_THRESHOLD) {
+                    chosen_bank = min_usage_bank;
+                    allow_write = 1.0;
+                }
+                if (ENABLE_ASSOC_SLOT_STRIPE && (t % h_slots) != slot_idx) {
+                    // Experimental multi-bank routing: make slots behave like distinct
+                    // write heads instead of duplicating the same early transitions.
+                    allow_write = 0.0;
+                }
+                shared_vals[3u * ASSOC_RANK] = f32(chosen_bank);
+                shared_vals[3u * ASSOC_RANK + 1u] = allow_write;
+                shared_vals[3u * ASSOC_RANK + 2u] = best_cos;
+                shared_vals[3u * ASSOC_RANK + 3u] = min_usage;
+                var transition_gate = 1.0;
+                if (ENABLE_ASSOC_TRANSITION_GATE) {
+                    var transition_score = 0.0;
+                    for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                        transition_score = transition_score + shared_vals[r] * shared_vals[ASSOC_RANK + r];
+                    }
+                    transition_gate =
+                        1.0 / (1.0 + exp(-transition_score * inverseSqrt(max(1.0, f32(ASSOC_RANK)))));
+                }
+                shared_vals[3u * ASSOC_RANK + 4u] = transition_gate;
+            }
+            workgroupBarrier();
+            let chosen_bank = u32(shared_vals[3u * ASSOC_RANK]);
+            let assoc_write_allowed = shared_vals[3u * ASSOC_RANK + 1u];
+            let assoc_transition_gate = shared_vals[3u * ASSOC_RANK + 4u];
+            let chosen_bank_base = assoc_slot_base + chosen_bank * assoc_bank_stride;
+            let bank_key_base = chosen_bank_base;
+            let bank_value_base = chosen_bank_base + ASSOC_RANK;
+            let bank_usage_idx = chosen_bank_base + ASSOC_RANK + d_model;
+            let effective_bind_gate = bind_gate * assoc_write_allowed * assoc_transition_gate;
+            let effective_keep_gate = 1.0 - effective_bind_gate;
+            if (tid == 0u) {
+                // TEMPORARY ASSOCIATIVE DIAGNOSTIC: write allocation telemetry.
+                if (debug_on) {
+                    let assoc_diag_base = 760u + slot_idx * 10u;
+                    DebugLog[assoc_diag_base + 4u] =
+                        DebugLog[assoc_diag_base + 4u] + assoc_write_allowed;
+                    DebugLog[assoc_diag_base + 5u] =
+                        DebugLog[assoc_diag_base + 5u] + effective_bind_gate;
+                    DebugLog[assoc_diag_base + 6u] =
+                        max(DebugLog[assoc_diag_base + 6u], shared_vals[3u * ASSOC_RANK + 2u]);
+                    DebugLog[assoc_diag_base + 7u] =
+                        min(DebugLog[assoc_diag_base + 7u], shared_vals[3u * ASSOC_RANK + 3u]);
+                    DebugLog[assoc_diag_base + 9u] = DebugLog[assoc_diag_base + 9u] + 1.0;
+                }
+            }
+            if (tid < ASSOC_RANK) {
+                AssocBuf[bank_key_base + tid] =
+                    effective_keep_gate * AssocBuf[bank_key_base + tid] + effective_bind_gate * shared_vals[tid];
+            }
+            workgroupBarrier();
+            if (debug_on) {
+                let prev0 = PrevHStarBuf[prev_hstar_base + d0];
+                let prev1 = PrevHStarBuf[prev_hstar_base + d1];
+                shared_vals[tid] = prev0 * assoc_src0 + prev1 * assoc_src1;
+                Scratch[signal_base + tid] = prev0 * prev0 + prev1 * prev1;
+                Scratch[signal_base + WG_SIZE + tid] = assoc_src0 * assoc_src0 + assoc_src1 * assoc_src1;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                        Scratch[signal_base + tid] = Scratch[signal_base + tid] + Scratch[signal_base + tid + stride];
+                        Scratch[signal_base + WG_SIZE + tid] =
+                            Scratch[signal_base + WG_SIZE + tid] + Scratch[signal_base + WG_SIZE + tid + stride];
+                    }
+                    workgroupBarrier();
+                }
+                if (tid == 0u) {
+                    let h_cos = shared_vals[0]
+                        * inverseSqrt(max(Scratch[signal_base] * Scratch[signal_base + WG_SIZE], 1.0e-12));
+                    let assoc_h_diag_base = 860u + slot_idx * 4u;
+                    DebugLog[assoc_h_diag_base + 0u] = DebugLog[assoc_h_diag_base + 0u] + h_cos;
+                    DebugLog[assoc_h_diag_base + 1u] = max(DebugLog[assoc_h_diag_base + 1u], h_cos);
+                    DebugLog[assoc_h_diag_base + 2u] = min(DebugLog[assoc_h_diag_base + 2u], h_cos);
+                    DebugLog[assoc_h_diag_base + 3u] = DebugLog[assoc_h_diag_base + 3u] + 1.0;
+                }
+                workgroupBarrier();
+            }
+            AssocBuf[bank_value_base + d0] =
+                effective_keep_gate * AssocBuf[bank_value_base + d0] + effective_bind_gate * assoc_src0;
+            AssocBuf[bank_value_base + d1] =
+                effective_keep_gate * AssocBuf[bank_value_base + d1] + effective_bind_gate * assoc_src1;
+            if (fpm_write_enabled) {
+                // Phase bridge: FPM first controls binding write strength; only after the
+                // binding bank is updated does FPM consolidate a small part of that selected
+                // value into its slower recurrent state. KV identity stays clean, while FPM
+                // gains a long-term path from the explicit binding memory.
+                let consolidate = ASSOC_TO_FPM_SCALE * effective_bind_gate;
+                fpm_m_cache[d0] =
+                    (1.0 - consolidate) * fpm_m_cache[d0] + consolidate * AssocBuf[bank_value_base + d0];
+                fpm_m_cache[d1] =
+                    (1.0 - consolidate) * fpm_m_cache[d1] + consolidate * AssocBuf[bank_value_base + d1];
+                HistCtx[h_base_t + slot_offset + d0] = fpm_m_cache[d0];
+                HistCtx[h_base_t + slot_offset + d1] = fpm_m_cache[d1];
+            }
+            if (tid == 0u) {
+                let decayed_usage = ASSOC_USAGE_DECAY * AssocBuf[bank_usage_idx];
+                AssocBuf[bank_usage_idx] = clamp(decayed_usage + effective_bind_gate, 0.0, 1.0);
+            }
+            workgroupBarrier();
+            if (tid < ASSOC_RANK) {
+                // keep workgroup ordering aligned before PrevHStar write
+            }
+            workgroupBarrier();
+            // Save token-local associative source for the next query/key.
+            // Identity stays explicit; FPM/DEQ coupling enters through write/read control.
+            PrevHStarBuf[prev_hstar_base + d0] = assoc_src0;
+            PrevHStarBuf[prev_hstar_base + d1] = assoc_src1;
         }
         if (debug_on && slot_idx == 0u && tid == 0u && t == 0u) {
             DebugLog[8] = 185.0;
@@ -1677,6 +2200,19 @@ fn deq_slot_coord_unified_main(
         DebugLog[slot_read_base + 0u] = max_memctx_rms_seen;
         DebugLog[slot_read_base + 1u] = max_memctx_to_signal_seen;
         DebugLog[slot_read_base + 3u] = DebugLog[slot_read_base + 3u] / token_den;
+        // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove DebugLog[760..] once assoc recall is fixed.
+        let assoc_diag_base = 760u + slot_idx * 10u;
+        let assoc_read_den = max(1.0, DebugLog[assoc_diag_base + 8u]);
+        let assoc_write_den = max(1.0, DebugLog[assoc_diag_base + 9u]);
+        DebugLog[assoc_diag_base + 0u] = DebugLog[assoc_diag_base + 0u] / assoc_read_den;
+        DebugLog[assoc_diag_base + 3u] = DebugLog[assoc_diag_base + 3u] / assoc_read_den;
+        DebugLog[assoc_diag_base + 4u] = DebugLog[assoc_diag_base + 4u] / assoc_write_den;
+        DebugLog[assoc_diag_base + 5u] = DebugLog[assoc_diag_base + 5u] / assoc_write_den;
+        let solve_exit_base = 688u + slot_idx * 4u;
+        DebugLog[solve_exit_base + 0u] = strict_converged_sum;
+        DebugLog[solve_exit_base + 1u] = homeostatic_converged_sum;
+        DebugLog[solve_exit_base + 2u] = failed_converged_sum;
+        DebugLog[solve_exit_base + 3u] = max_homeo_band_seen;
         if (debug_on && slot_idx == 0u) {
             DebugLog[8] = 901.0;
             DebugLog[9] = shape.epsilon;

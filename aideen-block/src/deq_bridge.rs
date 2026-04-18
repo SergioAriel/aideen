@@ -18,6 +18,7 @@ pub struct DeqComputeShape {
     pub fpm_stage: u32,
     pub fpm_alpha_m: f32,
     pub fpm_tau: f32,
+    pub fpm_read_gate_min: f32,
 }
 
 #[repr(C)]
@@ -76,6 +77,9 @@ pub struct RustDeqBridge {
     pub debug_buf: wgpu::Buffer,
     pub hist_ctx_buf: wgpu::Buffer,
     pub mstate_buf: wgpu::Buffer,
+    pub prev_hstar_buf: wgpu::Buffer,
+    pub assoc_buf: wgpu::Buffer,
+    pub assoc_hist_buf: wgpu::Buffer,
     pub signal_cache_buf: wgpu::Buffer,
     pub h_hist_buf: wgpu::Buffer,
     pub hist_ctx_enabled: bool,
@@ -123,7 +127,7 @@ pub fn aw_total_bytes(d: u64, h: u64, hist_len: u64) -> u64 {
 impl RustDeqBridge {
     fn clean_scratch_stride(d_model: u32, h_slots: u32) -> u32 {
         let signal = d_model * h_slots;
-        signal * 2 + h_slots * h_slots
+        signal * 3 + h_slots * h_slots
     }
 
     fn pooled_elements(batch_size: u32, seq_len: u32, d_model: u32) -> u64 {
@@ -160,6 +164,60 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|v| v.clamp(8, 32))
             .unwrap_or(32);
+        let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(1, 4))
+            .unwrap_or(1);
+        let assoc_transition_gate = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_slot_anchor = std::env::var("AIDEEN_ASSOC_SLOT_ANCHOR")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_reuse_match = std::env::var("AIDEEN_ASSOC_REUSE_MATCH")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_slot_stripe = std::env::var("AIDEEN_ASSOC_SLOT_STRIPE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_tie_qk = std::env::var("AIDEEN_ASSOC_TIE_QK")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_conf_read = std::env::var("AIDEEN_ASSOC_CONF_READ")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_event_gate = std::env::var("AIDEEN_ASSOC_EVENT_GATE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
 
         let mut entries = Vec::new();
         entries.push(wgpu::BindGroupLayoutEntry {
@@ -195,8 +253,9 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // bindings 3-11: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState, SignalCache, H_hist
-        for i in 3u32..=11 {
+        // bindings 3-14: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState,
+        // SignalCache, H_hist, PrevHStarBuf, AssocBuf, AssocHist
+        for i in 3u32..=14 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -297,6 +356,35 @@ impl RustDeqBridge {
             if fpm_enabled { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert("FPM_MEM_ITERS".to_string(), fpm_mem_iters as f64);
+        slot_coord_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_TRANSITION_GATE".to_string(),
+            if assoc_transition_gate { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_SLOT_ANCHOR".to_string(),
+            if assoc_slot_anchor { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_REUSE_MATCH".to_string(),
+            if assoc_reuse_match { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_SLOT_STRIPE".to_string(),
+            if assoc_slot_stripe { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_TIE_QK".to_string(),
+            if assoc_tie_qk { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_CONF_READ".to_string(),
+            if assoc_conf_read { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_EVENT_GATE".to_string(),
+            if assoc_event_gate { 1.0 } else { 0.0 },
+        );
         let slot_coord_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("DEQ SlotCoord Unified Pipeline"),
@@ -511,6 +599,7 @@ impl RustDeqBridge {
         // Single AllWeights buffer: W_q | W_k | W_v | W_o | W_in | W_x | W_out | A_log | NormScale | HistParams
         const RETAIN_RANK: u32 = 32;
         const MEM_READ_RANK: u32 = 32;
+        const ASSOC_RANK: u32 = 32;
         let hist_params_len = d_model * d_model              // hist_mat (1 shared)
             + 5u32 * h_slots * d_model                       // slot_anchor+scale/bias+hist_gate_query+w_write_gate
             + 2u32 * h_slots                                 // hist_gate + b_write_mem
@@ -521,7 +610,11 @@ impl RustDeqBridge {
             + 2u32 * h_slots * d_model * RETAIN_RANK         // W_retain_up + W_retain_down
             + h_slots * d_model                              // b_retain
             + 2u32 * h_slots * d_model * MEM_READ_RANK       // W_q_mem + W_k_mem
-            + h_slots;                                       // b_read_mem
+            + h_slots                                         // b_read_mem
+            + 3u32 * h_slots * d_model * ASSOC_RANK          // assoc projections/reserved layout
+            + h_slots                                        // alpha_assoc
+            + h_slots * d_model                              // W_event_assoc
+            + h_slots;                                       // b_event_assoc
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
@@ -578,10 +671,9 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Clean DEQ core scratch layout per (batch, token):
-        //   signal [h*d]
-        // The old full-DEQ layout reserved q/k/v/attn/fpm/history regions that the clean
-        // solve no longer touches.
+        // Clean DEQ core scratch layout per (batch, token), matching
+        // deq_slot_attn_unified_clean.wgsl:
+        //   signal[h*d] | attn[h*d] | alpha[h*d] | slot_scores[h*h]
         let scratch_stride = Self::clean_scratch_stride(d_model, h_slots);
         let scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scratchpad"),
@@ -619,6 +711,39 @@ impl RustDeqBridge {
         let mstate_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Hist V2 MState"),
             size: h_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let prev_hstar_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Prev HStar"),
+            size: h_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Associative binding memory layout per (batch, slot):
+        //   ASSOC_BANKS × (bank_key[R] | bank_value[d_model] | usage)
+        // FPM still modulates write strength, while binding uses a compact learned key
+        // and stores the converged value directly in model space.
+        let assoc_slot_stride =
+            (assoc_banks as u64) * ((ASSOC_RANK as u64 + d_model as u64 + 1u64) * 4u64);
+        let assoc_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc Buffer"),
+            size: (max_batch_size as u64) * (h_slots as u64) * assoc_slot_stride,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let assoc_hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc History"),
+            size: (max_batch_size as u64)
+                * (max_seq_len as u64)
+                * (h_slots as u64)
+                * assoc_slot_stride,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -692,6 +817,18 @@ impl RustDeqBridge {
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: h_hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: prev_hstar_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: assoc_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: assoc_hist_buf.as_entire_binding(),
                 },
             ],
         });
@@ -967,6 +1104,9 @@ impl RustDeqBridge {
             debug_buf,
             hist_ctx_buf,
             mstate_buf,
+            prev_hstar_buf,
+            assoc_buf,
+            assoc_hist_buf,
             signal_cache_buf,
             h_hist_buf,
             hist_ctx_enabled,
@@ -1402,7 +1542,11 @@ impl RustDeqBridge {
 
         let fpm_stage = shape.fpm_stage;
         let fpm_read_enabled = self.fpm_enabled && fpm_stage >= 2;
-        let fpm_persist_enabled = self.fpm_enabled && fpm_stage >= 5;
+        // Stage 4 enables fpm_write_enabled (m_inner written to HistCtx per token).
+        // Persist the last token's m_inner into MState so the next chunk's first
+        // token reads the carried state instead of MState=0.
+        // Previously this required stage>=5, which broke inter-chunk carry at stage 4.
+        let fpm_persist_enabled = self.fpm_enabled && fpm_stage >= 4;
         let fpm_slot_stride = if fpm_read_enabled {
             let slot_stride = (shape.h_slots as u64) * (shape.d_model as u64) * 4u64;
             Some(slot_stride)

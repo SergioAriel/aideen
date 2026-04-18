@@ -153,6 +153,27 @@ pub struct FixedPointMemoryReasoning {
     pub b_read_mem: DVector<f32>, // [h_slots], slot-wise read bias for FPM memory attention
     #[cfg(not(feature = "lab"))]
     pub(crate) b_read_mem: DVector<f32>,
+    // ── Associative binding memory projections (low-rank, r=32) ────────────
+    #[cfg(feature = "lab")]
+    // Decoupled binding key projection for durable associative banks.
+    pub w_k_assoc: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_k_assoc: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    // Reserved for the earlier rank-value binding variant. Current binding stores
+    // value directly in h* space and keeps this field for checkpoint/layout compatibility.
+    pub w_v_assoc: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_v_assoc: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    // Decoupled associative read-query projection.
+    pub w_q_assoc: Vec<DMatrix<f32>>, // h_slots matrices of shape (d_r, r)
+    #[cfg(not(feature = "lab"))]
+    pub(crate) w_q_assoc: Vec<DMatrix<f32>>,
+    #[cfg(feature = "lab")]
+    pub alpha_assoc: DVector<f32>, // [h_slots], residual read mix for assoc branch
+    #[cfg(not(feature = "lab"))]
+    pub(crate) alpha_assoc: DVector<f32>,
 
     // ── LayerNorm por slot ───────────────────────────────────────────────────
     #[cfg(feature = "lab")]
@@ -326,6 +347,10 @@ impl FixedPointMemoryReasoning {
                 })
             })
             .collect();
+        let w_k_assoc: Vec<DMatrix<f32>> = (0..h_slots)
+            .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
+            .collect();
+        let w_q_assoc = w_k_assoc.clone();
         let slot_anchor = Self::default_slot_anchor(&config);
 
         Self {
@@ -376,7 +401,7 @@ impl FixedPointMemoryReasoning {
                 .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
                 .collect(),
             w_retain_down: (0..h_slots).map(|_| DMatrix::zeros(32, d_r)).collect(),
-            b_retain: DMatrix::from_element(h_slots, d_r, 2.0_f32),
+            b_retain: DMatrix::from_element(h_slots, d_r, 0.0_f32),
             // Memory read projections: q/k start from the same base geometry so the content
             // read has an immediately legible dot-product space, instead of two unrelated
             // random subspaces that make the first reads effectively arbitrary.
@@ -386,6 +411,12 @@ impl FixedPointMemoryReasoning {
                 let centered = slot as f32 - (h_slots.saturating_sub(1) as f32 * 0.5);
                 centered * 0.02 + rng.gen_range(-5.0e-4f32..5.0e-4f32)
             }),
+            w_k_assoc,
+            w_v_assoc: (0..h_slots)
+                .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
+                .collect(),
+            w_q_assoc,
+            alpha_assoc: DVector::from_element(h_slots, 0.3_f32),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: break permutation symmetry with a *shared slot code*,
             // not two independent random tables. If q_bias and k_bias are unrelated,
@@ -709,6 +740,31 @@ impl FixedPointMemoryReasoning {
             self.b_read_mem.as_slice().to_vec(),
         );
         weights.insert(
+            "reasoning.w_k_assoc".to_string(),
+            self.w_k_assoc
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
+            "reasoning.w_v_assoc".to_string(),
+            self.w_v_assoc
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
+            "reasoning.w_q_assoc".to_string(),
+            self.w_q_assoc
+                .iter()
+                .flat_map(Self::matrix_to_row_major)
+                .collect(),
+        );
+        weights.insert(
+            "reasoning.alpha_assoc".to_string(),
+            self.alpha_assoc.as_slice().to_vec(),
+        );
+        weights.insert(
             "reasoning.a_log".to_string(),
             Self::matrix_to_row_major(&self.a_log),
         );
@@ -744,6 +800,10 @@ impl FixedPointMemoryReasoning {
         Vec<f32>, // w_q_mem (h_slots × d_r × r, row-major per slot)
         Vec<f32>, // w_k_mem (h_slots × d_r × r, row-major per slot)
         Vec<f32>, // b_read_mem (h_slots)
+        Vec<f32>, // w_k_assoc (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // w_v_assoc reserved (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // w_q_assoc (h_slots × d_r × r, row-major per slot)
+        Vec<f32>, // alpha_assoc (h_slots)
     ) {
         let w_retain_up_flat: Vec<f32> = self
             .w_retain_up
@@ -762,6 +822,21 @@ impl FixedPointMemoryReasoning {
             .collect();
         let w_k_mem_flat: Vec<f32> = self
             .w_k_mem
+            .iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
+        let w_k_assoc_flat: Vec<f32> = self
+            .w_k_assoc
+            .iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
+        let w_v_assoc_flat: Vec<f32> = self
+            .w_v_assoc
+            .iter()
+            .flat_map(|m| Self::matrix_to_row_major(m))
+            .collect();
+        let w_q_assoc_flat: Vec<f32> = self
+            .w_q_assoc
             .iter()
             .flat_map(|m| Self::matrix_to_row_major(m))
             .collect();
@@ -787,6 +862,10 @@ impl FixedPointMemoryReasoning {
             w_q_mem_flat,
             w_k_mem_flat,
             self.b_read_mem.as_slice().to_vec(),
+            w_k_assoc_flat,
+            w_v_assoc_flat,
+            w_q_assoc_flat,
+            self.alpha_assoc.as_slice().to_vec(),
         )
     }
 
@@ -1033,6 +1112,58 @@ impl FixedPointMemoryReasoning {
                 // read-bias prior. Keep that behavior only as import fallback.
                 self.b_read_mem = self.hist_gate_logit.clone();
             }
+            if let Some(data) = weights.get("reasoning.w_k_assoc") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_k_assoc size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_k_assoc = data
+                    .chunks_exact(d_r * RETAIN_RANK)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
+                    .collect();
+            }
+            if let Some(data) = weights.get("reasoning.w_v_assoc") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_v_assoc size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_v_assoc = data
+                    .chunks_exact(d_r * RETAIN_RANK)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
+                    .collect();
+            }
+            if let Some(data) = weights.get("reasoning.w_q_assoc") {
+                let expected = h_slots * d_r * RETAIN_RANK;
+                if data.len() != expected {
+                    return Err(format!(
+                        "reasoning.w_q_assoc size mismatch: expected {}, got {}",
+                        expected,
+                        data.len()
+                    ));
+                }
+                self.w_q_assoc = data
+                    .chunks_exact(d_r * RETAIN_RANK)
+                    .map(|chunk| nalgebra::DMatrix::from_row_slice(d_r, RETAIN_RANK, chunk))
+                    .collect();
+            }
+            if let Some(data) = weights.get("reasoning.alpha_assoc") {
+                if data.len() != h_slots {
+                    return Err(format!(
+                        "reasoning.alpha_assoc size mismatch: expected {}, got {}",
+                        h_slots,
+                        data.len()
+                    ));
+                }
+                self.alpha_assoc = nalgebra::DVector::from_vec(data.clone());
+            }
         }
 
         {
@@ -1137,7 +1268,7 @@ impl FixedPointMemoryReasoning {
             w_retain_down: (0..config.h_slots)
                 .map(|_| nalgebra::DMatrix::zeros(32, config.d_r))
                 .collect(),
-            b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 2.0_f32),
+            b_retain: nalgebra::DMatrix::from_element(config.h_slots, config.d_r, 0.0_f32),
             w_q_mem: (0..config.h_slots)
                 .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
                 .collect(),
@@ -1145,6 +1276,16 @@ impl FixedPointMemoryReasoning {
                 .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
                 .collect(),
             b_read_mem: nalgebra::DVector::zeros(config.h_slots),
+            w_k_assoc: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
+                .collect(),
+            w_v_assoc: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
+                .collect(),
+            w_q_assoc: (0..config.h_slots)
+                .map(|_| nalgebra::DMatrix::zeros(config.d_r, 32))
+                .collect(),
+            alpha_assoc: nalgebra::DVector::from_element(config.h_slots, 0.0_f32),
             backend: RefCell::new(None),
             damping,
             residual_alpha,

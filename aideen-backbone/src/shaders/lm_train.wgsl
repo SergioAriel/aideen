@@ -26,7 +26,7 @@ struct TrainParams {
     eps_bits:     u32,
     ternary_flag: u32,
     num_samples:  u32,
-    _pad1:        u32,
+    active_targets: u32,
     _pad2:        u32,
 };
 
@@ -53,6 +53,7 @@ struct TrainParams {
 
 const WG_SIZE: u32 = 256u;
 const TOKEN_GRID_X: u32 = 65535u;
+const IGNORE_TARGET: u32 = 0xffffffffu;
 
 fn probs_idx(t: u32, k: u32)    -> u32 { return t * params.num_samples + k; }
 fn s_h_rms_idx(t: u32, d: u32) -> u32 { return t * params.d_model + d; }
@@ -187,9 +188,9 @@ fn lm_probs_main(
     }
 
     // --- 5. Loss contribution ---
-    if (tid == 0u) {
+    if (tid == 0u && target_v != IGNORE_TARGET) {
         let target_prob = s_target_exp / sm;
-        let l_val = -log(max(target_prob, 1e-10)) / f32(params.seq_len);
+        let l_val = -log(max(target_prob, 1e-10)) / f32(max(1u, params.active_targets));
         atomicAdd(&loss_out[0], i32(l_val * 10000.0));
     }
 }
@@ -208,12 +209,15 @@ fn compute_dW_and_optionally_apply(
 
     let v     = sampled_indices[k];
     let w_idx = v * params.d_model + d;
-    let seq_f = f32(params.seq_len);
+    let seq_f = f32(max(1u, params.active_targets));
     let g_val = g_lm[d];
 
     // Accumulate dW[v,d] over the sequence
     var dW = 0.0;
     for (var t = 0u; t < params.seq_len; t++) {
+        if (target_indices[t] == IGNORE_TARGET) {
+            continue;
+        }
         let p       = probs[probs_idx(t, k)];
         let one_hot = select(0.0, 1.0, v == target_indices[t]);
         let h_rms   = s_h_rms[s_h_rms_idx(t, d)];
@@ -240,6 +244,9 @@ fn compute_dW_and_optionally_apply(
         if (d == 0u) {
             var db = 0.0;
             for (var t = 0u; t < params.seq_len; t++) {
+                if (target_indices[t] == IGNORE_TARGET) {
+                    continue;
+                }
                 let p       = probs[probs_idx(t, k)];
                 let one_hot = select(0.0, 1.0, v == target_indices[t]);
                 db += (p - one_hot);
@@ -305,7 +312,14 @@ fn lm_backprop_h_t_main(
     let d_model  = params.d_model;
     let base     = t * d_model;
     let target_v = target_indices[t];
-    let seq_scale = 1.0 / max(1.0, f32(params.seq_len));
+    if (target_v == IGNORE_TARGET) {
+        for (var d = tid; d < d_model; d += WG_SIZE) {
+            dl_dh_temp[base + d] = 0.0;
+            dl_dh[base + d] = 0.0;
+        }
+        return;
+    }
+    let seq_scale = 1.0 / max(1.0, f32(params.active_targets));
 
     // Cache probs for this token into workgroup memory
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {

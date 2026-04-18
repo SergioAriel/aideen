@@ -130,6 +130,8 @@ pub struct GpuDeqBackend {
     staged_wo_t_buf: wgpu::Buffer,
     tbptt_carry_buf: wgpu::Buffer,
     pub all_gradients_buf: wgpu::Buffer,
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after assoc backward path is localized.
+    assoc_bwd_debug_buf: wgpu::Buffer,
 
     // Anderson acceleration for adjoint Picard
     anderson_m: u32, // ring buffer depth (effective window = m-1)
@@ -146,6 +148,7 @@ pub struct GpuDeqBackend {
     pub cached_fpm_alpha_m: f32,
     pub cached_fpm_tau: f32,
     pub cached_fpm_stage: u32,
+    pub cached_fpm_read_gate_min: f32,
     cfg_hist_gated: bool,
     cfg_hist_selective: bool,
     cfg_slot_anchor_zero: bool,
@@ -233,8 +236,13 @@ impl GpuDeqBackend {
         w_q_mem: &[f32],
         w_k_mem: &[f32],
         b_read_mem: &[f32],
+        w_k_assoc: &[f32],
+        w_v_assoc: &[f32],
+        w_q_assoc: &[f32],
+        alpha_assoc: &[f32],
     ) -> Vec<f32> {
         const MEM_READ_RANK: usize = 32;
+        const ASSOC_RANK: usize = 32;
         let d = self.config.d_r;
         let h = self.config.h_slots;
         // h_hist gamma is stored as a raw logit-like parameter and squashed in the shader.
@@ -300,15 +308,31 @@ impl GpuDeqBackend {
         debug_assert_eq!(w_q_mem.len(), h * d * MEM_READ_RANK);
         debug_assert_eq!(w_k_mem.len(), h * d * MEM_READ_RANK);
         debug_assert_eq!(b_read_mem.len(), h);
+        // Reserved decoupled binding projections. The active coupled binding path
+        // uses W_k_write for addressing and stores values directly in model space.
+        debug_assert_eq!(w_k_assoc.len(), h * d * ASSOC_RANK);
+        debug_assert_eq!(w_v_assoc.len(), h * d * ASSOC_RANK);
+        debug_assert_eq!(w_q_assoc.len(), h * d * ASSOC_RANK);
+        debug_assert_eq!(alpha_assoc.len(), h);
         out.extend_from_slice(w_q_mem);
         out.extend_from_slice(w_k_mem);
         out.extend_from_slice(b_read_mem);
+        out.extend_from_slice(w_k_assoc);
+        out.extend_from_slice(w_v_assoc);
+        out.extend_from_slice(w_q_assoc);
+        out.extend_from_slice(alpha_assoc);
+        // Associative event gate: W_event_assoc (h×d) and b_event_assoc (h).
+        // Bias starts neutral (sigmoid(0)=0.5). The gate is disabled by default;
+        // when enabled, its L1 penalty makes "write everything" non-free.
+        out.extend(std::iter::repeat(0.0).take(h * d));
+        out.extend(std::iter::repeat(0.0).take(h));
         out
     }
 
     fn history_params_len(d: usize, h: usize) -> usize {
         const RETAIN_RANK: usize = 32;
         const MEM_READ_RANK: usize = 32;
+        const ASSOC_RANK: usize = 32;
         // hist_mat: 1*d²
         // slot_anchor, hist_scale, hist_bias, hist_gate_query, w_write_gate: 5*h*d
         // hist_gate, b_write_mem: 2*h
@@ -329,6 +353,10 @@ impl GpuDeqBackend {
             + h * d                     // b_retain
             + 2 * h * d * MEM_READ_RANK // W_q_mem + W_k_mem
             + h                         // b_read_mem
+            + 3 * h * d * ASSOC_RANK    // reserved decoupled W_k_assoc + W_v_assoc + W_q_assoc
+            + h                         // alpha_assoc
+            + h * d                     // W_event_assoc
+            + h                         // b_event_assoc
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -822,6 +850,47 @@ impl GpuDeqBackend {
                         },
                         count: None,
                     },
+                    // binding 10: v_state (adjoint ∂L/∂h* per slot/token) for READ-path gradient
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 11,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 12,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 13,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let fpm_shared_bg0_layout =
@@ -1262,13 +1331,105 @@ impl GpuDeqBackend {
             bind_group_layouts: &[&fpm_retain_bwd_bg0_layout, &fused_update_bg1_layout],
             push_constant_ranges: &[],
         });
+        let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(1, 4))
+            .unwrap_or(1);
+        let assoc_transition_gate = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_slot_anchor = std::env::var("AIDEEN_ASSOC_SLOT_ANCHOR")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_reuse_match = std::env::var("AIDEEN_ASSOC_REUSE_MATCH")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_slot_stripe = std::env::var("AIDEEN_ASSOC_SLOT_STRIPE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_tie_qk = std::env::var("AIDEEN_ASSOC_TIE_QK")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_conf_read = std::env::var("AIDEEN_ASSOC_CONF_READ")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_event_gate = std::env::var("AIDEEN_ASSOC_EVENT_GATE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_event_l1 = std::env::var("AIDEEN_ASSOC_EVENT_L1")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.005);
+        let mut fpm_retain_bwd_constants = std::collections::HashMap::new();
+        fpm_retain_bwd_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_TRANSITION_GATE".to_string(),
+            if assoc_transition_gate { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_SLOT_ANCHOR".to_string(),
+            if assoc_slot_anchor { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_REUSE_MATCH".to_string(),
+            if assoc_reuse_match { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_SLOT_STRIPE".to_string(),
+            if assoc_slot_stripe { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_TIE_QK".to_string(),
+            if assoc_tie_qk { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_CONF_READ".to_string(),
+            if assoc_conf_read { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_EVENT_GATE".to_string(),
+            if assoc_event_gate { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert("ASSOC_EVENT_L1".to_string(), assoc_event_l1);
         let fpm_retain_bwd_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("FPM Memory Backward Pipeline"),
                 layout: Some(&fpm_retain_bwd_pl),
                 module: &fpm_retain_bwd_shader,
                 entry_point: Some("fused_fpm_retain_bwd_main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &fpm_retain_bwd_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
                 cache: None,
             });
         let fpm_shared_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1792,6 +1953,15 @@ impl GpuDeqBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // TEMPORARY ASSOCIATIVE DIAGNOSTIC: h_slots × 16 float counters.
+        let assoc_bwd_debug_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc Bwd Debug"),
+            size: (config.h_slots as u64) * 16u64 * 4u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let fused_update_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Fused Update BG0"),
             layout: &bg0_layout,
@@ -2009,11 +2179,7 @@ impl GpuDeqBackend {
         let aw_win_sz = std::num::NonZeroU64::new(h64 * d64 * d64 * 4);
         let aw_alog_sz = std::num::NonZeroU64::new(h64 * d64 * 4);
         let aw_nscale_sz = std::num::NonZeroU64::new(d64 * 4);
-        let aw_hist_len = (config.h_slots + 1) * config.d_r * config.d_r
-            + 5 * config.h_slots * config.d_r
-            + 2 * config.h_slots
-            + config.d_r
-            + 21;
+        let aw_hist_len = Self::history_params_len(config.d_r, config.h_slots);
         let aw_hist_sz = std::num::NonZeroU64::new(aw_hist_len as u64 * 4);
         let staged_picard_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Staged Picard BG1"),
@@ -2140,6 +2306,23 @@ impl GpuDeqBackend {
                     binding: 9,
                     resource: fpm_gx_buf.as_entire_binding(),
                 },
+                // binding 10: adjoint v_state for READ-path gradient
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: adj_v_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: bridge.assoc_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: bridge.assoc_hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: assoc_bwd_debug_buf.as_entire_binding(),
+                },
             ],
         });
         let fpm_shared_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2200,6 +2383,11 @@ impl GpuDeqBackend {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(3)
             .clamp(0, 5);
+        let cached_fpm_read_gate_min = std::env::var("AIDEEN_FPM_READ_GATE_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         let cfg_hist_gated = std::env::var("AIDEEN_DEQ_HIST_GATED").ok().as_deref() != Some("0");
         let cfg_hist_selective = Self::hist_selective_from_env();
         let bool_flag = |s: &str| -> Option<bool> {
@@ -2333,6 +2521,7 @@ impl GpuDeqBackend {
             staged_wo_t_buf,
             tbptt_carry_buf,
             all_gradients_buf,
+            assoc_bwd_debug_buf,
             anderson_m: anderson_m_val,
             anderson_hist_bufs,
             anderson_slots_per_segment: slots_per_segment as u32,
@@ -2344,6 +2533,7 @@ impl GpuDeqBackend {
             cached_fpm_alpha_m,
             cached_fpm_tau,
             cached_fpm_stage,
+            cached_fpm_read_gate_min,
             cfg_hist_gated,
             cfg_hist_selective,
             cfg_slot_anchor_zero,
@@ -2394,12 +2584,22 @@ impl GpuDeqBackend {
         // Hist V2 keeps an explicit memory state across chunks and must reset on document boundaries.
         encoder.clear_buffer(&self.bridge.hist_ctx_buf, 0, None);
         encoder.clear_buffer(&self.bridge.mstate_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.prev_hstar_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.assoc_hist_buf, 0, None);
         // FPM/H_hist uses the same buffer (binding 11) as persistent slow memory.
         // Must reset on document boundaries — otherwise slow memory leaks across epoch boundaries.
         encoder.clear_buffer(&self.bridge.h_hist_buf, 0, None);
         // Clear TBPTT carry on document reset.
         encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
         self.queue.submit(Some(encoder.finish()));
+        // AssocBuf: zero the durable per-slot bank (bank_key, bank_value, usage).
+        // PrevHStarBuf is cleared separately above; together they reset the associative path.
+        {
+            let buf_bytes = self.bridge.assoc_buf.size() as usize;
+            let n_floats = buf_bytes / 4;
+            let data = vec![0.0f32; n_floats];
+            self.queue.write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
+        }
     }
 
     // --- HELPER UNIFICADO ---
@@ -2442,6 +2642,7 @@ impl GpuDeqBackend {
             fpm_stage: self.cached_fpm_stage,
             fpm_alpha_m: self.cached_fpm_alpha_m,
             fpm_tau: self.cached_fpm_tau,
+            fpm_read_gate_min: self.cached_fpm_read_gate_min,
         }
     }
 
@@ -2475,6 +2676,10 @@ impl GpuDeqBackend {
         w_q_mem: &[f32],
         w_k_mem: &[f32],
         b_read_mem: &[f32],
+        w_k_assoc: &[f32],
+        w_v_assoc: &[f32],
+        w_q_assoc: &[f32],
+        alpha_assoc: &[f32],
     ) {
         let d = self.config.d_r as u64;
         let h = self.config.h_slots as u64;
@@ -2537,6 +2742,10 @@ impl GpuDeqBackend {
             w_q_mem,
             w_k_mem,
             b_read_mem,
+            w_k_assoc,
+            w_v_assoc,
+            w_q_assoc,
+            alpha_assoc,
         );
         queue.write_buffer(
             &self.bridge.all_weights_buf,
@@ -2878,15 +3087,17 @@ impl GpuDeqBackend {
         clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
-        let runtime_cfg = DeqRuntimeConfig::from_env();
-        let deq_only_mode = runtime_cfg.is_deq_only();
         // The legacy staged adjoint assumes the pre-unified scratch contract
         // (q/k/v/signal/history packed in a larger stride). The current
         // unified forward no longer writes that layout, so running the staged
         // path here would train against stale/OOB activations. Route
-        // this mode through the clean adjoint until its dedicated backward is
+        // unified modes through the clean adjoint until its dedicated backward is
         // rewritten against the live forward contract.
-        if deq_only_mode {
+        let use_legacy_adjoint = std::env::var("AIDEEN_USE_LEGACY_ADJOINT")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !use_legacy_adjoint {
             return self.run_clean_adjoint_picard_no_readback(
                 seq_len,
                 damping,
@@ -3894,6 +4105,8 @@ impl GpuDeqBackend {
             // apply_grad pass so shared-parameter gradients participate in the same update.
             // One workgroup per slot, WG_SIZE=64. Uses separate bind groups.
             if self.bridge.fpm_enabled {
+                // TEMPORARY ASSOCIATIVE DIAGNOSTIC: clear counters before FPM backward.
+                enc.clear_buffer(&self.assoc_bwd_debug_buf, 0, None);
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("FPM Memory Bwd"),
                     timestamp_writes: None,
@@ -4288,31 +4501,33 @@ impl GpuDeqBackend {
                 );
             }
             if self.bridge.fpm_enabled {
-                // W_out gradient — factorized path (eliminates 135× read amplification):
-                //   Step 1: sum fpm_minner_buf over tokens for each (slot, col).
-                //   Step 2: outer product dm_const × minner_sum → dW_out.
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "fpm_minner_colsum",
-                    &self.fpm_minner_colsum_pipeline,
-                    &self.fpm_shared_bg0,
-                    &self.fused_update_bg1,
-                    h as u32,
-                    d.div_ceil(64) as u32,
-                    profile_fused,
-                );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "fpm_wout_factored",
-                    &self.fpm_wout_factored_pipeline,
-                    &self.fpm_shared_bg0,
-                    &self.fused_update_bg1,
-                    d.div_ceil(16) as u32,
-                    d.div_ceil(16) as u32,
-                    profile_fused,
-                );
+                if self.cfg_hist_train_wout {
+                    // Optional diagnostic/legacy path. The active FPM recurrence stores
+                    // m_inner as memory state, so W_out is not part of the recurrent
+                    // state transition and must not be trained by default as if it were.
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "fpm_minner_colsum",
+                        &self.fpm_minner_colsum_pipeline,
+                        &self.fpm_shared_bg0,
+                        &self.fused_update_bg1,
+                        h as u32,
+                        d.div_ceil(64) as u32,
+                        profile_fused,
+                    );
+                    run_stage(
+                        &self.device,
+                        &self.queue,
+                        "fpm_wout_factored",
+                        &self.fpm_wout_factored_pipeline,
+                        &self.fpm_shared_bg0,
+                        &self.fused_update_bg1,
+                        d.div_ceil(16) as u32,
+                        d.div_ceil(16) as u32,
+                        profile_fused,
+                    );
+                }
                 // W_x gradient — partial + reduce path.
                 let fpm_block = 64u32;
                 let n_entries = batch_size * seq_len * h as u32;
@@ -4704,11 +4919,38 @@ impl GpuDeqBackend {
         )
     }
 
+    pub fn read_assoc_state(&self) -> Vec<f32> {
+        let n_floats = (self.bridge.assoc_buf.size() / 4) as usize;
+        self.read_storage_buffer(&self.bridge.assoc_buf, n_floats, "AssocBuf Readback")
+    }
+
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after assoc backward path is localized.
+    pub fn read_assoc_bwd_debug(&self) -> Vec<f32> {
+        let n_floats = self.config.h_slots * 16;
+        self.read_storage_buffer(
+            &self.assoc_bwd_debug_buf,
+            n_floats,
+            "AssocBwdDebug Readback",
+        )
+    }
+
     /// Reads pooled state (hpooled_buf) from GPU for the first batch sample.
     /// Returns Vec<f32> of length d_r.
     pub fn read_hpooled(&self) -> Vec<f32> {
         let d_r = self.config.d_r;
         self.read_storage_buffer(&self.bridge.hpooled_buf, d_r, "H_pooled Readback Staging")
+    }
+
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read one token's pooled state for AR top-logit tracing.
+    pub fn read_hpooled_at(&self, token_index: usize) -> Vec<f32> {
+        let d_r = self.config.d_r;
+        let offset = (token_index * d_r * std::mem::size_of::<f32>()) as u64;
+        self.read_storage_buffer_at(
+            &self.bridge.hpooled_buf,
+            offset,
+            d_r,
+            "H_pooled Token Readback Staging",
+        )
     }
 
     pub fn read_staged_gcomb(&self, seq_len: u32) -> Vec<f32> {

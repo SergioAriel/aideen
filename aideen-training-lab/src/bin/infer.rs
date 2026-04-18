@@ -190,6 +190,10 @@ fn main() {
             _w_q_mem,
             _w_k_mem,
             _b_read_mem,
+            _w_k_assoc,
+            _w_v_assoc,
+            _w_q_assoc,
+            _alpha_assoc,
         ) = trainer.reasoning.history_params_gpu_layout();
         let (gate_min, gate_max) = min_max(&hist_gate_logit);
         let (slot_anchor_min, slot_anchor_max) = min_max(&slot_anchor);

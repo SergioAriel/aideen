@@ -118,6 +118,18 @@ impl Tokenizer {
         self.embeddings.row(token_id as usize).transpose()
     }
 
+    pub fn embeddings_row_major(&self) -> Vec<f32> {
+        let rows = self.embeddings.nrows();
+        let cols = self.embeddings.ncols();
+        let mut out = Vec::with_capacity(rows * cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                out.push(self.embeddings[(i, j)]);
+            }
+        }
+        out
+    }
+
     pub fn embed_context(&self, tokens: &[u32], max_ctx: usize) -> DVector<f32> {
         let ctx_start = tokens.len().saturating_sub(max_ctx);
         let ctx = &tokens[ctx_start..];

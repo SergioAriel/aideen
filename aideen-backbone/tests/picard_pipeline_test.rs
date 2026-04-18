@@ -321,6 +321,16 @@ fn test_hist_gated_forward_uses_prev_fpm_carrier() {
     let w_gate_hist = vec![0.0f32; h * d];
     let w_forget = vec![0.0f32; h * d];
     let b_forget = vec![3.0f32; h];
+    let w_retain_up = vec![0.0f32; h * d * 32];
+    let w_retain_down = vec![0.0f32; h * 32 * d];
+    let b_retain_full = vec![0.0f32; h * d];
+    let w_q_mem = vec![0.0f32; h * d * 32];
+    let w_k_mem = vec![0.0f32; h * d * 32];
+    let b_read_mem = vec![0.0f32; h];
+    let w_k_assoc = vec![0.0f32; h * d * 32];
+    let w_v_assoc = vec![0.0f32; h * d * 32];
+    let w_q_assoc = vec![0.0f32; h * d * 32];
+    let alpha_assoc = vec![0.0f32; h];
 
     for i in 0..d {
         w_in[i * d + i] = 1.0;
@@ -348,6 +358,16 @@ fn test_hist_gated_forward_uses_prev_fpm_carrier() {
         &w_gate_hist,
         &w_forget,
         &b_forget,
+        &w_retain_up,
+        &w_retain_down,
+        &b_retain_full,
+        &w_q_mem,
+        &w_k_mem,
+        &b_read_mem,
+        &w_k_assoc,
+        &w_v_assoc,
+        &w_q_assoc,
+        &alpha_assoc,
     );
 
     gpu.run_forward_deq_no_readback(
@@ -473,6 +493,16 @@ fn test_hist_gated_starts_near_no_fpm_with_real_initialized_weights() {
         .unwrap_or(&w_gate_hist_zeros);
     let w_forget_zeros = vec![0.0f32; h * d];
     let b_forget_init = vec![3.0f32; h];
+    let w_retain_up_zeros = vec![0.0f32; h * d * 32];
+    let w_retain_down_zeros = vec![0.0f32; h * 32 * d];
+    let b_retain_zeros = vec![0.0f32; h * d];
+    let w_q_mem_zeros = vec![0.0f32; h * d * 32];
+    let w_k_mem_zeros = vec![0.0f32; h * d * 32];
+    let b_read_mem_zeros = vec![0.0f32; h];
+    let w_k_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_v_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_q_assoc_zeros = vec![0.0f32; h * d * 32];
+    let alpha_assoc_zeros = vec![0.0f32; h];
     let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
 
     let seq_len = 3u32;
@@ -503,6 +533,16 @@ fn test_hist_gated_starts_near_no_fpm_with_real_initialized_weights() {
         w_gate_hist,
         &w_forget_zeros,
         &b_forget_init,
+        &w_retain_up_zeros,
+        &w_retain_down_zeros,
+        &b_retain_zeros,
+        &w_q_mem_zeros,
+        &w_k_mem_zeros,
+        &b_read_mem_zeros,
+        &w_k_assoc_zeros,
+        &w_v_assoc_zeros,
+        &w_q_assoc_zeros,
+        &alpha_assoc_zeros,
     );
 
     std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
