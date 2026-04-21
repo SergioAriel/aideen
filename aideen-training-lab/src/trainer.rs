@@ -209,6 +209,14 @@ impl Trainer {
         self.cfg_debug_sample_every = every;
     }
 
+    pub fn gpu_sequence_capacity(&self) -> usize {
+        #[cfg(feature = "wgpu")]
+        if let Some(gpu) = self.gpu_deq.as_ref() {
+            return gpu.forward_seq_cap.max(1) as usize;
+        }
+        self.config.ctx_len.max(1)
+    }
+
     #[cfg(feature = "wgpu")]
     fn w_delta_rank_summary(
         w_delta: &nalgebra::DMatrix<f32>,
@@ -1786,10 +1794,11 @@ impl Trainer {
                 // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
                 let fwd_batch_size_ts: usize = self.cfg_fwd_batch_size.max(1) as usize;
                 let seq_len = tokens.len().min(targets.len());
+                let seq_cap = self.gpu_sequence_capacity();
                 let actual_ctx_len = if fwd_batch_size_ts > 1 {
                     seq_len
                 } else {
-                    seq_len.min(self.config.ctx_len)
+                    seq_len.min(seq_cap)
                 };
                 let ctx = &tokens[seq_len - actual_ctx_len..];
                 let ctx_targets = &targets[seq_len - actual_ctx_len..];

@@ -211,6 +211,13 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_read_enabled = std::env::var("AIDEEN_ASSOC_READ")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(true);
         let assoc_event_gate = std::env::var("AIDEEN_ASSOC_EVENT_GATE")
             .ok()
             .map(|v| {
@@ -380,6 +387,10 @@ impl RustDeqBridge {
         slot_coord_constants.insert(
             "ENABLE_ASSOC_CONF_READ".to_string(),
             if assoc_conf_read { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_READ".to_string(),
+            if assoc_read_enabled { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_EVENT_GATE".to_string(),
@@ -730,6 +741,7 @@ impl RustDeqBridge {
         // and stores the converged value directly in model space.
         let assoc_slot_stride =
             (assoc_banks as u64) * ((ASSOC_RANK as u64 + d_model as u64 + 1u64) * 4u64);
+        let assoc_hist_slot_stride = assoc_slot_stride + 4u64 * 4u64;
         let assoc_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Assoc Buffer"),
             size: (max_batch_size as u64) * (h_slots as u64) * assoc_slot_stride,
@@ -743,7 +755,7 @@ impl RustDeqBridge {
             size: (max_batch_size as u64)
                 * (max_seq_len as u64)
                 * (h_slots as u64)
-                * assoc_slot_stride,
+                * assoc_hist_slot_stride,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,

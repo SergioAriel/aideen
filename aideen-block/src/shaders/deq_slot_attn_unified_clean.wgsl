@@ -44,6 +44,7 @@ override ENABLE_ASSOC_SLOT_STRIPE: bool = false;
 override ENABLE_ASSOC_TIE_QK: bool = false;
 override ENABLE_ASSOC_CONF_READ: bool = false;
 override ENABLE_ASSOC_EVENT_GATE: bool = false;
+override ENABLE_ASSOC_READ: bool = true;
 const SLOT_COORD_USE_BIAS: bool = true;
 const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
 const WG_SIZE: u32 = 256u;
@@ -52,11 +53,14 @@ const MAX_SLOTS: u32 = 8u;
 const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
 const SLOT_HEAD_CAP: u32 = MAX_SLOTS * MAX_SLOT_ATTN_HEAD_DIM;
 const ASSOC_RANK: u32 = 32u;
+const ASSOC_HIST_META: u32 = 4u;
 override ASSOC_BANKS: u32 = 1u;
 const ASSOC_WRITE_CAP: f32 = 0.95;
 const ASSOC_ALLOC_THRESHOLD: f32 = 0.05;
 const ASSOC_USAGE_DECAY: f32 = 0.999;
 const ASSOC_TO_FPM_SCALE: f32 = 0.02;
+const ASSOC_REUSE_THRESHOLD: f32 = 0.80;
+const ASSOC_ALLOC_NOVELTY_THRESHOLD: f32 = 0.20;
 // Experimental multi-bank addressing strength. With ASSOC_BANKS=1 this is
 // behaviorally inactive because the read softmax has a single candidate.
 const ASSOC_READ_BETA: f32 = 4.0;
@@ -432,6 +436,7 @@ fn deq_slot_coord_unified_main(
     let prev_hstar_base = h_base + slot_offset;
     let assoc_bank_stride = ASSOC_RANK + d_model + 1u;
     let assoc_slot_stride = ASSOC_BANKS * assoc_bank_stride;
+    let assoc_hist_slot_stride = assoc_slot_stride + ASSOC_HIST_META;
     let assoc_slot_base = (batch_idx * h_slots + slot_idx) * assoc_slot_stride;
     let signal_span = d_model * h_slots;
     let scratch_stride = signal_span * 3u + h_slots * h_slots;
@@ -460,7 +465,7 @@ fn deq_slot_coord_unified_main(
     // Reading at stage 3 while writes are still off leaves B identically zero and
     // makes the branch structurally dead.
     let assoc_write_enabled = fpm_write_enabled;
-    let assoc_read_enabled = assoc_write_enabled;
+    let assoc_read_enabled = assoc_write_enabled && ENABLE_ASSOC_READ;
 
     if (tid == 0u) {
         max_delta_seen = 0.0;
@@ -1029,13 +1034,16 @@ fn deq_slot_coord_unified_main(
                         memctx_rms / max(signal_rms, 1e-6),
                     );
                 }
+                var assoc_ctx0 = 0.0;
+                var assoc_ctx1 = 0.0;
                 if (assoc_read_enabled) {
                     let d0 = tid;
                     let d1 = tid + WG_SIZE;
-                    // Default coupled path: associative addressing shares the FPM write-key
-                    // encoder, so binding lookup uses the same learned event geometry as FPM.
+                    // Associative lookup must not deform the FPM write-key geometry.
+                    // It uses its own query matrix so the binding branch can learn without
+                    // destabilizing the recurrent FPM write path.
                     let wq_assoc = hist_base
-                        + w_k_write_base(d_model, h_slots)
+                        + w_q_assoc_base(d_model, h_slots)
                         + slot_idx * d_model * ASSOC_RANK;
                     let alpha_assoc = AllWeights[hist_base + alpha_assoc_base(d_model, h_slots) + slot_idx];
                     // Layout per bank: [bank_key | bank_value | usage].
@@ -1159,8 +1167,6 @@ fn deq_slot_coord_unified_main(
                     workgroupBarrier();
                     let assoc_read_conf =
                         select(1.0, shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 1u], ENABLE_ASSOC_CONF_READ);
-                    var assoc_ctx0 = 0.0;
-                    var assoc_ctx1 = 0.0;
                     for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                         let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                         let bank_value_base = bank_base + ASSOC_RANK;
@@ -1196,7 +1202,6 @@ fn deq_slot_coord_unified_main(
                     workgroupBarrier();
                     let assoc_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)));
                     let assoc_scale = 1.0 / max(assoc_rms, 0.1); // Soft normalization floor
-                    
                     fpm_ctx0 = fpm_ctx0 + alpha_assoc * assoc_ctx0 * assoc_scale;
                     fpm_ctx1 = fpm_ctx1 + alpha_assoc * assoc_ctx1 * assoc_scale;
                 }
@@ -1905,15 +1910,17 @@ fn deq_slot_coord_unified_main(
             let d0 = tid;
             let d1 = tid + WG_SIZE;
             let hist_base = aw_hist_base(d_model, h_slots);
-            // Default coupled path: write keys come from the FPM write-key encoder.
-            let wk_assoc = hist_base + w_k_write_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
+            // Associative write keys use their own address encoder. Sharing with the
+            // FPM write-key made a single unstable associative run corrupt the core
+            // FPM write geometry and bifurcate training.
+            let wk_assoc = hist_base + w_k_assoc_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
             let wv_assoc = hist_base + w_v_assoc_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
             let wevent_assoc = hist_base + w_event_assoc_base(d_model, h_slots) + slot_offset;
             let bevent_assoc = hist_base + b_event_assoc_base(d_model, h_slots) + slot_idx;
             let assoc_anchor_base = hist_base + slot_anchor_base(d_model, h_slots) + slot_offset;
             // Layout per bank: [bank_key | bank_value | usage].
             let assoc_hist_base =
-                ((batch_idx * shape.token_count + t) * h_slots + slot_idx) * assoc_slot_stride;
+                ((batch_idx * shape.token_count + t) * h_slots + slot_idx) * assoc_hist_slot_stride;
             for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                 let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                 let hist_bank_base = assoc_hist_base + bank * assoc_bank_stride;
@@ -1949,10 +1956,11 @@ fn deq_slot_coord_unified_main(
             let assoc_src1 = assoc_raw1 / max(assoc_signal_rms, 1.0e-6);
             let has_prev_hstar = select(0.0, 1.0, global_t > 0u);
             // Event gate is a learned transition classifier over prev_source → curr_source.
-            // It prevents capacity from being consumed by arbitrary adjacent-token transitions.
+            // The gate must react to change, not just signal magnitude; otherwise it becomes
+            // an almost-constant write valve that opens for nearly every token pair.
             shared_vals[tid] =
-                AllWeights[wevent_assoc + d0] * (PrevHStarBuf[prev_hstar_base + d0] + assoc_src0)
-                + AllWeights[wevent_assoc + d1] * (PrevHStarBuf[prev_hstar_base + d1] + assoc_src1);
+                AllWeights[wevent_assoc + d0] * (assoc_src0 - PrevHStarBuf[prev_hstar_base + d0])
+                + AllWeights[wevent_assoc + d1] * (assoc_src1 - PrevHStarBuf[prev_hstar_base + d1]);
             workgroupBarrier();
             for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
                 if (tid < stride) {
@@ -1964,7 +1972,13 @@ fn deq_slot_coord_unified_main(
                 1.0 + exp(-(shared_vals[0] * inv_sqrt_d_model + AllWeights[bevent_assoc]))
             );
             let event_gate = select(1.0, learned_event_gate, ENABLE_ASSOC_EVENT_GATE);
-            let bind_gate = clamp(assoc_write_gate_token, 0.0, ASSOC_WRITE_CAP) * event_gate * has_prev_hstar;
+            // Structural split:
+            // - the explicit associative bank writes when the transition classifier says
+            //   "this pair is a binding worth storing";
+            // - the FPM write budget only controls how much of that selected binding is
+            //   consolidated into the slower recurrent state.
+            // Using the FPM gate for both roles kept the system stable but starved binding.
+            let bind_gate = event_gate * has_prev_hstar;
             // Durable binding update:
             //   bank_key   <- (1-g) bank_key   + g * W_k(h*_{t-1})
             //   bank_value <- (1-g) bank_value + g * h*_t
@@ -1991,47 +2005,76 @@ fn deq_slot_coord_unified_main(
                 var found_empty = false;
                 var empty_bank = 0u;
                 var best_cos = -1.0e30;
+                var best_value_cos = -1.0e30;
                 var best_bank = 0u;
                 var min_usage = 1.0e30;
                 var min_usage_bank = 0u;
                 var allow_write = 0.0;
+                var overwrite_bank = 0.0;
                 var new_key_norm = 0.0;
+                var new_value_norm = 0.0;
                 for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
                     new_key_norm = new_key_norm + shared_vals[r] * shared_vals[r];
+                }
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let v_j =
+                        (Scratch[signal_base + j]
+                            + select(0.0, AllWeights[assoc_anchor_base + j], ENABLE_ASSOC_SLOT_ANCHOR))
+                        / max(assoc_signal_rms, 1.0e-6);
+                    new_value_norm = new_value_norm + v_j * v_j;
                 }
                 for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                     let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                     var key_norm = 0.0;
                     var score = 0.0;
+                    var value_norm = 0.0;
+                    var value_score = 0.0;
                     for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
                         let key_r = AssocBuf[bank_base + r];
                         key_norm = key_norm + key_r * key_r;
                         score = score + key_r * shared_vals[r];
+                    }
+                    for (var j = 0u; j < d_model; j = j + 1u) {
+                        let bank_v = AssocBuf[bank_base + ASSOC_RANK + j];
+                        let curr_v =
+                            (Scratch[signal_base + j]
+                                + select(0.0, AllWeights[assoc_anchor_base + j], ENABLE_ASSOC_SLOT_ANCHOR))
+                            / max(assoc_signal_rms, 1.0e-6);
+                        value_norm = value_norm + bank_v * bank_v;
+                        value_score = value_score + bank_v * curr_v;
                     }
                     let bank_usage = AssocBuf[bank_base + ASSOC_RANK + d_model];
                     if (bank_usage < min_usage) {
                         min_usage = bank_usage;
                         min_usage_bank = bank;
                     }
-                    if (!found_empty && (key_norm < 1.0e-8 || bank_usage < 1.0e-4)) {
+                    if (!found_empty && bank_usage < 1.0e-4) {
                         empty_bank = bank;
                         found_empty = true;
                     }
                     let cos = score / sqrt(max(key_norm * new_key_norm, 1.0e-12));
+                    let value_cos =
+                        value_score / sqrt(max(value_norm * new_value_norm, 1.0e-12));
                     if (cos > best_cos) {
                         best_cos = cos;
+                        best_value_cos = value_cos;
                         best_bank = bank;
                     }
                 }
-                if (ENABLE_ASSOC_REUSE_MATCH && best_cos > 0.80) {
+                let reuse_enabled = ENABLE_ASSOC_REUSE_MATCH || ASSOC_BANKS > 1u;
+                if (reuse_enabled
+                    && best_cos > ASSOC_REUSE_THRESHOLD
+                    && best_value_cos > ASSOC_REUSE_THRESHOLD) {
                     chosen_bank = best_bank;
                     allow_write = 1.0;
-                } else if (found_empty) {
+                } else if (
+                    found_empty
+                    && best_cos < ASSOC_ALLOC_NOVELTY_THRESHOLD
+                    && best_value_cos < ASSOC_ALLOC_NOVELTY_THRESHOLD
+                ) {
                     chosen_bank = empty_bank;
                     allow_write = 1.0;
-                } else if (best_cos <= 0.80 && min_usage < ASSOC_ALLOC_THRESHOLD) {
-                    chosen_bank = min_usage_bank;
-                    allow_write = 1.0;
+                    overwrite_bank = 1.0;
                 }
                 if (ENABLE_ASSOC_SLOT_STRIPE && (t % h_slots) != slot_idx) {
                     // Experimental multi-bank routing: make slots behave like distinct
@@ -2052,6 +2095,11 @@ fn deq_slot_coord_unified_main(
                         1.0 / (1.0 + exp(-transition_score * inverseSqrt(max(1.0, f32(ASSOC_RANK)))));
                 }
                 shared_vals[3u * ASSOC_RANK + 4u] = transition_gate;
+                let meta_base = assoc_hist_base + assoc_slot_stride;
+                AssocHist[meta_base + 0u] = f32(chosen_bank);
+                AssocHist[meta_base + 1u] = allow_write;
+                AssocHist[meta_base + 2u] = transition_gate;
+                AssocHist[meta_base + 3u] = overwrite_bank;
             }
             workgroupBarrier();
             let chosen_bank = u32(shared_vals[3u * ASSOC_RANK]);
@@ -2062,7 +2110,9 @@ fn deq_slot_coord_unified_main(
             let bank_value_base = chosen_bank_base + ASSOC_RANK;
             let bank_usage_idx = chosen_bank_base + ASSOC_RANK + d_model;
             let effective_bind_gate = bind_gate * assoc_write_allowed * assoc_transition_gate;
-            let effective_keep_gate = 1.0 - effective_bind_gate;
+            let overwrite_bank = AssocHist[assoc_hist_base + assoc_slot_stride + 3u];
+            let effective_keep_gate =
+                select(1.0 - effective_bind_gate, 0.0, overwrite_bank > 0.5);
             if (tid == 0u) {
                 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: write allocation telemetry.
                 if (debug_on) {
@@ -2119,7 +2169,8 @@ fn deq_slot_coord_unified_main(
                 // binding bank is updated does FPM consolidate a small part of that selected
                 // value into its slower recurrent state. KV identity stays clean, while FPM
                 // gains a long-term path from the explicit binding memory.
-                let consolidate = ASSOC_TO_FPM_SCALE * effective_bind_gate;
+                let consolidate =
+                    ASSOC_TO_FPM_SCALE * clamp(assoc_write_gate_token, 0.0, ASSOC_WRITE_CAP) * effective_bind_gate;
                 fpm_m_cache[d0] =
                     (1.0 - consolidate) * fpm_m_cache[d0] + consolidate * AssocBuf[bank_value_base + d0];
                 fpm_m_cache[d1] =
@@ -2128,8 +2179,13 @@ fn deq_slot_coord_unified_main(
                 HistCtx[h_base_t + slot_offset + d1] = fpm_m_cache[d1];
             }
             if (tid == 0u) {
-                let decayed_usage = ASSOC_USAGE_DECAY * AssocBuf[bank_usage_idx];
-                AssocBuf[bank_usage_idx] = clamp(decayed_usage + effective_bind_gate, 0.0, 1.0);
+                let prev_usage = AssocBuf[bank_usage_idx];
+                let usage_mix = 1.0 - ASSOC_USAGE_DECAY;
+                AssocBuf[bank_usage_idx] = clamp(
+                    ASSOC_USAGE_DECAY * prev_usage + usage_mix * effective_bind_gate,
+                    0.0,
+                    1.0,
+                );
             }
             workgroupBarrier();
             if (tid < ASSOC_RANK) {

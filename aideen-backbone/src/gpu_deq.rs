@@ -46,6 +46,7 @@ pub struct AdjointBuffers {
 /// Abstracción del DEQ vía GPU (WGPU).
 pub struct GpuDeqBackend {
     pub config: ArchitectureConfig,
+    pub forward_seq_cap: u32,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub subgroup_supported: bool,
@@ -518,7 +519,11 @@ impl GpuDeqBackend {
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(1)
             .max(1);
-        let forward_seq_cap = config.ctx_len.max(1) as u32;
+        let forward_seq_cap = std::env::var("AIDEEN_SEQ_CAP")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(config.ctx_len.max(1) as u32)
+            .max(config.ctx_len.max(1) as u32);
         // RustDeqBridge::new(device, d_model, h_slots, max_batch_size, max_seq_len)
         let bridge = RustDeqBridge::new(
             &device,
@@ -1378,6 +1383,13 @@ impl GpuDeqBackend {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_read_enabled = std::env::var("AIDEEN_ASSOC_READ")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(true);
         let assoc_event_gate = std::env::var("AIDEEN_ASSOC_EVENT_GATE")
             .ok()
             .map(|v| {
@@ -1414,6 +1426,10 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_CONF_READ".to_string(),
             if assoc_conf_read { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_READ".to_string(),
+            if assoc_read_enabled { 1.0 } else { 0.0 },
         );
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_EVENT_GATE".to_string(),
@@ -2436,6 +2452,7 @@ impl GpuDeqBackend {
 
         Some(Self {
             config,
+            forward_seq_cap,
             instance,
             adapter,
             subgroup_supported,

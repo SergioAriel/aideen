@@ -117,6 +117,16 @@ fn train_ar_sequence(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f3
     let mut start = 0;
     let total_len = inputs.len();
     let mut last_loss = f32::NAN;
+    let full_cap = trainer.gpu_sequence_capacity();
+
+    if total_len <= full_cap {
+        let mut full_targets =
+            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; total_len];
+        if let Some(last) = full_targets.last_mut() {
+            *last = targets[total_len - 1];
+        }
+        return trainer.train_sequence(inputs, &full_targets, true, eps);
+    }
 
     // Train continuously across the sequence. Only the final answer token is
     // supervised so this benchmark measures associative recall instead of
@@ -137,6 +147,68 @@ fn train_ar_sequence(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f3
     last_loss
 }
 
+#[cfg(feature = "wgpu")]
+fn train_ar_sequence_with_assoc_trace(
+    trainer: &mut Trainer,
+    seq: &[u32],
+    ctx_len: usize,
+    eps: f32,
+) -> (f32, Vec<String>) {
+    if seq.len() < 2 {
+        return (f32::NAN, Vec::new());
+    }
+    let inputs = &seq[..seq.len() - 1];
+    let targets = &seq[1..];
+    let mut first = true;
+    let mut start = 0;
+    let total_len = inputs.len();
+    let mut last_loss = f32::NAN;
+    let mut trace = Vec::new();
+    let full_cap = trainer.gpu_sequence_capacity();
+
+    if total_len <= full_cap {
+        let mut full_targets =
+            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; total_len];
+        if let Some(last) = full_targets.last_mut() {
+            *last = targets[total_len - 1];
+        }
+        last_loss = trainer.train_sequence(inputs, &full_targets, true, eps);
+        if let Some(gpu) = trainer.gpu_deq.as_ref() {
+            let fw = gpu.read_debug_buffer();
+            trace.push(format_assoc_chunk_summary(
+                trainer, &fw, 0, 0, total_len, true,
+            ));
+        }
+        return (last_loss, trace);
+    }
+
+    while start < total_len {
+        let end = (start + ctx_len).min(total_len);
+        let mut chunk_targets = vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
+        if end == total_len {
+            if let Some(last) = chunk_targets.last_mut() {
+                *last = targets[end - 1];
+            }
+        }
+        last_loss = trainer.train_sequence(&inputs[start..end], &chunk_targets, first, eps);
+        if let Some(gpu) = trainer.gpu_deq.as_ref() {
+            let fw = gpu.read_debug_buffer();
+            trace.push(format_assoc_chunk_summary(
+                trainer,
+                &fw,
+                trace.len(),
+                start,
+                end,
+                end == total_len,
+            ));
+        }
+        first = false;
+        start = end;
+    }
+
+    (last_loss, trace)
+}
+
 fn eval_answer_loss(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f32) -> f32 {
     if seq.len() < 2 {
         return f32::NAN;
@@ -144,6 +216,12 @@ fn eval_answer_loss(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f32
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
     let total_len = inputs.len();
+    let full_cap = trainer.gpu_sequence_capacity();
+
+    if total_len <= full_cap {
+        let _ = trainer.train_sequence(inputs, targets, true, eps);
+        return trainer.eval_cached_hpooled_token_loss(total_len - 1, targets[total_len - 1]);
+    }
 
     let mut first = true;
     let mut start = 0;
@@ -177,11 +255,24 @@ fn eval_answer_loss_with_assoc_trace(
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
     let total_len = inputs.len();
+    let full_cap = trainer.gpu_sequence_capacity();
 
     let mut first = true;
     let mut start = 0;
     let mut answer_loss = f32::NAN;
     let mut trace = Vec::new();
+
+    if total_len <= full_cap {
+        let _ = trainer.train_sequence(inputs, targets, true, eps);
+        answer_loss = trainer.eval_cached_hpooled_token_loss(total_len - 1, targets[total_len - 1]);
+        if let Some(gpu) = trainer.gpu_deq.as_ref() {
+            let fw = gpu.read_debug_buffer();
+            trace.push(format_assoc_chunk_summary(
+                trainer, &fw, 0, 0, total_len, true,
+            ));
+        }
+        return (answer_loss, trace);
+    }
 
     while start < total_len {
         let end = (start + ctx_len).min(total_len);
@@ -459,6 +550,18 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
         .clamp(1, N_KEYS as usize);
+    let required_seq_cap = gaps
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        + 2 * pairs_per_seq
+        + 2;
+    if std::env::var("AIDEEN_SEQ_CAP").is_err() {
+        unsafe {
+            std::env::set_var("AIDEEN_SEQ_CAP", required_seq_cap.max(ctx_len).to_string());
+        }
+    }
 
     let mode_label = if assoc_only {
         "Assoc-only (no slot-attn, no continuous FPM)"
@@ -561,13 +664,15 @@ fn main() {
             gpu.cached_fpm_stage = gpu.cached_fpm_stage.max(4);
         }
     }
+    if let Some(alpha_assoc_override) = std::env::var("AR_ASSOC_ALPHA")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        trainer.reasoning.alpha_assoc.fill(alpha_assoc_override);
+    } else if assoc_only {
+        trainer.reasoning.alpha_assoc.fill(0.3);
+    }
     if assoc_only {
-        trainer.reasoning.alpha_assoc.fill(
-            std::env::var("AR_ASSOC_ALPHA")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .unwrap_or(0.3),
-        );
         #[cfg(feature = "wgpu")]
         if let Some(gpu) = trainer.gpu_deq.as_mut() {
             gpu.cached_fpm_alpha_m = 0.0;
@@ -590,6 +695,11 @@ fn main() {
     println!("  GPU ready.");
     flush();
 
+    #[cfg(feature = "wgpu")]
+    if assoc_audit {
+        trainer.enable_temporary_assoc_debug_sampling(1);
+    }
+
     // ── Training: interleaved across all gap lengths ───────────────────────────
     // Each step draws a random gap from the configured set and trains one sequence.
     // This ensures the model learns to handle all gap lengths with one training run.
@@ -601,6 +711,7 @@ fn main() {
     let mut train_loss_sum = 0.0f32;
     let mut train_valid = 0usize;
     let n_gaps = gaps.len();
+    let mut last_train_case: Option<(usize, usize, ArSequence, f32, Vec<String>)> = None;
 
     for i in 0..n_train {
         // Cycle through gaps: each n_gaps sequences covers every gap once.
@@ -608,10 +719,20 @@ fn main() {
         let key = rng_train.gen_range(0..N_KEYS);
         let val = rng_train.gen_range(0..N_VALS);
         let ar = make_ar_sequence(key, val, gap, pairs_per_seq, &mut rng_train);
-        let loss = train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps);
+        #[cfg(feature = "wgpu")]
+        let (loss, train_trace) = if assoc_audit {
+            train_ar_sequence_with_assoc_trace(&mut trainer, &ar.seq, ctx_len, eps)
+        } else {
+            (train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps), Vec::new())
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let (loss, train_trace) = (train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps), Vec::new());
         if loss.is_finite() {
             train_loss_sum += loss;
             train_valid += 1;
+        }
+        if assoc_audit {
+            last_train_case = Some((i, gap, ar, loss, train_trace));
         }
 
         if (i + 1) % 100 == 0 {
@@ -644,6 +765,20 @@ fn main() {
     flush();
 
     if assoc_audit {
+        #[cfg(feature = "wgpu")]
+        if let Some((train_idx, train_gap, train_ar, train_loss, train_trace)) =
+            last_train_case.as_ref()
+        {
+            println!(
+                "  [assoc-train-last] idx={} gap={} key={} val={} loss={:.4} trace=[{}]",
+                train_idx,
+                train_gap,
+                train_ar.query_key,
+                train_ar.query_val,
+                train_loss,
+                train_trace.join(" || ")
+            );
+        }
         #[cfg(feature = "wgpu")]
         trainer.sync_inference_weights();
         let alpha_now = trainer.reasoning.alpha_assoc.as_slice().to_vec();
@@ -723,12 +858,12 @@ fn main() {
             let mut bwd_parts = Vec::with_capacity(h);
             for slot in 0..h {
                 let base = slot * 16;
-                if bwd.len() <= base + 11 {
+                if bwd.len() <= base + 14 {
                     continue;
                 }
                 let v_den = bwd[base + 1].max(1.0);
                 bwd_parts.push(format!(
-                    "s{}:v_rms_avg={:.3e},score_abs_sum={:.3e},score_abs_max={:.3e},wq_step_sum={:.3e},wq_step_max={:.3e},wk_step_sum={:.3e},wk_step_max={:.3e},alpha_step_sum={:.3e},alpha_step_max={:.3e}",
+                    "s{}:v_rms_avg={:.3e},score_abs_sum={:.3e},score_abs_max={:.3e},wq_step_sum={:.3e},wq_step_max={:.3e},wk_step_sum={:.3e},wk_step_max={:.3e},alpha_step_sum={:.3e},alpha_step_max={:.3e},key_grad_sum={:.3e},gprev_sum={:.3e},bind_sum={:.3e}",
                     slot,
                     bwd[base] / v_den,
                     bwd[base + 4],
@@ -739,6 +874,9 @@ fn main() {
                     bwd[base + 9],
                     bwd[base + 10],
                     bwd[base + 11],
+                    bwd[base + 12],
+                    bwd[base + 13],
+                    bwd[base + 14],
                 ));
             }
             println!("  [assoc-bwd-debug] {}", bwd_parts.join(" | "));
