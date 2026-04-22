@@ -201,6 +201,9 @@ pub struct Trainer {
     cfg_lr_plateau_factor: f32,    // AIDEEN_LR_PLATEAU_FACTOR
     cfg_lr_plateau_min_rel_improvement: f32, // AIDEEN_LR_PLATEAU_MIN_REL_IMPROVEMENT
     cfg_lr_plateau_min_lr_override: Option<f32>, // AIDEEN_LR_PLATEAU_MIN_LR
+    cfg_assoc_lr_mult: f32,        // AIDEEN_ASSOC_LR_MULT
+    cfg_assoc_event_lr_mult: f32,  // AIDEEN_ASSOC_EVENT_LR_MULT
+    cfg_assoc_alpha_lr_mult: f32,  // AIDEEN_ASSOC_ALPHA_LR_MULT
 }
 
 impl Trainer {
@@ -1581,6 +1584,9 @@ impl Trainer {
             .and_then(|v| v.trim().parse::<f32>().ok())
             .unwrap_or(0.005),
             cfg_lr_plateau_min_lr_override: Self::env_f32("AIDEEN_LR_PLATEAU_MIN_LR"),
+            cfg_assoc_lr_mult: Self::env_f32("AIDEEN_ASSOC_LR_MULT").unwrap_or(1.0),
+            cfg_assoc_event_lr_mult: Self::env_f32("AIDEEN_ASSOC_EVENT_LR_MULT").unwrap_or(1.0),
+            cfg_assoc_alpha_lr_mult: Self::env_f32("AIDEEN_ASSOC_ALPHA_LR_MULT").unwrap_or(1.0),
         };
         trainer.apply_experimental_profile_from_env();
 
@@ -2302,6 +2308,9 @@ impl Trainer {
                     grad_accum,
                     batch_size,
                     apply_accum,
+                    self.cfg_assoc_lr_mult,
+                    self.cfg_assoc_event_lr_mult,
+                    self.cfg_assoc_alpha_lr_mult,
                 );
                 if audit_cost {
                     audit_update_ms += update_t0.elapsed().as_secs_f64() * 1e3;

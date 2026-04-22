@@ -48,6 +48,10 @@ struct FpmBwdUniforms {
     batch_size: u32,
     apply_accum: u32,
     _pad0: u32,
+    assoc_lr_mult: f32,
+    assoc_event_lr_mult: f32,
+    assoc_alpha_lr_mult: f32,
+    _pad1: f32,
 };
 
 @group(0) @binding(0) var<uniform>             params: FpmBwdUniforms;
@@ -69,6 +73,7 @@ struct FpmBwdUniforms {
 @group(0) @binding(12) var<storage, read> AssocHist: array<f32>;
 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after backward learning path is localized.
 @group(0) @binding(13) var<storage, read_write> AssocBwdDebug: array<f32>;
+@group(0) @binding(14) var<storage, read> S_in: array<f32>;
 
 @group(1) @binding(0) var<storage, read_write> AllWeights: array<f32>;
 
@@ -135,6 +140,7 @@ const FPM_GATE_BIAS: f32 = -1.5;
 const ASSOC_WRITE_CAP: f32 = 0.95;
 override ASSOC_BANKS: u32 = 1u;
 const ASSOC_ALLOC_THRESHOLD: f32 = 0.05;
+const ASSOC_OCCUPIED_THRESHOLD: f32 = 1.0e-4;
 // Experimental multi-bank addressing strength. With ASSOC_BANKS=1 this is
 // behaviorally inactive because the read softmax has a single candidate.
 const ASSOC_READ_BETA: f32 = 4.0;
@@ -151,7 +157,7 @@ const FPM_DIRECT_WRITE_SCALE: f32 = 200.0;
 // d_model × rank while scalar alpha receives a reduced sum. This fan-in
 // compensation is temporary until these parameters use the same normalized
 // optimizer path as the rest of the model.
-const ASSOC_ADDR_GRAD_SCALE: f32 = 1024.0;
+const ASSOC_ADDR_GRAD_SCALE: f32 = 1.0;
 // Event-gate parameters are d_model-sized vectors plus one bias; using the same
 // boost as the addressing matrices over-amplified the classifier and was the
 // first source of NaN in exploding runs.
@@ -197,6 +203,9 @@ fn fused_fpm_retain_bwd_main(
     let n_norm = max(1.0, f32(n_tokens));
     let clip = 0.5;
     let lr_scaled = params.lr * params.grad_scale;
+    let assoc_lr_scaled = lr_scaled * params.assoc_lr_mult;
+    let assoc_event_lr_scaled = lr_scaled * params.assoc_event_lr_mult;
+    let assoc_alpha_lr_scaled = lr_scaled * params.assoc_alpha_lr_mult;
     let inv_sqrt_d = inverseSqrt(max(1.0, f32(d)));
 
     let hist_base = aw_hist_base(d, h);
@@ -349,13 +358,14 @@ fn fused_fpm_retain_bwd_main(
             //   source_t = norm(signal_t + optional slot_anchor)
             //   q_t = tanh(W_q_assoc * source_{t-1})
             //   k_t = tanh(W_k_assoc * source_{t-1})
-            //   v_t = tanh(W_v_assoc * source_t)
+            //   value_t = norm(h*_t)
             //   ctx_t = Σ_b match(bank_key_b, q_t) * bank_value_b
-            //   bank_b* <- EMA(bank_b*, [k_t | v_t])
+            //   bank_b* <- EMA(bank_b*, [k_t | value_t])
             //
             // AssocHist stores the exact pre-write bank for each token, so BPTT never
-            // reconstructs the EMA inverse. The backward must match the rank-space bank
-            // layout used by forward: [key[R] | value[d_model] | usage] per bank.
+            // reconstructs the EMA inverse. The backward must match the actual forward
+            // layout: [key[R] | value[d_model] | usage] per bank, with values stored in
+            // normalized h* space rather than raw signal space.
             let alpha_assoc = AllWeights[alpha_assoc_idx];
             var local_alpha_grad = 0.0;
             let vs_base = (slot * n_tokens + t_abs) * d;
@@ -378,17 +388,15 @@ fn fused_fpm_retain_bwd_main(
             var prev_event_rms = 1.0;
             var curr_event_rms = 1.0;
             if (t > 0u) {
-                let prev_sig_base_e = clean_signal_off(t_abs - 1u, slot, d, h);
-                let curr_sig_base_e = clean_signal_off(t_abs, slot, d, h);
                 var local_prev_sq_e = 0.0;
                 var local_curr_sq_e = 0.0;
                 for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                     let dim = lane * dims_per_lane + k;
                     let prev_j =
-                        Scratch[prev_sig_base_e + dim]
+                        S_in[(t_abs - 1u) * d + dim]
                         + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR);
                     let curr_j =
-                        Scratch[curr_sig_base_e + dim]
+                        S_in[t_abs * d + dim]
                         + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR);
                     local_prev_sq_e = local_prev_sq_e + prev_j * prev_j;
                     local_curr_sq_e = local_curr_sq_e + curr_j * curr_j;
@@ -399,15 +407,17 @@ fn fused_fpm_retain_bwd_main(
                 for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                     let dim = lane * dims_per_lane + k;
                     let prev_src_e =
-                        (Scratch[prev_sig_base_e + dim]
+                        (S_in[(t_abs - 1u) * d + dim]
                             + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR))
                         / max(prev_event_rms, 1.0e-6);
                     let curr_src_e =
-                        (Scratch[curr_sig_base_e + dim]
+                        (S_in[t_abs * d + dim]
                             + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR))
                         / max(curr_event_rms, 1.0e-6);
                     local_event_dot =
-                        local_event_dot + AllWeights[wevent_assoc_base + dim] * (curr_src_e - prev_src_e);
+                        local_event_dot
+                        + AllWeights[wevent_assoc_base + dim]
+                            * ((curr_src_e - prev_src_e) + curr_src_e * prev_src_e);
                 }
                 let event_logit =
                     reduce_sum(lane, local_event_dot) * inv_sqrt_d + AllWeights[bevent_assoc_idx];
@@ -429,47 +439,51 @@ fn fused_fpm_retain_bwd_main(
             if (lane < RETAIN_RANK) {
                 var q_acc = 0.0;
                 var k_acc = 0.0;
-                var v_acc = 0.0;
-                var prev_sig_sq = 0.0;
-                var curr_sig_sq_rank = 0.0;
+                var query_sig_sq = 0.0;
                 if (t > 0u) {
-                    let prev_sig_base = clean_signal_off(t_abs - 1u, slot, d, h);
                     for (var j = 0u; j < d; j = j + 1u) {
-                        let prev_sig_j =
-                            Scratch[prev_sig_base + j]
-                            + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR);
-                        prev_sig_sq = prev_sig_sq + prev_sig_j * prev_sig_j;
+                        let query_sig_j =
+                            Scratch[clean_signal_off(t_abs - 1u, slot, d, h) + j]
+                            + S_in[t_abs * d + j];
+                        query_sig_sq = query_sig_sq + query_sig_j * query_sig_j;
                     }
                 }
-                for (var j = 0u; j < d; j = j + 1u) {
-                    let curr_sig_j =
-                        Scratch[clean_signal_off(t_abs, slot, d, h) + j]
-                        + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR);
-                    curr_sig_sq_rank = curr_sig_sq_rank + curr_sig_j * curr_sig_j;
-                }
-                let prev_sig_rms = sqrt(prev_sig_sq / max(1.0, f32(d)) + 1.0e-6);
-                let curr_sig_rms_rank = sqrt(curr_sig_sq_rank / max(1.0, f32(d)) + 1.0e-6);
+                let query_sig_rms = sqrt(query_sig_sq / max(1.0, f32(d)) + 1.0e-6);
                 for (var j = 0u; j < d; j = j + 1u) {
                     var prev_src_j = 0.0;
                     if (t > 0u) {
-                        let prev_sig_base = clean_signal_off(t_abs - 1u, slot, d, h);
                         prev_src_j =
-                            (Scratch[prev_sig_base + j]
-                                + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR))
-                            / max(prev_sig_rms, 1.0e-6);
+                            (Scratch[clean_signal_off(t_abs - 1u, slot, d, h) + j] + S_in[t_abs * d + j])
+                            / max(query_sig_rms, 1.0e-6);
                     }
-                    let curr_src_j =
-                        (Scratch[clean_signal_off(t_abs, slot, d, h) + j]
-                            + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR))
-                        / max(curr_sig_rms_rank, 1.0e-6);
                     let wq_eff_base = select(wq_assoc_base, wk_assoc_base, ENABLE_ASSOC_TIE_QK);
                     q_acc = q_acc + AllWeights[wq_eff_base + j * RETAIN_RANK + lane] * prev_src_j;
                     k_acc = k_acc + AllWeights[wk_assoc_base + j * RETAIN_RANK + lane] * prev_src_j;
-                    v_acc = v_acc + AllWeights[wv_assoc_base + j * RETAIN_RANK + lane] * curr_src_j;
                 }
-                assoc_q[lane] = tanh(q_acc * inv_sqrt_d);
-                shared_kw[lane] = tanh(k_acc * inv_sqrt_d);
-                assoc_raw[lane] = tanh(v_acc * inv_sqrt_d);
+                assoc_q[lane] = tanh(q_acc);
+                shared_kw[lane] = tanh(k_acc);
+                assoc_raw[lane] = 0.0;
+                if (ENABLE_ASSOC_TRANSITION_GATE) {
+                    var v_acc = 0.0;
+                    var curr_val_sq_rank = 0.0;
+                    for (var j = 0u; j < d; j = j + 1u) {
+                        let curr_val_j =
+                            S_in[t_abs * d + j]
+                            + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR);
+                        curr_val_sq_rank = curr_val_sq_rank + curr_val_j * curr_val_j;
+                    }
+                    let curr_val_rms_rank = sqrt(curr_val_sq_rank / max(1.0, f32(d)) + 1.0e-6);
+                    for (var j = 0u; j < d; j = j + 1u) {
+                        let curr_src_j =
+                            (S_in[t_abs * d + j]
+                                + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR))
+                            / max(curr_val_rms_rank, 1.0e-6);
+                        v_acc = v_acc + AllWeights[wv_assoc_base + j * RETAIN_RANK + lane] * curr_src_j;
+                    }
+                    assoc_raw[lane] = tanh(
+                        v_acc * inverseSqrt(max(1.0, f32(RETAIN_RANK)))
+                    );
+                }
             }
             workgroupBarrier();
 
@@ -485,6 +499,8 @@ fn fused_fpm_retain_bwd_main(
             let assoc_write_allowed = shared_vec[1];
             let assoc_transition_gate = shared_vec[2];
             let overwrite_bank = shared_vec[3];
+            let effective_bind_gate_dbg = bind_gate * assoc_write_allowed * assoc_transition_gate;
+            let effective_write_mass_dbg = effective_bind_gate_dbg * effective_bind_gate_dbg;
             var local_bind_grad = 0.0;
             var local_key_grad_abs_dbg = 0.0;
             if (lane < RETAIN_RANK) {
@@ -494,25 +510,22 @@ fn fused_fpm_retain_bwd_main(
                 local_bind_grad = local_bind_grad
                     + assoc_gb[key_idx] * (shared_kw[lane] - bank_key_prev);
             }
+            var curr_value_sq = 0.0;
+            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                let dim = lane * dims_per_lane + k;
+                let curr_v = S_in[t_abs * d + dim];
+                curr_value_sq = curr_value_sq + curr_v * curr_v;
+            }
+            let curr_value_rms = sqrt(reduce_sum(lane, curr_value_sq) / max(1.0, f32(d)) + 1.0e-6);
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                 let dim = lane * dims_per_lane + k;
                 let val_idx = chosen_bank * assoc_bank_stride + RETAIN_RANK + dim;
-                var curr_sig_sq = 0.0;
-                for (var j = 0u; j < d; j = j + 1u) {
-                    let curr_sig_j =
-                        Scratch[clean_signal_off(t_abs, slot, d, h) + j]
-                        + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR);
-                    curr_sig_sq = curr_sig_sq + curr_sig_j * curr_sig_j;
-                }
-                let curr_sig_rms = sqrt(curr_sig_sq / max(1.0, f32(d)) + 1.0e-6);
                 let bank_val_prev = select(assoc_b_state[val_idx], 0.0, overwrite_bank > 0.5);
+                let curr_value_dim = S_in[t_abs * d + dim] / max(curr_value_rms, 1.0e-6);
                 local_bind_grad = local_bind_grad
                     + assoc_gb[val_idx]
                     * (
-                        (
-                            Scratch[clean_signal_off(t_abs, slot, d, h) + dim]
-                            + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR)
-                        ) / max(curr_sig_rms, 1.0e-6)
+                        curr_value_dim
                         - bank_val_prev
                     );
             }
@@ -525,13 +538,13 @@ fn fused_fpm_retain_bwd_main(
             );
 
             let event_gate_logit_grad =
-                bind_grad * assoc_write_allowed * assoc_transition_gate
+                bind_grad * 2.0 * effective_bind_gate_dbg * assoc_write_allowed * assoc_transition_gate
                 * event_gate_bwd * (1.0 - event_gate_bwd) * has_prev_hstar
                 + sparsity_penalty;
             var transition_gate_grad = 0.0;
             if (ENABLE_ASSOC_TRANSITION_GATE) {
                 transition_gate_grad =
-                    bind_grad * assoc_write_allowed * bind_gate
+                    bind_grad * 2.0 * effective_bind_gate_dbg * assoc_write_allowed * bind_gate
                     * assoc_transition_gate * (1.0 - assoc_transition_gate);
             }
 
@@ -553,49 +566,60 @@ fn fused_fpm_retain_bwd_main(
                 local_assoc_gprev_abs_dbg = abs(assoc_gprev[lane]);
             }
             let assoc_gprev_abs_dbg = reduce_sum(lane, local_assoc_gprev_abs_dbg);
-            let effective_bind_gate_dbg = bind_gate * assoc_write_allowed * assoc_transition_gate;
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                 let dim = lane * dims_per_lane + k;
                 let effective_bind_gate = bind_gate * assoc_write_allowed * assoc_transition_gate;
+                let effective_write_mass = effective_bind_gate * effective_bind_gate;
                 let effective_keep_gate =
-                    select(1.0 - effective_bind_gate, 0.0, overwrite_bank > 0.5);
+                    select(1.0 - effective_write_mass, 0.0, overwrite_bank > 0.5);
                 let val_idx = chosen_bank * assoc_bank_stride + RETAIN_RANK + dim;
                 let g_bank_val_curr = assoc_gb[val_idx];
+                shared_vec[dim] = effective_write_mass * g_bank_val_curr;
                 assoc_gb[val_idx] = effective_keep_gate * g_bank_val_curr;
             }
             workgroupBarrier();
 
             if (t > 0u) {
+                var local_value_dot = 0.0;
+                for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                    let dim = lane * dims_per_lane + k;
+                    let curr_value_dim = S_in[t_abs * d + dim] / max(curr_value_rms, 1.0e-6);
+                    local_value_dot = local_value_dot + shared_vec[dim] * curr_value_dim;
+                }
+                let value_dot = reduce_sum(lane, local_value_dot);
                 var local_wk_step_abs_dbg = 0.0;
                 let prev_sig_base = clean_signal_off(t_abs - 1u, slot, d, h);
                 let curr_sig_base = clean_signal_off(t_abs, slot, d, h);
                 var prev_sig_sq = 0.0;
-                var curr_sig_sq = 0.0;
                 for (var j = 0u; j < d; j = j + 1u) {
                     let prev_sig_j = Scratch[prev_sig_base + j];
                     let prev_sig_j_anchor =
                         prev_sig_j + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR);
                     prev_sig_sq = prev_sig_sq + prev_sig_j_anchor * prev_sig_j_anchor;
-                    let curr_sig_j =
-                        Scratch[curr_sig_base + j]
-                        + select(0.0, AllWeights[slot_anchor_root + j], ENABLE_ASSOC_SLOT_ANCHOR);
-                    curr_sig_sq = curr_sig_sq + curr_sig_j * curr_sig_j;
                 }
                 let prev_sig_rms = sqrt(prev_sig_sq / max(1.0, f32(d)) + 1.0e-6);
-                let curr_sig_rms = sqrt(curr_sig_sq / max(1.0, f32(d)) + 1.0e-6);
                 for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                     let dim = lane * dims_per_lane + k;
                     let prev_src =
                         (Scratch[prev_sig_base + dim]
                             + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR))
                         / max(prev_sig_rms, 1.0e-6);
-                    let curr_src =
-                        (Scratch[curr_sig_base + dim]
+                    let curr_value_src =
+                        (S_in[t_abs * d + dim]
+                            )
+                        / max(curr_event_rms, 1.0e-6);
+                    let prev_event_src =
+                        (S_in[(t_abs - 1u) * d + dim]
                             + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR))
-                        / max(curr_sig_rms, 1.0e-6);
-                    let event_feature = curr_src - prev_src;
+                        / max(prev_event_rms, 1.0e-6);
+                    let g_value_norm = shared_vec[dim];
+                    let g_value_dim =
+                        g_value_norm
+                        - curr_value_src * value_dot / max(1.0, f32(d));
+                    let event_feature =
+                        (curr_value_src - prev_event_src) + curr_value_src * prev_event_src;
                     let step_wevent_assoc =
-                        ASSOC_EVENT_GRAD_SCALE * lr_scaled * event_gate_logit_grad * event_feature * inv_sqrt_d / n_norm;
+                        ASSOC_EVENT_GRAD_SCALE * assoc_event_lr_scaled * event_gate_logit_grad * event_feature * inv_sqrt_d / n_norm;
                     if (params.grad_accum_mode == 1u) {
                         AllGradients[wevent_assoc_base + dim] += step_wevent_assoc;
                     } else {
@@ -605,30 +629,59 @@ fn fused_fpm_retain_bwd_main(
                         let transition_to_key =
                             transition_gate_grad * assoc_raw[r]
                             * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
-                        let transition_to_val =
-                            transition_gate_grad * shared_kw[r]
-                            * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
                         let gk_pre =
                             (assoc_gprev[r] + transition_to_key)
                             * (1.0 - shared_kw[r] * shared_kw[r]);
-                        let gv_pre =
-                            transition_to_val * (1.0 - assoc_raw[r] * assoc_raw[r]);
                         let step_wk_assoc =
-                            ASSOC_ADDR_GRAD_SCALE * lr_scaled * gk_pre * prev_src * inv_sqrt_d / n_norm;
-                        let step_wv_assoc =
-                            ASSOC_ADDR_GRAD_SCALE * lr_scaled * gv_pre * curr_src * inv_sqrt_d / n_norm;
+                            ASSOC_ADDR_GRAD_SCALE
+                            * assoc_lr_scaled
+                            * gk_pre
+                            * prev_src
+                            / n_norm;
                         local_wk_step_abs_dbg = local_wk_step_abs_dbg + abs(step_wk_assoc);
                         if (params.grad_accum_mode == 1u) {
                             AllGradients[wk_assoc_base + dim * RETAIN_RANK + r] += step_wk_assoc;
-                            AllGradients[wv_assoc_base + dim * RETAIN_RANK + r] += step_wv_assoc;
+                            if (ENABLE_ASSOC_TRANSITION_GATE) {
+                                let transition_to_val =
+                                    transition_gate_grad * shared_kw[r]
+                                    * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
+                                let gv_pre =
+                                    transition_to_val * (1.0 - assoc_raw[r] * assoc_raw[r]);
+                                let step_wv_assoc =
+                                    assoc_lr_scaled
+                                    * (
+                                        ASSOC_ADDR_GRAD_SCALE
+                                        * gv_pre
+                                        * curr_value_src
+                                        * inverseSqrt(max(1.0, f32(RETAIN_RANK)))
+                                    )
+                                    / n_norm;
+                                AllGradients[wv_assoc_base + dim * RETAIN_RANK + r] += step_wv_assoc;
+                            }
                         } else {
                             AllWeights[wk_assoc_base + dim * RETAIN_RANK + r] -= clamp(step_wk_assoc, -clip, clip);
-                            AllWeights[wv_assoc_base + dim * RETAIN_RANK + r] -= clamp(step_wv_assoc, -clip, clip);
+                            if (ENABLE_ASSOC_TRANSITION_GATE) {
+                                let transition_to_val =
+                                    transition_gate_grad * shared_kw[r]
+                                    * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
+                                let gv_pre =
+                                    transition_to_val * (1.0 - assoc_raw[r] * assoc_raw[r]);
+                                let step_wv_assoc =
+                                    assoc_lr_scaled
+                                    * (
+                                        ASSOC_ADDR_GRAD_SCALE
+                                        * gv_pre
+                                        * curr_value_src
+                                        * inverseSqrt(max(1.0, f32(RETAIN_RANK)))
+                                    )
+                                    / n_norm;
+                                AllWeights[wv_assoc_base + dim * RETAIN_RANK + r] -= clamp(step_wv_assoc, -clip, clip);
+                            }
                         }
                     }
                 }
                 if (lane == 0u) {
-                    let step_bevent_assoc = ASSOC_EVENT_GRAD_SCALE * lr_scaled * event_gate_logit_grad / n_norm;
+                    let step_bevent_assoc = ASSOC_EVENT_GRAD_SCALE * assoc_event_lr_scaled * event_gate_logit_grad / n_norm;
                     if (params.grad_accum_mode == 1u) {
                         AllGradients[bevent_assoc_idx] += step_bevent_assoc;
                     } else {
@@ -646,7 +699,7 @@ fn fused_fpm_retain_bwd_main(
                     AssocBwdDebug[assoc_debug_base + 13u] =
                         AssocBwdDebug[assoc_debug_base + 13u] + assoc_gprev_abs_dbg;
                     AssocBwdDebug[assoc_debug_base + 14u] =
-                        AssocBwdDebug[assoc_debug_base + 14u] + effective_bind_gate_dbg;
+                        AssocBwdDebug[assoc_debug_base + 14u] + effective_write_mass_dbg;
                 }
                 workgroupBarrier();
             }
@@ -682,9 +735,16 @@ fn fused_fpm_retain_bwd_main(
                     }
                     let bank_usage = assoc_b_state[bank_base + RETAIN_RANK + d];
                     let q_norm = shared_vec[16u];
-                    let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
-                    shared_dup[bank] =
-                        clamp(ASSOC_READ_BETA * address_score + log(max(bank_usage, 1.0e-4)), -25.0, 25.0);
+                    if (bank_usage < ASSOC_OCCUPIED_THRESHOLD) {
+                        shared_dup[bank] = -25.0;
+                    } else {
+                        let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
+                        shared_dup[bank] = clamp(
+                            ASSOC_READ_BETA * address_score + log(max(bank_usage, ASSOC_OCCUPIED_THRESHOLD)),
+                            -25.0,
+                            25.0,
+                        );
+                    }
                     shared_vec[20u + bank * 2u] = dot_score;
                     shared_vec[20u + bank * 2u + 1u] = key_norm;
                 }
@@ -731,7 +791,7 @@ fn fused_fpm_retain_bwd_main(
             }
             workgroupBarrier();
             let assoc_rms = sqrt(shared_vec[18u] / max(1.0, f32(d)));
-            let assoc_scale = 1.0 / max(assoc_rms, 0.1); 
+            let assoc_scale = 1.0 / max(assoc_rms, 0.1);
 
             // Read backward: ctx_dim = alpha * Σ_b match_b * bank_value_b[dim].
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
@@ -828,7 +888,11 @@ fn fused_fpm_retain_bwd_main(
                         / max(prev_sig_rms, 1.0e-6);
                     for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
                         let step_wq_assoc =
-                            ASSOC_ADDR_GRAD_SCALE * lr_scaled * shared_kw[r] * prev_src * inv_sqrt_d / n_norm;
+                            ASSOC_ADDR_GRAD_SCALE
+                            * assoc_lr_scaled
+                            * shared_kw[r]
+                            * prev_src
+                            / n_norm;
                         local_wq_step_abs_dbg = local_wq_step_abs_dbg + abs(step_wq_assoc);
                         let wq_eff_base = select(wq_assoc_base, wk_assoc_base, ENABLE_ASSOC_TIE_QK);
                         if (params.grad_accum_mode == 1u) {
@@ -851,7 +915,7 @@ fn fused_fpm_retain_bwd_main(
             // Alpha update
             let g_alpha_total = reduce_sum(lane, local_alpha_grad);
             if (lane == 0u) {
-                let step_alpha_assoc = lr_scaled * g_alpha_total / n_norm;
+                let step_alpha_assoc = assoc_alpha_lr_scaled * g_alpha_total / n_norm;
                 AssocBwdDebug[assoc_debug_base + 10u] =
                     AssocBwdDebug[assoc_debug_base + 10u] + abs(step_alpha_assoc);
                 AssocBwdDebug[assoc_debug_base + 11u] =

@@ -105,7 +105,34 @@ fn make_ar_sequence(
     ArSequence { seq, query_key, query_val }
 }
 
-// ── Chunked forward: carry M across context-window boundaries ─────────────────
+// ── Train/eval full sequence when GPU capacity fits; chunk only as fallback ───
+
+fn run_sequence_chunks<F>(total_len: usize, ctx_len: usize, full_cap: usize, mut f: F)
+where
+    F: FnMut(bool, usize, usize, bool),
+{
+    if total_len <= full_cap {
+        f(true, 0, total_len, true);
+        return;
+    }
+
+    let mut first = true;
+    let mut start = 0;
+    while start < total_len {
+        let end = (start + ctx_len).min(total_len);
+        let final_chunk = end == total_len;
+        f(first, start, end, final_chunk);
+        first = false;
+        start = end;
+    }
+}
+
+fn final_cached_token_index(total_len: usize, ctx_len: usize, full_cap: usize) -> usize {
+    if total_len <= full_cap {
+        return total_len.saturating_sub(1);
+    }
+    total_len.saturating_sub(1) % ctx_len
+}
 
 fn train_ar_sequence(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f32) -> f32 {
     if seq.len() < 2 {
@@ -113,36 +140,19 @@ fn train_ar_sequence(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f3
     }
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
-    let mut first = true;
-    let mut start = 0;
     let total_len = inputs.len();
-    let mut last_loss = f32::NAN;
     let full_cap = trainer.gpu_sequence_capacity();
-
-    if total_len <= full_cap {
-        let mut full_targets =
-            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; total_len];
-        if let Some(last) = full_targets.last_mut() {
-            *last = targets[total_len - 1];
-        }
-        return trainer.train_sequence(inputs, &full_targets, true, eps);
-    }
-
-    // Train continuously across the sequence. Only the final answer token is
-    // supervised so this benchmark measures associative recall instead of
-    // next-token modeling on the prompt itself.
-    while start < total_len {
-        let end = (start + ctx_len).min(total_len);
-        let mut chunk_targets = vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
+    let mut last_loss = f32::NAN;
+    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, _final_chunk| {
+        let mut chunk_targets =
+            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
         if end == total_len {
             if let Some(last) = chunk_targets.last_mut() {
                 *last = targets[end - 1];
             }
         }
         last_loss = trainer.train_sequence(&inputs[start..end], &chunk_targets, first, eps);
-        first = false;
-        start = end;
-    }
+    });
 
     last_loss
 }
@@ -159,33 +169,14 @@ fn train_ar_sequence_with_assoc_trace(
     }
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
-    let mut first = true;
-    let mut start = 0;
     let total_len = inputs.len();
+    let full_cap = trainer.gpu_sequence_capacity();
     let mut last_loss = f32::NAN;
     let mut trace = Vec::new();
-    let full_cap = trainer.gpu_sequence_capacity();
-
-    if total_len <= full_cap {
-        let mut full_targets =
-            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; total_len];
-        if let Some(last) = full_targets.last_mut() {
-            *last = targets[total_len - 1];
-        }
-        last_loss = trainer.train_sequence(inputs, &full_targets, true, eps);
-        if let Some(gpu) = trainer.gpu_deq.as_ref() {
-            let fw = gpu.read_debug_buffer();
-            trace.push(format_assoc_chunk_summary(
-                trainer, &fw, 0, 0, total_len, true,
-            ));
-        }
-        return (last_loss, trace);
-    }
-
-    while start < total_len {
-        let end = (start + ctx_len).min(total_len);
-        let mut chunk_targets = vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
-        if end == total_len {
+    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
+        let mut chunk_targets =
+            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
+        if final_chunk {
             if let Some(last) = chunk_targets.last_mut() {
                 *last = targets[end - 1];
             }
@@ -199,12 +190,10 @@ fn train_ar_sequence_with_assoc_trace(
                 trace.len(),
                 start,
                 end,
-                end == total_len,
+                final_chunk,
             ));
         }
-        first = false;
-        start = end;
-    }
+    });
 
     (last_loss, trace)
 }
@@ -217,27 +206,13 @@ fn eval_answer_loss(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f32
     let targets = &seq[1..];
     let total_len = inputs.len();
     let full_cap = trainer.gpu_sequence_capacity();
-
-    if total_len <= full_cap {
-        let _ = trainer.train_sequence(inputs, targets, true, eps);
-        return trainer.eval_cached_hpooled_token_loss(total_len - 1, targets[total_len - 1]);
-    }
-
-    let mut first = true;
-    let mut start = 0;
     let mut answer_loss = f32::NAN;
-
-    // Evaluate across the full sequence by naturally advancing the memory state M.
-    // The previous token's converged h* is retained in PrevHStarBuf automatically.
-    while start < total_len {
-        let end = (start + ctx_len).min(total_len);
+    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
         let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
-        if end == total_len {
+        if final_chunk {
             answer_loss = trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
         }
-        first = false;
-        start = end;
-    }
+    });
 
     answer_loss
 }
@@ -256,28 +231,11 @@ fn eval_answer_loss_with_assoc_trace(
     let targets = &seq[1..];
     let total_len = inputs.len();
     let full_cap = trainer.gpu_sequence_capacity();
-
-    let mut first = true;
-    let mut start = 0;
     let mut answer_loss = f32::NAN;
     let mut trace = Vec::new();
-
-    if total_len <= full_cap {
-        let _ = trainer.train_sequence(inputs, targets, true, eps);
-        answer_loss = trainer.eval_cached_hpooled_token_loss(total_len - 1, targets[total_len - 1]);
-        if let Some(gpu) = trainer.gpu_deq.as_ref() {
-            let fw = gpu.read_debug_buffer();
-            trace.push(format_assoc_chunk_summary(
-                trainer, &fw, 0, 0, total_len, true,
-            ));
-        }
-        return (answer_loss, trace);
-    }
-
-    while start < total_len {
-        let end = (start + ctx_len).min(total_len);
+    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
         let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
-        if end == total_len {
+        if final_chunk {
             answer_loss = trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
         }
         if let Some(gpu) = trainer.gpu_deq.as_ref() {
@@ -288,12 +246,10 @@ fn eval_answer_loss_with_assoc_trace(
                 trace.len(),
                 start,
                 end,
-                end == total_len,
+                final_chunk,
             ));
         }
-        first = false;
-        start = end;
-    }
+    });
 
     (answer_loss, trace)
 }
@@ -303,7 +259,12 @@ fn flush() {
 }
 
 #[cfg(feature = "wgpu")]
-fn format_lm_top_debug(trainer: &Trainer, final_token_index: usize, target: u32) -> String {
+fn format_lm_top_debug(
+    trainer: &Trainer,
+    final_token_index: usize,
+    query_key_tok: u32,
+    target: u32,
+) -> String {
     let Some(gpu) = trainer.gpu_deq.as_ref() else {
         return "lm_top=NA".to_string();
     };
@@ -314,21 +275,58 @@ fn format_lm_top_debug(trainer: &Trainer, final_token_index: usize, target: u32)
         return "lm_top=NA".to_string();
     };
     let h = gpu.read_hpooled_at(final_token_index);
+    let h_slots_flat = gpu.read_hnext_seq((final_token_index + 1) as u32);
+    let assoc_state = gpu.read_assoc_state();
     let d = trainer.config.d_r;
+    let h_slots = trainer.config.h_slots;
     let vocab = trainer.config.vocab_size;
-    if h.len() < d || w.len() < vocab * d || b.len() < vocab || g.len() < d {
+    let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+    const ASSOC_RANK: usize = 32;
+    let assoc_bank_stride = ASSOC_RANK + d + 1;
+    let assoc_slot_stride = assoc_banks * assoc_bank_stride;
+    if h.len() < d
+        || h_slots_flat.len() < (final_token_index + 1) * h_slots * d
+        || assoc_state.len() < h_slots * assoc_slot_stride
+        || w.len() < vocab * d
+        || b.len() < vocab
+        || g.len() < d
+    {
         return "lm_top=bad-shape".to_string();
     }
-    let h_rms = (h.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32 + 1e-5).sqrt();
-    let mut logits = vec![0.0f32; vocab];
-    for v in 0..vocab {
-        let mut acc = b[v];
-        let row = v * d;
-        for j in 0..d {
-            acc += w[row + j] * (h[j] / h_rms) * g[j];
+    let compute_logits = |h_vec: &[f32]| -> Vec<f32> {
+        let h_rms = (h_vec.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32 + 1e-5).sqrt();
+        let mut logits = vec![0.0f32; vocab];
+        for v in 0..vocab {
+            let mut acc = b[v];
+            let row = v * d;
+            for j in 0..d {
+                acc += w[row + j] * (h_vec[j] / h_rms) * g[j];
+            }
+            logits[v] = acc;
         }
-        logits[v] = acc;
-    }
+        logits
+    };
+    let emb_cos = |h_vec: &[f32], tok: u32| -> f32 {
+        let tok_idx = tok as usize;
+        if tok_idx >= trainer.tokenizer.embeddings.nrows() {
+            return f32::NAN;
+        }
+        let mut dot = 0.0f32;
+        let mut h_norm = 0.0f32;
+        let mut e_norm = 0.0f32;
+        for j in 0..d {
+            let hv = h_vec[j];
+            let ev = trainer.tokenizer.embeddings[(tok_idx, j)];
+            dot += hv * ev;
+            h_norm += hv * hv;
+            e_norm += ev * ev;
+        }
+        dot / (h_norm * e_norm).max(1e-12).sqrt()
+    };
+    let logits = compute_logits(&h[..d]);
     let mut top = (0usize, f32::NEG_INFINITY);
     let mut second = (0usize, f32::NEG_INFINITY);
     for (idx, &logit) in logits.iter().enumerate() {
@@ -347,8 +345,92 @@ fn format_lm_top_debug(trainer: &Trainer, final_token_index: usize, target: u32)
     } else {
         0.0
     };
+    let token_base = final_token_index * h_slots * d;
+    let mut best_slot = 0usize;
+    let mut best_slot_target_prob = f32::NEG_INFINITY;
+    let mut best_slot_target_logit = f32::NEG_INFINITY;
+    for slot in 0..h_slots {
+        let slot_base = token_base + slot * d;
+        let slot_logits = compute_logits(&h_slots_flat[slot_base..slot_base + d]);
+        let slot_mx = slot_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let slot_denom = slot_logits
+            .iter()
+            .map(|x| (*x - slot_mx).exp())
+            .sum::<f32>()
+            .max(1e-20);
+        let slot_target_prob = if target_idx < slot_logits.len() {
+            (slot_logits[target_idx] - slot_mx).exp() / slot_denom
+        } else {
+            0.0
+        };
+        if slot_target_prob > best_slot_target_prob {
+            best_slot = slot;
+            best_slot_target_prob = slot_target_prob;
+            best_slot_target_logit = slot_logits.get(target_idx).copied().unwrap_or(f32::NAN);
+        }
+    }
+    let mut best_bank_slot = 0usize;
+    let mut best_bank = 0usize;
+    let mut best_bank_target_prob = f32::NEG_INFINITY;
+    let mut best_bank_target_logit = f32::NEG_INFINITY;
+    let mut best_bank_target_cos = f32::NEG_INFINITY;
+    let mut best_bank_key_cos = f32::NEG_INFINITY;
+    let mut best_bank_query_cos = f32::NEG_INFINITY;
+    let mut best_bank_late_fuse_target_prob = f32::NEG_INFINITY;
+    let mut best_bank_late_fuse_target_logit = f32::NEG_INFINITY;
+    for slot in 0..h_slots {
+        let slot_base = slot * assoc_slot_stride;
+        for bank in 0..assoc_banks {
+            let bank_base = slot_base + bank * assoc_bank_stride;
+            let value_base = bank_base + ASSOC_RANK;
+            let usage = assoc_state[bank_base + ASSOC_RANK + d];
+            if usage <= 0.0 {
+                continue;
+            }
+            let bank_logits = compute_logits(&assoc_state[value_base..value_base + d]);
+            let bank_mx = bank_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let bank_denom = bank_logits
+                .iter()
+                .map(|x| (*x - bank_mx).exp())
+                .sum::<f32>()
+                .max(1e-20);
+            let bank_target_prob = if target_idx < bank_logits.len() {
+                (bank_logits[target_idx] - bank_mx).exp() / bank_denom
+            } else {
+                0.0
+            };
+            if bank_target_prob > best_bank_target_prob {
+                best_bank_slot = slot;
+                best_bank = bank;
+                best_bank_target_prob = bank_target_prob;
+                best_bank_target_logit = bank_logits.get(target_idx).copied().unwrap_or(f32::NAN);
+                let bank_value = &assoc_state[value_base..value_base + d];
+                best_bank_target_cos = emb_cos(bank_value, target);
+                best_bank_key_cos = emb_cos(bank_value, query_key_tok);
+                best_bank_query_cos = emb_cos(bank_value, TOK_QUERY);
+                let mut fused = h[..d].to_vec();
+                for j in 0..d {
+                    fused[j] += bank_value[j];
+                }
+                let fused_logits = compute_logits(&fused);
+                let fused_mx = fused_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let fused_denom = fused_logits
+                    .iter()
+                    .map(|x| (*x - fused_mx).exp())
+                    .sum::<f32>()
+                    .max(1e-20);
+                best_bank_late_fuse_target_prob = if target_idx < fused_logits.len() {
+                    (fused_logits[target_idx] - fused_mx).exp() / fused_denom
+                } else {
+                    0.0
+                };
+                best_bank_late_fuse_target_logit =
+                    fused_logits.get(target_idx).copied().unwrap_or(f32::NAN);
+            }
+        }
+    }
     format!(
-        "lm_top={} top_logit={:.3} second={} margin={:.3} target={} target_logit={:.3} target_p={:.3e}",
+        "lm_top={} top_logit={:.3} second={} margin={:.3} target={} target_logit={:.3} target_p={:.3e} best_slot={} best_slot_target_logit={:.3} best_slot_target_p={:.3e} best_bank_slot={} best_bank={} best_bank_target_logit={:.3} best_bank_target_p={:.3e} best_bank_target_cos={:.3e} best_bank_key_cos={:.3e} best_bank_query_cos={:.3e} late_fuse_target_logit={:.3} late_fuse_target_p={:.3e}",
         top.0,
         top.1,
         second.0,
@@ -356,6 +438,18 @@ fn format_lm_top_debug(trainer: &Trainer, final_token_index: usize, target: u32)
         target,
         logits.get(target_idx).copied().unwrap_or(f32::NAN),
         target_prob,
+        best_slot,
+        best_slot_target_logit,
+        best_slot_target_prob,
+        best_bank_slot,
+        best_bank,
+        best_bank_target_logit,
+        best_bank_target_prob,
+        best_bank_target_cos,
+        best_bank_key_cos,
+        best_bank_query_cos,
+        best_bank_late_fuse_target_logit,
+        best_bank_late_fuse_target_prob,
     )
 }
 
@@ -418,13 +512,17 @@ fn format_assoc_chunk_summary(
     let mut qrms = 0.0f32;
     let mut wallow = 0.0f32;
     let mut wgate = 0.0f32;
-    let mut hcos = 0.0f32;
+    let mut prev_rms = 0.0f32;
+    let mut kpre_rms = 0.0f32;
+    let mut wkcand = 0.0f32;
+    let mut wvcand = 0.0f32;
+    let mut overwrite = 0.0f32;
     let mut n = 0.0f32;
     for slot in 0..h {
         let base = 760 + slot * 10;
         let qbase = 820 + slot * 8;
-        let hbase = 860 + slot * 4;
-        if fw.len() > qbase + 7 && fw.len() > base + 9 && fw.len() > hbase + 3 {
+        let wbase = 900 + slot * 6;
+        if fw.len() > qbase + 7 && fw.len() > base + 9 && fw.len() > wbase + 5 {
             qmax += fw[qbase + 1];
             qctx += fw[qbase + 2];
             qusage += fw[qbase + 3];
@@ -433,13 +531,17 @@ fn format_assoc_chunk_summary(
             qrms += fw[qbase + 7] / fw[qbase + 6].max(1.0);
             wallow += fw[base + 4];
             wgate += fw[base + 5];
-            hcos += fw[hbase] / fw[hbase + 3].max(1.0);
+            prev_rms += fw[wbase + 3];
+            kpre_rms += fw[wbase + 4];
+            wkcand += fw[wbase + 0];
+            wvcand += fw[wbase + 1];
+            overwrite += fw[wbase + 5];
             n += 1.0;
         }
     }
     let den = n.max(1.0);
     format!(
-        "chunk={} [{}..{}) final={} qmax={:.3e} qctx={:.3e} usage={:.3e} spread={:.3e} bank_cos={:.3e} q_rms={:.3e} w_allow={:.3e} w_gate={:.3e} hcos={:.3e}",
+        "chunk={} [{}..{}) final={} qmax={:.3e} qctx={:.3e} usage={:.3e} spread={:.3e} bank_cos={:.3e} q_rms={:.3e} w_allow={:.3e} w_gate={:.3e} prev_rms={:.3e} k_pre={:.3e} k_cand={:.3e} v_cand={:.3e} overwrite={:.3e}",
         chunk_idx,
         start,
         end,
@@ -452,7 +554,11 @@ fn format_assoc_chunk_summary(
         qrms / den,
         wallow / den,
         wgate / den,
-        hcos / den,
+        prev_rms / den,
+        kpre_rms / den,
+        wkcand / den,
+        wvcand / den,
+        overwrite / den,
     )
 }
 
@@ -466,7 +572,6 @@ fn format_assoc_forward_debug(
     let h = trainer.config.h_slots;
     let mut parts = Vec::with_capacity(h);
     let mut query_parts = Vec::with_capacity(h);
-    let mut h_parts = Vec::with_capacity(h);
     for slot in 0..h {
         let base = 760 + slot * 10;
         if fw.len() > base + 9 {
@@ -486,6 +591,7 @@ fn format_assoc_forward_debug(
             ));
         }
         let qbase = 820 + slot * 8;
+        let wbase = 900 + slot * 6;
         if fw.len() > qbase + 7 {
             query_parts.push(format!(
                 "s{}:q_ent={:.3e},q_max={:.3e},q_ctx={:.3e},q_usage={:.3e},q_spread={:.3e},bank_cos={:.3e},q_rms={:.3e},q_n={:.0}",
@@ -500,26 +606,25 @@ fn format_assoc_forward_debug(
                 fw[qbase + 6],
             ));
         }
-        let hbase = 860 + slot * 4;
-        if fw.len() > hbase + 3 {
-            let n = fw[hbase + 3].max(1.0);
-            h_parts.push(format!(
-                "s{}:hcos_avg={:.3e},hcos_max={:.3e},hcos_min={:.3e},h_n={:.0}",
+        if fw.len() > wbase + 4 {
+            parts.push(format!(
+                "s{}:prev={:.3e},k_pre={:.3e},k_cand={:.3e},v_cand={:.3e},overwrite={:.3e},w_n={:.0}",
                 slot,
-                fw[hbase] / n,
-                fw[hbase + 1],
-                fw[hbase + 2],
-                fw[hbase + 3],
+                fw[wbase + 3],
+                fw[wbase + 4],
+                fw[wbase + 0],
+                fw[wbase + 1],
+                fw[wbase + 5],
+                fw[wbase + 2],
             ));
         }
     }
     format!(
-        "{} loss={:.4} all=[{}] query=[{}] hsep=[{}]",
+        "{} loss={:.4} all=[{}] query=[{}]",
         label,
         loss,
         parts.join(" | "),
         query_parts.join(" | "),
-        h_parts.join(" | ")
     )
 }
 
@@ -646,7 +751,11 @@ fn main() {
         != "0"
     {
         trainer.lm_head.w = trainer.tokenizer.embeddings.clone();
-        trainer.frozen_emb = true;
+        trainer.frozen_emb = std::env::var("AR_TIE_LM_FREEZE_EMB")
+            .ok()
+            .as_deref()
+            .unwrap_or("1")
+            != "0";
     }
     if let Ok(v) = std::env::var("AIDEEN_DAMPING").and_then(|s| {
         s.parse::<f32>()
@@ -655,9 +764,9 @@ fn main() {
         trainer.adaptive_damping = v;
         trainer.reasoning.damping = v;
     }
-    // Associative memory needs write-enabled stages; stage 3 reads but does not write.
-    // Force the benchmark onto the first coherent stage for memory learning unless
-    // the user explicitly disabled the memory path.
+    // Associative memory needs a write-enabled stage. Stage 3 can inject/read
+    // but cannot create bindings, so the benchmark forces the first coherent
+    // training stage unless memory was explicitly disabled by configuration.
     #[cfg(feature = "wgpu")]
     if let Some(gpu) = trainer.gpu_deq.as_mut() {
         if gpu.cached_residual_alpha > -1.5 {
@@ -690,6 +799,7 @@ fn main() {
     let init_alpha_assoc = trainer.reasoning.alpha_assoc.as_slice().to_vec();
     let init_wk_write: Vec<f32> = trainer.reasoning.w_k_write.as_slice().to_vec();
     let init_wk_assoc = flatten_mats(&trainer.reasoning.w_k_assoc);
+    let init_wv_assoc = flatten_mats(&trainer.reasoning.w_v_assoc);
     let init_wq_assoc = flatten_mats(&trainer.reasoning.w_q_assoc);
 
     println!("  GPU ready.");
@@ -784,6 +894,7 @@ fn main() {
         let alpha_now = trainer.reasoning.alpha_assoc.as_slice().to_vec();
         let wk_write_now: Vec<f32> = trainer.reasoning.w_k_write.as_slice().to_vec();
         let wk_assoc_now = flatten_mats(&trainer.reasoning.w_k_assoc);
+        let wv_assoc_now = flatten_mats(&trainer.reasoning.w_v_assoc);
         let wq_assoc_now = flatten_mats(&trainer.reasoning.w_q_assoc);
         let delta_rms = |a: &[f32], b: &[f32]| -> f32 {
             if a.len() != b.len() || a.is_empty() {
@@ -800,59 +911,133 @@ fn main() {
             (ss / a.len() as f32).sqrt()
         };
         println!(
-            "  [assoc-audit] decoupled=1 alpha(mean={:.4}, delta_rms={:.4e}) gate_key=W_k_write(rms={:.4e}, delta_rms={:.4e}) Wk_assoc(delta={:.4e}) Wq_assoc(delta={:.4e}) value=direct_signal",
+            "  [assoc-audit] decoupled=1 alpha(mean={:.4}, delta_rms={:.4e}) gate_key=W_k_write(rms={:.4e}, delta_rms={:.4e}) Wk_assoc(delta={:.4e}) Wv_assoc(delta={:.4e}) Wq_assoc(delta={:.4e}) value=raw_token_identity",
             alpha_now.iter().copied().sum::<f32>() / alpha_now.len().max(1) as f32,
             delta_rms(&init_alpha_assoc, &alpha_now),
             rms(&wk_write_now),
             delta_rms(&init_wk_write, &wk_write_now),
             delta_rms(&init_wk_assoc, &wk_assoc_now),
+            delta_rms(&init_wv_assoc, &wv_assoc_now),
             delta_rms(&init_wq_assoc, &wq_assoc_now),
         );
         #[cfg(feature = "wgpu")]
         if let Some(gpu) = trainer.gpu_deq.as_ref() {
+            let hist = gpu.read_hist_params_full();
             let assoc = gpu.read_assoc_state();
             let d = trainer.config.d_r;
             let h = trainer.config.h_slots;
             let rank = 32usize;
+            let w_k_assoc_base = {
+                let hist_mat = d * d;
+                let hist_slot_scale = h * d;
+                let hist_slot_bias = h * d;
+                let hist_gate = h;
+                let slot_anchor = h * d;
+                let w_kv_write = 2 * h * d * rank;
+                let b_delta = d;
+                let flags = 21usize;
+                let w_gate_hist = h * d;
+                let w_write_gate = h * d;
+                let b_write_mem = h;
+                let gamma = h;
+                let w_retain_up = h * d * rank;
+                let w_retain_down = h * d * rank;
+                let b_retain = h * d;
+                let w_q_mem = h * d * rank;
+                let w_k_mem = h * d * rank;
+                let b_read_mem = h;
+                hist_mat
+                    + hist_slot_scale
+                    + hist_slot_bias
+                    + hist_gate
+                    + slot_anchor
+                    + w_kv_write
+                    + b_delta
+                    + flags
+                    + w_gate_hist
+                    + w_write_gate
+                    + b_write_mem
+                    + gamma
+                    + w_retain_up
+                    + w_retain_down
+                    + b_retain
+                    + w_q_mem
+                    + w_k_mem
+                    + b_read_mem
+            };
+            let w_v_assoc_base = w_k_assoc_base + h * d * rank;
+            let w_q_assoc_base = w_v_assoc_base + h * d * rank;
+            let wk_assoc_gpu_rms = rms(hist.get(w_k_assoc_base..w_v_assoc_base).unwrap_or(&[]));
+            let wv_assoc_gpu_rms = rms(hist.get(w_v_assoc_base..w_q_assoc_base).unwrap_or(&[]));
+            let wq_assoc_gpu_rms =
+                rms(hist.get(w_q_assoc_base..w_q_assoc_base + h * d * rank).unwrap_or(&[]));
             let banks = std::env::var("AR_ASSOC_BANKS_AUDIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    std::env::var("AIDEEN_ASSOC_BANKS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                })
                 .unwrap_or(1usize);
             let bank_stride = rank + d + 1;
             let slot_stride = banks * bank_stride;
             let mut key_ss = 0.0f32;
             let mut key_n = 0usize;
+            let mut key_abs_max = 0.0f32;
             let mut val_ss = 0.0f32;
             let mut val_n = 0usize;
+            let mut val_abs_max = 0.0f32;
             let mut usage_sum = 0.0f32;
             let mut usage_max = 0.0f32;
             let mut usage_n = 0usize;
+            let mut usage_head: Vec<f32> = Vec::new();
             for slot in 0..h {
                 let slot_base = slot * slot_stride;
                 for bank in 0..banks {
                     let base = slot_base + bank * bank_stride;
                     for &x in assoc.get(base..base + rank).unwrap_or(&[]) {
                         key_ss += x * x;
+                        key_abs_max = key_abs_max.max(x.abs());
                         key_n += 1;
                     }
                     for &x in assoc.get(base + rank..base + rank + d).unwrap_or(&[]) {
                         val_ss += x * x;
+                        val_abs_max = val_abs_max.max(x.abs());
                         val_n += 1;
                     }
                     if let Some(&usage) = assoc.get(base + rank + d) {
                         usage_sum += usage;
                         usage_max = usage_max.max(usage);
                         usage_n += 1;
+                        if usage_head.len() < 8 {
+                            usage_head.push(usage);
+                        }
                     }
                 }
             }
             println!(
-                "  [assoc-state] key_rms={:.4e} value_rms={:.4e} usage_mean={:.4e} usage_max={:.4e}",
+                "  [assoc-state] wk_gpu_rms={:.4e} wv_gpu_rms={:.4e} wq_gpu_rms={:.4e} key_rms={:.4e} key_abs_max={:.4e} value_rms={:.4e} value_abs_max={:.4e} usage_mean={:.4e} usage_max={:.4e}",
+                wk_assoc_gpu_rms,
+                wv_assoc_gpu_rms,
+                wq_assoc_gpu_rms,
                 (key_ss / key_n.max(1) as f32).sqrt(),
+                key_abs_max,
                 (val_ss / val_n.max(1) as f32).sqrt(),
+                val_abs_max,
                 usage_sum / usage_n.max(1) as f32,
                 usage_max,
             );
+            // TEMPORARY ASSOCIATIVE DIAGNOSTIC: raw bank head for persistence inspection.
+            if assoc.len() >= bank_stride {
+                let key_head = assoc[0..rank.min(8)].to_vec();
+                let value_head = assoc[rank..(rank + d).min(rank + 8)].to_vec();
+                let usage0 = assoc.get(rank + d).copied().unwrap_or(0.0);
+                println!(
+                    "  [assoc-state-head] key={:?} value={:?} usage0={:.4e} usage_head={:?}",
+                    key_head, value_head, usage0, usage_head
+                );
+            }
             // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after backward learning path is localized.
             let bwd = gpu.read_assoc_bwd_debug();
             let mut bwd_parts = Vec::with_capacity(h);
@@ -968,7 +1153,12 @@ fn main() {
             if assoc_audit {
                 #[cfg(feature = "wgpu")]
                 let lm_top =
-                    format_lm_top_debug(&trainer, (seq.len() - 2) % ctx_len, TOK_VAL_BASE + ar.query_val);
+                    format_lm_top_debug(
+                        &trainer,
+                        final_cached_token_index(seq.len() - 1, ctx_len, trainer.gpu_sequence_capacity()),
+                        TOK_KEY_BASE + ar.query_key,
+                        TOK_VAL_BASE + ar.query_val,
+                    );
                 #[cfg(not(feature = "wgpu"))]
                 let lm_top = "lm_top=NA".to_string();
                 #[cfg(feature = "wgpu")]

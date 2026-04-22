@@ -26,6 +26,10 @@ struct UpdateUniforms {
     batch_size: u32,      // number of sequences processed in parallel
     apply_accum: u32,     // 1=apply accumulated gradients (apply_grad_update_main)
     _pad0: u32,
+    assoc_lr_mult: f32,
+    assoc_event_lr_mult: f32,
+    assoc_alpha_lr_mult: f32,
+    _pad1: f32,
 }
 
 #[repr(C)]
@@ -891,6 +895,16 @@ impl GpuDeqBackend {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 14,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -2339,6 +2353,10 @@ impl GpuDeqBackend {
                     binding: 13,
                     resource: assoc_bwd_debug_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: bridge.s_buf.as_entire_binding(),
+                },
             ],
         });
         let fpm_shared_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2610,7 +2628,8 @@ impl GpuDeqBackend {
         encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
         self.queue.submit(Some(encoder.finish()));
         // AssocBuf: zero the durable per-slot bank (bank_key, bank_value, usage).
-        // PrevHStarBuf is cleared separately above; together they reset the associative path.
+        // PrevAssocSrc is cleared separately above; together they reset the
+        // associative path and its temporal carry.
         {
             let buf_bytes = self.bridge.assoc_buf.size() as usize;
             let n_floats = buf_bytes / 4;
@@ -3146,6 +3165,10 @@ impl GpuDeqBackend {
             batch_size,
             apply_accum: 0,
             _pad0: 0,
+            assoc_lr_mult: 1.0,
+            assoc_event_lr_mult: 1.0,
+            assoc_alpha_lr_mult: 1.0,
+            _pad1: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3772,6 +3795,10 @@ impl GpuDeqBackend {
             batch_size,
             apply_accum: 0,
             _pad0: 0,
+            assoc_lr_mult: 1.0,
+            assoc_event_lr_mult: 1.0,
+            assoc_alpha_lr_mult: 1.0,
+            _pad1: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -3894,6 +3921,9 @@ impl GpuDeqBackend {
         n_accum: u32,
         batch_size: u32,
         apply_accum: bool,
+        assoc_lr_mult: f32,
+        assoc_event_lr_mult: f32,
+        assoc_alpha_lr_mult: f32,
     ) -> Result<(), String> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
@@ -3915,6 +3945,10 @@ impl GpuDeqBackend {
             batch_size,
             apply_accum: if apply_accum { 1 } else { 0 },
             _pad0: 0,
+            assoc_lr_mult,
+            assoc_event_lr_mult,
+            assoc_alpha_lr_mult,
+            _pad1: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -4622,6 +4656,10 @@ impl GpuDeqBackend {
             batch_size: 1,
             apply_accum: 0,
             _pad0: 0,
+            assoc_lr_mult: 1.0,
+            assoc_event_lr_mult: 1.0,
+            assoc_alpha_lr_mult: 1.0,
+            _pad1: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,

@@ -261,7 +261,7 @@ impl RustDeqBridge {
             count: None,
         });
         // bindings 3-14: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState,
-        // SignalCache, H_hist, PrevHStarBuf, AssocBuf, AssocHist
+        // SignalCache, H_hist, PrevAssocSrcBuf, AssocBuf, AssocHist
         for i in 3u32..=14 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
@@ -728,7 +728,7 @@ impl RustDeqBridge {
             mapped_at_creation: false,
         });
         let prev_hstar_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Prev HStar"),
+            label: Some("Prev Assoc Source"),
             size: h_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
