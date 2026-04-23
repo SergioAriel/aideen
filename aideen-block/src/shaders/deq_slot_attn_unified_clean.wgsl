@@ -41,9 +41,12 @@ override ENABLE_ASSOC_TRANSITION_GATE: bool = false;
 override ENABLE_ASSOC_SLOT_ANCHOR: bool = false;
 override ENABLE_ASSOC_REUSE_MATCH: bool = false;
 override ENABLE_ASSOC_SLOT_STRIPE: bool = false;
+override ENABLE_ASSOC_SLOT_OWNER: bool = false;
 override ENABLE_ASSOC_TIE_QK: bool = false;
 override ENABLE_ASSOC_CONF_READ: bool = false;
 override ENABLE_ASSOC_EVENT_GATE: bool = false;
+override ENABLE_ASSOC_HARD_READ: bool = false;
+override ENABLE_ASSOC_LINEAR_WRITE: bool = false;
 override ENABLE_ASSOC_READ: bool = true;
 const SLOT_COORD_USE_BIAS: bool = true;
 const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
@@ -1052,22 +1055,21 @@ fn deq_slot_coord_unified_main(
                         + slot_idx * d_model * ASSOC_RANK;
                     let alpha_assoc = AllWeights[hist_base + alpha_assoc_base(d_model, h_slots) + slot_idx];
                     // Layout per bank: [bank_key | bank_value | usage].
-                    // Query the durable bank with the previous associative source. The source
-                    // keeps token identity; FPM/DEQ gates control whether it is consolidated.
+                    // Query the durable bank in the same explicit source manifold that wrote
+                    // the bank key. At QUERY time PrevHStar already holds the preceding KEY
+                    // identity; mixing in the current token here rotates the query away from
+                    // the stored key geometry and makes addressing chase the wrong bank.
                     if (tid < ASSOC_RANK) {
                         var query_sig_sq = 0.0;
                         for (var j = 0u; j < d_model; j = j + 1u) {
-                            let query_src_j =
-                                PrevHStarBuf[prev_hstar_base + j]
-                                + S_in[s_in_base + j];
+                            let query_src_j = PrevHStarBuf[prev_hstar_base + j];
                             query_sig_sq = query_sig_sq + query_src_j * query_src_j;
                         }
                         let query_sig_rms = sqrt(query_sig_sq / max(1.0, f32(d_model)) + 1.0e-6);
                         var q_acc = 0.0;
                         for (var j = 0u; j < d_model; j = j + 1u) {
                             let query_src_j =
-                                (PrevHStarBuf[prev_hstar_base + j] + S_in[s_in_base + j])
-                                / max(query_sig_rms, 1.0e-6);
+                                PrevHStarBuf[prev_hstar_base + j] / max(query_sig_rms, 1.0e-6);
                             q_acc = q_acc
                                 + AllWeights[wq_assoc + j * ASSOC_RANK + tid]
                                 * query_src_j;
@@ -1103,10 +1105,13 @@ fn deq_slot_coord_unified_main(
                             if (bank_usage < ASSOC_OCCUPIED_THRESHOLD) {
                                 shared_vals[3u * ASSOC_RANK + bank] = -25.0;
                             } else {
+                                // Once empty banks are masked out, retrieval should be
+                                // purely content-addressed. A usage prior biases reads
+                                // toward older/more-written banks even when a different
+                                // occupied bank matches the query key better.
                                 let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
-                                let occupied_prior = log(max(bank_usage, ASSOC_OCCUPIED_THRESHOLD));
                                 shared_vals[3u * ASSOC_RANK + bank] =
-                                    clamp(ASSOC_READ_BETA * address_score + occupied_prior, -25.0, 25.0);
+                                    clamp(ASSOC_READ_BETA * address_score, -25.0, 25.0);
                             }
                         }
                         workgroupBarrier();
@@ -1134,15 +1139,30 @@ fn deq_slot_coord_unified_main(
                             }
                             bank_key_cos = key_dot * inverseSqrt(max(key0_norm * key1_norm, 1.0e-12));
                         }
-                        var denom = 0.0;
-                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
-                            let e = exp(shared_vals[3u * ASSOC_RANK + bank] - max_score);
-                            shared_vals[3u * ASSOC_RANK + bank] = e;
-                            denom = denom + e;
-                        }
-                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
-                            shared_vals[3u * ASSOC_RANK + bank] =
-                                shared_vals[3u * ASSOC_RANK + bank] / max(denom, 1.0e-6);
+                        if (ENABLE_ASSOC_HARD_READ) {
+                            var best_bank = 0u;
+                            var best_score = -1.0e30;
+                            for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                let score = shared_vals[3u * ASSOC_RANK + bank];
+                                if (score > best_score) {
+                                    best_score = score;
+                                    best_bank = bank;
+                                }
+                            }
+                            for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                shared_vals[3u * ASSOC_RANK + bank] = select(0.0, 1.0, bank == best_bank);
+                            }
+                        } else {
+                            var denom = 0.0;
+                            for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                let e = exp(shared_vals[3u * ASSOC_RANK + bank] - max_score);
+                                shared_vals[3u * ASSOC_RANK + bank] = e;
+                                denom = denom + e;
+                            }
+                            for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                shared_vals[3u * ASSOC_RANK + bank] =
+                                    shared_vals[3u * ASSOC_RANK + bank] / max(denom, 1.0e-6);
+                            }
                         }
                         // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read competition/occupancy telemetry.
                         var read_entropy = 0.0;
@@ -1167,6 +1187,15 @@ fn deq_slot_coord_unified_main(
                             DebugLog[assoc_diag_base + 8u] = DebugLog[assoc_diag_base + 8u] + 1.0;
                             if (t + 1u == shape.token_count) {
                                 let assoc_query_diag_base = 820u + slot_idx * 8u;
+                                var best_bank_idx = 0u;
+                                var best_bank_prob = -1.0;
+                                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                    let p = shared_vals[3u * ASSOC_RANK + bank];
+                                    if (p > best_bank_prob) {
+                                        best_bank_prob = p;
+                                        best_bank_idx = bank;
+                                    }
+                                }
                                 DebugLog[assoc_query_diag_base + 0u] =
                                     DebugLog[assoc_query_diag_base + 0u] + read_entropy;
                                 DebugLog[assoc_query_diag_base + 1u] =
@@ -1181,6 +1210,9 @@ fn deq_slot_coord_unified_main(
                                 DebugLog[assoc_query_diag_base + 7u] =
                                     DebugLog[assoc_query_diag_base + 7u]
                                     + sqrt(shared_vals[3u * ASSOC_RANK + ASSOC_BANKS] / max(1.0, f32(ASSOC_RANK)));
+                                let assoc_query_pick_base = 940u + slot_idx * 2u;
+                                DebugLog[assoc_query_pick_base + 0u] = f32(best_bank_idx);
+                                DebugLog[assoc_query_pick_base + 1u] = best_bank_prob;
                             }
                         }
                     }
@@ -1934,6 +1966,9 @@ fn deq_slot_coord_unified_main(
             // FPM write-key made a single unstable associative run corrupt the core
             // FPM write geometry and bifurcate training.
             let wk_assoc = hist_base + w_k_assoc_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
+            // W_v_assoc is reserved for the transition-gate auxiliary branch. The default
+            // bank-value path stores raw token identity directly into bank_value so the
+            // explicit associative memory keeps token semantics without a hidden projector.
             let wv_assoc = hist_base + w_v_assoc_base(d_model, h_slots) + slot_idx * d_model * ASSOC_RANK;
             let wevent_assoc = hist_base + w_event_assoc_base(d_model, h_slots) + slot_offset;
             let bevent_assoc = hist_base + b_event_assoc_base(d_model, h_slots) + slot_idx;
@@ -2191,20 +2226,64 @@ fn deq_slot_coord_unified_main(
                     }
                 }
                 let reuse_enabled = ENABLE_ASSOC_REUSE_MATCH || ASSOC_BANKS > 1u;
-                if (reuse_enabled
-                    && best_cos > ASSOC_REUSE_THRESHOLD
-                    && best_value_cos > ASSOC_REUSE_THRESHOLD) {
+                // Banks are read back by key, not by value. Requiring value-cos to
+                // also match before reuse lets the same key drift into multiple banks,
+                // which makes later key-based retrieval ambiguous. When a strong key
+                // match already exists, preserve key-address identity and reuse it.
+                if (reuse_enabled && best_cos > ASSOC_REUSE_THRESHOLD) {
                     chosen_bank = best_bank;
                     allow_write = 1.0;
                 } else if (found_empty && best_cos < ASSOC_ALLOC_NOVELTY_THRESHOLD) {
                     chosen_bank = empty_bank;
-                    allow_write = 1.0;
+                    // Reusing an existing keyed memory and opening a brand-new bank are
+                    // not equivalent operations. New allocation should require stronger
+                    // event evidence, otherwise novel filler transitions quickly consume
+                    // every empty bank. Reuse stays linear in the event gate; allocation
+                    // is made stricter by passing through the learned event gate here and
+                    // again in bind_gate below.
+                    allow_write = event_gate;
                     overwrite_bank = 1.0;
                 }
                 if (ENABLE_ASSOC_SLOT_STRIPE && (t % h_slots) != slot_idx) {
                     // Experimental multi-bank routing: make slots behave like distinct
                     // write heads instead of duplicating the same early transitions.
                     allow_write = 0.0;
+                }
+                if (ENABLE_ASSOC_SLOT_OWNER) {
+                    // Route each binding to a single slot owner in the existing slot-anchor
+                    // geometry. Without an owner, multiple slots can learn the same binding,
+                    // which collapses effective capacity even when each slot has its own banks.
+                    let slot_anchor_root_write = hist_base + slot_anchor_base(d_model, h_slots);
+                    var prev_sig_sq_owner = 0.0;
+                    for (var j = 0u; j < d_model; j = j + 1u) {
+                        let prev_j = PrevHStarBuf[prev_hstar_base + j];
+                        prev_sig_sq_owner = prev_sig_sq_owner + prev_j * prev_j;
+                    }
+                    let prev_sig_rms_owner = sqrt(
+                        prev_sig_sq_owner / max(1.0, f32(d_model)) + 1.0e-6
+                    );
+                    var best_owner_slot = 0u;
+                    var best_owner_score = -1.0e30;
+                    for (var owner = 0u; owner < h_slots; owner = owner + 1u) {
+                        let owner_off = slot_anchor_root_write + owner * d_model;
+                        var anchor_sq = 0.0;
+                        var dot = 0.0;
+                        for (var j = 0u; j < d_model; j = j + 1u) {
+                            let prev_j =
+                                PrevHStarBuf[prev_hstar_base + j] / max(prev_sig_rms_owner, 1.0e-6);
+                            let anchor_j = AllWeights[owner_off + j];
+                            anchor_sq = anchor_sq + anchor_j * anchor_j;
+                            dot = dot + prev_j * anchor_j;
+                        }
+                        let owner_score = dot / sqrt(max(anchor_sq, 1.0e-12));
+                        if (owner_score > best_owner_score) {
+                            best_owner_score = owner_score;
+                            best_owner_slot = owner;
+                        }
+                    }
+                    if (slot_idx != best_owner_slot) {
+                        allow_write = 0.0;
+                    }
                 }
                 shared_vals[3u * ASSOC_RANK] = f32(chosen_bank);
                 shared_vals[3u * ASSOC_RANK + 1u] = allow_write;
@@ -2235,7 +2314,11 @@ fn deq_slot_coord_unified_main(
             let bank_value_base = chosen_bank_base + ASSOC_RANK;
             let bank_usage_idx = chosen_bank_base + ASSOC_RANK + d_model;
             let effective_bind_gate = bind_gate * assoc_write_allowed * assoc_transition_gate;
-            let effective_write_mass = effective_bind_gate * effective_bind_gate;
+            let effective_write_mass = select(
+                effective_bind_gate * effective_bind_gate,
+                effective_bind_gate,
+                ENABLE_ASSOC_LINEAR_WRITE,
+            );
             let overwrite_bank = AssocHist[assoc_hist_base + assoc_slot_stride + 3u];
             let effective_keep_gate =
                 select(1.0 - effective_write_mass, 0.0, overwrite_bank > 0.5);
@@ -2282,7 +2365,10 @@ fn deq_slot_coord_unified_main(
             }
             if (tid == 0u) {
                 let prev_usage = AssocBuf[bank_usage_idx];
-                let occupied_write = effective_bind_gate;
+                // Usage should track durable committed content, not the pre-squared
+                // gate. Otherwise weak filler writes mark empty banks as strongly
+                // occupied even when the actual bank update mass was tiny.
+                let occupied_write = effective_write_mass;
                 AssocBuf[bank_usage_idx] = clamp(
                     max(ASSOC_USAGE_DECAY * prev_usage, occupied_write),
                     0.0,

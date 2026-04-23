@@ -277,6 +277,7 @@ fn format_lm_top_debug(
     let h = gpu.read_hpooled_at(final_token_index);
     let h_slots_flat = gpu.read_hnext_seq((final_token_index + 1) as u32);
     let assoc_state = gpu.read_assoc_state();
+    let debug = gpu.read_debug_buffer();
     let d = trainer.config.d_r;
     let h_slots = trainer.config.h_slots;
     let vocab = trainer.config.vocab_size;
@@ -304,6 +305,18 @@ fn format_lm_top_debug(
             let row = v * d;
             for j in 0..d {
                 acc += w[row + j] * (h_vec[j] / h_rms) * g[j];
+            }
+            logits[v] = acc;
+        }
+        logits
+    };
+    let compute_embed_logits = |h_vec: &[f32]| -> Vec<f32> {
+        let h_rms = (h_vec.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32 + 1e-5).sqrt();
+        let mut logits = vec![0.0f32; trainer.tokenizer.vocab_size()];
+        for v in 0..trainer.tokenizer.vocab_size() {
+            let mut acc = 0.0f32;
+            for j in 0..d {
+                acc += trainer.tokenizer.embeddings[(v, j)] * (h_vec[j] / h_rms);
             }
             logits[v] = acc;
         }
@@ -373,12 +386,29 @@ fn format_lm_top_debug(
     let mut best_bank = 0usize;
     let mut best_bank_target_prob = f32::NEG_INFINITY;
     let mut best_bank_target_logit = f32::NEG_INFINITY;
+    let mut best_bank_embed_target_prob = f32::NEG_INFINITY;
+    let mut best_bank_embed_target_logit = f32::NEG_INFINITY;
     let mut best_bank_target_cos = f32::NEG_INFINITY;
     let mut best_bank_key_cos = f32::NEG_INFINITY;
     let mut best_bank_query_cos = f32::NEG_INFINITY;
     let mut best_bank_late_fuse_target_prob = f32::NEG_INFINITY;
     let mut best_bank_late_fuse_target_logit = f32::NEG_INFINITY;
+    let mut chosen_read_slot = 0usize;
+    let mut chosen_read_bank = 0usize;
+    let mut chosen_read_prob = f32::NEG_INFINITY;
+    let mut chosen_read_target_prob = f32::NEG_INFINITY;
+    let mut chosen_read_target_logit = f32::NEG_INFINITY;
     for slot in 0..h_slots {
+        let query_pick_base = 940 + slot * 2;
+        let slot_read_bank = debug
+            .get(query_pick_base)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0) as usize;
+        let slot_read_prob = debug
+            .get(query_pick_base + 1)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY);
         let slot_base = slot * assoc_slot_stride;
         for bank in 0..assoc_banks {
             let bank_base = slot_base + bank * assoc_bank_stride;
@@ -387,7 +417,8 @@ fn format_lm_top_debug(
             if usage <= 0.0 {
                 continue;
             }
-            let bank_logits = compute_logits(&assoc_state[value_base..value_base + d]);
+            let bank_value = &assoc_state[value_base..value_base + d];
+            let bank_logits = compute_logits(bank_value);
             let bank_mx = bank_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let bank_denom = bank_logits
                 .iter()
@@ -399,12 +430,39 @@ fn format_lm_top_debug(
             } else {
                 0.0
             };
+            let bank_embed_logits = compute_embed_logits(bank_value);
+            let bank_embed_mx = bank_embed_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let bank_embed_denom = bank_embed_logits
+                .iter()
+                .map(|x| (*x - bank_embed_mx).exp())
+                .sum::<f32>()
+                .max(1e-20);
+            let bank_embed_target_prob = if target_idx < bank_embed_logits.len() {
+                (bank_embed_logits[target_idx] - bank_embed_mx).exp() / bank_embed_denom
+            } else {
+                0.0
+            };
+            if bank == slot_read_bank && slot_read_prob > chosen_read_prob {
+                chosen_read_slot = slot;
+                chosen_read_bank = bank;
+                chosen_read_prob = slot_read_prob;
+                chosen_read_target_prob = bank_target_prob;
+                chosen_read_target_logit =
+                    bank_logits.get(target_idx).copied().unwrap_or(f32::NAN);
+            }
             if bank_target_prob > best_bank_target_prob {
                 best_bank_slot = slot;
                 best_bank = bank;
                 best_bank_target_prob = bank_target_prob;
                 best_bank_target_logit = bank_logits.get(target_idx).copied().unwrap_or(f32::NAN);
-                let bank_value = &assoc_state[value_base..value_base + d];
+                best_bank_embed_target_prob = bank_embed_target_prob;
+                best_bank_embed_target_logit = bank_embed_logits
+                    .get(target_idx)
+                    .copied()
+                    .unwrap_or(f32::NAN);
                 best_bank_target_cos = emb_cos(bank_value, target);
                 best_bank_key_cos = emb_cos(bank_value, query_key_tok);
                 best_bank_query_cos = emb_cos(bank_value, TOK_QUERY);
@@ -430,7 +488,7 @@ fn format_lm_top_debug(
         }
     }
     format!(
-        "lm_top={} top_logit={:.3} second={} margin={:.3} target={} target_logit={:.3} target_p={:.3e} best_slot={} best_slot_target_logit={:.3} best_slot_target_p={:.3e} best_bank_slot={} best_bank={} best_bank_target_logit={:.3} best_bank_target_p={:.3e} best_bank_target_cos={:.3e} best_bank_key_cos={:.3e} best_bank_query_cos={:.3e} late_fuse_target_logit={:.3} late_fuse_target_p={:.3e}",
+        "lm_top={} top_logit={:.3} second={} margin={:.3} target={} target_logit={:.3} target_p={:.3e} best_slot={} best_slot_target_logit={:.3} best_slot_target_p={:.3e} chosen_read_slot={} chosen_read_bank={} chosen_read_prob={:.3e} chosen_read_target_logit={:.3} chosen_read_target_p={:.3e} best_bank_slot={} best_bank={} best_bank_target_logit={:.3} best_bank_target_p={:.3e} best_bank_embed_target_logit={:.3} best_bank_embed_target_p={:.3e} best_bank_target_cos={:.3e} best_bank_key_cos={:.3e} best_bank_query_cos={:.3e} late_fuse_target_logit={:.3} late_fuse_target_p={:.3e}",
         top.0,
         top.1,
         second.0,
@@ -441,10 +499,17 @@ fn format_lm_top_debug(
         best_slot,
         best_slot_target_logit,
         best_slot_target_prob,
+        chosen_read_slot,
+        chosen_read_bank,
+        chosen_read_prob,
+        chosen_read_target_logit,
+        chosen_read_target_prob,
         best_bank_slot,
         best_bank,
         best_bank_target_logit,
         best_bank_target_prob,
+        best_bank_embed_target_logit,
+        best_bank_embed_target_prob,
         best_bank_target_cos,
         best_bank_key_cos,
         best_bank_query_cos,
@@ -631,6 +696,13 @@ fn format_assoc_forward_debug(
 fn main() {
     let assoc_only = std::env::var("AR_ASSOC_ONLY").ok().as_deref() == Some("1");
     let assoc_audit = std::env::var("AR_AUDIT").ok().as_deref() == Some("1");
+    let assoc_transition_gate_enabled = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
+        .ok()
+        .map(|v| {
+            let vl = v.trim().to_ascii_lowercase();
+            vl == "1" || vl == "true" || vl == "yes"
+        })
+        .unwrap_or(false);
     let ctx_len: usize = std::env::var("AIDEEN_CTX_LEN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -910,14 +982,21 @@ fn main() {
                 .sum();
             (ss / a.len() as f32).sqrt()
         };
+        let wv_delta = delta_rms(&init_wv_assoc, &wv_assoc_now);
+        let wv_mode = if assoc_transition_gate_enabled {
+            "transition_gate_active"
+        } else {
+            "transition_gate_inactive"
+        };
         println!(
-            "  [assoc-audit] decoupled=1 alpha(mean={:.4}, delta_rms={:.4e}) gate_key=W_k_write(rms={:.4e}, delta_rms={:.4e}) Wk_assoc(delta={:.4e}) Wv_assoc(delta={:.4e}) Wq_assoc(delta={:.4e}) value=raw_token_identity",
+            "  [assoc-audit] decoupled=1 alpha(mean={:.4}, delta_rms={:.4e}) gate_key=W_k_write(rms={:.4e}, delta_rms={:.4e}) Wk_assoc(delta={:.4e}) Wv_assoc(mode={}, delta={:.4e}) Wq_assoc(delta={:.4e}) value=raw_token_identity",
             alpha_now.iter().copied().sum::<f32>() / alpha_now.len().max(1) as f32,
             delta_rms(&init_alpha_assoc, &alpha_now),
             rms(&wk_write_now),
             delta_rms(&init_wk_write, &wk_write_now),
             delta_rms(&init_wk_assoc, &wk_assoc_now),
-            delta_rms(&init_wv_assoc, &wv_assoc_now),
+            wv_mode,
+            wv_delta,
             delta_rms(&init_wq_assoc, &wq_assoc_now),
         );
         #[cfg(feature = "wgpu")]
@@ -1017,7 +1096,7 @@ fn main() {
                 }
             }
             println!(
-                "  [assoc-state] wk_gpu_rms={:.4e} wv_gpu_rms={:.4e} wq_gpu_rms={:.4e} key_rms={:.4e} key_abs_max={:.4e} value_rms={:.4e} value_abs_max={:.4e} usage_mean={:.4e} usage_max={:.4e}",
+                "  [assoc-state] wk_gpu_rms={:.4e} wv_transition_gpu_rms={:.4e} wq_gpu_rms={:.4e} key_rms={:.4e} key_abs_max={:.4e} value_rms={:.4e} value_abs_max={:.4e} usage_mean={:.4e} usage_max={:.4e}",
                 wk_assoc_gpu_rms,
                 wv_assoc_gpu_rms,
                 wq_assoc_gpu_rms,

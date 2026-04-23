@@ -435,7 +435,12 @@ fn fused_fpm_retain_bwd_main(
             }
             workgroupBarrier();
 
-            // Recompute read-query, write-key and write-value exactly as forward did.
+            // Recompute read-query, write-key and transition-gate value features exactly as
+            // forward did. In the default path bank_value itself is raw token identity; W_v_assoc
+            // is only active for ENABLE_ASSOC_TRANSITION_GATE.
+            // Query and key both live in the lagged associative source manifold
+            // (source_{t-1}); adding the current token here breaks forward/backward
+            // consistency and rotates addressing away from the bank geometry.
             if (lane < RETAIN_RANK) {
                 var q_acc = 0.0;
                 var k_acc = 0.0;
@@ -443,8 +448,7 @@ fn fused_fpm_retain_bwd_main(
                 if (t > 0u) {
                     for (var j = 0u; j < d; j = j + 1u) {
                         let query_sig_j =
-                            Scratch[clean_signal_off(t_abs - 1u, slot, d, h) + j]
-                            + S_in[t_abs * d + j];
+                            Scratch[clean_signal_off(t_abs - 1u, slot, d, h) + j];
                         query_sig_sq = query_sig_sq + query_sig_j * query_sig_j;
                     }
                 }
@@ -453,7 +457,7 @@ fn fused_fpm_retain_bwd_main(
                     var prev_src_j = 0.0;
                     if (t > 0u) {
                         prev_src_j =
-                            (Scratch[clean_signal_off(t_abs - 1u, slot, d, h) + j] + S_in[t_abs * d + j])
+                            Scratch[clean_signal_off(t_abs - 1u, slot, d, h) + j]
                             / max(query_sig_rms, 1.0e-6);
                     }
                     let wq_eff_base = select(wq_assoc_base, wk_assoc_base, ENABLE_ASSOC_TIE_QK);
@@ -738,9 +742,12 @@ fn fused_fpm_retain_bwd_main(
                     if (bank_usage < ASSOC_OCCUPIED_THRESHOLD) {
                         shared_dup[bank] = -25.0;
                     } else {
+                        // Match the forward invariant: once empty banks are excluded,
+                        // associative retrieval ranks occupied banks by key content,
+                        // not by accumulated write usage.
                         let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
                         shared_dup[bank] = clamp(
-                            ASSOC_READ_BETA * address_score + log(max(bank_usage, ASSOC_OCCUPIED_THRESHOLD)),
+                            ASSOC_READ_BETA * address_score,
                             -25.0,
                             25.0,
                         );
@@ -782,6 +789,7 @@ fn fused_fpm_retain_bwd_main(
                     let bank_base = bank * assoc_bank_stride;
                     ctx_dim = ctx_dim + shared_dup[bank] * assoc_b_state[bank_base + RETAIN_RANK + dim];
                 }
+                ctx_dim = assoc_read_conf * ctx_dim;
                 local_ctx_sq = local_ctx_sq + ctx_dim * ctx_dim;
             }
             // Reuse lane reduction
@@ -805,7 +813,6 @@ fn fused_fpm_retain_bwd_main(
                 local_alpha_grad = local_alpha_grad + g_ctx * assoc_read_conf * ctx_dim;
             }
 
-            // Gradients to every bank_value/key plus accumulated query preactivation.
             if (lane < RETAIN_RANK) {
                 shared_kw[lane] = 0.0;
             }
