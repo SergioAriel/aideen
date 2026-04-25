@@ -127,6 +127,46 @@ where
     }
 }
 
+fn assoc_local_segment_mode() -> bool {
+    std::env::var("AR_ASSOC_LOCAL_SEGMENTS")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn internal_segment_recurrence_mode() -> bool {
+    assoc_local_segment_mode()
+        && std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+}
+
+fn assoc_segment_len(ctx_len: usize) -> Option<usize> {
+    if !assoc_local_segment_mode() {
+        return None;
+    }
+    let seg_len = std::env::var("AR_SEGMENT_LEN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(ctx_len.max(1));
+    Some(seg_len.max(1))
+}
+
+fn segment_dense_train_mode() -> bool {
+    std::env::var("AR_SEGMENT_DENSE_TRAIN")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or_else(|| assoc_local_segment_mode())
+}
+
+fn effective_full_cap(trainer: &Trainer, ctx_len: usize) -> usize {
+    if internal_segment_recurrence_mode() {
+        trainer.gpu_sequence_capacity()
+    } else {
+        assoc_segment_len(ctx_len).unwrap_or_else(|| trainer.gpu_sequence_capacity())
+    }
+}
+
 fn final_cached_token_index(total_len: usize, ctx_len: usize, full_cap: usize) -> usize {
     if total_len <= full_cap {
         return total_len.saturating_sub(1);
@@ -141,12 +181,18 @@ fn train_ar_sequence(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f3
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
     let total_len = inputs.len();
-    let full_cap = trainer.gpu_sequence_capacity();
+    let full_cap = effective_full_cap(trainer, ctx_len);
     let mut last_loss = f32::NAN;
     run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, _final_chunk| {
-        let mut chunk_targets =
-            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
-        if end == total_len {
+        if !first && assoc_local_segment_mode() {
+            trainer.reset_local_segment_state();
+        }
+        let mut chunk_targets = if segment_dense_train_mode() {
+            targets[start..end].to_vec()
+        } else {
+            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start]
+        };
+        if !segment_dense_train_mode() && end == total_len {
             if let Some(last) = chunk_targets.last_mut() {
                 *last = targets[end - 1];
             }
@@ -170,13 +216,19 @@ fn train_ar_sequence_with_assoc_trace(
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
     let total_len = inputs.len();
-    let full_cap = trainer.gpu_sequence_capacity();
+    let full_cap = effective_full_cap(trainer, ctx_len);
     let mut last_loss = f32::NAN;
     let mut trace = Vec::new();
     run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
-        let mut chunk_targets =
-            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start];
-        if final_chunk {
+        if !first && assoc_local_segment_mode() {
+            trainer.reset_local_segment_state();
+        }
+        let mut chunk_targets = if segment_dense_train_mode() {
+            targets[start..end].to_vec()
+        } else {
+            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start]
+        };
+        if !segment_dense_train_mode() && final_chunk {
             if let Some(last) = chunk_targets.last_mut() {
                 *last = targets[end - 1];
             }
@@ -205,9 +257,12 @@ fn eval_answer_loss(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f32
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
     let total_len = inputs.len();
-    let full_cap = trainer.gpu_sequence_capacity();
+    let full_cap = effective_full_cap(trainer, ctx_len);
     let mut answer_loss = f32::NAN;
     run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
+        if !first && assoc_local_segment_mode() {
+            trainer.reset_local_segment_state();
+        }
         let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
         if final_chunk {
             answer_loss = trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
@@ -230,10 +285,13 @@ fn eval_answer_loss_with_assoc_trace(
     let inputs = &seq[..seq.len() - 1];
     let targets = &seq[1..];
     let total_len = inputs.len();
-    let full_cap = trainer.gpu_sequence_capacity();
+    let full_cap = effective_full_cap(trainer, ctx_len);
     let mut answer_loss = f32::NAN;
     let mut trace = Vec::new();
     run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
+        if !first && assoc_local_segment_mode() {
+            trainer.reset_local_segment_state();
+        }
         let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
         if final_chunk {
             answer_loss = trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
@@ -694,6 +752,30 @@ fn format_assoc_forward_debug(
 }
 
 fn main() {
+    if std::env::var("AR_SEGMENT_MEMORY_TOKEN").is_ok()
+        && std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN").is_err()
+    {
+        unsafe {
+            std::env::set_var(
+                "AIDEEN_SEGMENT_MEMORY_TOKEN",
+                std::env::var("AR_SEGMENT_MEMORY_TOKEN").unwrap(),
+            );
+        }
+    }
+    if std::env::var("AR_SEGMENT_LEN").is_ok()
+        && std::env::var("AIDEEN_INTERNAL_SEGMENT_LEN").is_err()
+        && std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    {
+        unsafe {
+            std::env::set_var(
+                "AIDEEN_INTERNAL_SEGMENT_LEN",
+                std::env::var("AR_SEGMENT_LEN").unwrap(),
+            );
+        }
+    }
     let assoc_only = std::env::var("AR_ASSOC_ONLY").ok().as_deref() == Some("1");
     let assoc_audit = std::env::var("AR_AUDIT").ok().as_deref() == Some("1");
     let assoc_transition_gate_enabled = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
@@ -814,6 +896,18 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1e-4);
     let mut trainer = Trainer::from_tokenizer_seeded(tok, lr as f32, 42);
+
+    #[cfg(feature = "wgpu")]
+    {
+        // This benchmark is only meaningful on the DEQ GPU path. If adapter init
+        // fails and we silently continue through CPU/fallback paths, the run emits
+        // avg_loss=0, empty traces, and NaN evals that look like model regressions.
+        // Fail fast instead of producing invalid metrics.
+        if trainer.gpu_deq.is_none() {
+            eprintln!("ERROR: assoc_recall requiere un backend GPU activo; la corrida actual quedó en fallback inválido.");
+            std::process::exit(1);
+        }
+    }
     // Experimental only: tying the decoder to embeddings changes what the
     // benchmark measures, so it must not be the default memory baseline.
     if std::env::var("AR_TIE_LM_TO_EMB")

@@ -12,7 +12,13 @@ struct RunUniforms {
     token_count: u32,
     diag_zero_win: u32,
     diag_one_iter: u32,
-    _pad0: vec3<u32>,
+    fpm_stage: u32,
+    fpm_alpha_m: f32,
+    fpm_tau: f32,
+    fpm_read_gate_min: f32,
+    segment_len: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;

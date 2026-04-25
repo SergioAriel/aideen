@@ -122,5 +122,25 @@ Cambiar en `aideen-core/src/state.rs`.
 
 **Estado:** PENDIENTE
 
-Implementar para garantizar convergencia DEQ con pesos entrenados.
+Implement para garantizar convergencia DEQ con pesos entrenados.
 Sin spectral norm, el DEQ puede divergir o oscilar con pesos no-triviales.
+
+---
+
+## ADR-004: Estabilización Estructural de Memoria Asociativa
+
+**Estado:** ACEPTADO (2026-04-18)
+
+**Contexto:**
+Durante tareas de multi-binding (2+ pares), el motor DEQ presentaba divergencias numéricas (NaNs). El diagnóstico reveló que la inyección de energía de la memoria asociativa no estaba acotada, lo que rompía la contractividad del solver Picard.
+
+**Decisiones:**
+1.  **Logit Clipping**: Limitar los scores de atención asociativa a `[-25.0, 25.0]`. Previene que `exp()` desborde los límites de `f32`.
+2.  **RMSNorm en Salida**: Normalizar el vector `assoc_ctx` antes de sumarlo al estado del slot. Esto "gobierna" la magnitud de la señal inyectada.
+3.  **Calibración de Gradiente**: Reducir `ASSOC_ADDR_GRAD_SCALE` de `4096.0` a `1024.0`.
+
+**Racional:**
+Pasar de un modelo "bruto" que funcionaba por suerte en casos simples a uno con **física de control industrial**. La normalización permite que el modelo escale en parámetros y datos sin volverse inestable.
+
+**Resultado:**
+Reducción de pérdida en Gap 256 de `~23.0` (explosión) a `1.17` (estable).

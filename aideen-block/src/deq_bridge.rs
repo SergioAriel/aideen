@@ -19,6 +19,9 @@ pub struct DeqComputeShape {
     pub fpm_alpha_m: f32,
     pub fpm_tau: f32,
     pub fpm_read_gate_min: f32,
+    pub segment_len: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 #[repr(C)]
@@ -57,6 +60,7 @@ pub struct RustDeqBridge {
     pub hist_v2_temporal_pipeline: wgpu::ComputePipeline,
     pub pool_pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
+    pub pool_bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
     pub update_bind_group: wgpu::BindGroup,
     update_params_buf: wgpu::Buffer,
@@ -74,18 +78,22 @@ pub struct RustDeqBridge {
     pub hnext_buf: wgpu::Buffer,
     pub scratch_buf: wgpu::Buffer,
     pub hpooled_buf: wgpu::Buffer,
+    pub assoc_pooled_buf: wgpu::Buffer,
     pub debug_buf: wgpu::Buffer,
     pub hist_ctx_buf: wgpu::Buffer,
     pub mstate_buf: wgpu::Buffer,
     pub prev_hstar_buf: wgpu::Buffer,
     pub assoc_buf: wgpu::Buffer,
+    pub assoc_persistent_buf: wgpu::Buffer,
     pub assoc_hist_buf: wgpu::Buffer,
+    pub assoc_read_buf: wgpu::Buffer,
     pub signal_cache_buf: wgpu::Buffer,
     pub h_hist_buf: wgpu::Buffer,
     pub hist_ctx_enabled: bool,
     pub fpm_enabled: bool,
 
     pub bind_group: wgpu::BindGroup,
+    pub pool_bind_group: wgpu::BindGroup,
 }
 
 /// AllWeights flat-buffer byte offsets (verified 256-byte aligned for d=512, h=8).
@@ -137,8 +145,8 @@ impl RustDeqBridge {
         b * t * d
     }
 
-    fn shape_bytes(shape: &DeqComputeShape) -> [u8; 80] {
-        let mut out = [0u8; 80];
+    fn shape_bytes(shape: &DeqComputeShape) -> [u8; std::mem::size_of::<DeqComputeShape>()] {
+        let mut out = [0u8; std::mem::size_of::<DeqComputeShape>()];
         let raw = bytemuck::bytes_of(shape);
         out[..raw.len()].copy_from_slice(raw);
         out
@@ -197,6 +205,20 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_slot_owner = std::env::var("AIDEEN_ASSOC_SLOT_OWNER")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_read_slot_prior = std::env::var("AIDEEN_ASSOC_READ_SLOT_PRIOR")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(true);
         let assoc_tie_qk = std::env::var("AIDEEN_ASSOC_TIE_QK")
             .ok()
             .map(|v| {
@@ -211,6 +233,27 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_hard_read = std::env::var("AIDEEN_ASSOC_HARD_READ")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_linear_write = std::env::var("AIDEEN_ASSOC_LINEAR_WRITE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_post_hstar = std::env::var("AIDEEN_ASSOC_POST_HSTAR")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let assoc_read_enabled = std::env::var("AIDEEN_ASSOC_READ")
             .ok()
             .map(|v| {
@@ -219,6 +262,20 @@ impl RustDeqBridge {
             })
             .unwrap_or(true);
         let assoc_event_gate = std::env::var("AIDEEN_ASSOC_EVENT_GATE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let segment_memory_token = std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_persistent = std::env::var("AIDEEN_ASSOC_PERSISTENT")
             .ok()
             .map(|v| {
                 let vl = v.trim().to_ascii_lowercase();
@@ -260,9 +317,9 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // bindings 3-14: H_curr, H_next, Scratch, H_pooled, DebugLog, HistCtx, MState,
-        // SignalCache, H_hist, PrevAssocSrcBuf, AssocBuf, AssocHist
-        for i in 3u32..=14 {
+        // Core hot path excludes pooled outputs so the unified path stays below
+        // per-stage storage-buffer limits on Metal.
+        for i in [3u32, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -284,6 +341,67 @@ impl RustDeqBridge {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
+        let pool_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("DEQ Pool Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 16,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 17,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let pool_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("DEQ Pool Pipeline Layout"),
+            bind_group_layouts: &[&pool_bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
         let pool_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("AIDEEN DEQ Forward Pool Shader"),
@@ -291,7 +409,7 @@ impl RustDeqBridge {
         });
         let pool_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("DEQ Forward Pool Pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&pool_pipeline_layout),
             module: &pool_shader,
             entry_point: Some("deq_forward_pool_main"),
             compilation_options: Default::default(),
@@ -381,12 +499,40 @@ impl RustDeqBridge {
             if assoc_slot_stripe { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
+            "ENABLE_ASSOC_SLOT_OWNER".to_string(),
+            if assoc_slot_owner { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_READ_SLOT_PRIOR".to_string(),
+            if assoc_read_slot_prior { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
             "ENABLE_ASSOC_TIE_QK".to_string(),
             if assoc_tie_qk { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_CONF_READ".to_string(),
             if assoc_conf_read { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_HARD_READ".to_string(),
+            if assoc_hard_read { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_LINEAR_WRITE".to_string(),
+            if assoc_linear_write { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_POST_HSTAR".to_string(),
+            if assoc_post_hstar { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_SEGMENT_MEMORY_TOKEN".to_string(),
+            if segment_memory_token { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_PERSISTENT".to_string(),
+            if assoc_persistent { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_READ".to_string(),
@@ -593,7 +739,7 @@ impl RustDeqBridge {
             cache: None,
         });
 
-        let uniform_size = 80u64;
+        let uniform_size = std::mem::size_of::<DeqComputeShape>() as u64;
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Shape Uniform"),
             size: uniform_size,
@@ -702,6 +848,14 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let assoc_pooled_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc_pooled"),
+            size: Self::pooled_elements(max_batch_size, max_seq_len, d_model) * 4u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let debug_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Debug Log"),
@@ -750,12 +904,28 @@ impl RustDeqBridge {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let assoc_persistent_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc Persistent Buffer"),
+            size: (max_batch_size as u64) * (h_slots as u64) * assoc_slot_stride,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let assoc_hist_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Assoc History"),
             size: (max_batch_size as u64)
                 * (max_seq_len as u64)
                 * (h_slots as u64)
                 * assoc_hist_slot_stride,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let assoc_read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc Read"),
+            size: hnext_bytes,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -807,10 +977,6 @@ impl RustDeqBridge {
                     resource: scratch_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: hpooled_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
                     binding: 7,
                     resource: debug_buf.as_entire_binding(),
                 },
@@ -840,7 +1006,41 @@ impl RustDeqBridge {
                 },
                 wgpu::BindGroupEntry {
                     binding: 14,
+                    resource: assoc_persistent_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
                     resource: assoc_hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: assoc_read_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let pool_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("DEQ Forward Pool Bind Group"),
+            layout: &pool_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: hnext_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: hpooled_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: assoc_read_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: assoc_pooled_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1098,6 +1298,7 @@ impl RustDeqBridge {
             hist_v2_temporal_pipeline,
             pool_pipeline,
             bind_group_layout,
+            pool_bind_group_layout,
             update_pipeline,
             update_bind_group,
             update_params_buf,
@@ -1113,17 +1314,21 @@ impl RustDeqBridge {
             hnext_buf,
             scratch_buf,
             hpooled_buf,
+            assoc_pooled_buf,
             debug_buf,
             hist_ctx_buf,
             mstate_buf,
             prev_hstar_buf,
             assoc_buf,
+            assoc_persistent_buf,
             assoc_hist_buf,
+            assoc_read_buf,
             signal_cache_buf,
             h_hist_buf,
             hist_ctx_enabled,
             fpm_enabled,
             bind_group,
+            pool_bind_group,
         }
     }
 
@@ -1618,7 +1823,7 @@ impl RustDeqBridge {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pool_pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.set_bind_group(0, &self.pool_bind_group, &[]);
             cpass.dispatch_workgroups(
                 shape.d_model.div_ceil(256).max(1),
                 shape.batch_size.max(1),

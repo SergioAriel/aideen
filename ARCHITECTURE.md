@@ -186,7 +186,19 @@ h_new_s = NormScale ⊙ (combined_s / rms_s)
 h_next_s = damping * h_new_s + (1 - damping) * h_curr_s
 ```
 
-### 3d. Convergence Check and Contractivity
+### 3e. Associative Memory (FPM Integration)
+
+Si `ENABLE_ASSOC_EVENT_GATE` está activo, cada slot procesa una rama de memoria asociativa:
+1.  **Read Query**: `q_assoc = W_q_assoc × h_s`.
+2.  **Softmax Attention**: Se compara `q_assoc` contra las llaves en los `ASSOC_BANKS`.
+    *   **Clipping**: Los logits de atención se claman a `[-25, 25]` para estabilidad.
+3.  **Context Retrieval**: `assoc_ctx = Σ_b match_b * bank_value_b`.
+4.  **Normalization**: `assoc_ctx = assoc_ctx / RMS(assoc_ctx)`.
+5.  **Injection**: `fpm_ctx = fpm_ctx + alpha_assoc * assoc_ctx`.
+
+Esta señal inyectada es lo que permite al modelo realizar **Associative Recall** de largo plazo.
+
+### 3f. Convergence Check and Contractivity
 
 ```
 max_delta = max_s,d |h_next_s[d] - h_curr_s[d]|

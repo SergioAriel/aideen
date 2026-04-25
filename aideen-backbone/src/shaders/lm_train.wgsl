@@ -12,7 +12,7 @@
 //   5. lm_backprop_h_t_main  (min(seq_len,65535), ceil(seq_len/65535), 1)
 //                                         – backprop dL/dh to DEQ
 //
-// Bindings: 0-15 (16 total, matching bgl_probs in gpu_lm_head.rs)
+// Bindings: 0-16 (17 total, matching bgl_probs in gpu_lm_head.rs)
 // =============================================================================
 
 struct TrainParams {
@@ -27,7 +27,8 @@ struct TrainParams {
     ternary_flag: u32,
     num_samples:  u32,
     active_targets: u32,
-    _pad2:        u32,
+    tie_lambda_bits: u32,
+    assoc_logit_lambda_bits: u32,
 };
 
 @group(0) @binding(0)  var<uniform>            params:          TrainParams;
@@ -46,6 +47,7 @@ struct TrainParams {
 @group(0) @binding(13) var<storage, read_write> dl_dh_temp:      array<f32>;
 @group(0) @binding(14) var<storage, read>       sampled_indices: array<u32>;
 @group(0) @binding(15) var<storage, read_write> s_h_rms:         array<f32>;
+@group(0) @binding(16) var<storage, read>       emb_ref:         array<f32>;
 // Binding 15 (s_h_rms) is also used as dl_dh_rms_red scratch via offset:
 // s_h_rms[seq_len * d_model + t] = rms_dot[t]  (if buffer is large enough)
 // In practice the Rust allocates s_h_rms_buf = seq_len * d_model floats,
@@ -88,6 +90,7 @@ fn lm_probs_main(
     let d_model  = params.d_model;
     let base_h   = t * d_model;
     let target_v = target_indices[t];
+    let assoc_lambda = bitcast<f32>(params.assoc_logit_lambda_bits);
 
     // --- 1. RMSNorm: compute RMS of h_t ---
     var local_sq = 0.0;
@@ -145,6 +148,12 @@ fn lm_probs_main(
             var acc = 0.0;
             for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
                 acc += w_lm[row_base + tj] * s_h_tile[tj];
+            }
+            if (assoc_lambda > 0.0) {
+                let assoc_row_base = v * d_model + tile;
+                for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                    acc += assoc_lambda * emb_ref[assoc_row_base + tj] * dl_dh_temp[base_h + tile + tj];
+                }
             }
             s_logits[k] = s_logits[k] + acc;
         }
@@ -230,6 +239,7 @@ fn compute_dW_and_optionally_apply(
         let beta1 = bitcast<f32>(params.beta1_bits);
         let beta2 = bitcast<f32>(params.beta2_bits);
         let eps   = bitcast<f32>(params.eps_bits);
+        let tie_lambda = bitcast<f32>(params.tie_lambda_bits);
         let t_f   = max(1.0, f32(params.step_t));
         let bc1   = 1.0 - pow(beta1, t_f);
         let bc2   = 1.0 - pow(beta2, t_f);
@@ -239,6 +249,9 @@ fn compute_dW_and_optionally_apply(
         let v_new   = beta2 * mv.y + (1.0 - beta2) * dW * dW;
         moments_w[w_idx] = vec2<f32>(m_new, v_new);
         w_lm[w_idx] -= lr * (m_new / bc1) / (sqrt(v_new / bc2) + eps);
+        if (tie_lambda > 0.0) {
+            w_lm[w_idx] -= lr * tie_lambda * (w_lm[w_idx] - emb_ref[w_idx]);
+        }
 
         // Bias update: only thread d==0 per vocab entry
         if (d == 0u) {
@@ -337,14 +350,19 @@ fn lm_backprop_h_t_main(
     var local_rms_dot = 0.0;
     for (var d = tid; d < d_model; d += WG_SIZE) {
         var dldy = 0.0;
+        var dlassoc = 0.0;
         for (var k = 0u; k < params.num_samples; k++) {
             let v       = s_indices_cache[k];
             let p       = s_probs_cache[k];
             let one_hot = select(0.0, 1.0, v == target_v);
-            dldy += (p - one_hot) * w_lm[v * d_model + d];
+            let coeff = p - one_hot;
+            dldy += coeff * w_lm[v * d_model + d];
+            dlassoc += coeff * bitcast<f32>(params.assoc_logit_lambda_bits) * emb_ref[v * d_model + d];
         }
         dldy = dldy * seq_scale;
+        dlassoc = dlassoc * seq_scale;
         dl_dh_temp[base + d] = dldy;
+        s_h_rms[s_h_rms_idx(t, d)] = dlassoc;
         // Accumulate dot product for RMSNorm backward: sum_d dldy * g[d] * h[d]
         local_rms_dot += dldy * g_lm[d] * h_pooled[base + d];
     }

@@ -15,7 +15,8 @@ struct TrainParams {
     ternary_flag: u32,
     num_samples: u32,
     active_targets: u32,
-    _pad2: u32,
+    tie_lambda_bits: u32,
+    assoc_logit_lambda_bits: u32,
 }
 
 pub struct GpuLmHeadTrainer {
@@ -25,6 +26,7 @@ pub struct GpuLmHeadTrainer {
     h_buf: wgpu::Buffer,
     w_buf: wgpu::Buffer,
     b_buf: wgpu::Buffer,
+    emb_ref_buf: wgpu::Buffer,
     pub dl_dh_buf: wgpu::Buffer,
     pub dl_dh_temp_buf: wgpu::Buffer,
 
@@ -50,6 +52,8 @@ pub struct GpuLmHeadTrainer {
     lm_scratch_buf: wgpu::Buffer,
     fused_b19: bool,
     cfg_lm_debug: bool,
+    cfg_lm_emb_tie_lambda: f32,
+    cfg_assoc_logit_lambda: f32,
     last_sampled_indices: Vec<u32>,
     last_num_samples: u32,
     sampled_indices_reuse: Vec<u32>, // pre-alloc to avoid heap alloc per training step
@@ -169,6 +173,10 @@ impl GpuLmHeadTrainer {
                 wgpu::BindGroupEntry {
                     binding: 15,
                     resource: self.s_h_rms_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: self.emb_ref_buf.as_entire_binding(),
                 },
             ],
         })
@@ -345,6 +353,16 @@ impl GpuLmHeadTrainer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -432,6 +450,14 @@ impl GpuLmHeadTrainer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let emb_ref_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("LM Embedding Reference"),
+            size: (vocab_size * d_r * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let dl_dh_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM dL/dh"),
             size: (safe_ctx * d_r * 4) as u64,
@@ -509,7 +535,9 @@ impl GpuLmHeadTrainer {
         let dl_dh_temp_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM dL/dh Temp"),
             size: (safe_ctx * d_r * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let sampled_indices_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -606,6 +634,10 @@ impl GpuLmHeadTrainer {
                     binding: 15,
                     resource: s_h_rms_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: emb_ref_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -616,6 +648,7 @@ impl GpuLmHeadTrainer {
             h_buf,
             w_buf,
             b_buf,
+            emb_ref_buf,
             dl_dh_buf,
             loss_buf,
             rms_buf,
@@ -650,6 +683,16 @@ impl GpuLmHeadTrainer {
                     vl == "1" || vl == "true" || vl == "yes"
                 })
                 .unwrap_or(false),
+            cfg_lm_emb_tie_lambda: std::env::var("AIDEEN_LM_EMB_TIE_LAMBDA")
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .max(0.0),
+            cfg_assoc_logit_lambda: std::env::var("AIDEEN_ASSOC_LOGIT_LAMBDA")
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .max(0.0),
             last_sampled_indices: Vec::new(),
             last_num_samples: 0,
             sampled_indices_reuse: Vec::new(),
@@ -662,6 +705,10 @@ impl GpuLmHeadTrainer {
 
     pub fn last_num_samples(&self) -> u32 {
         self.last_num_samples
+    }
+
+    pub fn assoc_grad_buf(&self) -> &wgpu::Buffer {
+        &self.s_h_rms_buf
     }
 
     pub fn train_step(
@@ -722,7 +769,8 @@ impl GpuLmHeadTrainer {
             ternary_flag: if ternary { 1 } else { 0 },
             num_samples: actual_num_samples,
             active_targets: self.active_target_count(targets),
-            _pad2: 0,
+            tie_lambda_bits: 0.0f32.to_bits(),
+            assoc_logit_lambda_bits: 0.0f32.to_bits(),
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(&self.target_indices_buf, 0, bytemuck::cast_slice(targets));
@@ -894,7 +942,8 @@ impl GpuLmHeadTrainer {
             ternary_flag: if ternary { 1 } else { 0 },
             num_samples: actual_num_samples,
             active_targets: self.active_target_count(targets),
-            _pad2: 0,
+            tie_lambda_bits: 0.0f32.to_bits(),
+            assoc_logit_lambda_bits: 0.0f32.to_bits(),
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(&self.target_indices_buf, 0, bytemuck::cast_slice(targets));
@@ -1028,6 +1077,9 @@ impl GpuLmHeadTrainer {
         queue: &wgpu::Queue,
         h_src: &wgpu::Buffer,
         h_offset: u64,
+        assoc_src: &wgpu::Buffer,
+        assoc_offset: u64,
+        emb_ref_src: Option<&wgpu::Buffer>,
         targets: &[u32],
         lr: f32,
         step_t: u32,
@@ -1067,7 +1119,8 @@ impl GpuLmHeadTrainer {
             ternary_flag: if ternary { 1 } else { 0 },
             num_samples: actual_num_samples,
             active_targets: self.active_target_count(targets),
-            _pad2: 0,
+            tie_lambda_bits: self.cfg_lm_emb_tie_lambda.to_bits(),
+            assoc_logit_lambda_bits: self.cfg_assoc_logit_lambda.to_bits(),
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(&self.target_indices_buf, 0, bytemuck::cast_slice(targets));
@@ -1081,13 +1134,25 @@ impl GpuLmHeadTrainer {
             label: Some("LM Train Encoder (NO READBACK)"),
         });
 
-        let probs_bg = if h_offset == 0 {
-            self.make_probs_bg_for_h(device, h_src)
+        if self.cfg_lm_emb_tie_lambda > 0.0 || self.cfg_assoc_logit_lambda > 0.0 {
+            if let Some(src) = emb_ref_src {
+                let copy_size = (self.vocab_size * self.config.d_r * 4) as u64;
+                encoder.copy_buffer_to_buffer(src, 0, &self.emb_ref_buf, 0, copy_size);
+            }
+        }
+
+        let copy_size = (self.config.d_r * seq_len * 4) as u64;
+        if h_offset == 0 {
+            encoder.copy_buffer_to_buffer(h_src, 0, &self.h_buf, 0, copy_size);
         } else {
-            let copy_size = (self.config.d_r * seq_len * 4) as u64;
             encoder.copy_buffer_to_buffer(h_src, h_offset, &self.h_buf, 0, copy_size);
-            self.make_probs_bg_for_h(device, &self.h_buf)
-        };
+        }
+        if assoc_offset == 0 {
+            encoder.copy_buffer_to_buffer(assoc_src, 0, &self.dl_dh_temp_buf, 0, copy_size);
+        } else {
+            encoder.copy_buffer_to_buffer(assoc_src, assoc_offset, &self.dl_dh_temp_buf, 0, copy_size);
+        }
+        let probs_bg = self.make_probs_bg_for_h(device, &self.h_buf);
         encoder.clear_buffer(&self.loss_buf, 0, None);
         let seq_len_u32 = seq_len as u32;
         let t_grid_x = seq_len_u32.min(65535).max(1);

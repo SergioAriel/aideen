@@ -6,7 +6,7 @@ use aideen_block::deq_bridge::{
 use crate::deq_mode::DeqRuntimeConfig;
 use aideen_core::state::ArchitectureConfig;
 use bytemuck::{Pod, Zeroable};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -41,6 +41,24 @@ struct AndersonParams {
     _pad0: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct SlotRhsParams {
+    d_model: u32,
+    h_slots: u32,
+    seq_len: u32,
+    batch_size: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct SegmentMemoryPromoteParams {
+    d_model: u32,
+    h_slots: u32,
+    batch_size: u32,
+    _pad0: u32,
+}
+
 /// Minimal buffers needed by the Picard adjoint path (replaces the old RustCgBridge).
 pub struct AdjointBuffers {
     pub b_dl: wgpu::Buffer, // ∂L/∂h input for the Picard adjoint (size: ctx_len × d_model)
@@ -51,12 +69,17 @@ pub struct AdjointBuffers {
 pub struct GpuDeqBackend {
     pub config: ArchitectureConfig,
     pub forward_seq_cap: u32,
+    pub forward_batch_cap: u32,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub subgroup_supported: bool,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub bridge: RustDeqBridge,
+    assoc_banks: usize,
+    assoc_slot_stride_floats: usize,
+    segment_memory_token: bool,
+    assoc_persistent: bool,
     pub adj_bufs: AdjointBuffers,
     tps_timestamp_enabled: bool,
     tps_timestamp_period: f32,
@@ -79,6 +102,9 @@ pub struct GpuDeqBackend {
     staged_picard_accum_v_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_k_pipeline: wgpu::ComputePipeline,
     staged_picard_accum_q_pipeline: wgpu::ComputePipeline,
+    slot_rhs_expand_pipeline: wgpu::ComputePipeline,
+    segment_memory_promote_pipeline: wgpu::ComputePipeline,
+    assoc_persistent_promote_pipeline: wgpu::ComputePipeline,
     fused_update_stage1a_pipeline: wgpu::ComputePipeline,
     fused_update_stage1b_pipeline: wgpu::ComputePipeline,
     fused_update_stage2_pipeline: wgpu::ComputePipeline,
@@ -115,6 +141,11 @@ pub struct GpuDeqBackend {
     staged_picard_bg: wgpu::BindGroup,
     staged_picard_bg_alt: wgpu::BindGroup,
     staged_picard_bg1: wgpu::BindGroup,
+    slot_rhs_expand_bgl: wgpu::BindGroupLayout,
+    slot_rhs_params_buf: wgpu::Buffer,
+    segment_memory_promote_bgl: wgpu::BindGroupLayout,
+    segment_memory_promote_params_buf: wgpu::Buffer,
+    assoc_persistent_promote_bgl: wgpu::BindGroupLayout,
     fused_update_bg0: wgpu::BindGroup,
     fused_update_bg1: wgpu::BindGroup,
     pub fused_update_params_buf: wgpu::Buffer,
@@ -584,6 +615,27 @@ impl GpuDeqBackend {
                     include_str!("shaders/staged_adjoint_picard_clean.wgsl").into(),
                 ),
             });
+        let slot_rhs_expand_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Slot RHS Expand Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/slot_rhs_expand.wgsl").into(),
+                ),
+            });
+        let segment_memory_promote_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Segment Memory Promote Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/segment_memory_promote.wgsl").into(),
+                ),
+            });
+        let assoc_persistent_promote_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Assoc Persistent Promote Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/assoc_persistent_promote.wgsl").into(),
+                ),
+            });
 
         let bg0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Fused Update BG0 Layout"),
@@ -751,6 +803,134 @@ impl GpuDeqBackend {
                 },
             ],
         });
+        let slot_rhs_expand_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Slot RHS Expand BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let segment_memory_promote_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Segment Memory Promote BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let assoc_persistent_promote_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Assoc Persistent Promote BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         // fpm_retain_bwd_bg0_layout: 9 bindings for the active FPM token-local backward.
         // bindings 0-9: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients,
@@ -1383,6 +1563,13 @@ impl GpuDeqBackend {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_slot_owner = std::env::var("AIDEEN_ASSOC_SLOT_OWNER")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let assoc_tie_qk = std::env::var("AIDEEN_ASSOC_TIE_QK")
             .ok()
             .map(|v| {
@@ -1432,6 +1619,10 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_SLOT_STRIPE".to_string(),
             if assoc_slot_stripe { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_SLOT_OWNER".to_string(),
+            if assoc_slot_owner { 1.0 } else { 0.0 },
         );
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_TIE_QK".to_string(),
@@ -1562,6 +1753,71 @@ impl GpuDeqBackend {
                 module: &staged_picard_clean_shader,
                 entry_point: Some("picard_clean_step_main"),
                 compilation_options: Default::default(),
+                cache: None,
+            });
+        let slot_rhs_expand_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Slot RHS Expand Pipeline"),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Slot RHS Expand PL"),
+                    bind_group_layouts: &[&slot_rhs_expand_bgl],
+                    push_constant_ranges: &[],
+                })),
+                module: &slot_rhs_expand_shader,
+                entry_point: Some("slot_rhs_expand_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let segment_memory_token_enabled = std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let assoc_persistent_enabled = std::env::var("AIDEEN_ASSOC_PERSISTENT")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let segment_memory_beta = std::env::var("AIDEEN_SEGMENT_MEMORY_BETA")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.05, 1.0);
+        let mut segment_memory_constants = std::collections::HashMap::new();
+        segment_memory_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
+        segment_memory_constants.insert("ASSOC_RANK".to_string(), 32.0);
+        segment_memory_constants.insert(
+            "SEGMENT_MEMORY_BETA".to_string(),
+            segment_memory_beta as f64,
+        );
+        let segment_memory_promote_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Segment Memory Promote Pipeline"),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Segment Memory Promote PL"),
+                    bind_group_layouts: &[&segment_memory_promote_bgl],
+                    push_constant_ranges: &[],
+                })),
+                module: &segment_memory_promote_shader,
+                entry_point: Some("segment_memory_promote_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &segment_memory_constants,
+                    ..Default::default()
+                },
+                cache: None,
+            });
+        let assoc_persistent_promote_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Assoc Persistent Promote Pipeline"),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Assoc Persistent Promote PL"),
+                    bind_group_layouts: &[&assoc_persistent_promote_bgl],
+                    push_constant_ranges: &[],
+                })),
+                module: &assoc_persistent_promote_shader,
+                entry_point: Some("assoc_persistent_promote_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &segment_memory_constants,
+                    ..Default::default()
+                },
                 cache: None,
             });
         let staged_picard_gmix_pipeline =
@@ -1812,6 +2068,19 @@ impl GpuDeqBackend {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let slot_rhs_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Slot RHS Params"),
+            size: std::mem::size_of::<SlotRhsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let segment_memory_promote_params_buf =
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Segment Memory Promote Params"),
+                size: std::mem::size_of::<SegmentMemoryPromoteParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
         let attn_entries =
             (forward_batch_cap as usize * config.ctx_len.max(1) * config.h_slots * config.d_r)
                 as u64;
@@ -2467,16 +2736,22 @@ impl GpuDeqBackend {
             .unwrap_or(false);
         let cfg_picard_internal_probe = bool_flag("AIDEEN_PICARD_INTERNAL_PROBE").unwrap_or(false);
         let cfg_picard_gscore_fused = bool_flag("AIDEEN_PICARD_GSCORE_FUSED").unwrap_or(false);
+        let assoc_slot_stride_floats = assoc_banks as usize * (32usize + config.d_r + 1usize);
 
         Some(Self {
             config,
             forward_seq_cap,
+            forward_batch_cap,
             instance,
             adapter,
             subgroup_supported,
             device: Arc::new(device),
             queue: Arc::new(queue),
             bridge,
+            assoc_banks: assoc_banks as usize,
+            assoc_slot_stride_floats,
+            segment_memory_token: segment_memory_token_enabled,
+            assoc_persistent: assoc_persistent_enabled,
             adj_bufs: AdjointBuffers {
                 b_dl: adj_dl_buf,
                 b_v_out: adj_v_out_buf,
@@ -2500,6 +2775,9 @@ impl GpuDeqBackend {
             staged_picard_accum_v_pipeline,
             staged_picard_accum_k_pipeline,
             staged_picard_accum_q_pipeline,
+            slot_rhs_expand_pipeline,
+            segment_memory_promote_pipeline,
+            assoc_persistent_promote_pipeline,
             fused_update_stage1a_pipeline,
             fused_update_stage1b_pipeline,
             fused_update_stage2_pipeline,
@@ -2536,6 +2814,11 @@ impl GpuDeqBackend {
             staged_picard_bg,
             staged_picard_bg_alt,
             staged_picard_bg1,
+            slot_rhs_expand_bgl,
+            slot_rhs_params_buf,
+            segment_memory_promote_bgl,
+            segment_memory_promote_params_buf,
+            assoc_persistent_promote_bgl,
             fused_update_bg0,
             fused_update_bg1,
             fused_update_params_buf,
@@ -2635,7 +2918,188 @@ impl GpuDeqBackend {
             let n_floats = buf_bytes / 4;
             let data = vec![0.0f32; n_floats];
             self.queue.write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
+            self.queue.write_buffer(
+                &self.bridge.assoc_persistent_buf,
+                0,
+                bytemuck::cast_slice(&data),
+            );
         }
+    }
+
+    fn promote_segment_memory_gpu(&self) {
+        if !self.segment_memory_token || self.config.h_slots < 2 {
+            return;
+        }
+        let params = SegmentMemoryPromoteParams {
+            d_model: self.config.d_r as u32,
+            h_slots: self.config.h_slots as u32,
+            batch_size: self.forward_batch_cap,
+            _pad0: 0,
+        };
+        self.queue.write_buffer(
+            &self.segment_memory_promote_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let promote_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Segment Memory Promote BG"),
+            layout: &self.segment_memory_promote_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.segment_memory_promote_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.bridge.mstate_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.bridge.assoc_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.bridge.all_weights_buf,
+                        offset: aw_hist_byte_off(
+                            self.config.d_r as u64,
+                            self.config.h_slots as u64,
+                        ),
+                        size: std::num::NonZeroU64::new(
+                            (Self::history_params_len(self.config.d_r, self.config.h_slots) * 4)
+                                as u64,
+                        ),
+                    }),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Segment Memory Promote"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Segment Memory Promote"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.segment_memory_promote_pipeline);
+            pass.set_bind_group(0, &promote_bg, &[]);
+            pass.dispatch_workgroups(
+                (self.config.d_r as u32).div_ceil(64),
+                self.forward_batch_cap.max(1),
+                1,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    fn promote_assoc_persistent_gpu(&self) {
+        if !self.assoc_persistent {
+            return;
+        }
+        let params = SegmentMemoryPromoteParams {
+            d_model: self.config.d_r as u32,
+            h_slots: self.config.h_slots as u32,
+            batch_size: self.forward_batch_cap,
+            _pad0: 0,
+        };
+        self.queue.write_buffer(
+            &self.segment_memory_promote_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let promote_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Assoc Persistent Promote BG"),
+            layout: &self.assoc_persistent_promote_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.segment_memory_promote_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.bridge.assoc_persistent_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.bridge.assoc_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Assoc Persistent Promote"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Assoc Persistent Promote"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.assoc_persistent_promote_pipeline);
+            pass.set_bind_group(0, &promote_bg, &[]);
+            let assoc_bank_stride = 32u32 + self.config.d_r as u32 + 1u32;
+            let total = self.forward_batch_cap
+                * self.config.h_slots as u32
+                * self.assoc_banks as u32
+                * assoc_bank_stride;
+            pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    fn reset_internal_segment_runtime_state(&self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GPU Reset Internal Segment Runtime State"),
+            });
+        encoder.clear_buffer(&self.bridge.hcurr_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.scratch_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.prev_hstar_buf, 0, None);
+        encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
+        self.queue.submit(Some(encoder.finish()));
+        let buf_bytes = self.bridge.assoc_buf.size() as usize;
+        let n_floats = buf_bytes / 4;
+        let data = vec![0.0f32; n_floats];
+        self.queue
+            .write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
+    }
+
+
+
+    /// Reinicia solo la memoria local/intra-segmento.
+    ///
+    /// Mantiene intacto el carry lento de FPM (`mstate_buf` y `h_hist_buf`) para que
+    /// el siguiente segmento del mismo stream lógico siga teniendo continuidad, pero
+    /// evita que la memoria asociativa precisa arrastre ruido token-a-token entre segmentos.
+    pub fn reset_local_segment_state(&self) {
+        // GPU promote: consolidate Assoc_local → Assoc_persistent before clearing
+        // the local banks. This is the only promotion path; CPU promote was removed.
+        self.promote_assoc_persistent_gpu();
+        if self.segment_memory_token {
+            self.promote_segment_memory_gpu();
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GPU Reset Local Segment State"),
+            });
+        encoder.clear_buffer(&self.bridge.hcurr_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.hnext_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.scratch_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.hist_ctx_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.prev_hstar_buf, 0, None);
+        encoder.clear_buffer(&self.bridge.assoc_hist_buf, 0, None);
+        encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
+        self.queue.submit(Some(encoder.finish()));
+        // Clear Assoc_local for the next segment. Assoc_persistent is intentionally
+        // NOT cleared here — it is the inter-segment carry and persists until reset_state.
+        let buf_bytes = self.bridge.assoc_buf.size() as usize;
+        let n_floats = buf_bytes / 4;
+        let data = vec![0.0f32; n_floats];
+        self.queue.write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
     }
 
     // --- HELPER UNIFICADO ---
@@ -2648,6 +3112,33 @@ impl GpuDeqBackend {
         damping: f32,
         debug_enable: bool,
     ) -> DeqComputeShape {
+        self.build_compute_shape_range(
+            batch_size,
+            seq_len,
+            0,
+            seq_len,
+            max_iters,
+            epsilon,
+            damping,
+            debug_enable,
+        )
+    }
+
+    fn build_compute_shape_range(
+        &self,
+        batch_size: u32,
+        seq_len: u32,
+        token_start: u32,
+        token_count: u32,
+        max_iters: u32,
+        epsilon: f32,
+        damping: f32,
+        debug_enable: bool,
+    ) -> DeqComputeShape {
+        let segment_len = std::env::var("AIDEEN_INTERNAL_SEGMENT_LEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
         DeqComputeShape {
             batch_size,
             d_model: self.config.d_r as u32,
@@ -2658,8 +3149,8 @@ impl GpuDeqBackend {
             seq_len,
             residual_alpha: self.cached_residual_alpha,
             debug_enable: if debug_enable { 1 } else { 0 },
-            token_start: 0,
-            token_count: seq_len,
+            token_start,
+            token_count,
             // Clean-DEQ diagnostics only:
             // diag_zero_win != 0 => zero W_in injection
             // diag_one_iter != 0 => force single-iteration solve
@@ -2679,6 +3170,9 @@ impl GpuDeqBackend {
             fpm_alpha_m: self.cached_fpm_alpha_m,
             fpm_tau: self.cached_fpm_tau,
             fpm_read_gate_min: self.cached_fpm_read_gate_min,
+            segment_len,
+            _pad0: 0,
+            _pad1: 0,
         }
     }
 
@@ -3102,15 +3596,86 @@ impl GpuDeqBackend {
         }
 
         let copy_size = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("DEQ Forward (GPU s_buf) Copy Encoder"),
-            });
-        encoder.copy_buffer_to_buffer(s_buf_gpu, 0, &self.bridge.s_buf, 0, copy_size);
-        self.queue.submit(Some(encoder.finish()));
+        if !std::ptr::eq(s_buf_gpu, &self.bridge.s_buf) {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("DEQ Forward (GPU s_buf) Copy Encoder"),
+                });
+            encoder.copy_buffer_to_buffer(s_buf_gpu, 0, &self.bridge.s_buf, 0, copy_size);
+            self.queue.submit(Some(encoder.finish()));
+        }
         self.bridge
             .run_forward_gpu_only(&self.device, &self.queue, &shape);
+        Ok(())
+    }
+
+    pub fn run_forward_segmented_from_seq_buf(
+        &self,
+        batch_size: u32,
+        seq_len: u32,
+        segment_len: u32,
+        max_iters: u32,
+        damping: f32,
+        epsilon: f32,
+        debug_enable: bool,
+        s_buf_gpu: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        if segment_len == 0 || seq_len <= segment_len {
+            return Ok(self.run_forward_from_seq_buf(
+                batch_size,
+                seq_len,
+                max_iters,
+                epsilon,
+                damping,
+                s_buf_gpu,
+                false,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )?);
+        }
+
+        let copy_size = (batch_size as u64) * (seq_len as u64) * (self.config.d_r as u64) * 4;
+        if !std::ptr::eq(s_buf_gpu, &self.bridge.s_buf) {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("DEQ Forward Segmented (GPU s_buf) Copy Encoder"),
+                });
+            encoder.copy_buffer_to_buffer(s_buf_gpu, 0, &self.bridge.s_buf, 0, copy_size);
+            self.queue.submit(Some(encoder.finish()));
+        }
+
+        let mut start = 0u32;
+        while start < seq_len {
+            let count = (seq_len - start).min(segment_len);
+            let shape = self.build_compute_shape_range(
+                batch_size,
+                seq_len,
+                start,
+                count,
+                max_iters,
+                epsilon,
+                damping,
+                debug_enable && start == 0,
+            );
+            self.bridge
+                .run_forward_gpu_only(&self.device, &self.queue, &shape);
+            start += count;
+            if start < seq_len {
+                if self.segment_memory_token {
+                    self.promote_segment_memory_gpu();
+                }
+                self.reset_internal_segment_runtime_state();
+            }
+        }
         Ok(())
     }
 
@@ -3120,6 +3685,7 @@ impl GpuDeqBackend {
         damping: f32,
         iters: u32,
         dl_dh_src: Option<&wgpu::Buffer>,
+        rhs_slot_src: Option<&wgpu::Buffer>,
         clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
@@ -3139,6 +3705,7 @@ impl GpuDeqBackend {
                 damping,
                 iters,
                 dl_dh_src,
+                rhs_slot_src,
                 clear_slot_rhs,
                 batch_size,
             );
@@ -3776,7 +4343,8 @@ impl GpuDeqBackend {
         damping: f32,
         iters: u32,
         dl_dh_src: Option<&wgpu::Buffer>,
-        _clear_slot_rhs: bool,
+        rhs_slot_src: Option<&wgpu::Buffer>,
+        clear_slot_rhs: bool,
         batch_size: u32,
     ) -> Result<(), String> {
         let params = UpdateUniforms {
@@ -3840,6 +4408,52 @@ impl GpuDeqBackend {
             });
         if let Some(dl_dh_src) = dl_dh_src {
             enc.copy_buffer_to_buffer(dl_dh_src, 0, &self.adj_bufs.b_dl, 0, dl_bytes);
+        }
+        if let Some(rhs_slot_src) = rhs_slot_src {
+            let expand_params = SlotRhsParams {
+                d_model: d,
+                h_slots: self.config.h_slots as u32,
+                seq_len,
+                batch_size,
+            };
+            self.queue.write_buffer(
+                &self.slot_rhs_params_buf,
+                0,
+                bytemuck::bytes_of(&expand_params),
+            );
+            let slot_rhs_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Slot RHS Expand BG"),
+                layout: &self.slot_rhs_expand_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.slot_rhs_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs_slot_src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.fused_hist_ctx_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.bridge.assoc_read_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Slot RHS Expand"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_rhs_expand_pipeline);
+                pass.set_bind_group(0, &slot_rhs_bg, &[]);
+                pass.dispatch_workgroups(d.div_ceil(16), n_entries.div_ceil(16).max(1), 1);
+            }
+        } else if clear_slot_rhs {
+            enc.clear_buffer(&self.fused_hist_ctx_buf, 0, None);
         }
         enc.clear_buffer(&self.adj_bufs.b_v_out, 0, None);
         enc.clear_buffer(&self.fused_weighted_h_buf, 0, None);

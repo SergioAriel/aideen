@@ -16,6 +16,9 @@ struct RunUniforms {
     fpm_alpha_m: f32,
     fpm_tau: f32,
     fpm_read_gate_min: f32,
+    segment_len: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
@@ -31,7 +34,9 @@ struct RunUniforms {
 // shifted by the slot anchor. FPM/DEQ controls write strength separately.
 @group(0) @binding(12) var<storage, read_write> PrevHStarBuf: array<f32>;
 @group(0) @binding(13) var<storage, read_write> AssocBuf: array<f32>;
-@group(0) @binding(14) var<storage, read_write> AssocHist: array<f32>;
+@group(0) @binding(14) var<storage, read_write> AssocPersistentBuf: array<f32>;
+@group(0) @binding(15) var<storage, read_write> AssocHist: array<f32>;
+@group(0) @binding(16) var<storage, read_write> AssocReadBuf: array<f32>;
 
 override SLOT_ATTN_HEAD_DIM: u32 = 32u;
 override ENABLE_TOKEN_CARRY: bool = true;
@@ -42,12 +47,16 @@ override ENABLE_ASSOC_SLOT_ANCHOR: bool = false;
 override ENABLE_ASSOC_REUSE_MATCH: bool = false;
 override ENABLE_ASSOC_SLOT_STRIPE: bool = false;
 override ENABLE_ASSOC_SLOT_OWNER: bool = false;
+override ENABLE_ASSOC_READ_SLOT_PRIOR: bool = true;
 override ENABLE_ASSOC_TIE_QK: bool = false;
 override ENABLE_ASSOC_CONF_READ: bool = false;
 override ENABLE_ASSOC_EVENT_GATE: bool = false;
 override ENABLE_ASSOC_HARD_READ: bool = false;
 override ENABLE_ASSOC_LINEAR_WRITE: bool = false;
 override ENABLE_ASSOC_READ: bool = true;
+override ENABLE_ASSOC_POST_HSTAR: bool = false;
+override ENABLE_SEGMENT_MEMORY_TOKEN: bool = false;
+override ENABLE_ASSOC_PERSISTENT: bool = false;
 const SLOT_COORD_USE_BIAS: bool = true;
 const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
 const WG_SIZE: u32 = 256u;
@@ -68,6 +77,7 @@ const ASSOC_ALLOC_NOVELTY_THRESHOLD: f32 = 0.20;
 // Experimental multi-bank addressing strength. With ASSOC_BANKS=1 this is
 // behaviorally inactive because the read softmax has a single candidate.
 const ASSOC_READ_BETA: f32 = 4.0;
+const ASSOC_READ_SLOT_PRIOR_BETA: f32 = 8.0;
 const H_SELF_FEEDBACK: f32 = 1.0;
 
 var<workgroup> slot_coord_weights: array<f32, MAX_SLOTS>;
@@ -435,6 +445,8 @@ fn deq_slot_coord_unified_main(
 
     let d_model = shape.d_model;
     let h_slots = shape.h_slots;
+    let segment_memory_slot = h_slots - 1u;
+    let is_segment_memory_slot = ENABLE_SEGMENT_MEMORY_TOKEN && slot_idx == segment_memory_slot;
     let head_dim = min(d_model, SLOT_ATTN_HEAD_DIM);
     let total_elements = h_slots * d_model;
     let slot_offset = slot_idx * d_model;
@@ -607,7 +619,7 @@ fn deq_slot_coord_unified_main(
         let attn_base = batch_scratch_t + signal_span + slot_offset;
         let alpha_base = batch_scratch_t + signal_span * 2u;
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
-        let use_prev_token_mem = global_t > 0u;
+        let use_prev_token_mem = t > 0u;
         var prev_hist_base_t = 0u;
         if (use_prev_token_mem) {
             prev_hist_base_t = (batch_idx * shape.seq_len + (global_t - 1u)) * total_elements;
@@ -657,6 +669,12 @@ fn deq_slot_coord_unified_main(
             }
         }
         workgroupBarrier();
+        if (is_segment_memory_slot) {
+            for (var d = tid; d < d_model; d = d + WG_SIZE) {
+                Scratch[signal_base + d] = 0.0;
+            }
+        }
+        workgroupBarrier();
         if (debug_on && slot_idx == 0u && tid == 0u && t == 0u) {
             DebugLog[8] = 121.0;
         }
@@ -673,7 +691,9 @@ fn deq_slot_coord_unified_main(
         var hist_ctx1 = 0.0;
         var hist_mem0 = 0.0;
         var hist_mem1 = 0.0;
-        if (ENABLE_H_HIST && d_model == WG_SIZE * 2u) {
+        var assoc_post0 = 0.0;
+        var assoc_post1 = 0.0;
+        if (ENABLE_H_HIST && !is_segment_memory_slot && d_model == WG_SIZE * 2u) {
             h_hist0 = H_hist[h_base + slot_offset + tid];
             h_hist1 = H_hist[h_base + slot_offset + tid + WG_SIZE];
             if (tid == 0u) {
@@ -732,7 +752,7 @@ fn deq_slot_coord_unified_main(
             workgroupBarrier();
         }
 
-        let should_init_h = global_t == 0u || !ENABLE_TOKEN_CARRY;
+        let should_init_h = t == 0u || !ENABLE_TOKEN_CARRY;
         if (should_init_h) {
             var local_sumsq0 = 0.0;
             // rms from signal only (h_hist excluded — stop-grad, same as hist_ctx)
@@ -1044,6 +1064,10 @@ fn deq_slot_coord_unified_main(
                 }
                 var assoc_ctx0 = 0.0;
                 var assoc_ctx1 = 0.0;
+                if (d_model == WG_SIZE * 2u) {
+                    AssocReadBuf[h_base_t + slot_offset + tid] = 0.0;
+                    AssocReadBuf[h_base_t + slot_offset + tid + WG_SIZE] = 0.0;
+                }
                 if (assoc_read_enabled) {
                     let d0 = tid;
                     let d1 = tid + WG_SIZE;
@@ -1083,6 +1107,49 @@ fn deq_slot_coord_unified_main(
                             q_norm = q_norm + shared_vals[r] * shared_vals[r];
                         }
                         shared_vals[3u * ASSOC_RANK + ASSOC_BANKS] = q_norm;
+                        var slot_read_allowed = 1.0;
+                        if (ENABLE_ASSOC_SLOT_OWNER && ENABLE_ASSOC_READ_SLOT_PRIOR) {
+                            let slot_anchor_root_read = hist_base + slot_anchor_base(d_model, h_slots);
+                            var owner_query_sq = 0.0;
+                            for (var j = 0u; j < d_model; j = j + 1u) {
+                                let query_src_j = PrevHStarBuf[prev_hstar_base + j];
+                                owner_query_sq = owner_query_sq + query_src_j * query_src_j;
+                            }
+                            let owner_query_rms = sqrt(
+                                owner_query_sq / max(1.0, f32(d_model)) + 1.0e-6
+                            );
+                            var best_owner_score = -1.0e30;
+                            var slot_owner_score = -1.0e30;
+                            for (var owner = 0u; owner < h_slots; owner = owner + 1u) {
+                                let owner_off = slot_anchor_root_read + owner * d_model;
+                                var anchor_sq = 0.0;
+                                var dot = 0.0;
+                                for (var j = 0u; j < d_model; j = j + 1u) {
+                                    let query_src_j =
+                                        PrevHStarBuf[prev_hstar_base + j] / max(owner_query_rms, 1.0e-6);
+                                    let anchor_j = AllWeights[owner_off + j];
+                                    anchor_sq = anchor_sq + anchor_j * anchor_j;
+                                    dot = dot + query_src_j * anchor_j;
+                                }
+                                let owner_score = dot / sqrt(max(anchor_sq, 1.0e-12));
+                                if (owner_score > best_owner_score) {
+                                    best_owner_score = owner_score;
+                                }
+                                if (owner == slot_idx) {
+                                    slot_owner_score = owner_score;
+                                }
+                            }
+                            // WRITE ownership can stay exclusive to avoid duplicated bindings.
+                            // READ needs softer access: useful banks may live outside the best
+                            // owner slot, so use owner geometry as a prior on slot contribution
+                            // instead of a hard binary gate.
+                            slot_read_allowed = exp(clamp(
+                                ASSOC_READ_SLOT_PRIOR_BETA * (slot_owner_score - best_owner_score),
+                                -8.0,
+                                0.0
+                            ));
+                        }
+                        shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 2u] = slot_read_allowed;
                     }
                     workgroupBarrier();
                     for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
@@ -1117,6 +1184,7 @@ fn deq_slot_coord_unified_main(
                         workgroupBarrier();
                     }
                     if (tid == 0u) {
+                        let slot_read_allowed = shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 2u];
                         var max_score = -1.0e30;
                         var min_score = 1.0e30;
                         for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
@@ -1180,8 +1248,10 @@ fn deq_slot_coord_unified_main(
                             let assoc_diag_base = 760u + slot_idx * 10u;
                             DebugLog[assoc_diag_base + 0u] =
                                 DebugLog[assoc_diag_base + 0u] + read_entropy;
-                            DebugLog[assoc_diag_base + 1u] =
-                                max(DebugLog[assoc_diag_base + 1u], read_max_prob);
+                            DebugLog[assoc_diag_base + 1u] = max(
+                                DebugLog[assoc_diag_base + 1u],
+                                read_max_prob * slot_read_allowed
+                            );
                             DebugLog[assoc_diag_base + 3u] =
                                 DebugLog[assoc_diag_base + 3u] + read_usage / max(1.0, f32(ASSOC_BANKS));
                             DebugLog[assoc_diag_base + 8u] = DebugLog[assoc_diag_base + 8u] + 1.0;
@@ -1198,8 +1268,10 @@ fn deq_slot_coord_unified_main(
                                 }
                                 DebugLog[assoc_query_diag_base + 0u] =
                                     DebugLog[assoc_query_diag_base + 0u] + read_entropy;
-                                DebugLog[assoc_query_diag_base + 1u] =
-                                    max(DebugLog[assoc_query_diag_base + 1u], read_max_prob);
+                                DebugLog[assoc_query_diag_base + 1u] = max(
+                                    DebugLog[assoc_query_diag_base + 1u],
+                                    read_max_prob * slot_read_allowed
+                                );
                                 DebugLog[assoc_query_diag_base + 3u] =
                                     DebugLog[assoc_query_diag_base + 3u] + read_usage / max(1.0, f32(ASSOC_BANKS));
                                 DebugLog[assoc_query_diag_base + 4u] =
@@ -1212,19 +1284,94 @@ fn deq_slot_coord_unified_main(
                                     + sqrt(shared_vals[3u * ASSOC_RANK + ASSOC_BANKS] / max(1.0, f32(ASSOC_RANK)));
                                 let assoc_query_pick_base = 940u + slot_idx * 2u;
                                 DebugLog[assoc_query_pick_base + 0u] = f32(best_bank_idx);
-                                DebugLog[assoc_query_pick_base + 1u] = best_bank_prob;
+                                DebugLog[assoc_query_pick_base + 1u] =
+                                    best_bank_prob * slot_read_allowed;
                             }
                         }
                     }
                     workgroupBarrier();
+                    if (ENABLE_ASSOC_PERSISTENT) {
+                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                            let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                            let bank_key_base = bank_base;
+                            let bank_usage = AssocPersistentBuf[bank_base + ASSOC_RANK + d_model];
+                            if (tid < ASSOC_RANK) {
+                                shared_vals[2u * ASSOC_RANK + tid] =
+                                    AssocPersistentBuf[bank_key_base + tid] * shared_vals[tid];
+                            }
+                            workgroupBarrier();
+                            if (tid == 0u) {
+                                var dot_score = 0.0;
+                                var key_norm = 0.0;
+                                for (var r = 0u; r < ASSOC_RANK; r = r + 1u) {
+                                    let key_r = AssocPersistentBuf[bank_key_base + r];
+                                    dot_score = dot_score + shared_vals[2u * ASSOC_RANK + r];
+                                    key_norm = key_norm + key_r * key_r;
+                                }
+                                let q_norm = shared_vals[3u * ASSOC_RANK + ASSOC_BANKS];
+                                if (bank_usage < ASSOC_OCCUPIED_THRESHOLD) {
+                                    shared_vals[4u * ASSOC_RANK + bank] = -25.0;
+                                } else {
+                                    let address_score = dot_score * inverseSqrt(max(key_norm * q_norm, 1.0e-12));
+                                    shared_vals[4u * ASSOC_RANK + bank] =
+                                        clamp(ASSOC_READ_BETA * address_score, -25.0, 25.0);
+                                }
+                            }
+                            workgroupBarrier();
+                        }
+                        if (tid == 0u) {
+                            var persistent_max_score = -1.0e30;
+                            if (ENABLE_ASSOC_HARD_READ) {
+                                var best_bank = 0u;
+                                var best_score = -1.0e30;
+                                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                    let score = shared_vals[4u * ASSOC_RANK + bank];
+                                    if (score > best_score) {
+                                        best_score = score;
+                                        best_bank = bank;
+                                    }
+                                }
+                                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                    shared_vals[4u * ASSOC_RANK + bank] = select(0.0, 1.0, bank == best_bank);
+                                }
+                            } else {
+                                var denom = 0.0;
+                                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                    persistent_max_score = max(persistent_max_score, shared_vals[4u * ASSOC_RANK + bank]);
+                                }
+                                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                    let e = exp(shared_vals[4u * ASSOC_RANK + bank] - persistent_max_score);
+                                    shared_vals[4u * ASSOC_RANK + bank] = e;
+                                    denom = denom + e;
+                                }
+                                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                                    shared_vals[4u * ASSOC_RANK + bank] =
+                                        shared_vals[4u * ASSOC_RANK + bank] / max(denom, 1.0e-6);
+                                }
+                            }
+                        }
+                        workgroupBarrier();
+                    }
+                    let slot_read_allowed = shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 2u];
                     let assoc_read_conf =
                         select(1.0, shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 1u], ENABLE_ASSOC_CONF_READ);
                     for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                         let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                         let bank_value_base = bank_base + ASSOC_RANK;
-                        let assoc_match = assoc_read_conf * shared_vals[3u * ASSOC_RANK + bank];
+                        let assoc_match =
+                            slot_read_allowed * assoc_read_conf * shared_vals[3u * ASSOC_RANK + bank];
                         assoc_ctx0 = assoc_ctx0 + assoc_match * AssocBuf[bank_value_base + d0];
                         assoc_ctx1 = assoc_ctx1 + assoc_match * AssocBuf[bank_value_base + d1];
+                    }
+                    if (ENABLE_ASSOC_PERSISTENT) {
+                        for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                            let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                            let bank_value_base = bank_base + ASSOC_RANK;
+                            let assoc_match =
+                                slot_read_allowed * assoc_read_conf * shared_vals[4u * ASSOC_RANK + bank];
+                            assoc_ctx0 = assoc_ctx0 + assoc_match * AssocPersistentBuf[bank_value_base + d0];
+                            assoc_ctx1 = assoc_ctx1 + assoc_match * AssocPersistentBuf[bank_value_base + d1];
+                        }
                     }
                     // TEMPORARY ASSOCIATIVE DIAGNOSTIC: measure injected assoc context magnitude.
                     shared_vals[tid] = assoc_ctx0 * assoc_ctx0 + assoc_ctx1 * assoc_ctx1;
@@ -1254,8 +1401,18 @@ fn deq_slot_coord_unified_main(
                     workgroupBarrier();
                     let assoc_rms = sqrt(shared_vals[0] / max(1.0, f32(d_model)));
                     let assoc_scale = 1.0 / max(assoc_rms, 0.1); // Soft normalization floor
-                    fpm_ctx0 = fpm_ctx0 + alpha_assoc * assoc_ctx0 * assoc_scale;
-                    fpm_ctx1 = fpm_ctx1 + alpha_assoc * assoc_ctx1 * assoc_scale;
+                    let assoc_inj0 = alpha_assoc * assoc_ctx0 * assoc_scale;
+                    let assoc_inj1 = alpha_assoc * assoc_ctx1 * assoc_scale;
+                    let assoc_export0 = assoc_ctx0;
+                    let assoc_export1 = assoc_ctx1;
+                    AssocReadBuf[h_base_t + slot_offset + d0] = assoc_export0;
+                    AssocReadBuf[h_base_t + slot_offset + d1] = assoc_export1;
+                    fpm_ctx0 = fpm_ctx0 + assoc_inj0;
+                    fpm_ctx1 = fpm_ctx1 + assoc_inj1;
+                    if (ENABLE_ASSOC_POST_HSTAR) {
+                        assoc_post0 = assoc_inj0;
+                        assoc_post1 = assoc_inj1;
+                    }
                 }
                 workgroupBarrier();
             }
@@ -1612,6 +1769,16 @@ fn deq_slot_coord_unified_main(
         }
         workgroupBarrier();
 
+        if (ENABLE_ASSOC_POST_HSTAR && assoc_read_enabled && d_model == WG_SIZE * 2u) {
+            let d0 = tid;
+            let d1 = tid + WG_SIZE;
+            H_curr[h_base + slot_offset + d0] = H_curr[h_base + slot_offset + d0] + assoc_post0;
+            H_curr[h_base + slot_offset + d1] = H_curr[h_base + slot_offset + d1] + assoc_post1;
+            H_next[h_base_t + slot_offset + d0] = H_curr[h_base + slot_offset + d0];
+            H_next[h_base_t + slot_offset + d1] = H_curr[h_base + slot_offset + d1];
+        }
+        workgroupBarrier();
+
         // h_currSSM: h_ssm = a * h_ssm + (1-a) * h*
         //   a[d] = sigmoid(-A_log[d]) — per-dim time constant, zero extra params
         //   state lives directly in h* space, no projections needed
@@ -1637,7 +1804,7 @@ fn deq_slot_coord_unified_main(
         // reference path (a_log / w_x / w_out), while retain/z/proposal modulate the novelty
         // injected into that carrier.
         var assoc_write_gate_token = 1.0;
-        if (fpm_write_enabled && d_model == WG_SIZE * 2u) {
+        if (fpm_write_enabled && !is_segment_memory_slot && d_model == WG_SIZE * 2u) {
             let d0 = tid;
             let d1 = tid + WG_SIZE;
             let h_val0 = H_curr[h_base + slot_offset + d0];
@@ -1950,7 +2117,7 @@ fn deq_slot_coord_unified_main(
         // Model A token-local history: once write is enabled, each token materializes its
         // internal FPM state into HistCtx so the next token in the same chunk can read it.
         // Inter-chunk persistence remains a separate stage handled by the bridge via MState.
-        if (fpm_write_enabled && d_model == WG_SIZE * 2u) {
+        if (d_model == WG_SIZE * 2u) {
             let working0 = fpm_m_cache[tid];
             let working1 = fpm_m_cache[tid + WG_SIZE];
             // Per-token storage for the causal history snapshot and retain-gate backward.
@@ -1958,7 +2125,7 @@ fn deq_slot_coord_unified_main(
             HistCtx[h_base_t + slot_offset + tid] = working0;
             HistCtx[h_base_t + slot_offset + tid + WG_SIZE] = working1;
         }
-        if (assoc_write_enabled && d_model == WG_SIZE * 2u) {
+        if (assoc_write_enabled && !is_segment_memory_slot && d_model == WG_SIZE * 2u) {
             let d0 = tid;
             let d1 = tid + WG_SIZE;
             let hist_base = aw_hist_base(d_model, h_slots);
@@ -2009,12 +2176,12 @@ fn deq_slot_coord_unified_main(
             let assoc_signal_rms = sqrt(shared_vals[0] * inv_d_model + 1.0e-6);
             let assoc_src0 = assoc_raw0 / max(assoc_signal_rms, 1.0e-6);
             let assoc_src1 = assoc_raw1 / max(assoc_signal_rms, 1.0e-6);
-            let has_prev_hstar = select(0.0, 1.0, global_t > 0u);
+            let has_prev_hstar = select(0.0, 1.0, t > 0u);
             var event_prev0 = 0.0;
             var event_prev1 = 0.0;
             var event_curr0 = 0.0;
             var event_curr1 = 0.0;
-            if (global_t > 0u) {
+            if (t > 0u) {
                 let prev_s_in_base = (batch_idx * shape.seq_len + (global_t - 1u)) * d_model;
                 event_prev0 =
                     S_in[prev_s_in_base + d0]
@@ -2320,8 +2487,10 @@ fn deq_slot_coord_unified_main(
                 ENABLE_ASSOC_LINEAR_WRITE,
             );
             let overwrite_bank = AssocHist[assoc_hist_base + assoc_slot_stride + 3u];
-            let effective_keep_gate =
-                select(1.0 - effective_write_mass, 0.0, overwrite_bank > 0.5);
+            let key_write_mass = effective_write_mass;
+            let key_keep_gate = 1.0 - effective_write_mass;
+            let value_write_mass = select(0.0, effective_write_mass, overwrite_bank > 0.5);
+            let value_keep_gate = select(1.0, 1.0 - value_write_mass, overwrite_bank > 0.5);
             if (tid == 0u) {
                 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: write allocation telemetry.
                 if (debug_on) {
@@ -2342,24 +2511,39 @@ fn deq_slot_coord_unified_main(
             }
             if (tid < ASSOC_RANK) {
                 AssocBuf[bank_key_base + tid] =
-                    effective_keep_gate * AssocBuf[bank_key_base + tid] + effective_write_mass * q_self[tid];
+                    key_keep_gate * AssocBuf[bank_key_base + tid] + key_write_mass * q_self[tid];
             }
             workgroupBarrier();
             AssocBuf[bank_value_base + d0] =
-                effective_keep_gate * AssocBuf[bank_value_base + d0] + effective_write_mass * assoc_value0;
+                value_keep_gate * AssocBuf[bank_value_base + d0] + value_write_mass * assoc_value0;
             AssocBuf[bank_value_base + d1] =
-                effective_keep_gate * AssocBuf[bank_value_base + d1] + effective_write_mass * assoc_value1;
+                value_keep_gate * AssocBuf[bank_value_base + d1] + value_write_mass * assoc_value1;
             if (fpm_write_enabled) {
-                // Phase bridge: FPM first controls binding write strength; only after the
-                // binding bank is updated does FPM consolidate a small part of that selected
-                // value into its slower recurrent state. KV identity stays clean, while FPM
-                // gains a long-term path from the explicit binding memory.
+                // Phase bridge:
+                // - AssocBuf keeps the exact token-level binding (bank_value).
+                // - FPM should not copy that binding verbatim, or it becomes a second,
+                //   blurrier associative memory. Instead it absorbs a slow contextual trace
+                //   of the token state that produced the binding. This preserves the hybrid
+                //   contract: explicit memory stays precise; FPM stays contextual.
+                shared_vals[tid] =
+                    H_curr[h_base + slot_offset + d0] * H_curr[h_base + slot_offset + d0]
+                    + H_curr[h_base + slot_offset + d1] * H_curr[h_base + slot_offset + d1];
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
+                let fpm_trace_rms = sqrt(shared_vals[0] * inv_d_model + 1.0e-6);
+                let h_trace0 = H_curr[h_base + slot_offset + d0] / max(fpm_trace_rms, 1.0e-6);
+                let h_trace1 = H_curr[h_base + slot_offset + d1] / max(fpm_trace_rms, 1.0e-6);
                 let consolidate =
                     ASSOC_TO_FPM_SCALE * clamp(assoc_write_gate_token, 0.0, ASSOC_WRITE_CAP) * effective_write_mass;
                 fpm_m_cache[d0] =
-                    (1.0 - consolidate) * fpm_m_cache[d0] + consolidate * AssocBuf[bank_value_base + d0];
+                    (1.0 - consolidate) * fpm_m_cache[d0] + consolidate * h_trace0;
                 fpm_m_cache[d1] =
-                    (1.0 - consolidate) * fpm_m_cache[d1] + consolidate * AssocBuf[bank_value_base + d1];
+                    (1.0 - consolidate) * fpm_m_cache[d1] + consolidate * h_trace1;
                 HistCtx[h_base_t + slot_offset + d0] = fpm_m_cache[d0];
                 HistCtx[h_base_t + slot_offset + d1] = fpm_m_cache[d1];
             }

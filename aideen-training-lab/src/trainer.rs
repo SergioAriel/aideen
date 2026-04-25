@@ -1684,6 +1684,22 @@ impl Trainer {
         }
     }
 
+    /// Reinicia solo la memoria local/intra-segmento manteniendo el carry largo de FPM.
+    pub fn reset_local_segment_state(&mut self) {
+        self.m_prev = None;
+        #[cfg(feature = "wgpu")]
+        if let Some(gpu) = self.gpu_deq.as_ref() {
+            gpu.reset_local_segment_state();
+        }
+    }
+
+    fn internal_segment_len(&self) -> Option<u32> {
+        std::env::var("AIDEEN_INTERNAL_SEGMENT_LEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+    }
+
     /// Ejecuta un paso de entrenamiento dado un slice de tokens.
     /// `context`: tokens de contexto (input)
     /// `target`: token a predecir
@@ -1932,6 +1948,9 @@ impl Trainer {
             &gpu.queue,
             &gpu.bridge.hpooled_buf,
             h_offset,
+            &gpu.bridge.assoc_pooled_buf,
+            h_offset,
+            None,
             &[target],
             0.0,
             step_t,
@@ -1996,6 +2015,7 @@ impl Trainer {
         } else {
             (num_tokens as u32) / fwd_batch_size
         };
+        let internal_segment_len = self.internal_segment_len();
         let audit_forward_bytes = self.estimate_forward_bandwidth_bytes(
             fwd_batch_size,
             per_seq_len,
@@ -2077,14 +2097,27 @@ impl Trainer {
                 );
             }
             let forward_t0 = std::time::Instant::now();
-            let _ = gpu.run_forward(
-                fwd_batch_size,
-                per_seq_len,
-                self.adaptive_max_iters,
-                damping_eff,
-                epsilon,
-                debug_enable,
-            );
+            if let Some(segment_len) = internal_segment_len {
+                let _ = gpu.run_forward_segmented_from_seq_buf(
+                    fwd_batch_size,
+                    per_seq_len,
+                    segment_len,
+                    self.adaptive_max_iters,
+                    damping_eff,
+                    epsilon,
+                    debug_enable,
+                    &gpu.bridge.s_buf,
+                );
+            } else {
+                let _ = gpu.run_forward(
+                    fwd_batch_size,
+                    per_seq_len,
+                    self.adaptive_max_iters,
+                    damping_eff,
+                    epsilon,
+                    debug_enable,
+                );
+            }
             if audit_cost && self.cfg_system_cost_wait {
                 // Audit-only: force GPU completion so forward_ms reflects execution, not enqueue.
                 gpu.device.poll(wgpu::Maintain::Wait);
@@ -2246,6 +2279,9 @@ impl Trainer {
                     &gpu.queue,
                     &gpu.bridge.hpooled_buf,
                     0,
+                    &gpu.bridge.assoc_pooled_buf,
+                    0,
+                    Some(gpu_emb.weights_buffer()),
                     &targets_u32,
                     lm_lr,
                     self.optimizer.step_count() as u32,
@@ -2283,6 +2319,7 @@ impl Trainer {
                     self.reasoning.damping,
                     self.config.adj_iters as u32,
                     Some(&gpu_lm.dl_dh_buf),
+                    Some(gpu_lm.assoc_grad_buf()),
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );

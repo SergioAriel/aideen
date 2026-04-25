@@ -40,6 +40,10 @@ pub struct GpuEmbeddingTrainer {
 }
 
 impl GpuEmbeddingTrainer {
+    pub fn weights_buffer(&self) -> &wgpu::Buffer {
+        &self.emb_buf
+    }
+
     fn build_unique_token_csr(tokens: &[u32], vocab_size: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         use std::collections::BTreeMap;
 
