@@ -3059,6 +3059,9 @@ impl GpuDeqBackend {
         encoder.clear_buffer(&self.bridge.scratch_buf, 0, None);
         encoder.clear_buffer(&self.bridge.prev_hstar_buf, 0, None);
         encoder.clear_buffer(&self.tbptt_carry_buf, 0, None);
+        // NOTE: assoc_persistent_buf is intentionally NOT cleared here.
+        // It acts as the durable inter-segment carry for the associative path.
+        // It is only cleared in reset_state() when crossing document boundaries.
         self.queue.submit(Some(encoder.finish()));
         let buf_bytes = self.bridge.assoc_buf.size() as usize;
         let n_floats = buf_bytes / 4;

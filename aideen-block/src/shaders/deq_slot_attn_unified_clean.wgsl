@@ -1355,13 +1355,17 @@ fn deq_slot_coord_unified_main(
                     let slot_read_allowed = shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 2u];
                     let assoc_read_conf =
                         select(1.0, shared_vals[3u * ASSOC_RANK + ASSOC_BANKS + 1u], ENABLE_ASSOC_CONF_READ);
+                    
+                    // Signal Balancing: if Persistent is active, split energy 50/50 to maintain total magnitude.
+                    let assoc_mix_weight = select(1.0, 0.5, ENABLE_ASSOC_PERSISTENT);
+
                     for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                         let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                         let bank_value_base = bank_base + ASSOC_RANK;
                         let assoc_match =
                             slot_read_allowed * assoc_read_conf * shared_vals[3u * ASSOC_RANK + bank];
-                        assoc_ctx0 = assoc_ctx0 + assoc_match * AssocBuf[bank_value_base + d0];
-                        assoc_ctx1 = assoc_ctx1 + assoc_match * AssocBuf[bank_value_base + d1];
+                        assoc_ctx0 = assoc_ctx0 + assoc_mix_weight * assoc_match * AssocBuf[bank_value_base + d0];
+                        assoc_ctx1 = assoc_ctx1 + assoc_mix_weight * assoc_match * AssocBuf[bank_value_base + d1];
                     }
                     if (ENABLE_ASSOC_PERSISTENT) {
                         for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
@@ -1369,8 +1373,8 @@ fn deq_slot_coord_unified_main(
                             let bank_value_base = bank_base + ASSOC_RANK;
                             let assoc_match =
                                 slot_read_allowed * assoc_read_conf * shared_vals[4u * ASSOC_RANK + bank];
-                            assoc_ctx0 = assoc_ctx0 + assoc_match * AssocPersistentBuf[bank_value_base + d0];
-                            assoc_ctx1 = assoc_ctx1 + assoc_match * AssocPersistentBuf[bank_value_base + d1];
+                            assoc_ctx0 = assoc_ctx0 + assoc_mix_weight * assoc_match * AssocPersistentBuf[bank_value_base + d0];
+                            assoc_ctx1 = assoc_ctx1 + assoc_mix_weight * assoc_match * AssocPersistentBuf[bank_value_base + d1];
                         }
                     }
                     // TEMPORARY ASSOCIATIVE DIAGNOSTIC: measure injected assoc context magnitude.
