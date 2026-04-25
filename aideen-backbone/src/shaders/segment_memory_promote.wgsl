@@ -11,8 +11,8 @@ struct PromoteParams {
 
 @group(0) @binding(0) var<uniform> Params: PromoteParams;
 @group(0) @binding(1) var<storage, read_write> MState: array<f32>;
-@group(0) @binding(2) var<storage, read> AssocBuf: array<f32>;
-@group(0) @binding(3) var<storage, read> HistWeights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> AssocBuf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> HistWeights: array<f32>;
 
 fn hist_mat_len(d: u32) -> u32 { return d * d; }
 fn hist_scale_base(d: u32, h_slots: u32) -> u32 { return hist_mat_len(d); }

@@ -63,6 +63,8 @@ pub struct RustDeqBridge {
     pub pool_bind_group_layout: wgpu::BindGroupLayout,
     pub update_pipeline: wgpu::ComputePipeline,
     pub update_bind_group: wgpu::BindGroup,
+    pub solve_pool_bg1_layout: wgpu::BindGroupLayout,
+    pub solve_pool_bg1: wgpu::BindGroup,
     update_params_buf: wgpu::Buffer,
     update_grad_mat_buf: wgpu::Buffer,
     update_grad_vec_buf: wgpu::Buffer,
@@ -295,7 +297,7 @@ impl RustDeqBridge {
             count: None,
         });
 
-        // binding 1: S_in (read-only)
+        // binding 1: v_adjoint (read-only)
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 1,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -306,7 +308,7 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // binding 2: AllWeights (read-only)
+        // binding 2: q_input (read-only)
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 2,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -317,9 +319,19 @@ impl RustDeqBridge {
             },
             count: None,
         });
-        // Core hot path excludes pooled outputs so the unified path stays below
-        // per-stage storage-buffer limits on Metal.
-        for i in [3u32, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
+        // binding 6: adj_dl (read-only)
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 6,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+        // read_write slots: 3,4,5 and 7..15
+        for i in [3u32, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -336,9 +348,125 @@ impl RustDeqBridge {
             entries: &entries,
         });
 
+        let solve_pool_bg1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Solve Pool BG1 Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("DEQ Core Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &solve_pool_bg1_layout],
             push_constant_ranges: &[],
         });
         let pool_bind_group_layout =
@@ -962,7 +1090,7 @@ impl RustDeqBridge {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: all_weights_buf.as_entire_binding(),
+                    resource: s_buf.as_entire_binding(), // Dummy for q_input in forward
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -977,44 +1105,44 @@ impl RustDeqBridge {
                     resource: scratch_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: s_buf.as_entire_binding(), // Dummy for adj_dl in forward
+                },
+                wgpu::BindGroupEntry {
                     binding: 7,
                     resource: debug_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: hist_ctx_buf.as_entire_binding(),
+                    resource: scratch_buf.as_entire_binding(), // Dummy for mix_buf in forward
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: mstate_buf.as_entire_binding(),
+                    resource: scratch_buf.as_entire_binding(), // Dummy for weighted_h in forward
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: signal_cache_buf.as_entire_binding(),
+                    resource: scratch_buf.as_entire_binding(), // Dummy for gmix in forward
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: h_hist_buf.as_entire_binding(),
+                    resource: scratch_buf.as_entire_binding(), // Dummy for gscore in forward
                 },
                 wgpu::BindGroupEntry {
                     binding: 12,
-                    resource: prev_hstar_buf.as_entire_binding(),
+                    resource: scratch_buf.as_entire_binding(), // Dummy for qgrad in forward
                 },
                 wgpu::BindGroupEntry {
                     binding: 13,
-                    resource: assoc_buf.as_entire_binding(),
+                    resource: hist_ctx_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 14,
-                    resource: assoc_persistent_buf.as_entire_binding(),
+                    resource: mstate_buf.as_entire_binding(), // hist_delta in layout 2.0
                 },
                 wgpu::BindGroupEntry {
                     binding: 15,
-                    resource: assoc_hist_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: assoc_read_buf.as_entire_binding(),
+                    resource: h_hist_buf.as_entire_binding(), // tbptt_carry in layout 2.0
                 },
             ],
         });
@@ -1287,6 +1415,56 @@ impl RustDeqBridge {
                     binding: 9,
                     resource: s_v_buf.as_entire_binding(),
                 },
+             ], });
+
+        let solve_pool_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Solve Pool BG1 (Forward)"),
+            layout: &solve_pool_bg1_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: assoc_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: assoc_persistent_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: assoc_hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: assoc_read_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: all_weights_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -1301,6 +1479,8 @@ impl RustDeqBridge {
             pool_bind_group_layout,
             update_pipeline,
             update_bind_group,
+            solve_pool_bg1_layout,
+            solve_pool_bg1,
             update_params_buf,
             update_grad_mat_buf,
             update_grad_vec_buf,
@@ -1779,6 +1959,7 @@ impl RustDeqBridge {
                 });
                 cpass.set_pipeline(&self.hist_v2_signal_cache_pipeline);
                 cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.set_bind_group(1, &self.solve_pool_bg1, &[]);
                 cpass.dispatch_workgroups(shape.batch_size.max(1), shape.token_count.max(1), 1);
             }
         }
@@ -1790,6 +1971,7 @@ impl RustDeqBridge {
                 });
                 cpass.set_pipeline(&self.hist_v2_project_pipeline);
                 cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.set_bind_group(1, &self.solve_pool_bg1, &[]);
                 cpass.dispatch_workgroups(
                     shape.batch_size.max(1),
                     shape.h_slots.max(1),
@@ -1804,6 +1986,7 @@ impl RustDeqBridge {
             });
             cpass.set_pipeline(&self.slot_coord_unified_pipeline);
             cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.set_bind_group(1, &self.solve_pool_bg1, &[]);
             cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
         }
         {
@@ -1814,6 +1997,7 @@ impl RustDeqBridge {
                 });
                 cpass.set_pipeline(&self.hist_v2_temporal_pipeline);
                 cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.set_bind_group(1, &self.solve_pool_bg1, &[]);
                 cpass.dispatch_workgroups(shape.batch_size.max(1), shape.h_slots.max(1), 1);
             }
         }

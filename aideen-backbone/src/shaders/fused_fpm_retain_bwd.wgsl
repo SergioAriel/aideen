@@ -68,9 +68,9 @@ struct FpmBwdUniforms {
 // Layout: [slot * n_tokens + t_abs, dim] = slot-major, same as v_next_entry_base in adjoint.
 // Used to compute the READ-path gradient: fpm_ctx_t reads M[t-1], so
 // ∂L/∂M[t-1] += v_state[slot,t] * (∂fpm_ctx_t/∂M[t-1]) ≈ v_state[slot,t] * FPM_READ_GRAD_SCALE
-@group(0) @binding(10) var<storage, read> v_state: array<f32>;
-@group(0) @binding(11) var<storage, read> AssocState: array<f32>;
-@group(0) @binding(12) var<storage, read> AssocHist: array<f32>;
+@group(0) @binding(10) var<storage, read_write> v_state: array<f32>;
+@group(0) @binding(11) var<storage, read_write> AssocState: array<f32>;
+@group(0) @binding(12) var<storage, read_write> AssocHist: array<f32>;
 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after backward learning path is localized.
 @group(0) @binding(13) var<storage, read_write> AssocBwdDebug: array<f32>;
 @group(0) @binding(14) var<storage, read> S_in: array<f32>;

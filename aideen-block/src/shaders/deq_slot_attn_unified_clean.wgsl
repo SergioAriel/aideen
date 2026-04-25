@@ -23,7 +23,6 @@ struct RunUniforms {
 
 @group(0) @binding(0) var<uniform> shape: RunUniforms;
 @group(0) @binding(1) var<storage, read> S_in: array<f32>;
-@group(0) @binding(2) var<storage, read> AllWeights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> H_curr: array<f32>;
 @group(0) @binding(4) var<storage, read_write> H_next: array<f32>;
 @group(0) @binding(5) var<storage, read_write> Scratch: array<f32>;
@@ -33,10 +32,13 @@ struct RunUniforms {
 // Previous associative source: normalized token identity signal, optionally
 // shifted by the slot anchor. FPM/DEQ controls write strength separately.
 @group(0) @binding(12) var<storage, read_write> PrevHStarBuf: array<f32>;
-@group(0) @binding(13) var<storage, read_write> AssocBuf: array<f32>;
-@group(0) @binding(14) var<storage, read_write> AssocPersistentBuf: array<f32>;
-@group(0) @binding(15) var<storage, read_write> AssocHist: array<f32>;
-@group(0) @binding(16) var<storage, read_write> AssocReadBuf: array<f32>;
+
+// Group 1: Associative Memory Pool (moved to satisfy Metal 16-buffer limit per group)
+@group(1) @binding(0) var<storage, read_write> AssocBuf: array<f32>;
+@group(1) @binding(1) var<storage, read_write> AssocPersistentBuf: array<f32>;
+@group(1) @binding(2) var<storage, read_write> AssocHist: array<f32>;
+@group(1) @binding(3) var<storage, read_write> AssocReadBuf: array<f32>;
+@group(1) @binding(4) var<storage, read_write> AllWeights: array<f32>;
 
 override SLOT_ATTN_HEAD_DIM: u32 = 32u;
 override ENABLE_TOKEN_CARRY: bool = true;

@@ -816,11 +816,8 @@ fn main() {
         .unwrap_or(0)
         + 2 * pairs_per_seq
         + 2;
-    if std::env::var("AIDEEN_SEQ_CAP").is_err() {
-        unsafe {
-            std::env::set_var("AIDEEN_SEQ_CAP", required_seq_cap.max(ctx_len).to_string());
-        }
-    }
+    // AIDEEN_SEQ_CAP override removed to enforce strict local learning chunking.
+    // The sequence will now be properly split into ctx_len chunks by run_sequence_chunks.
 
     let mode_label = if assoc_only {
         "Assoc-only (no slot-attn, no continuous FPM)"

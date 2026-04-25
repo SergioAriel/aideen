@@ -1,0 +1,32 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=600  n_eval=150  gaps=[0, 64, 128, 256]  pairs_per_seq=1
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  GPU ready.
+
+  Training (600 sequences, gaps=[0, 64, 128, 256])…
+  train  100/600 | avg_loss=1.0123 | 67.2s
+  train  200/600 | avg_loss=0.5079 | 133.2s
+  train  300/600 | avg_loss=0.3391 | 198.1s
+  train  400/600 | avg_loss=0.2546 | 263.8s
+  train  500/600 | avg_loss=0.2038 | 329.1s
+  train  600/600 | avg_loss=0.1699 | 394.6s
+  Training done: avg_loss=0.1699  (394.6s total)
+
+  Evaluation (eval_mode, no weight updates):
+       gap   answer_loss   random_base  retention
+  ────────────────────────────────────────────────────────
+         0        0.0004        3.9120  0.0% MEMORY WORKS ✓
+        64        0.0004        3.9120  0.0% MEMORY WORKS ✓
+       128        0.0004        3.9120  0.0% MEMORY WORKS ✓
+       256        0.0004        3.9120  0.0% MEMORY WORKS ✓
+
+  Done.

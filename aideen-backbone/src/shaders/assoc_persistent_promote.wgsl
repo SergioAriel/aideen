@@ -13,7 +13,7 @@ struct PromoteParams {
 
 @group(0) @binding(0) var<uniform> Params: PromoteParams;
 @group(0) @binding(1) var<storage, read_write> AssocPersistent: array<f32>;
-@group(0) @binding(2) var<storage, read> AssocLocal: array<f32>;
+@group(0) @binding(2) var<storage, read_write> AssocLocal: array<f32>;
 
 @compute @workgroup_size(256, 1, 1)
 fn assoc_persistent_promote_main(
@@ -53,3 +53,20 @@ fn assoc_persistent_promote_main(
     let beta = clamp(local_usage, 0.0, 1.0);
     AssocPersistent[idx] = select(src, (1.0 - beta) * prev + beta * src, persistent_usage > ASSOC_OCCUPIED_THRESHOLD);
 }
+
+@compute @workgroup_size(256, 1, 1)
+fn assoc_persistent_load_main(
+    @builtin(global_invocation_id) gid: vec3<u32>
+) {
+    let assoc_bank_stride = ASSOC_RANK + Params.d_model + 1u;
+    let total = Params.batch_size * Params.h_slots * ASSOC_BANKS * assoc_bank_stride;
+    let idx = gid.x;
+    if (idx >= total) {
+        return;
+    }
+
+    // Simple copy from Persistent back to Local.
+    // This allows the DEQ solver to start with the consolidated memory state.
+    AssocLocal[idx] = AssocPersistent[idx];
+}
+

@@ -19,23 +19,28 @@ struct UpdateUniforms {
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
 @group(0) @binding(1) var<storage, read> v_adjoint: array<f32>;
 @group(0) @binding(2) var<storage, read> q_input: array<f32>;
-@group(0) @binding(3) var<storage, read> h_star: array<f32>;
-@group(0) @binding(4) var<storage, read_write> debug_log: array<f32>;
-@group(0) @binding(5) var<storage, read> dl_dh_temp_buf: array<f32>;
-@group(0) @binding(6) var<storage, read> Scratch: array<f32>;
-@group(0) @binding(7) var<storage, read_write> mix_buf: array<f32>;
-@group(0) @binding(8) var<storage, read_write> weighted_h_buf: array<f32>;
-@group(0) @binding(9) var<storage, read_write> gmix_buf: array<f32>;
-@group(0) @binding(10) var<storage, read_write> gscore_buf: array<f32>;
-@group(0) @binding(11) var<storage, read_write> qgrad_buf: array<f32>;
-@group(0) @binding(12) var<storage, read_write> hist_ctx_buf: array<f32>;
-@group(0) @binding(13) var<storage, read_write> hist_delta_buf: array<f32>;
-@group(0) @binding(14) var<storage, read_write> tbptt_carry_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> h_star: array<f32>;
+@group(0) @binding(4) var<storage, read_write> h_next: array<f32>;
+@group(0) @binding(5) var<storage, read_write> Scratch: array<f32>;
+@group(0) @binding(6) var<storage, read> dl_dh_temp_buf: array<f32>;
+@group(0) @binding(7) var<storage, read_write> debug_log: array<f32>;
+@group(0) @binding(8) var<storage, read_write> mix_buf: array<f32>;
+@group(0) @binding(9) var<storage, read_write> weighted_h_buf: array<f32>;
+@group(0) @binding(10) var<storage, read_write> gmix_buf: array<f32>;
+@group(0) @binding(11) var<storage, read_write> gscore_buf: array<f32>;
+@group(0) @binding(12) var<storage, read_write> qgrad_buf: array<f32>;
+@group(0) @binding(13) var<storage, read_write> hist_ctx_buf: array<f32>;
+@group(0) @binding(14) var<storage, read_write> hist_delta_buf: array<f32>;
 
-@group(0) @binding(15) var<storage, read_write> AllGradients: array<f32>;
+@group(0) @binding(15) var<storage, read_write> tbptt_carry_buf: array<f32>;
 
-@group(1) @binding(0) var<storage, read_write> AllWeights: array<f32>;
-
+// Group 1: Solve Pool (Unified across all solve shaders)
+@group(1) @binding(0) var<storage, read_write> AssocBuf: array<f32>;
+@group(1) @binding(1) var<storage, read_write> AssocPersistentBuf: array<f32>;
+@group(1) @binding(2) var<storage, read_write> AssocHist: array<f32>;
+@group(1) @binding(3) var<storage, read_write> AssocReadBuf: array<f32>;
+@group(1) @binding(4) var<storage, read_write> AllWeights: array<f32>;
+@group(1) @binding(5) var<storage, read_write> AllGradients: array<f32>;
 // AllWeights layout offset functions (must match deq_forward.wgsl and deq_bridge.rs).
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h*d*d + h*d; }

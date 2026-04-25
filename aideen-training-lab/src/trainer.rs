@@ -2359,6 +2359,22 @@ impl Trainer {
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
+                if self.cfg_debug_sample_every > 0 && self.optimizer.step_count() % self.cfg_debug_sample_every == 0 {
+                    let adbg = gpu.read_assoc_bwd_debug();
+                    if !adbg.is_empty() {
+                        let h = self.config.h_slots;
+                        for s in 0..h {
+                            let b = s * 16;
+                            if b + 15 < adbg.len() {
+                                eprintln!(
+                                    "[ASSOC-BWD-STEP] s{}: val_rms={:.3e} score_grad_max={:.3e} wq_step_max={:.3e} wk_step_max={:.3e} alpha_grad_max={:.3e} key_grad_sum={:.3e} gprev_sum={:.3e} write_mass={:.3e}",
+                                    s, adbg[b], adbg[b+5], adbg[b+7], adbg[b+9], adbg[b+11], adbg[b+12], adbg[b+13], adbg[b+14]
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // =============================================================================
 
                 // Spectral Renormalization (Periodic)

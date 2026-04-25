@@ -105,6 +105,7 @@ pub struct GpuDeqBackend {
     slot_rhs_expand_pipeline: wgpu::ComputePipeline,
     segment_memory_promote_pipeline: wgpu::ComputePipeline,
     assoc_persistent_promote_pipeline: wgpu::ComputePipeline,
+    assoc_persistent_load_pipeline: wgpu::ComputePipeline,
     fused_update_stage1a_pipeline: wgpu::ComputePipeline,
     fused_update_stage1b_pipeline: wgpu::ComputePipeline,
     fused_update_stage2_pipeline: wgpu::ComputePipeline,
@@ -674,7 +675,7 @@ impl GpuDeqBackend {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -695,7 +696,7 @@ impl GpuDeqBackend {
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -877,7 +878,7 @@ impl GpuDeqBackend {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -887,7 +888,7 @@ impl GpuDeqBackend {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -923,7 +924,7 @@ impl GpuDeqBackend {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -1039,12 +1040,11 @@ impl GpuDeqBackend {
                         },
                         count: None,
                     },
-                    // binding 10: v_state (adjoint ∂L/∂h* per slot/token) for READ-path gradient
                     wgpu::BindGroupLayoutEntry {
                         binding: 10,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -1054,7 +1054,7 @@ impl GpuDeqBackend {
                         binding: 11,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -1064,7 +1064,7 @@ impl GpuDeqBackend {
                         binding: 12,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -1183,129 +1183,128 @@ impl GpuDeqBackend {
 
         // bg1_layout: 10 read_write bindings — used by staged_picard_pl (staged_adjoint_picard_clean.wgsl)
         // fused_update_bg1_layout: 1 binding — AllWeights for fused_deq_update.wgsl @group(1)
-        let fused_update_bg1_layout =
+        // Unified Solve Pool Layout (Group 1): Assoc(0..3) + AllWeights(4)
+        let solve_pool_bg1_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Fused Update BG1 Layout (AllWeights)"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                label: Some("Solve Pool BG1 Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
-        let bg1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Staged Picard BG1 Layout (Weights)"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
+        let bg1_layout = &solve_pool_bg1_layout;
+        let fused_update_bg1_layout = &solve_pool_bg1_layout;
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Fused Update PL"),
-            bind_group_layouts: &[&bg0_layout, &fused_update_bg1_layout],
+            bind_group_layouts: &[&bg0_layout, &solve_pool_bg1_layout],
             push_constant_ranges: &[],
         });
 
@@ -1820,6 +1819,22 @@ impl GpuDeqBackend {
                 },
                 cache: None,
             });
+        let assoc_persistent_load_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Assoc Persistent Load Pipeline"),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Assoc Persistent Load PL"),
+                    bind_group_layouts: &[&assoc_persistent_promote_bgl],
+                    push_constant_ranges: &[],
+                })),
+                module: &assoc_persistent_promote_shader,
+                entry_point: Some("assoc_persistent_load_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &segment_memory_constants,
+                    ..Default::default()
+                },
+                cache: None,
+            });
         let staged_picard_gmix_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Staged Picard GMix Pipeline"),
@@ -2271,7 +2286,7 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: adj_v_out_buf.as_entire_binding(),
+                    resource: bridge.s_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -2279,39 +2294,39 @@ impl GpuDeqBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: bridge.hnext_buf.as_entire_binding(),
+                    resource: bridge.hcurr_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: bridge.debug_buf.as_entire_binding(),
+                    resource: bridge.hnext_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: adj_dl_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
                     resource: bridge.scratch_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: adj_dl_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: fused_mix_buf.as_entire_binding(),
+                    resource: bridge.debug_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: fused_weighted_h_buf.as_entire_binding(),
+                    resource: fused_mix_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: fused_gmix_buf.as_entire_binding(),
+                    resource: fused_weighted_h_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: fused_gscore_buf.as_entire_binding(),
+                    resource: fused_gmix_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: fused_qgrad_buf.as_entire_binding(),
+                    resource: fused_gscore_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 12,
@@ -2548,16 +2563,62 @@ impl GpuDeqBackend {
                         size: aw_hist_sz,
                     }),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
             ],
         });
 
         let fused_update_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Fused Update BG1 (AllWeights)"),
-            layout: &fused_update_bg1_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: bridge.all_weights_buf.as_entire_binding(),
-            }],
+            label: Some("Fused Update BG1 (Pool)"),
+            layout: &solve_pool_bg1_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bridge.assoc_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bridge.assoc_persistent_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bridge.assoc_hist_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bridge.assoc_read_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: all_gradients_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: bridge.all_weights_buf.as_entire_binding(),
+                },
+            ],
         });
         // FPM memory bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients
         // | tbptt_carry | dm_new | m_inner | h_unit | g_x
@@ -2778,6 +2839,7 @@ impl GpuDeqBackend {
             slot_rhs_expand_pipeline,
             segment_memory_promote_pipeline,
             assoc_persistent_promote_pipeline,
+            assoc_persistent_load_pipeline,
             fused_update_stage1a_pipeline,
             fused_update_stage1b_pipeline,
             fused_update_stage2_pipeline,
@@ -3049,6 +3111,61 @@ impl GpuDeqBackend {
         self.queue.submit(Some(encoder.finish()));
     }
 
+    pub fn promote_assoc_persistent_load(&self) {
+        if !self.assoc_persistent {
+            return;
+        }
+        let params = SegmentMemoryPromoteParams {
+            d_model: self.config.d_r as u32,
+            h_slots: self.config.h_slots as u32,
+            batch_size: self.forward_batch_cap,
+            _pad0: 0,
+        };
+        self.queue.write_buffer(
+            &self.segment_memory_promote_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let promote_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Assoc Persistent Load BG"),
+            layout: &self.assoc_persistent_promote_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.segment_memory_promote_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.bridge.assoc_persistent_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.bridge.assoc_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Assoc Persistent Load"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Assoc Persistent Load"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.assoc_persistent_load_pipeline);
+            pass.set_bind_group(0, &promote_bg, &[]);
+            let assoc_bank_stride = 32u32 + self.config.d_r as u32 + 1u32;
+            let total = self.forward_batch_cap
+                * self.config.h_slots as u32
+                * self.assoc_banks as u32
+                * assoc_bank_stride;
+            pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
     fn reset_internal_segment_runtime_state(&self) {
         let mut encoder = self
             .device
@@ -3081,6 +3198,7 @@ impl GpuDeqBackend {
         // GPU promote: consolidate Assoc_local → Assoc_persistent before clearing
         // the local banks. This is the only promotion path; CPU promote was removed.
         self.promote_assoc_persistent_gpu();
+
         if self.segment_memory_token {
             self.promote_segment_memory_gpu();
         }
@@ -3342,6 +3460,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
+        self.promote_assoc_persistent_load();
+
         let shape =
             self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward(
@@ -3382,6 +3502,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(Vec<f32>, Vec<u32>), &'static str> {
+        self.promote_assoc_persistent_load();
+
         let shape =
             self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward_pooled(
@@ -3506,6 +3628,8 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(), &'static str> {
+        self.promote_assoc_persistent_load();
+
         let shape =
             self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.bridge.run_forward_no_readback(
@@ -3545,6 +3669,8 @@ impl GpuDeqBackend {
         a_log: &[f32],
         norm: &[f32],
     ) -> Result<(), &'static str> {
+        self.promote_assoc_persistent_load();
+
         let shape =
             self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
         self.queue
@@ -5242,6 +5368,7 @@ impl GpuDeqBackend {
                 self.device.poll(wgpu::Maintain::Poll);
             }
         }
+        self.promote_assoc_persistent_gpu();
         Ok(())
     }
 

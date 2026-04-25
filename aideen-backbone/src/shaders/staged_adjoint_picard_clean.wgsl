@@ -20,9 +20,9 @@ struct UpdateUniforms {
 @group(0) @binding(0) var<uniform> params: UpdateUniforms;
 @group(0) @binding(1) var<storage, read> v_state: array<f32>;
 @group(0) @binding(2) var<storage, read> q_input_unused: array<f32>;
-@group(0) @binding(3) var<storage, read> H_star: array<f32>;
+@group(0) @binding(3) var<storage, read_write> H_star: array<f32>;
 @group(0) @binding(4) var<storage, read_write> debug_log: array<f32>;
-@group(0) @binding(5) var<storage, read> b_in: array<f32>;
+@group(0) @binding(5) var<storage, read_write> b_in: array<f32>;
 @group(0) @binding(6) var<storage, read> Scratch: array<f32>;
 @group(0) @binding(7) var<storage, read_write> gcomb_buf: array<f32>;
 @group(0) @binding(8) var<storage, read_write> v_next: array<f32>;
