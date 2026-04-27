@@ -1,0 +1,67 @@
+warning: unused import: `Mutex`
+ --> aideen-backbone/src/gpu_deq.rs:9:22
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: field `assoc_slot_stride_floats` is never read
+  --> aideen-backbone/src/gpu_deq.rs:80:5
+   |
+69 | pub struct GpuDeqBackend {
+   |            ------------- field in this struct
+...
+80 |     assoc_slot_stride_floats: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `aideen-backbone` (lib) generated 2 warnings (run `cargo fix --lib -p aideen-backbone` to apply 1 suggestion)
+warning: unused variable: `required_seq_cap`
+   --> aideen-training-lab/src/bin/assoc_recall.rs:812:9
+    |
+812 |     let required_seq_cap = gaps
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_required_seq_cap`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `aideen-training` (bin "assoc_recall") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.45s
+     Running `/Users/sergiosolis/Programacion/aideen/target/release/assoc_recall`
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=1000  n_eval=150  gaps=[0, 64, 128, 256]  pairs_per_seq=4
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  GPU ready.
+
+  Training (1000 sequences, gaps=[0, 64, 128, 256])…
+  train  100/1000 | avg_loss=3.5274 | 88.2s
+  train  200/1000 | avg_loss=3.4288 | 175.3s
+  train  300/1000 | avg_loss=3.3428 | 244.1s
+  train  400/1000 | avg_loss=3.2991 | 313.1s
+  train  500/1000 | avg_loss=3.2599 | 381.0s
+  train  600/1000 | avg_loss=3.2275 | 444.9s
+  train  700/1000 | avg_loss=3.2319 | 508.6s
+  train  800/1000 | avg_loss=3.2041 | 576.1s
+  train  900/1000 | avg_loss=3.1694 | 643.0s
+  train 1000/1000 | avg_loss=3.1708 | 710.2s
+  Training done: avg_loss=3.1708  (710.2s total)
+
+  Evaluation (eval_mode, no weight updates):
+       gap   answer_loss   random_base  retention
+  ────────────────────────────────────────────────────────
+         0        2.8520        3.9120  72.9% partial
+        64        3.2333        3.9120  82.6% ~ random
+       128        2.9611        3.9120  75.7% partial
+       256        2.9032        3.9120  74.2% partial
+
+  Done.

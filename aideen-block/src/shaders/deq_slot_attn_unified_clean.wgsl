@@ -66,7 +66,7 @@ const FPM_CACHE_CAP: u32 = 512u;
 const MAX_SLOTS: u32 = 8u;
 const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
 const SLOT_HEAD_CAP: u32 = MAX_SLOTS * MAX_SLOT_ATTN_HEAD_DIM;
-const ASSOC_RANK: u32 = 32u;
+
 const ASSOC_HIST_META: u32 = 4u;
 override ASSOC_BANKS: u32 = 1u;
 const ASSOC_WRITE_CAP: f32 = 0.95;
@@ -121,6 +121,10 @@ var<workgroup> hhist_gamma_wg: f32;
 const H_HIST_GAMMA_SCALE: f32 = 0.1;
 const HIST_CTX_SCALE: f32 = 0.05;
 
+// ── Layout Functions (Clean Layout) ─────────────────────────────────────────
+const RETAIN_RANK: u32 = 32u;
+const ASSOC_RANK: u32 = 32u;
+
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h * d * d + h * d; }
 fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d, h) + h * d * d + h * d; }
@@ -128,26 +132,19 @@ fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d, h) + h * d * d; }
 fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d, h) + h * d * d; }
 fn aw_wx_base(d: u32, h: u32) -> u32 { return aw_win_base(d, h) + h * d * d; }
 fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d, h) + d * d; }
-fn aw_nscale_base(d: u32, h: u32) -> u32 {
-    let aw_wx = aw_wx_base(d, h);
-    let aw_wout = aw_wout_base(d, h);
-    let aw_alog = aw_wout + d * d;
-    return aw_alog + h * d;
-}
-fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) - h * d; }
+fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_wout_base(d, h) + d * d; }
+fn aw_nscale_base(d: u32, h: u32) -> u32 { return aw_alog_base(d, h) + h * d; }
 fn aw_hist_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) + d; }
+
 fn hist_mat_len(d: u32) -> u32 { return d * d; }
 fn hist_scale_base(d: u32, h_slots: u32) -> u32 { return hist_mat_len(d); }
 fn hist_bias_base(d: u32, h_slots: u32) -> u32 { return hist_scale_base(d, h_slots) + h_slots * d; }
 fn hist_gate_base(d: u32, h_slots: u32) -> u32 { return hist_bias_base(d, h_slots) + h_slots * d; }
 fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_slots) + h_slots; }
-// Write path: factored k×v (replaces full-rank W_delta h*d² with 2*h*d*r)
-// W_k_write[slot]: d×RETAIN_RANK  — projects c to write bottleneck
-// W_v_write[slot]: RETAIN_RANK×d  — expands bottleneck to proposal
 fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
 fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * RETAIN_RANK; }
 fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return w_v_write_base(d, h_slots) + h_slots * RETAIN_RANK * d; }
-fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d; }
+fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d; }
 fn hist_alpha_warmup_factor_base(d: u32, h_slots: u32) -> u32 { return hist_selective_flag_base(d, h_slots) + 1u; }
 fn hist_rms_floor_base(d: u32, h_slots: u32) -> u32 { return hist_alpha_warmup_factor_base(d, h_slots) + 1u; }
 fn hist_contr_floor_base(d: u32, h_slots: u32) -> u32 { return hist_rms_floor_base(d, h_slots) + 1u; }
@@ -161,16 +158,10 @@ fn attn_out_mode_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, 
 fn attn_uniform_base(d: u32, h_slots: u32) -> u32 { return attn_out_mode_base(d, h_slots) + 1u; }
 fn attn_freeze_base(d: u32, h_slots: u32) -> u32 { return attn_uniform_base(d, h_slots) + 1u; }
 fn signal_scale_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, h_slots) + 7u; }
-fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d + 21u; }
+fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d + 21u; }
 fn w_write_gate_base(d: u32, h_slots: u32) -> u32 { return hist_gate_query_base(d, h_slots) + h_slots * d; }
 fn b_write_mem_base(d: u32, h_slots: u32) -> u32 { return w_write_gate_base(d, h_slots) + h_slots * d; }
-// γ per slot sits after the factored write path and scalar controls:
-// slot_anchor(h*d) + W_k_write(h*d*r) + W_v_write(h*r*d) + b_delta(d)
-// + 21 flags + W_gate_hist(h*d) + W_write_gate(h*d) + b_write_mem(h).
 fn hhist_gamma_base(d: u32, h: u32) -> u32 { return b_write_mem_base(d, h) + h; }
-// Retain gate (low-rank): W_up (h×d×r), W_down (h×r×d), b_retain (h×d)
-// r=32, placed after hhist_gamma (h floats)
-const RETAIN_RANK: u32 = 32u;
 fn w_retain_up_base(d: u32, h: u32) -> u32 { return hhist_gamma_base(d, h) + h; }
 fn w_retain_down_base(d: u32, h: u32) -> u32 { return w_retain_up_base(d, h) + h * d * RETAIN_RANK; }
 fn b_retain_base(d: u32, h: u32) -> u32 { return w_retain_down_base(d, h) + h * RETAIN_RANK * d; }
@@ -183,6 +174,10 @@ fn w_q_assoc_base(d: u32, h: u32) -> u32 { return w_v_assoc_base(d, h) + h * d *
 fn alpha_assoc_base(d: u32, h: u32) -> u32 { return w_q_assoc_base(d, h) + h * d * ASSOC_RANK; }
 fn w_event_assoc_base(d: u32, h: u32) -> u32 { return alpha_assoc_base(d, h) + h; }
 fn b_event_assoc_base(d: u32, h: u32) -> u32 { return w_event_assoc_base(d, h) + h * d; }
+
+fn scratch_stride(d: u32, h: u32) -> u32 {
+    return d * (h * 8u) + h * h + h;
+}
 
 @group(0) @binding(11) var<storage, read_write> H_hist: array<f32>;
 
@@ -200,10 +195,6 @@ const FPM_FATIGUE_RATE: f32 = 0.002;
 const FPM_RESCUE_TAIL: u32 = 2u;
 const FPM_JOINT_POLICY_STAGE: u32 = 6u;
 const FPM_DEAD_THRESHOLD: f32 = 0.01;
-// Saturation now refers to near-max use of the slot's write budget.
-// Under the old z∈[0, 0.5] clamp, 0.45 meant "almost fully saturated".
-// With z reparameterized into [0, 1], the same semantics are recovered by
-// checking for near-ceiling utilization instead of mid-range activity.
 const FPM_SAT_THRESHOLD: f32 = 0.95;
 const FPM_EPS: f32 = 1e-6;
 const FPM_HOMEO_MIN_ITERS: u32 = 4u;
@@ -435,7 +426,7 @@ fn deq_slot_coord_unified_main(
     let batch_idx = wid.x;
     let slot_idx = wid.y;
     if (batch_idx >= shape.batch_size || slot_idx >= shape.h_slots) { return; }
-    let debug_on = shape.debug_enable != 0u;
+    let debug_on = true; // FORCE DEBUG FOR AUDIT
     if (debug_on && slot_idx == 0u && tid == 0u) {
         // Forward debug progress markers:
         // 101 = entered kernel, 201 = finished token loop, 901 = finalized snapshot.
@@ -1079,7 +1070,8 @@ fn deq_slot_coord_unified_main(
                     let wq_assoc = hist_base
                         + w_q_assoc_base(d_model, h_slots)
                         + slot_idx * d_model * ASSOC_RANK;
-                    let alpha_assoc = AllWeights[hist_base + alpha_assoc_base(d_model, h_slots) + slot_idx];
+                    let alpha_raw = AllWeights[hist_base + alpha_assoc_base(d_model, h_slots) + slot_idx];
+                    let alpha_assoc = 1.0 / (1.0 + exp(-alpha_raw));
                     // Layout per bank: [bank_key | bank_value | usage].
                     // Query the durable bank in the same explicit source manifold that wrote
                     // the bank key. At QUERY time PrevHStar already holds the preceding KEY
@@ -1857,7 +1849,7 @@ fn deq_slot_coord_unified_main(
             // Factored k×v write proposal: bottleneck = W_k_write·c  (d→r), proposal = tanh(W_v_write·bottleneck + b)
             let wkw_base = hist_base + w_k_write_base(d_model, h_slots) + slot_idx * d_model * RETAIN_RANK;
             let wvw_base = hist_base + w_v_write_base(d_model, h_slots) + slot_idx * RETAIN_RANK * d_model;
-            let bd_base  = hist_base + hist_delta_bias_base(d_model, h_slots);
+            let bd_base  = hist_base + hist_delta_bias_base(d_model, h_slots) + slot_idx * d_model;
             // Step 1: bottleneck[r] = Σ_j W_k_write[j,r] * c_j  (RETAIN_RANK lanes)
             if (tid < RETAIN_RANK) {
                 var kw_acc = 0.0;
@@ -2363,6 +2355,7 @@ fn deq_slot_coord_unified_main(
                     let v_j = Scratch[signal_base + j] / max(assoc_value_rms, 1.0e-6);
                     new_value_norm = new_value_norm + v_j * v_j;
                 }
+                var bank_scores: array<f32, 8>; 
                 for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                     let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                     var key_norm = 0.0;
@@ -2390,6 +2383,7 @@ fn deq_slot_coord_unified_main(
                         found_empty = true;
                     }
                     let cos = score / sqrt(max(key_norm * new_key_norm, 1.0e-12));
+                    if (bank < 8u) { bank_scores[bank] = cos; }
                     let value_cos =
                         value_score / sqrt(max(value_norm * new_value_norm, 1.0e-12));
                     if (cos > best_cos) {
@@ -2398,65 +2392,66 @@ fn deq_slot_coord_unified_main(
                         best_bank = bank;
                     }
                 }
-                let reuse_enabled = ENABLE_ASSOC_REUSE_MATCH || ASSOC_BANKS > 1u;
-                // Banks are read back by key, not by value. Requiring value-cos to
-                // also match before reuse lets the same key drift into multiple banks,
-                // which makes later key-based retrieval ambiguous. When a strong key
-                // match already exists, preserve key-address identity and reuse it.
-                if (reuse_enabled && best_cos > ASSOC_REUSE_THRESHOLD) {
-                    chosen_bank = best_bank;
-                    allow_write = 1.0;
-                } else if (found_empty && best_cos < ASSOC_ALLOC_NOVELTY_THRESHOLD) {
-                    chosen_bank = empty_bank;
-                    // Reusing an existing keyed memory and opening a brand-new bank are
-                    // not equivalent operations. New allocation should require stronger
-                    // event evidence, otherwise novel filler transitions quickly consume
-                    // every empty bank. Reuse stays linear in the event gate; allocation
-                    // is made stricter by passing through the learned event gate here and
-                    // again in bind_gate below.
-                    allow_write = event_gate;
-                    overwrite_bank = 1.0;
+
+                // ── Librarian Stage 2: Competitive Slot Allocation ─────────────────────
+                // All slots compete for the current token using their anchor geometry.
+                // Every slot recomputes the global allocation to determine its own share.
+                let slot_anchor_root_write = hist_base + slot_anchor_base(d_model, h_slots);
+                var prev_sig_sq_owner = 0.0;
+                for (var j = 0u; j < d_model; j = j + 1u) {
+                    let prev_j = PrevHStarBuf[prev_hstar_base + j];
+                    prev_sig_sq_owner = prev_sig_sq_owner + prev_j * prev_j;
                 }
-                if (ENABLE_ASSOC_SLOT_STRIPE && (t % h_slots) != slot_idx) {
-                    // Experimental multi-bank routing: make slots behave like distinct
-                    // write heads instead of duplicating the same early transitions.
-                    allow_write = 0.0;
-                }
-                if (ENABLE_ASSOC_SLOT_OWNER) {
-                    // Route each binding to a single slot owner in the existing slot-anchor
-                    // geometry. Without an owner, multiple slots can learn the same binding,
-                    // which collapses effective capacity even when each slot has its own banks.
-                    let slot_anchor_root_write = hist_base + slot_anchor_base(d_model, h_slots);
-                    var prev_sig_sq_owner = 0.0;
+                let prev_sig_rms_owner = sqrt(prev_sig_sq_owner / max(1.0, f32(d_model)) + 1.0e-6);
+                
+                var max_slot_score = -1.0e30;
+                for (var owner = 0u; owner < h_slots; owner = owner + 1u) {
+                    let owner_off = slot_anchor_root_write + owner * d_model;
+                    var anchor_sq = 0.0;
+                    var dot = 0.0;
                     for (var j = 0u; j < d_model; j = j + 1u) {
-                        let prev_j = PrevHStarBuf[prev_hstar_base + j];
-                        prev_sig_sq_owner = prev_sig_sq_owner + prev_j * prev_j;
+                        let prev_j = PrevHStarBuf[prev_hstar_base + j] / max(prev_sig_rms_owner, 1.0e-6);
+                        let anchor_j = AllWeights[owner_off + j];
+                        anchor_sq = anchor_sq + anchor_j * anchor_j;
+                        dot = dot + prev_j * anchor_j;
                     }
-                    let prev_sig_rms_owner = sqrt(
-                        prev_sig_sq_owner / max(1.0, f32(d_model)) + 1.0e-6
-                    );
-                    var best_owner_slot = 0u;
-                    var best_owner_score = -1.0e30;
-                    for (var owner = 0u; owner < h_slots; owner = owner + 1u) {
-                        let owner_off = slot_anchor_root_write + owner * d_model;
-                        var anchor_sq = 0.0;
-                        var dot = 0.0;
-                        for (var j = 0u; j < d_model; j = j + 1u) {
-                            let prev_j =
-                                PrevHStarBuf[prev_hstar_base + j] / max(prev_sig_rms_owner, 1.0e-6);
-                            let anchor_j = AllWeights[owner_off + j];
-                            anchor_sq = anchor_sq + anchor_j * anchor_j;
-                            dot = dot + prev_j * anchor_j;
-                        }
-                        let owner_score = dot / sqrt(max(anchor_sq, 1.0e-12));
-                        if (owner_score > best_owner_score) {
-                            best_owner_score = owner_score;
-                            best_owner_slot = owner;
-                        }
-                    }
-                    if (slot_idx != best_owner_slot) {
-                        allow_write = 0.0;
-                    }
+                    let owner_score = dot / sqrt(max(anchor_sq, 1.0e-12));
+                    shared_vals[owner] = owner_score; // Temporary store in shared_vals
+                    max_slot_score = max(max_slot_score, owner_score);
+                }
+                var slot_denom = 0.0;
+                for (var owner = 0u; owner < h_slots; owner = owner + 1u) {
+                    let e = exp(4.0 * (shared_vals[owner] - max_slot_score)); // Beta=4.0 for slot selection
+                    shared_vals[owner] = e;
+                    slot_denom = slot_denom + e;
+                }
+                let p_slot_i = shared_vals[slot_idx] / max(slot_denom, 1.0e-6);
+
+                // ── Librarian Stage 3: Competitive Bank Placement ────────────────────
+                // Within the slot, banks compete for the token using cosine similarity.
+                var max_bank_score = -1.0e30;
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    max_bank_score = max(max_bank_score, bank_scores[bank]);
+                }
+                var bank_denom = 0.0;
+                var bank_probs: array<f32, 8>;
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    let e = exp(4.0 * (bank_scores[bank] - max_bank_score)); // Beta=4.0 for bank selection
+                    bank_probs[bank] = e;
+                    bank_denom = bank_denom + e;
+                }
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    bank_probs[bank] = bank_probs[bank] / max(bank_denom, 1.0e-6);
+                }
+                
+                // Hierarchical Decision: Total Write Mass = Relevance * SlotProb * BankProb
+                chosen_bank = best_bank;
+                allow_write = event_gate * p_slot_i * bank_probs[best_bank];
+                if (best_cos < ASSOC_ALLOC_NOVELTY_THRESHOLD && found_empty) {
+                    chosen_bank = empty_bank;
+                    // If novel, we use the allocated slot mass but equally distributed across banks.
+                    allow_write = event_gate * p_slot_i; 
+                    overwrite_bank = 1.0;
                 }
                 shared_vals[3u * ASSOC_RANK] = f32(chosen_bank);
                 shared_vals[3u * ASSOC_RANK + 1u] = allow_write;
@@ -2499,20 +2494,22 @@ fn deq_slot_coord_unified_main(
             let value_keep_gate = select(1.0, 1.0 - value_write_mass, overwrite_bank > 0.5);
             if (tid == 0u) {
                 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: write allocation telemetry.
-                if (debug_on) {
+                // We use a clean snapshot of the last token in the first batch to avoid race-riddled averages.
+                if (debug_on && batch_idx == 0u && t == shape.token_count - 1u) {
                     let assoc_diag_base = 760u + slot_idx * 10u;
-                    DebugLog[assoc_diag_base + 4u] =
-                        DebugLog[assoc_diag_base + 4u] + assoc_write_allowed;
-                    DebugLog[assoc_diag_base + 5u] =
-                        DebugLog[assoc_diag_base + 5u] + effective_bind_gate;
-                    DebugLog[assoc_diag_base + 6u] =
-                        max(DebugLog[assoc_diag_base + 6u], shared_vals[3u * ASSOC_RANK + 2u]);
-                    DebugLog[assoc_diag_base + 7u] =
-                        min(DebugLog[assoc_diag_base + 7u], shared_vals[3u * ASSOC_RANK + 3u]);
-                    DebugLog[assoc_diag_base + 9u] = DebugLog[assoc_diag_base + 9u] + 1.0;
+                    DebugLog[assoc_diag_base + 0u] = 0.0; // r_ent (unused)
+                    DebugLog[assoc_diag_base + 1u] = 1.0; // r_max (unused)
+                    DebugLog[assoc_diag_base + 2u] = 1.0; // ctx_rms (unused)
+                    DebugLog[assoc_diag_base + 3u] = min_usage;
+                    DebugLog[assoc_diag_base + 4u] = assoc_write_allowed;
+                    DebugLog[assoc_diag_base + 5u] = effective_bind_gate;
+                    DebugLog[assoc_diag_base + 6u] = best_cos;
+                    DebugLog[assoc_diag_base + 7u] = p_slot_i;
+                    DebugLog[assoc_diag_base + 8u] = 1.0; // r_n marker
+                    DebugLog[assoc_diag_base + 9u] = 1.0; // w_n marker
+                    
                     let assoc_write_probe_base = 900u + slot_idx * 6u;
-                    DebugLog[assoc_write_probe_base + 5u] =
-                        DebugLog[assoc_write_probe_base + 5u] + overwrite_bank;
+                    DebugLog[assoc_write_probe_base + 5u] = overwrite_bank;
                 }
             }
             if (tid < ASSOC_RANK) {

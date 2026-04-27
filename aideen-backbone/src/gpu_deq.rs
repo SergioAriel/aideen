@@ -117,18 +117,7 @@ pub struct GpuDeqBackend {
     fused_update_stage4_wk_pipeline: wgpu::ComputePipeline,
     fused_update_stage4_wv_pipeline: wgpu::ComputePipeline,
     fused_update_stage4_bias_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_prep_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_mat_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_scale_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_gate_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_tbptt_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_wout_pipeline: wgpu::ComputePipeline,
     fused_update_hist_wx_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_alog_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_wdelta_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_bdelta_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_wgate_pipeline: wgpu::ComputePipeline,
-    fused_update_hist_forget_pipeline: wgpu::ComputePipeline,
     fused_update_apply_grad_pipeline: wgpu::ComputePipeline,
     fpm_retain_bwd_pipeline: wgpu::ComputePipeline,
     fpm_shared_wout_pipeline: wgpu::ComputePipeline,
@@ -382,7 +371,7 @@ impl GpuDeqBackend {
         d * d                           // hist_mat
             + 5 * h * d                 // slot_anchor + hist_scale/bias + hist_gate_query + w_write_gate
             + 2 * h                     // hist_gate + b_write_mem
-            + d                         // b_delta
+            + h * d                     // b_delta
             + 21                        // flags
             + h                         // γ per slot
             + 2 * h * d * RETAIN_RANK   // W_k_write + W_v_write (factored write path)
@@ -1407,111 +1396,12 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let fused_update_hist_prep_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Prep Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_prep_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_mat_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Mat Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_mat_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_scale_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Scale Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_scale_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_gate_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Gate Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_gate_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_tbptt_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist TBPTT Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_tbptt_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_wout_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Wout Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_wout_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
         let fused_update_hist_wx_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Wx Pipeline"),
+                label: Some("Fused DEQ Update Hist WX Pipeline"),
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_hist_stage_wx_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_alog_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist ALog Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_alog_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_wdelta_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist WDelta Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_wdelta_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_bdelta_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist BDelta Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_bdelta_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_wgate_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist WGate Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_wgate_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let fused_update_hist_forget_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Fused DEQ Update Hist Forget Pipeline"),
-                layout: Some(&pl),
-                module: &update_shader,
-                entry_point: Some("fused_hist_stage_forget_main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -2851,18 +2741,7 @@ impl GpuDeqBackend {
             fused_update_stage4_wk_pipeline,
             fused_update_stage4_wv_pipeline,
             fused_update_stage4_bias_pipeline,
-            fused_update_hist_prep_pipeline,
-            fused_update_hist_mat_pipeline,
-            fused_update_hist_scale_pipeline,
-            fused_update_hist_gate_pipeline,
-            fused_update_hist_tbptt_pipeline,
-            fused_update_hist_wout_pipeline,
             fused_update_hist_wx_pipeline,
-            fused_update_hist_alog_pipeline,
-            fused_update_hist_wdelta_pipeline,
-            fused_update_hist_bdelta_pipeline,
-            fused_update_hist_wgate_pipeline,
-            fused_update_hist_forget_pipeline,
             fused_update_apply_grad_pipeline,
             fpm_retain_bwd_pipeline,
             fpm_shared_wout_pipeline,
@@ -4708,6 +4587,7 @@ impl GpuDeqBackend {
             && !self.bridge.fpm_enabled;
         let hist_selective = self.cfg_hist_selective;
         let hist_internal_probe = self.cfg_hist_internal_probe;
+        let train_hist_wx = self.cfg_hist_train_wx;
         let stage4_wo_win_pipeline = &self.fused_update_stage4_wo_win_pipeline;
         if profile_fused {
             // Drain any previously queued GPU work (notably CG) so per-stage fused timings
@@ -4784,63 +4664,12 @@ impl GpuDeqBackend {
                     pass.dispatch_workgroups($x, $y, $z);
                 }};
             }
-            if hist_gated {
-                let train_hist_carrier = self.cfg_hist_train_carrier;
-                let train_hist_wx = self.cfg_hist_train_wx;
-                let train_hist_wout = self.cfg_hist_train_wout;
-                let train_hist_alog = self.cfg_hist_train_alog;
-                let train_hist_delta = self.cfg_hist_train_delta;
-                let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
-                add_pass!(&self.fused_update_hist_prep_pipeline, n, 1);
-                add_pass!(&self.fused_update_hist_gate_pipeline, hs.div_ceil(64), 1);
+            if hist_gated && train_hist_wx {
                 add_pass!(
-                    &self.fused_update_hist_mat_pipeline,
+                    &self.fused_update_hist_wx_pipeline,
                     d.div_ceil(16),
                     d.div_ceil(16)
                 );
-                add_pass!(
-                    &self.fused_update_hist_scale_pipeline,
-                    d.div_ceil(16),
-                    hs.div_ceil(16)
-                );
-                add_pass!(
-                    &self.fused_update_hist_wgate_pipeline,
-                    d.div_ceil(16),
-                    hs.div_ceil(16)
-                );
-                if train_hist_temporal {
-                    add_pass!(&self.fused_update_hist_tbptt_pipeline, batch_size * hs, 1);
-                    add_pass!(
-                        &self.fused_update_hist_forget_pipeline,
-                        d.div_ceil(16),
-                        hs.div_ceil(16)
-                    );
-                    if train_hist_alog {
-                        add_pass!(&self.fused_update_hist_alog_pipeline, d.div_ceil(64), 1);
-                    }
-                    if train_hist_wout {
-                        add_pass!(
-                            &self.fused_update_hist_wout_pipeline,
-                            d.div_ceil(16),
-                            d.div_ceil(16)
-                        );
-                    }
-                    if train_hist_wx {
-                        add_pass!(
-                            &self.fused_update_hist_wx_pipeline,
-                            d.div_ceil(16),
-                            d.div_ceil(16)
-                        );
-                    }
-                    if train_hist_delta && hist_selective {
-                        add_pass!(
-                            &self.fused_update_hist_wdelta_pipeline,
-                            d.div_ceil(16),
-                            d.div_ceil(16)
-                        );
-                        add_pass!(&self.fused_update_hist_bdelta_pipeline, d.div_ceil(64), 1);
-                    }
-                }
             }
             if !deq_only {
                 add_pass_3d!(
@@ -5017,155 +4846,18 @@ impl GpuDeqBackend {
                     eprintln!("[FUSED-PROFILE] {label}: {} ms", t0.elapsed().as_millis());
                 }
             };
-            if hist_gated {
-                let train_hist_carrier = self.cfg_hist_train_carrier;
-                let train_hist_wx = self.cfg_hist_train_wx;
-                let train_hist_wout = self.cfg_hist_train_wout;
-                let train_hist_alog = self.cfg_hist_train_alog;
-                let train_hist_delta = self.cfg_hist_train_delta;
+            if hist_gated && train_hist_wx {
                 run_stage(
                     &self.device,
                     &self.queue,
-                    "hist_prep",
-                    &self.fused_update_hist_prep_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    n,
-                    1,
-                    profile_fused,
-                );
-                let train_hist_temporal = train_hist_carrier || train_hist_alog || train_hist_delta;
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "hist_gate",
-                    &self.fused_update_hist_gate_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    hs.div_ceil(64),
-                    1,
-                    profile_fused,
-                );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "hist_mat",
-                    &self.fused_update_hist_mat_pipeline,
+                    "hist_wx",
+                    &self.fused_update_hist_wx_pipeline,
                     &self.fused_update_bg0,
                     &self.fused_update_bg1,
                     d.div_ceil(16),
                     d.div_ceil(16),
                     profile_fused,
                 );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "hist_scale",
-                    &self.fused_update_hist_scale_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    d.div_ceil(16),
-                    hs.div_ceil(16),
-                    profile_fused,
-                );
-                run_stage(
-                    &self.device,
-                    &self.queue,
-                    "hist_wgate",
-                    &self.fused_update_hist_wgate_pipeline,
-                    &self.fused_update_bg0,
-                    &self.fused_update_bg1,
-                    d.div_ceil(16),
-                    hs.div_ceil(16),
-                    profile_fused,
-                );
-                if train_hist_temporal {
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_tbptt_final",
-                        &self.fused_update_hist_tbptt_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        batch_size * hs,
-                        1,
-                        profile_fused,
-                    );
-                    run_stage(
-                        &self.device,
-                        &self.queue,
-                        "hist_forget",
-                        &self.fused_update_hist_forget_pipeline,
-                        &self.fused_update_bg0,
-                        &self.fused_update_bg1,
-                        d.div_ceil(16),
-                        hs.div_ceil(16),
-                        profile_fused,
-                    );
-                    if train_hist_alog {
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_alog",
-                            &self.fused_update_hist_alog_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(64),
-                            1,
-                            profile_fused,
-                        );
-                    }
-                    if train_hist_wout {
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_wout",
-                            &self.fused_update_hist_wout_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(16),
-                            d.div_ceil(16),
-                            profile_fused,
-                        );
-                    }
-                    if train_hist_wx {
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_wx",
-                            &self.fused_update_hist_wx_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(16),
-                            d.div_ceil(16),
-                            profile_fused,
-                        );
-                    }
-                    if train_hist_delta && hist_selective {
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_wdelta",
-                            &self.fused_update_hist_wdelta_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(16),
-                            d.div_ceil(16),
-                            profile_fused,
-                        );
-                        run_stage(
-                            &self.device,
-                            &self.queue,
-                            "hist_bdelta",
-                            &self.fused_update_hist_bdelta_pipeline,
-                            &self.fused_update_bg0,
-                            &self.fused_update_bg1,
-                            d.div_ceil(64),
-                            1,
-                            profile_fused,
-                        );
-                    }
-                }
             }
             if !deq_only {
                 run_stage_3d(

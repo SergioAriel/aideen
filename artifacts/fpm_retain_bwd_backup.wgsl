@@ -1,4 +1,6 @@
 // FPM memory backward pass for the active Model-A write path.
+const ASSOC_BANKS: u32 = 1u;
+const ASSOC_HIST_META: u32 = 4u;
 //
 // Forward (per token t, slot s):
 //   c         = 0.5 * (h_star[t,s] + signal[t,s])
@@ -87,11 +89,6 @@ override ENABLE_ASSOC_CONF_READ: bool = false;
 override ENABLE_ASSOC_EVENT_GATE: bool = false;
 override ASSOC_EVENT_L1: f32 = 0.001;
 
-// ── Layout Functions (Clean Layout) ─────────────────────────────────────────
-const RETAIN_RANK: u32 = 32u;
-const ASSOC_RANK: u32 = 32u;
-const ASSOC_HIST_META: u32 = 4u;
-
 fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
 fn aw_wk_base(d: u32, h: u32) -> u32 { return h * d * d + h * d; }
 fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d, h) + h * d * d + h * d; }
@@ -102,20 +99,42 @@ fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d, h) + d * d; }
 fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_wout_base(d, h) + d * d; }
 fn aw_nscale_base(d: u32, h: u32) -> u32 { return aw_alog_base(d, h) + h * d; }
 fn aw_hist_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) + d; }
-
+const WG_SIZE: u32 = 64u;
 fn hist_mat_len(d: u32) -> u32 { return d * d; }
 fn hist_scale_base(d: u32, h_slots: u32) -> u32 { return hist_mat_len(d); }
 fn hist_bias_base(d: u32, h_slots: u32) -> u32 { return hist_scale_base(d, h_slots) + h_slots * d; }
 fn hist_gate_base(d: u32, h_slots: u32) -> u32 { return hist_bias_base(d, h_slots) + h_slots * d; }
 fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_slots) + h_slots; }
+// Write path: factored k×v (replaces full-rank W_delta h*d² with 2*h*d*r)
+// W_k_write[slot]: d×RETAIN_RANK  — projects c to write bottleneck
+// W_v_write[slot]: RETAIN_RANK×d  — expands bottleneck to proposal
 fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
 fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * RETAIN_RANK; }
 fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return w_v_write_base(d, h_slots) + h_slots * RETAIN_RANK * d; }
 fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d; }
+fn hist_alpha_warmup_factor_base(d: u32, h_slots: u32) -> u32 { return hist_selective_flag_base(d, h_slots) + 1u; }
+fn hist_rms_floor_base(d: u32, h_slots: u32) -> u32 { return hist_alpha_warmup_factor_base(d, h_slots) + 1u; }
+fn hist_contr_floor_base(d: u32, h_slots: u32) -> u32 { return hist_rms_floor_base(d, h_slots) + 1u; }
+fn hist_inject_flag_base(d: u32, h_slots: u32) -> u32 { return hist_contr_floor_base(d, h_slots) + 1u; }
+fn hist_minner_zero_base(d: u32, h_slots: u32) -> u32 { return hist_inject_flag_base(d, h_slots) + 1u; }
+fn hist_force_nofpm_base(d: u32, h_slots: u32) -> u32 { return hist_minner_zero_base(d, h_slots) + 1u; }
+fn hist_prelude_skip_base(d: u32, h_slots: u32) -> u32 { return hist_force_nofpm_base(d, h_slots) + 1u; }
+fn hist_loop_force_nofpm_base(d: u32, h_slots: u32) -> u32 { return hist_prelude_skip_base(d, h_slots) + 1u; }
+fn signal_zero_base(d: u32, h_slots: u32) -> u32 { return hist_loop_force_nofpm_base(d, h_slots) + 1u; }
+fn attn_out_mode_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, h_slots) + 1u; }
+fn attn_uniform_base(d: u32, h_slots: u32) -> u32 { return attn_out_mode_base(d, h_slots) + 1u; }
+fn attn_freeze_base(d: u32, h_slots: u32) -> u32 { return attn_uniform_base(d, h_slots) + 1u; }
+fn signal_scale_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, h_slots) + 7u; }
 fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d + 21u; }
 fn w_write_gate_base(d: u32, h_slots: u32) -> u32 { return hist_gate_query_base(d, h_slots) + h_slots * d; }
 fn b_write_mem_base(d: u32, h_slots: u32) -> u32 { return w_write_gate_base(d, h_slots) + h_slots * d; }
+// γ per slot sits after the factored write path and scalar controls:
+// slot_anchor(h*d) + W_k_write(h*d*r) + W_v_write(h*r*d) + b_delta(d)
+// + 21 flags + W_gate_hist(h*d) + W_write_gate(h*d) + b_write_mem(h).
 fn hhist_gamma_base(d: u32, h: u32) -> u32 { return b_write_mem_base(d, h) + h; }
+// Retain gate (low-rank): W_up (h×d×r), W_down (h×r×d), b_retain (h×d)
+// r=32, placed after hhist_gamma (h floats)
+const RETAIN_RANK: u32 = 32u;
 fn w_retain_up_base(d: u32, h: u32) -> u32 { return hhist_gamma_base(d, h) + h; }
 fn w_retain_down_base(d: u32, h: u32) -> u32 { return w_retain_up_base(d, h) + h * d * RETAIN_RANK; }
 fn b_retain_base(d: u32, h: u32) -> u32 { return w_retain_down_base(d, h) + h * RETAIN_RANK * d; }
@@ -129,48 +148,30 @@ fn alpha_assoc_base(d: u32, h: u32) -> u32 { return w_q_assoc_base(d, h) + h * d
 fn w_event_assoc_base(d: u32, h: u32) -> u32 { return alpha_assoc_base(d, h) + h; }
 fn b_event_assoc_base(d: u32, h: u32) -> u32 { return w_event_assoc_base(d, h) + h * d; }
 
-fn scratch_stride(d: u32, h: u32) -> u32 {
-    return d * (h * 8u) + h * h + h;
-}
-fn clean_signal_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
-    return t_abs * scratch_stride(d, h) + slot * d;
-}
+@group(0) @binding(11) var<storage, read_write> H_hist: array<f32>;
+
+const ASSOC_RANK: u32 = 32u;
+const FPM_RESIDUAL_SCALE: f32 = 0.1;
+const FPM_GATE_BIAS: f32 = -1.5;
+
 fn hstar_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
     return t_abs * h * d + slot * d;
 }
 fn fpm_m_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
     return t_abs * h * d + slot * d;
 }
-
-const WG_SIZE: u32 = 64u;
-const FPM_RESIDUAL_SCALE: f32 = 0.1;
-const FPM_GATE_BIAS: f32 = -1.5;
-const ASSOC_WRITE_CAP: f32 = 0.95;
-override ASSOC_BANKS: u32 = 1u;
-const ASSOC_ALLOC_THRESHOLD: f32 = 0.05;
-const ASSOC_OCCUPIED_THRESHOLD: f32 = 1.0e-4;
-// Experimental multi-bank addressing strength. With ASSOC_BANKS=1 this is
-// behaviorally inactive because the read softmax has a single candidate.
-const ASSOC_READ_BETA: f32 = 4.0;
-const ASSOC_READ_SLOT_PRIOR_BETA: f32 = 8.0;
-// Scale for the READ-path gradient contribution (matches fpm_alpha_m default = 0.01).
-// Approximates ∂fpm_ctx_t/∂M[t-1] ≈ alpha_m (ignores tanh curvature and gate).
-const FPM_READ_GRAD_SCALE: f32 = 0.5;
-// Amplification for direct write-matrix update from READ gradient.
-// The standard write-backward path has ≈0.002 attenuation at init (retain≈0.88, z≈0.18, RESIDUAL_SCALE=0.1),
-// making the READ→W_k_write/W_v_write gradient ~10⁻¹⁰ per step — essentially zero.
-// This bypasses that attenuation and applies dm_new directly to write matrices.
-// Calibrated so that after ~1000 sequences, W_k_write moves ~5% of init std.
-const FPM_DIRECT_WRITE_SCALE: f32 = 200.0;
-// Associative addressing matrices receive per-weight gradients diluted by
-// d_model × rank while scalar alpha receives a reduced sum. This fan-in
-// compensation is temporary until these parameters use the same normalized
-// optimizer path as the rest of the model.
-const ASSOC_ADDR_GRAD_SCALE: f32 = 1.0;
-// Event-gate parameters are d_model-sized vectors plus one bias; using the same
-// boost as the addressing matrices over-amplified the classifier and was the
-// first source of NaN in exploding runs.
-const ASSOC_EVENT_GRAD_SCALE: f32 = 1.0;
+fn scratch_stride(d: u32, h: u32) -> u32 {
+    return d * (h * 8u) + h * h + h;
+}
+fn clean_signal_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
+    return t_abs * scratch_stride(d, h) + 0u;
+}
+fn routing_alpha_off(t: u32, s: u32, d: u32, h: u32) -> u32 {
+    return t * scratch_stride(d, h) + d * (h * 8u) + s * h;
+}
+fn routing_g_alpha_off(t: u32, s: u32, d: u32, h: u32) -> u32 {
+    return t * scratch_stride(d, h) + d * (h * 8u) + h * h + s;
+}
 
 var<workgroup> shared_up: array<f32, 32>;   // retain-gate up activations (W_retain_up · c)
 var<workgroup> shared_kw: array<f32, 32>;   // k-write bottleneck (W_k_write · c)
@@ -182,30 +183,6 @@ var<workgroup> assoc_raw: array<f32, 32>;
 var<workgroup> assoc_gprev: array<f32, 32>;
 var<workgroup> shared_vec: array<f32, 512>;
 var<workgroup> shared_red: array<f32, 64>;
-
-fn reduce_sum(lane: u32, v: f32) -> f32 {
-    shared_red[lane] = v;
-    workgroupBarrier();
-    for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            shared_red[lane] = shared_red[lane] + shared_red[lane + stride];
-        }
-        workgroupBarrier();
-    }
-    return shared_red[0];
-}
-
-fn reduce_max(lane: u32, v: f32) -> f32 {
-    shared_red[lane] = v;
-    workgroupBarrier();
-    for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            shared_red[lane] = max(shared_red[lane], shared_red[lane + stride]);
-        }
-        workgroupBarrier();
-    }
-    return shared_red[0];
-}
 
 @compute
 @workgroup_size(64, 1, 1)
@@ -247,10 +224,6 @@ fn fused_fpm_retain_bwd_main(
     let wv_assoc_base = hist_base + w_v_assoc_base(d, h) + slot * d * RETAIN_RANK;
     let wq_assoc_base = hist_base + w_q_assoc_base(d, h) + slot * d * RETAIN_RANK;
     let alpha_assoc_idx = hist_base + alpha_assoc_base(d, h) + slot;
-    let alpha_raw = AllWeights[alpha_assoc_idx];
-    let alpha_assoc = 1.0 / (1.0 + exp(-alpha_raw));
-    let alpha_deriv = alpha_assoc * (1.0 - alpha_assoc);
-
     let wevent_assoc_base = hist_base + w_event_assoc_base(d, h) + slot * d;
     let bevent_assoc_idx = hist_base + b_event_assoc_base(d, h) + slot;
     let assoc_bank_stride = RETAIN_RANK + d + 1u;
@@ -264,40 +237,12 @@ fn fused_fpm_retain_bwd_main(
 
     for (var b = 0u; b < params.batch_size; b = b + 1u) {
         let assoc_slot_base = (b * h + slot) * assoc_slot_stride;
-        // Zero out gradients for this slot before sequence processing
-        for (var i = lane; i < d * RETAIN_RANK; i = i + WG_SIZE) {
-            AllGradients[wkw_base + i] = 0.0;
-            AllGradients[wvw_base + i] = 0.0;
-            AllGradients[wup_base + i] = 0.0;
-            AllGradients[wdown_base + i] = 0.0;
-            AllGradients[wk_assoc_base + i] = 0.0;
-            AllGradients[wv_assoc_base + i] = 0.0;
-            AllGradients[wq_assoc_base + i] = 0.0;
-        }
-        for (var i = lane; i < d; i = i + WG_SIZE) {
-            AllGradients[bd_base + i] = 0.0;
-            AllGradients[wf_base + i] = 0.0;
-            AllGradients[bret_base + i] = 0.0;
-            AllGradients[wevent_assoc_base + i] = 0.0;
-        }
-        if (lane == 0u) {
-            AllGradients[alpha_assoc_idx] = 0.0;
-            AllGradients[bwrite_idx] = 0.0;
-            AllGradients[bevent_assoc_idx] = 0.0;
-        }
-        // Zero out workgroup state gradients (assoc_gb is size 4096)
-        for (var i = lane; i < 4096u; i = i + WG_SIZE) {
-            assoc_gb[i] = 0.0;
-        }
-        if (lane < 32u) {
-            assoc_q[lane] = 0.0;
-            assoc_raw[lane] = 0.0;
-            assoc_gprev[lane] = 0.0;
+        // Load the final durable bank state: ASSOC_BANKS × [bank_key[R] | bank_value[d_model] | usage].
+        for (var idx = lane; idx < assoc_slot_stride; idx = idx + WG_SIZE) {
+            assoc_b_state[idx] = AssocState[assoc_slot_base + idx];
+            assoc_gb[idx] = 0.0;
         }
         workgroupBarrier();
-
-        // Load the final durable bank state...
-
         let carry_base = (b * h + slot) * d;
         var dm_new: array<f32, 8>;
         for (var k = 0u; k < 8u; k = k + 1u) { dm_new[k] = 0.0; }
@@ -419,8 +364,7 @@ fn fused_fpm_retain_bwd_main(
             // reconstructs the EMA inverse. The backward must match the actual forward
             // layout: [key[R] | value[d_model] | usage] per bank, with values stored in
             // normalized h* space rather than raw signal space.
-            // alpha_assoc ya está precalculado con sigmoid arriba.
-
+            let alpha_assoc = AllWeights[alpha_assoc_idx];
             var local_alpha_grad = 0.0;
             let vs_base = (slot * n_tokens + t_abs) * d;
             // TEMPORARY ASSOCIATIVE DIAGNOSTIC: v_state magnitude entering assoc read backward.
@@ -597,111 +541,10 @@ fn fused_fpm_retain_bwd_main(
                 ENABLE_ASSOC_EVENT_GATE,
             );
 
-            // ── Librarian Backward: Hierarchical Gradient Propagation ────────────────
-            // Recompute p_slot_i and p_bank_best to propagate gradients through Librarian logic.
-            
-            // 1. Slot Allocation Recomputation
-            var local_max_slot_score = -1.0e30;
-            let slot_anchor_root_bwd = hist_base + slot_anchor_base(d, h);
-            var local_sig_sq_owner = 0.0;
-            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
-                let dim = lane * dims_per_lane + k;
-                let prev_j = S_in[select(0u, t_abs - 1u, t > 0u) * d + dim];
-                local_sig_sq_owner = local_sig_sq_owner + prev_j * prev_j;
-            }
-            let sig_rms_owner = sqrt(reduce_sum(lane, local_sig_sq_owner) / max(1.0, f32(d)) + 1.0e-6);
-            
-            for (var owner = 0u; owner < h; owner = owner + 1u) {
-                let owner_off = slot_anchor_root_bwd + owner * d;
-                var local_dot = 0.0;
-                var local_anc_sq = 0.0;
-                for (var k = 0u; k < dims_per_lane; k = k + 1u) {
-                    let dim = lane * dims_per_lane + k;
-                    let prev_src_j = S_in[select(0u, t_abs - 1u, t > 0u) * d + dim] / max(sig_rms_owner, 1.0e-6);
-                    let anchor_j = AllWeights[owner_off + dim];
-                    local_dot = local_dot + prev_src_j * anchor_j;
-                    local_anc_sq = local_anc_sq + anchor_j * anchor_j;
-                }
-                let dot = reduce_sum(lane, local_dot);
-                let anc_sq = reduce_sum(lane, local_anc_sq);
-                let score = dot / sqrt(max(anc_sq, 1.0e-12));
-                if (lane == 0u) { shared_vec[owner] = score; }
-                local_max_slot_score = max(local_max_slot_score, score);
-            }
-            let max_slot_score = reduce_max(lane, local_max_slot_score);
-            var local_slot_denom = 0.0;
-            if (lane == 0u) {
-                for (var owner = 0u; owner < h; owner = owner + 1u) {
-                    let e = exp(4.0 * (shared_vec[owner] - max_slot_score));
-                    shared_vec[owner] = e;
-                    local_slot_denom = local_slot_denom + e;
-                }
-            }
-            let slot_denom = reduce_sum(lane, local_slot_denom);
-            let p_slot_i_wg = reduce_sum(lane, select(0.0, shared_vec[slot] / max(slot_denom, 1.0e-6), lane == 0u));
-
-            // 2. Bank Placement Recomputation (re-estimate bank probs for grad flow)
-            var local_max_bank_score = -1.0e30;
-            var local_bank_scores: array<f32, 8>;
-            for (var b_idx = 0u; b_idx < ASSOC_BANKS; b_idx = b_idx + 1u) {
-                let bank_base = b_idx * assoc_bank_stride;
-                var local_bank_dot = 0.0;
-                var local_bank_key_sq = 0.0;
-                for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
-                    let key_r = assoc_b_state[bank_base + r];
-                    local_bank_dot = local_bank_dot + key_r * shared_kw[r];
-                    local_bank_key_sq = local_bank_key_sq + key_r * key_r;
-                }
-                let bank_q_sq = reduce_sum(lane, select(0.0, shared_kw[lane] * shared_kw[lane], lane < RETAIN_RANK));
-                let bank_dot = reduce_sum(lane, select(0.0, local_bank_dot, lane < RETAIN_RANK));
-                let bank_key_sq = reduce_sum(lane, select(0.0, local_bank_key_sq, lane < RETAIN_RANK));
-                let score = bank_dot / sqrt(max(bank_key_sq * bank_q_sq, 1.0e-12));
-                local_bank_scores[b_idx] = score;
-                local_max_bank_score = max(local_max_bank_score, score);
-            }
-            let max_bank_score = reduce_max(lane, local_max_bank_score);
-            var local_bank_denom = 0.0;
-            for (var b_idx = 0u; b_idx < ASSOC_BANKS; b_idx = b_idx + 1u) {
-                let e = exp(4.0 * (local_bank_scores[b_idx] - max_bank_score));
-                local_bank_scores[b_idx] = e;
-                local_bank_denom = local_bank_denom + e;
-            }
-            let bank_denom = local_bank_denom;
-            let p_bank_best = local_bank_scores[chosen_bank] / max(bank_denom, 1.0e-6);
-
-            // 3. Hierarchical Gradient Chain
-            let d_allow_write = bind_grad * 2.0 * effective_bind_gate_dbg * assoc_transition_gate;
-            let event_gate_logit_grad = d_allow_write * p_slot_i_wg * p_bank_best 
-                                      * event_gate_bwd * (1.0 - event_gate_bwd) * has_prev_hstar
-                                      + sparsity_penalty;
-            let d_p_slot_i = d_allow_write * event_gate_bwd * p_bank_best;
-            let slot_logit_grad_i = 4.0 * p_slot_i_wg * (d_p_slot_i - p_slot_i_wg * d_p_slot_i);
-            let d_p_bank_best = d_allow_write * event_gate_bwd * p_slot_i_wg;
-            let bank_logit_grad_best = 4.0 * p_bank_best * (d_p_bank_best - p_bank_best * d_p_bank_best);
-
-            // 4. Update Librarian Weights (Accumulate into AllGradients)
-            if (t > 0u) {
-                for (var k = 0u; k < dims_per_lane; k = k + 1u) {
-                    let dim = lane * dims_per_lane + k;
-                    let prev_src_e = (S_in[(t_abs - 1u) * d + dim] + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR)) / max(prev_event_rms, 1.0e-6);
-                    let curr_src_e = (S_in[t_abs * d + dim] + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR)) / max(curr_event_rms, 1.0e-6);
-                    let grad = event_gate_logit_grad * ((curr_src_e - prev_src_e) + curr_src_e * prev_src_e) * inv_sqrt_d;
-                    AllGradients[wevent_assoc_base + dim] += grad;
-                }
-                if (lane == 0u) { AllGradients[bevent_assoc_idx] += event_gate_logit_grad; }
-            }
-            for (var k = 0u; k < dims_per_lane; k = k + 1u) {
-                let dim = lane * dims_per_lane + k;
-                let owner_off = slot_anchor_root_bwd + slot * d;
-                let prev_src_j = S_in[select(0u, t_abs - 1u, t > 0u) * d + dim] / max(sig_rms_owner, 1.0e-6);
-                let anchor_j = AllWeights[owner_off + dim];
-                let anc_sq = reduce_sum(lane, anchor_j * anchor_j);
-                let anc_norm = sqrt(max(anc_sq, 1.0e-12));
-                let cos_i = shared_vec[slot]; 
-                let anchor_grad = (slot_logit_grad_i / max(anc_norm, 1.0e-6)) * (prev_src_j - cos_i * anchor_j / max(anc_norm, 1.0e-6));
-                AllGradients[owner_off + dim] += anchor_grad;
-            }
-
+            let event_gate_logit_grad =
+                bind_grad * 2.0 * effective_bind_gate_dbg * assoc_write_allowed * assoc_transition_gate
+                * event_gate_bwd * (1.0 - event_gate_bwd) * has_prev_hstar
+                + sparsity_penalty;
             var transition_gate_grad = 0.0;
             if (ENABLE_ASSOC_TRANSITION_GATE) {
                 transition_gate_grad =
@@ -709,26 +552,18 @@ fn fused_fpm_retain_bwd_main(
                     * assoc_transition_gate * (1.0 - assoc_transition_gate);
             }
 
-            // ── Durable associative memory backward (FPM-coupled binding) ──────────────────
+            // Backward through the selected-bank EMA write:
+            //   ∂L/∂x_t += g_t * ∂L/∂B_t
+            //   ∂L/∂B_{t-1} from future = (1 - g_t) * ∂L/∂B_t
             if (lane < RETAIN_RANK) {
-                let bank_base = chosen_bank * assoc_bank_stride;
-                let g_bank_key_curr = assoc_gb[bank_base + lane];
+                let key_idx = chosen_bank * assoc_bank_stride + lane;
+                let g_bank_key_curr = assoc_gb[key_idx];
                 let effective_bind_gate = bind_gate * assoc_write_allowed * assoc_transition_gate;
                 let effective_write_mass = effective_bind_gate * effective_bind_gate;
                 let key_write_mass = effective_write_mass;
                 let key_keep_gate = 1.0 - effective_write_mass;
-                
-                // addressing_grad: dL/d_token_key from write-softmax addressing
-                let key_r = assoc_b_state[bank_base + lane];
-                let key_sq = reduce_sum(lane, select(0.0, key_r * key_r, lane < RETAIN_RANK));
-                let q_sq = reduce_sum(lane, select(0.0, shared_kw[lane] * shared_kw[lane], lane < RETAIN_RANK));
-                let k_norm = sqrt(max(key_sq, 1.0e-12));
-                let q_norm = sqrt(max(q_sq, 1.0e-12));
-                let cos_b = local_bank_scores[chosen_bank];
-                let dscore_dq_write = (bank_logit_grad_best / max(q_norm, 1.0e-6)) * (key_r / max(k_norm, 1.0e-6) - cos_b * shared_kw[lane] / max(q_norm, 1.0e-6));
-
-                assoc_gprev[lane] = key_write_mass * g_bank_key_curr + dscore_dq_write;
-                assoc_gb[bank_base + lane] = key_keep_gate * g_bank_key_curr;
+                assoc_gprev[lane] = key_write_mass * g_bank_key_curr;
+                assoc_gb[key_idx] = key_keep_gate * g_bank_key_curr;
             }
             workgroupBarrier();
             var local_assoc_gprev_abs_dbg = 0.0;
@@ -788,9 +623,13 @@ fn fused_fpm_retain_bwd_main(
                         - curr_value_src * value_dot / max(1.0, f32(d));
                     let event_feature =
                         (curr_value_src - prev_event_src) + curr_value_src * prev_event_src;
-                    let g_wevent = ASSOC_EVENT_GRAD_SCALE * event_gate_logit_grad * event_feature * inv_sqrt_d;
-                    AllGradients[wevent_assoc_base + dim] += g_wevent;
-
+                    let step_wevent_assoc =
+                        ASSOC_EVENT_GRAD_SCALE * assoc_event_lr_scaled * event_gate_logit_grad * event_feature * inv_sqrt_d / n_norm;
+                    if (params.grad_accum_mode == 1u) {
+                        AllGradients[wevent_assoc_base + dim] += step_wevent_assoc;
+                    } else {
+                        AllWeights[wevent_assoc_base + dim] -= clamp(step_wevent_assoc, -clip, clip);
+                    }
                     for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
                         let transition_to_key =
                             transition_gate_grad * assoc_raw[r]
@@ -798,30 +637,62 @@ fn fused_fpm_retain_bwd_main(
                         let gk_pre =
                             (assoc_gprev[r] + transition_to_key)
                             * (1.0 - shared_kw[r] * shared_kw[r]);
-                        let g_wk_assoc = ASSOC_ADDR_GRAD_SCALE * gk_pre * prev_src;
-                        AllGradients[wk_assoc_base + dim * RETAIN_RANK + r] += g_wk_assoc;
-
-                        if (ENABLE_ASSOC_TRANSITION_GATE) {
-                            let transition_to_val =
-                                transition_gate_grad * shared_kw[r]
-                                * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
-                            let gv_pre =
-                                transition_to_val * (1.0 - assoc_raw[r] * assoc_raw[r]);
-                            let g_wv_assoc =
-                                ASSOC_ADDR_GRAD_SCALE
-                                * gv_pre
-                                * curr_value_src
-                                * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
-                            AllGradients[wv_assoc_base + dim * RETAIN_RANK + r] += g_wv_assoc;
+                        let step_wk_assoc =
+                            ASSOC_ADDR_GRAD_SCALE
+                            * assoc_lr_scaled
+                            * gk_pre
+                            * prev_src
+                            / n_norm;
+                        local_wk_step_abs_dbg = local_wk_step_abs_dbg + abs(step_wk_assoc);
+                        if (params.grad_accum_mode == 1u) {
+                            AllGradients[wk_assoc_base + dim * RETAIN_RANK + r] += step_wk_assoc;
+                            if (ENABLE_ASSOC_TRANSITION_GATE) {
+                                let transition_to_val =
+                                    transition_gate_grad * shared_kw[r]
+                                    * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
+                                let gv_pre =
+                                    transition_to_val * (1.0 - assoc_raw[r] * assoc_raw[r]);
+                                let step_wv_assoc =
+                                    assoc_lr_scaled
+                                    * (
+                                        ASSOC_ADDR_GRAD_SCALE
+                                        * gv_pre
+                                        * curr_value_src
+                                        * inverseSqrt(max(1.0, f32(RETAIN_RANK)))
+                                    )
+                                    / n_norm;
+                                AllGradients[wv_assoc_base + dim * RETAIN_RANK + r] += step_wv_assoc;
+                            }
+                        } else {
+                            AllWeights[wk_assoc_base + dim * RETAIN_RANK + r] -= clamp(step_wk_assoc, -clip, clip);
+                            if (ENABLE_ASSOC_TRANSITION_GATE) {
+                                let transition_to_val =
+                                    transition_gate_grad * shared_kw[r]
+                                    * inverseSqrt(max(1.0, f32(RETAIN_RANK)));
+                                let gv_pre =
+                                    transition_to_val * (1.0 - assoc_raw[r] * assoc_raw[r]);
+                                let step_wv_assoc =
+                                    assoc_lr_scaled
+                                    * (
+                                        ASSOC_ADDR_GRAD_SCALE
+                                        * gv_pre
+                                        * curr_value_src
+                                        * inverseSqrt(max(1.0, f32(RETAIN_RANK)))
+                                    )
+                                    / n_norm;
+                                AllWeights[wv_assoc_base + dim * RETAIN_RANK + r] -= clamp(step_wv_assoc, -clip, clip);
+                            }
                         }
-
                     }
                 }
                 if (lane == 0u) {
-                    let g_bevent = ASSOC_EVENT_GRAD_SCALE * event_gate_logit_grad;
-                    AllGradients[bevent_assoc_idx] += g_bevent;
+                    let step_bevent_assoc = ASSOC_EVENT_GRAD_SCALE * assoc_event_lr_scaled * event_gate_logit_grad / n_norm;
+                    if (params.grad_accum_mode == 1u) {
+                        AllGradients[bevent_assoc_idx] += step_bevent_assoc;
+                    } else {
+                        AllWeights[bevent_assoc_idx] -= clamp(step_bevent_assoc, -clip, clip);
+                    }
                 }
-
                 let wk_step_abs_dbg = reduce_sum(lane, local_wk_step_abs_dbg);
                 if (lane == 0u) {
                     AssocBwdDebug[assoc_debug_base + 8u] =
@@ -907,7 +778,6 @@ fn fused_fpm_retain_bwd_main(
                     }
                     let bank_usage = assoc_b_state[bank_base + RETAIN_RANK + d];
                     let q_norm = shared_vec[16u];
-                    let bank_occupied = select(0.0, 1.0, bank_usage >= ASSOC_OCCUPIED_THRESHOLD);
                     if (bank_usage < ASSOC_OCCUPIED_THRESHOLD) {
                         shared_dup[bank] = -25.0;
                     } else {
@@ -922,9 +792,7 @@ fn fused_fpm_retain_bwd_main(
                         );
                     }
                     shared_vec[20u + bank * 2u] = dot_score;
-                    // Store key_norm in the upper bits only for occupied banks.
-                    // Empty-bank key_norm is stored as 0.0 (flag: skip score_grad).
-                    shared_vec[20u + bank * 2u + 1u] = bank_occupied * key_norm;
+                    shared_vec[20u + bank * 2u + 1u] = key_norm;
                 }
                 workgroupBarrier();
             }
@@ -1017,10 +885,6 @@ fn fused_fpm_retain_bwd_main(
             workgroupBarrier();
             for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                 let bank_base = bank * assoc_bank_stride;
-                // shared_vec[20+bank*2+1] == 0.0 means empty bank: skip score_grad
-                // to avoid NaN from (dot_score/key_norm) with key_norm≈0.
-                let bank_key_norm_stored = shared_vec[20u + bank * 2u + 1u];
-                let bank_is_occupied = bank_key_norm_stored > 0.0;
                 if (lane < RETAIN_RANK) {
                     let score_grad =
                         shared_dup[bank]
@@ -1031,23 +895,18 @@ fn fused_fpm_retain_bwd_main(
                         AssocBwdDebug[assoc_debug_base + 5u] =
                             max(AssocBwdDebug[assoc_debug_base + 5u], abs(score_grad));
                     }
-                    // Only compute key/query gradient for occupied banks.
-                    // Empty banks have key_norm≈0 which causes NaN in the
-                    // cosine-similarity Jacobian (dot_score/key_norm term).
-                    if (bank_is_occupied) {
-                        let dot_score = shared_vec[20u + bank * 2u];
-                        let key_norm = max(bank_key_norm_stored, 1.0e-8);
-                        let q_norm = max(shared_vec[16u], 1.0e-8);
-                        let inv_norm = inverseSqrt(max(key_norm * q_norm, 1.0e-12));
-                        let key_val = assoc_b_state[bank_base + lane];
-                        let q_val = assoc_q[lane];
-                        let dscore_dkey = ASSOC_READ_BETA * inv_norm * (q_val - (dot_score / key_norm) * key_val);
-                        let dscore_dq = ASSOC_READ_BETA * inv_norm * (key_val - (dot_score / q_norm) * q_val);
-                        assoc_gb[bank_base + lane] =
-                            assoc_gb[bank_base + lane] + dscore_dkey * score_grad;
-                        shared_kw[lane] =
-                            shared_kw[lane] + dscore_dq * score_grad;
-                    }
+                    let dot_score = shared_vec[20u + bank * 2u];
+                    let key_norm = max(shared_vec[20u + bank * 2u + 1u], 1.0e-12);
+                    let q_norm = max(shared_vec[16u], 1.0e-12);
+                    let inv_norm = inverseSqrt(max(key_norm * q_norm, 1.0e-12));
+                    let key_val = assoc_b_state[bank_base + lane];
+                    let q_val = assoc_q[lane];
+                    let dscore_dkey = ASSOC_READ_BETA * inv_norm * (q_val - (dot_score / key_norm) * key_val);
+                    let dscore_dq = ASSOC_READ_BETA * inv_norm * (key_val - (dot_score / q_norm) * q_val);
+                    assoc_gb[bank_base + lane] =
+                        assoc_gb[bank_base + lane] + dscore_dkey * score_grad;
+                    shared_kw[lane] =
+                        shared_kw[lane] + dscore_dq * score_grad;
                 }
                 workgroupBarrier();
             }
@@ -1079,13 +938,18 @@ fn fused_fpm_retain_bwd_main(
                             ASSOC_ADDR_GRAD_SCALE
                             * assoc_lr_scaled
                             * shared_kw[r]
-                            * prev_src;
+                            * prev_src
+                            / n_norm;
+                        local_wq_step_abs_dbg = local_wq_step_abs_dbg + abs(step_wq_assoc);
                         let wq_eff_base = select(wq_assoc_base, wk_assoc_base, ENABLE_ASSOC_TIE_QK);
-                        AllGradients[wq_eff_base + dim * RETAIN_RANK + r] += step_wq_assoc;
+                        if (params.grad_accum_mode == 1u) {
+                            AllGradients[wq_eff_base + dim * RETAIN_RANK + r] += step_wq_assoc;
+                        } else {
+                            AllWeights[wq_eff_base + dim * RETAIN_RANK + r] -= clamp(step_wq_assoc, -clip, clip);
+                        }
                     }
                 }
             }
-
             let wq_step_abs_dbg = reduce_sum(lane, local_wq_step_abs_dbg);
             if (lane == 0u) {
                 AssocBwdDebug[assoc_debug_base + 6u] =
@@ -1095,11 +959,23 @@ fn fused_fpm_retain_bwd_main(
             }
             workgroupBarrier();
 
-            // Alpha update accumulation
+            // Alpha update
             let g_alpha_total = reduce_sum(lane, local_alpha_grad);
             if (lane == 0u) {
-                // Multiplicamos por la derivada del sigmoide para corregir la ganancia acotada
-                AllGradients[alpha_assoc_idx] += g_alpha_total * alpha_deriv;
+                let step_alpha_assoc = assoc_alpha_lr_scaled * g_alpha_total / n_norm;
+                AssocBwdDebug[assoc_debug_base + 10u] =
+                    AssocBwdDebug[assoc_debug_base + 10u] + abs(step_alpha_assoc);
+                AssocBwdDebug[assoc_debug_base + 11u] =
+                    max(AssocBwdDebug[assoc_debug_base + 11u], abs(step_alpha_assoc));
+                if (params.grad_accum_mode == 1u) {
+                    AllGradients[alpha_assoc_idx] += step_alpha_assoc;
+                } else {
+                    AllWeights[alpha_assoc_idx] = clamp(
+                        AllWeights[alpha_assoc_idx] - clamp(step_alpha_assoc, -clip, clip),
+                        0.0,
+                        1.0,
+                    );
+                }
             }
             workgroupBarrier();
 
@@ -1237,10 +1113,31 @@ fn fused_fpm_retain_bwd_main(
                 let g_delta = g_prop * (1.0 - proposal[k] * proposal[k]);
                 g_prev[k] = g_prev[k] + g_prev_from_nov;
                 let g_alog = -a[k] * (1.0 - a[k]) * g_a;
-                AllGradients[alog_base + dim] += g_alog;
+                let step_alog = lr_scaled * g_alog / n_norm;
+                if (params.grad_accum_mode == 1u) {
+                    AllGradients[alog_base + dim] += step_alog;
+                } else {
+                    AllWeights[alog_base + dim] = clamp(
+                        AllWeights[alog_base + dim] - clamp(step_alog, -clip, clip),
+                        -1.0,
+                        9.0,
+                    );
+                }
 
-                AllGradients[bd_base + dim] += g_prop * (1.0 - proposal[k] * proposal[k]);
-                AllGradients[bret_base + dim] += g_pre[k];
+                let step_bdelta = lr_scaled * g_delta / n_norm;
+                if (params.grad_accum_mode == 1u) {
+                    AllGradients[bd_base + dim] += step_bdelta;
+                } else {
+                    AllWeights[bd_base + dim] -= clamp(step_bdelta, -clip, clip);
+                }
+                // Store g_delta for factored W_v / W_k gradient computation below.
+                // g_retain for W_down / W_up handled in the retain-gate backward block.
+                let step_bret = lr_scaled * g_pre[k] / n_norm;
+                if (params.grad_accum_mode == 1u) {
+                    AllGradients[bret_base + dim] += step_bret;
+                } else {
+                    AllWeights[bret_base + dim] -= clamp(step_bret, -clip, clip);
+                }
                 shared_vec[dim] = g_pre[k];   // used by retain-gate W_down backward
             }
             workgroupBarrier();
@@ -1257,14 +1154,24 @@ fn fused_fpm_retain_bwd_main(
             for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                 let dim = lane * dims_per_lane + k;
                 for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
-                    AllGradients[wdown_base + r * d + dim] += g_pre[k] * shared_up[r];
-                    AllGradients[wup_base + dim * RETAIN_RANK + r] += shared_dup[r] * c[k];
+                    let step_wdown = lr_scaled * g_pre[k] * shared_up[r] / n_norm;
+                    let step_wup = lr_scaled * shared_dup[r] * c[k] / n_norm;
+                    if (params.grad_accum_mode == 1u) {
+                        AllGradients[wdown_base + r * d + dim] += step_wdown;
+                        AllGradients[wup_base + dim * RETAIN_RANK + r] += step_wup;
+                    } else {
+                        AllWeights[wdown_base + r * d + dim] -= clamp(step_wdown, -clip, clip);
+                        AllWeights[wup_base + dim * RETAIN_RANK + r] -= clamp(step_wup, -clip, clip);
+                    }
                 }
-                AllGradients[wf_base + dim] += g_raw_z * c[k] * inv_sqrt_d;
+                let step_wg = lr_scaled * g_raw_z * c[k] * inv_sqrt_d / n_norm;
+                if (params.grad_accum_mode == 1u) {
+                    AllGradients[wf_base + dim] += step_wg;
+                } else {
+                    AllWeights[wf_base + dim] -= clamp(step_wg, -clip, clip);
+                }
                 dm_new[k] = g_prev[k];
             }
-
-
 
             // ── READ-path gradient: ∂L/∂M[t-1] from fpm_ctx reading M at token t ─────
             // fpm_ctx_t ≈ tanh(M[t-1]) * alpha_m → ∂fpm_ctx_t/∂M ≈ alpha_m * I
@@ -1304,13 +1211,19 @@ fn fused_fpm_retain_bwd_main(
                     let dim = lane * dims_per_lane + k;
                     let gd = shared_vec[dim];
                     for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
-                        AllGradients[wvw_base + r * d + dim] += FPM_DIRECT_WRITE_SCALE * gd * shared_kw[r];
-                        AllGradients[wkw_base + dim * RETAIN_RANK + r] += FPM_DIRECT_WRITE_SCALE * shared_dup[r] * c[k];
+                        let step_wvw = FPM_DIRECT_WRITE_SCALE * lr_scaled * gd * shared_kw[r] / n_norm;
+                        let step_wkw = FPM_DIRECT_WRITE_SCALE * lr_scaled * shared_dup[r] * c[k] / n_norm;
+                        if (params.grad_accum_mode == 1u) {
+                            AllGradients[wvw_base + r * d + dim] += step_wvw;
+                            AllGradients[wkw_base + dim * RETAIN_RANK + r] += step_wkw;
+                        } else {
+                            AllWeights[wvw_base + r * d + dim] -= clamp(step_wvw, -clip, clip);
+                            AllWeights[wkw_base + dim * RETAIN_RANK + r] -= clamp(step_wkw, -clip, clip);
+                        }
                     }
                 }
                 workgroupBarrier();
             }
-
 
             // ── Factored k×v write backward (W_v_write, W_k_write) ───────────────────
             // g_delta values are in registers; store in shared_vec for bottleneck backprop.
@@ -1361,53 +1274,64 @@ fn fused_fpm_retain_bwd_main(
                 }
             }
             if (lane == 0u) {
-                AllGradients[bwrite_idx] += g_raw_z;
+                let step_bg = lr_scaled * g_raw_z / n_norm;
+                if (params.grad_accum_mode == 1u) {
+                    AllGradients[bwrite_idx] += step_bg;
+                } else {
+                    AllWeights[bwrite_idx] -= clamp(step_bg, -clip, clip);
+                }
             }
             workgroupBarrier();
         }
-
-        // Consolidated Weight Update at the end of sequence (BPTT style)
-        // This prevents 'Online SGD' amnesia and stabilizes neuroplasticity.
-        let wd_factor = 1.0 - params.lr * params.weight_decay;
-        for (var i = lane; i < d * RETAIN_RANK; i = i + WG_SIZE) {
-            let wk_idx = wkw_base + i;
-            let wv_idx = wvw_base + i;
-            let wup_idx = wup_base + i;
-            let wd_idx = wdown_base + i;
-            let wqa_idx = wq_assoc_base + i;
-            let wka_idx = wk_assoc_base + i;
-            let wva_idx = wv_assoc_base + i;
-
-            AllWeights[wk_idx] = AllWeights[wk_idx] * wd_factor - clamp(AllGradients[wk_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[wv_idx] = AllWeights[wv_idx] * wd_factor - clamp(AllGradients[wv_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[wup_idx] = AllWeights[wup_idx] * wd_factor - clamp(AllGradients[wup_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[wd_idx] = AllWeights[wd_idx] * wd_factor - clamp(AllGradients[wd_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[wqa_idx] = AllWeights[wqa_idx] * wd_factor - clamp(AllGradients[wqa_idx] * assoc_lr_scaled / n_norm, -clip, clip);
-            AllWeights[wka_idx] = AllWeights[wka_idx] * wd_factor - clamp(AllGradients[wka_idx] * assoc_lr_scaled / n_norm, -clip, clip);
-            AllWeights[wva_idx] = AllWeights[wva_idx] * wd_factor - clamp(AllGradients[wva_idx] * assoc_lr_scaled / n_norm, -clip, clip);
-        }
-        for (var i = lane; i < d; i = i + WG_SIZE) {
-            let bd_idx = bd_base + i;
-            let wf_idx = wf_base + i;
-            let br_idx = bret_base + i;
-            let we_idx = wevent_assoc_base + i;
-
-            AllWeights[bd_idx] = AllWeights[bd_idx] * wd_factor - clamp(AllGradients[bd_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[wf_idx] = AllWeights[wf_idx] * wd_factor - clamp(AllGradients[wf_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[br_idx] = AllWeights[br_idx] * wd_factor - clamp(AllGradients[br_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[we_idx] = AllWeights[we_idx] * wd_factor - clamp(AllGradients[we_idx] * assoc_event_lr_scaled / n_norm, -clip, clip);
-        }
-        if (lane == 0u) {
-            AllWeights[alpha_assoc_idx] = AllWeights[alpha_assoc_idx] * wd_factor - clamp(AllGradients[alpha_assoc_idx] * assoc_alpha_lr_scaled / n_norm, -clip, clip);
-            AllWeights[bwrite_idx] = AllWeights[bwrite_idx] * wd_factor - clamp(AllGradients[bwrite_idx] * lr_scaled / n_norm, -clip, clip);
-            AllWeights[bevent_assoc_idx] = AllWeights[bevent_assoc_idx] * wd_factor - clamp(AllGradients[bevent_assoc_idx] * assoc_event_lr_scaled / n_norm, -clip, clip);
-        }
-        workgroupBarrier();
-
 
         for (var k = 0u; k < dims_per_lane; k = k + 1u) {
             tbptt_carry_buf[carry_base + lane * dims_per_lane + k] = dm_new[k];
         }
         workgroupBarrier();
+    }
+}
+
+// ── Routing Backward Micro-Kernel (Softmax Jacobian) ────────────────────────
+// Parallel by slot, sequential by token to avoid race conditions on gating weights.
+@compute
+@workgroup_size(64, 1, 1)
+fn fused_fpm_routing_bwd_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let slot = gid.x;
+    let d = params.d_model;
+    let h = params.h_slots;
+    if (slot >= h) { return; }
+
+    let n_tokens = params.batch_size * params.seq_len;
+    let n_norm = max(1.0, f32(n_tokens));
+    let lr_scaled = params.lr * params.grad_scale;
+    let inv_sqrt_d = inverseSqrt(max(1.0, f32(d)));
+    let hist_base = aw_hist_base(d, h);
+    let wf_base = hist_base + w_write_gate_base(d, h) + slot * d;
+    let bwrite_idx = hist_base + b_write_mem_base(d, h) + slot;
+    
+    // We only use one thread per slot for the token loop for now to be safe
+    if (gid.y > 0u) { return; }
+
+    for (var t: u32 = 0u; t < n_tokens; t = t + 1u) {
+        let t_abs = t; 
+        let g_alpha = Scratch[routing_g_alpha_off(t_abs, slot, d, h)];
+        let alpha = Scratch[routing_alpha_off(t_abs, slot, d, h)];
+        
+        let dL_dlogit = g_alpha; 
+
+        let sig_base = clean_signal_off(t_abs, slot, d, h);
+        let h_base = t_abs * h * d + slot * d;
+
+        for (var j: u32 = 0u; j < d; j = j + 1u) {
+            let c_j = 0.5 * (h_star[h_base + j] + Scratch[sig_base + j]);
+            let g_wf = dL_dlogit * c_j * inv_sqrt_d;
+            
+            // Accumulate gradient for W_write_gate
+            let wf_idx = wf_base + j;
+            AllGradients[wf_idx] += g_wf * lr_scaled / n_norm;
+        }
+        
+        // Accumulate gradient for b_write_mem
+        AllGradients[bwrite_idx] += dL_dlogit * lr_scaled / n_norm;
     }
 }

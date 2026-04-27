@@ -888,7 +888,7 @@ impl RustDeqBridge {
         let hist_params_len = d_model * d_model              // hist_mat (1 shared)
             + 5u32 * h_slots * d_model                       // slot_anchor+scale/bias+hist_gate_query+w_write_gate
             + 2u32 * h_slots                                 // hist_gate + b_write_mem
-            + d_model                                        // b_delta (shared)
+            + h_slots * d_model                              // b_delta (per-slot)
             + 21u32                                          // flags
             + h_slots                                        // γ per slot
             + 2u32 * h_slots * d_model * RETAIN_RANK         // W_k_write + W_v_write (factored write)

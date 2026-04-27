@@ -1,0 +1,320 @@
+diff --git a/aideen-backbone/src/gpu_deq.rs b/aideen-backbone/src/gpu_deq.rs
+index 30d4384..f0c47e7 100644
+--- a/aideen-backbone/src/gpu_deq.rs
++++ b/aideen-backbone/src/gpu_deq.rs
+@@ -382,7 +382,7 @@ impl GpuDeqBackend {
+         d * d                           // hist_mat
+             + 5 * h * d                 // slot_anchor + hist_scale/bias + hist_gate_query + w_write_gate
+             + 2 * h                     // hist_gate + b_write_mem
+-            + d                         // b_delta
++            + h * d                     // b_delta
+             + 21                        // flags
+             + h                         // γ per slot
+             + 2 * h * d * RETAIN_RANK   // W_k_write + W_v_write (factored write path)
+diff --git a/aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl b/aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl
+index 3cc35f2..01716af 100644
+--- a/aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl
++++ b/aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl
+@@ -87,6 +87,11 @@ override ENABLE_ASSOC_CONF_READ: bool = false;
+ override ENABLE_ASSOC_EVENT_GATE: bool = false;
+ override ASSOC_EVENT_L1: f32 = 0.001;
+ 
++// ── Layout Functions (Clean Layout) ─────────────────────────────────────────
++const RETAIN_RANK: u32 = 32u;
++const ASSOC_RANK: u32 = 32u;
++const ASSOC_HIST_META: u32 = 4u;
++
+ fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
+ fn aw_wk_base(d: u32, h: u32) -> u32 { return h * d * d + h * d; }
+ fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d, h) + h * d * d + h * d; }
+@@ -98,18 +103,19 @@ fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_wout_base(d, h) + d * d; }
+ fn aw_nscale_base(d: u32, h: u32) -> u32 { return aw_alog_base(d, h) + h * d; }
+ fn aw_hist_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) + d; }
+ 
+-fn hist_gate_base(d: u32, h: u32) -> u32 { return d * d + 2u * h * d; }
+-fn slot_anchor_base(d: u32, h: u32) -> u32 { return hist_gate_base(d, h) + h; }
++fn hist_mat_len(d: u32) -> u32 { return d * d; }
++fn hist_scale_base(d: u32, h_slots: u32) -> u32 { return hist_mat_len(d); }
++fn hist_bias_base(d: u32, h_slots: u32) -> u32 { return hist_scale_base(d, h_slots) + h_slots * d; }
++fn hist_gate_base(d: u32, h_slots: u32) -> u32 { return hist_bias_base(d, h_slots) + h_slots * d; }
++fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_slots) + h_slots; }
+ fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
+ fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * RETAIN_RANK; }
+-fn hist_delta_bias_base(d: u32, h: u32) -> u32 { return w_v_write_base(d, h) + h * RETAIN_RANK * d; }
+-fn hist_gate_query_base(d: u32, h: u32) -> u32 { return hist_delta_bias_base(d, h) + d + 21u; }
+-fn w_write_gate_base(d: u32, h: u32) -> u32 { return hist_gate_query_base(d, h) + h * d; }
+-fn b_write_mem_base(d: u32, h: u32) -> u32 { return w_write_gate_base(d, h) + h * d; }
++fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return w_v_write_base(d, h_slots) + h_slots * RETAIN_RANK * d; }
++fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d; }
++fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d + 21u; }
++fn w_write_gate_base(d: u32, h_slots: u32) -> u32 { return hist_gate_query_base(d, h_slots) + h_slots * d; }
++fn b_write_mem_base(d: u32, h_slots: u32) -> u32 { return w_write_gate_base(d, h_slots) + h_slots * d; }
+ fn hhist_gamma_base(d: u32, h: u32) -> u32 { return b_write_mem_base(d, h) + h; }
+-
+-const RETAIN_RANK: u32 = 32u;
+-const ASSOC_HIST_META: u32 = 4u;
+ fn w_retain_up_base(d: u32, h: u32) -> u32 { return hhist_gamma_base(d, h) + h; }
+ fn w_retain_down_base(d: u32, h: u32) -> u32 { return w_retain_up_base(d, h) + h * d * RETAIN_RANK; }
+ fn b_retain_base(d: u32, h: u32) -> u32 { return w_retain_down_base(d, h) + h * RETAIN_RANK * d; }
+@@ -117,16 +123,17 @@ fn w_q_mem_base(d: u32, h: u32) -> u32 { return b_retain_base(d, h) + h * d; }
+ fn w_k_mem_base(d: u32, h: u32) -> u32 { return w_q_mem_base(d, h) + h * d * RETAIN_RANK; }
+ fn b_read_mem_base(d: u32, h: u32) -> u32 { return w_k_mem_base(d, h) + h * d * RETAIN_RANK; }
+ fn w_k_assoc_base(d: u32, h: u32) -> u32 { return b_read_mem_base(d, h) + h; }
+-fn w_v_assoc_base(d: u32, h: u32) -> u32 { return w_k_assoc_base(d, h) + h * d * RETAIN_RANK; }
+-fn w_q_assoc_base(d: u32, h: u32) -> u32 { return w_v_assoc_base(d, h) + h * d * RETAIN_RANK; }
+-fn alpha_assoc_base(d: u32, h: u32) -> u32 { return w_q_assoc_base(d, h) + h * d * RETAIN_RANK; }
++fn w_v_assoc_base(d: u32, h: u32) -> u32 { return w_k_assoc_base(d, h) + h * d * ASSOC_RANK; }
++fn w_q_assoc_base(d: u32, h: u32) -> u32 { return w_v_assoc_base(d, h) + h * d * ASSOC_RANK; }
++fn alpha_assoc_base(d: u32, h: u32) -> u32 { return w_q_assoc_base(d, h) + h * d * ASSOC_RANK; }
+ fn w_event_assoc_base(d: u32, h: u32) -> u32 { return alpha_assoc_base(d, h) + h; }
+ fn b_event_assoc_base(d: u32, h: u32) -> u32 { return w_event_assoc_base(d, h) + h * d; }
+ 
++fn scratch_stride(d: u32, h: u32) -> u32 {
++    return d * (h * 8u) + h * h + h;
++}
+ fn clean_signal_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
+-    let signal_span = h * d;
+-    let scratch_stride = signal_span * 3u + h * h;
+-    return t_abs * scratch_stride + slot * d;
++    return t_abs * scratch_stride(d, h) + slot * d;
+ }
+ fn hstar_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
+     return t_abs * h * d + slot * d;
+diff --git a/aideen-block/src/deq_bridge.rs b/aideen-block/src/deq_bridge.rs
+index c57d35d..b655b72 100644
+--- a/aideen-block/src/deq_bridge.rs
++++ b/aideen-block/src/deq_bridge.rs
+@@ -888,7 +888,7 @@ impl RustDeqBridge {
+         let hist_params_len = d_model * d_model              // hist_mat (1 shared)
+             + 5u32 * h_slots * d_model                       // slot_anchor+scale/bias+hist_gate_query+w_write_gate
+             + 2u32 * h_slots                                 // hist_gate + b_write_mem
+-            + d_model                                        // b_delta (shared)
++            + h_slots * d_model                              // b_delta (per-slot)
+             + 21u32                                          // flags
+             + h_slots                                        // γ per slot
+             + 2u32 * h_slots * d_model * RETAIN_RANK         // W_k_write + W_v_write (factored write)
+diff --git a/aideen-block/src/shaders/deq_sgd_update.wgsl b/aideen-block/src/shaders/deq_sgd_update.wgsl
+index 7865749..3fda0c5 100644
+--- a/aideen-block/src/shaders/deq_sgd_update.wgsl
++++ b/aideen-block/src/shaders/deq_sgd_update.wgsl
+@@ -29,23 +29,27 @@ fn deq_sgd_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+     let idx = gid.x;
+ 
+     if (idx < params.mat_len) {
+-        let g = grad_mat[idx];
+-        let clamped_g = clamp(g, -1.0, 1.0);
++        let g_raw = grad_mat[idx];
++        let g = select(0.0, g_raw, (g_raw == g_raw) && (abs(g_raw) < 1.0e30));
++        let clamped_g = clamp(g, -0.1, 0.1);
+         let delta = params.lr * clamped_g;
+-        W_q[idx] = W_q[idx] - delta;
+-        W_k[idx] = W_k[idx] - delta;
+-        W_v[idx] = W_v[idx] - delta;
+-        W_o[idx] = W_o[idx] - delta;
+-        W_in[idx] = W_in[idx] - delta;
+-        W_x[idx] = W_x[idx] - delta;
+-        W_out[idx] = W_out[idx] - delta;
++        
++        W_q[idx] = clamp(W_q[idx] - delta, -10.0, 10.0);
++        W_k[idx] = clamp(W_k[idx] - delta, -10.0, 10.0);
++        W_v[idx] = clamp(W_v[idx] - delta, -10.0, 10.0);
++        W_o[idx] = clamp(W_o[idx] - delta, -10.0, 10.0);
++        W_in[idx] = clamp(W_in[idx] - delta, -10.0, 10.0);
++        W_x[idx] = clamp(W_x[idx] - delta, -10.0, 10.0);
++        W_out[idx] = clamp(W_out[idx] - delta, -10.0, 10.0);
+     }
+ 
+     if (idx < params.vec_len) {
+-        let g = grad_vec[idx];
+-        let clamped_g = clamp(g, -1.0, 1.0);
++        let g_raw = grad_vec[idx];
++        let g = select(0.0, g_raw, (g_raw == g_raw) && (abs(g_raw) < 1.0e30));
++        let clamped_g = clamp(g, -0.1, 0.1);
+         let delta = params.lr * clamped_g;
+-        A_log[idx] = A_log[idx] - delta;
+-        NormScale[idx] = NormScale[idx] - delta;
++        
++        A_log[idx] = clamp(A_log[idx] - delta, -10.0, 10.0);
++        NormScale[idx] = clamp(NormScale[idx] - delta, -10.0, 10.0);
+     }
+ }
+diff --git a/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl b/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+index fe84664..252d216 100644
+--- a/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
++++ b/aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+@@ -66,7 +66,7 @@ const FPM_CACHE_CAP: u32 = 512u;
+ const MAX_SLOTS: u32 = 8u;
+ const MAX_SLOT_ATTN_HEAD_DIM: u32 = 32u;
+ const SLOT_HEAD_CAP: u32 = MAX_SLOTS * MAX_SLOT_ATTN_HEAD_DIM;
+-const ASSOC_RANK: u32 = 32u;
++
+ const ASSOC_HIST_META: u32 = 4u;
+ override ASSOC_BANKS: u32 = 1u;
+ const ASSOC_WRITE_CAP: f32 = 0.95;
+@@ -121,6 +121,10 @@ var<workgroup> hhist_gamma_wg: f32;
+ const H_HIST_GAMMA_SCALE: f32 = 0.1;
+ const HIST_CTX_SCALE: f32 = 0.05;
+ 
++// ── Layout Functions (Clean Layout) ─────────────────────────────────────────
++const RETAIN_RANK: u32 = 32u;
++const ASSOC_RANK: u32 = 32u;
++
+ fn aw_wq_base(d: u32, h: u32) -> u32 { return 0u; }
+ fn aw_wk_base(d: u32, h: u32) -> u32 { return h * d * d + h * d; }
+ fn aw_wv_base(d: u32, h: u32) -> u32 { return aw_wk_base(d, h) + h * d * d + h * d; }
+@@ -128,26 +132,19 @@ fn aw_wo_base(d: u32, h: u32) -> u32 { return aw_wv_base(d, h) + h * d * d; }
+ fn aw_win_base(d: u32, h: u32) -> u32 { return aw_wo_base(d, h) + h * d * d; }
+ fn aw_wx_base(d: u32, h: u32) -> u32 { return aw_win_base(d, h) + h * d * d; }
+ fn aw_wout_base(d: u32, h: u32) -> u32 { return aw_wx_base(d, h) + d * d; }
+-fn aw_nscale_base(d: u32, h: u32) -> u32 {
+-    let aw_wx = aw_wx_base(d, h);
+-    let aw_wout = aw_wout_base(d, h);
+-    let aw_alog = aw_wout + d * d;
+-    return aw_alog + h * d;
+-}
+-fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) - h * d; }
++fn aw_alog_base(d: u32, h: u32) -> u32 { return aw_wout_base(d, h) + d * d; }
++fn aw_nscale_base(d: u32, h: u32) -> u32 { return aw_alog_base(d, h) + h * d; }
+ fn aw_hist_base(d: u32, h: u32) -> u32 { return aw_nscale_base(d, h) + d; }
++
+ fn hist_mat_len(d: u32) -> u32 { return d * d; }
+ fn hist_scale_base(d: u32, h_slots: u32) -> u32 { return hist_mat_len(d); }
+ fn hist_bias_base(d: u32, h_slots: u32) -> u32 { return hist_scale_base(d, h_slots) + h_slots * d; }
+ fn hist_gate_base(d: u32, h_slots: u32) -> u32 { return hist_bias_base(d, h_slots) + h_slots * d; }
+ fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_slots) + h_slots; }
+-// Write path: factored k×v (replaces full-rank W_delta h*d² with 2*h*d*r)
+-// W_k_write[slot]: d×RETAIN_RANK  — projects c to write bottleneck
+-// W_v_write[slot]: RETAIN_RANK×d  — expands bottleneck to proposal
+ fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
+ fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * RETAIN_RANK; }
+ fn hist_delta_bias_base(d: u32, h_slots: u32) -> u32 { return w_v_write_base(d, h_slots) + h_slots * RETAIN_RANK * d; }
+-fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d; }
++fn hist_selective_flag_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d; }
+ fn hist_alpha_warmup_factor_base(d: u32, h_slots: u32) -> u32 { return hist_selective_flag_base(d, h_slots) + 1u; }
+ fn hist_rms_floor_base(d: u32, h_slots: u32) -> u32 { return hist_alpha_warmup_factor_base(d, h_slots) + 1u; }
+ fn hist_contr_floor_base(d: u32, h_slots: u32) -> u32 { return hist_rms_floor_base(d, h_slots) + 1u; }
+@@ -161,16 +158,10 @@ fn attn_out_mode_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d,
+ fn attn_uniform_base(d: u32, h_slots: u32) -> u32 { return attn_out_mode_base(d, h_slots) + 1u; }
+ fn attn_freeze_base(d: u32, h_slots: u32) -> u32 { return attn_uniform_base(d, h_slots) + 1u; }
+ fn signal_scale_base(d: u32, h_slots: u32) -> u32 { return signal_zero_base(d, h_slots) + 7u; }
+-fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + d + 21u; }
++fn hist_gate_query_base(d: u32, h_slots: u32) -> u32 { return hist_delta_bias_base(d, h_slots) + h_slots * d + 21u; }
+ fn w_write_gate_base(d: u32, h_slots: u32) -> u32 { return hist_gate_query_base(d, h_slots) + h_slots * d; }
+ fn b_write_mem_base(d: u32, h_slots: u32) -> u32 { return w_write_gate_base(d, h_slots) + h_slots * d; }
+-// γ per slot sits after the factored write path and scalar controls:
+-// slot_anchor(h*d) + W_k_write(h*d*r) + W_v_write(h*r*d) + b_delta(d)
+-// + 21 flags + W_gate_hist(h*d) + W_write_gate(h*d) + b_write_mem(h).
+ fn hhist_gamma_base(d: u32, h: u32) -> u32 { return b_write_mem_base(d, h) + h; }
+-// Retain gate (low-rank): W_up (h×d×r), W_down (h×r×d), b_retain (h×d)
+-// r=32, placed after hhist_gamma (h floats)
+-const RETAIN_RANK: u32 = 32u;
+ fn w_retain_up_base(d: u32, h: u32) -> u32 { return hhist_gamma_base(d, h) + h; }
+ fn w_retain_down_base(d: u32, h: u32) -> u32 { return w_retain_up_base(d, h) + h * d * RETAIN_RANK; }
+ fn b_retain_base(d: u32, h: u32) -> u32 { return w_retain_down_base(d, h) + h * RETAIN_RANK * d; }
+@@ -184,6 +175,10 @@ fn alpha_assoc_base(d: u32, h: u32) -> u32 { return w_q_assoc_base(d, h) + h * d
+ fn w_event_assoc_base(d: u32, h: u32) -> u32 { return alpha_assoc_base(d, h) + h; }
+ fn b_event_assoc_base(d: u32, h: u32) -> u32 { return w_event_assoc_base(d, h) + h * d; }
+ 
++fn scratch_stride(d: u32, h: u32) -> u32 {
++    return d * (h * 8u) + h * h + h;
++}
++
+ @group(0) @binding(11) var<storage, read_write> H_hist: array<f32>;
+ 
+ override ENABLE_FPM: bool = false;
+@@ -200,10 +195,6 @@ const FPM_FATIGUE_RATE: f32 = 0.002;
+ const FPM_RESCUE_TAIL: u32 = 2u;
+ const FPM_JOINT_POLICY_STAGE: u32 = 6u;
+ const FPM_DEAD_THRESHOLD: f32 = 0.01;
+-// Saturation now refers to near-max use of the slot's write budget.
+-// Under the old z∈[0, 0.5] clamp, 0.45 meant "almost fully saturated".
+-// With z reparameterized into [0, 1], the same semantics are recovered by
+-// checking for near-ceiling utilization instead of mid-range activity.
+ const FPM_SAT_THRESHOLD: f32 = 0.95;
+ const FPM_EPS: f32 = 1e-6;
+ const FPM_HOMEO_MIN_ITERS: u32 = 4u;
+diff --git a/aideen-training-lab/src/bin/assoc_recall.rs b/aideen-training-lab/src/bin/assoc_recall.rs
+index d492dba..3bf73d8 100644
+--- a/aideen-training-lab/src/bin/assoc_recall.rs
++++ b/aideen-training-lab/src/bin/assoc_recall.rs
+@@ -983,6 +983,7 @@ fn main() {
+     let mut rng_train = StdRng::seed_from_u64(42);
+     let mut train_loss_sum = 0.0f32;
+     let mut train_valid = 0usize;
++    let mut train_tokens_total = 0usize;
+     let n_gaps = gaps.len();
+     let mut last_train_case: Option<(usize, usize, ArSequence, f32, Vec<String>)> = None;
+ 
+@@ -1004,23 +1005,51 @@ fn main() {
+             train_loss_sum += loss;
+             train_valid += 1;
+         }
++        train_tokens_total += ar.seq.len();
+         if assoc_audit {
+             last_train_case = Some((i, gap, ar, loss, train_trace));
+         }
+ 
+-        if (i + 1) % 100 == 0 {
++        if (i + 1) % 20 == 0 {
+             let avg = if train_valid > 0 {
+                 train_loss_sum / train_valid as f32
+             } else {
+                 f32::NAN
+             };
++            let elapsed = t_train.elapsed().as_secs_f32();
++            let tps = if elapsed > 0.0 {
++                train_tokens_total as f32 / elapsed
++            } else {
++                0.0
++            };
+             println!(
+-                "  train {:>4}/{} | avg_loss={:.4} | {:.1}s",
++                "  train {:>4}/{} | avg_loss={:.4} | {:.1}s | TPS={:.1}",
+                 i + 1,
+                 n_train,
+                 avg,
+-                t_train.elapsed().as_secs_f32()
++                elapsed,
++                tps
+             );
++            #[cfg(feature = "wgpu")]
++            if let Some(gpu) = trainer.gpu_deq.as_ref() {
++                let fw = gpu.read_debug_buffer();
++                for s in 0..trainer.config.h_slots {
++                    let diag_base = 760 + s * 10;
++                    println!(
++                        "  [slot-audit] s{}: r_ent={:.3e} r_max={:.3} ctx_rms={:.3e} r_usage={:.3e} w_allow={:.3e} w_gate={:.3e} cos_max={:.3} r_n={:.0} w_n={:.0}",
++                        s,
++                        fw[diag_base],       // +0 avg read_entropy  (↓ = especialización)
++                        fw[diag_base + 1],   // +1 max read_max_prob (↑ = confía en 1 banco)
++                        fw[diag_base + 2],   // +2 max ctx_rms
++                        fw[diag_base + 3],   // +3 avg read_usage
++                        fw[diag_base + 4],   // +4 avg w_allow
++                        fw[diag_base + 5],   // +5 avg effective_bind_gate
++                        fw[diag_base + 6],   // +6 max cos_similarity
++                        fw[diag_base + 8],   // +8 r_n (contador lecturas)
++                        fw[diag_base + 9],   // +9 w_n (contador escrituras)
++                    );
++                }
++            }
+             flush();
+         }
+     }
+@@ -1091,6 +1120,17 @@ fn main() {
+             delta_rms(&init_wq_assoc, &wq_assoc_now),
+         );
+         #[cfg(feature = "wgpu")]
++        if let Some(gpu) = trainer.gpu_deq.as_ref() {
++            let fw = gpu.read_debug_buffer();
++            for s in 0..trainer.config.h_slots {
++                let diag_base = 760 + s * 10;
++                println!(
++                    "  [routing-audit] s{}: logit0={:.3} logit1={:.3} max_logit={:.3} sum_exp={:.3} z={:.3}",
++                    s, fw[diag_base], fw[diag_base + 1], fw[diag_base + 2], fw[diag_base + 3], fw[diag_base + 4]
++                );
++            }
++        }
++        #[cfg(feature = "wgpu")]
+         if let Some(gpu) = trainer.gpu_deq.as_ref() {
+             let hist = gpu.read_hist_params_full();
+             let assoc = gpu.read_assoc_state();

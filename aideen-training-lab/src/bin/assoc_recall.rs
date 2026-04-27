@@ -983,6 +983,7 @@ fn main() {
     let mut rng_train = StdRng::seed_from_u64(42);
     let mut train_loss_sum = 0.0f32;
     let mut train_valid = 0usize;
+    let mut train_tokens_total = 0usize;
     let n_gaps = gaps.len();
     let mut last_train_case: Option<(usize, usize, ArSequence, f32, Vec<String>)> = None;
 
@@ -1004,23 +1005,51 @@ fn main() {
             train_loss_sum += loss;
             train_valid += 1;
         }
+        train_tokens_total += ar.seq.len();
         if assoc_audit {
             last_train_case = Some((i, gap, ar, loss, train_trace));
         }
 
-        if (i + 1) % 100 == 0 {
+        if (i + 1) % 20 == 0 {
             let avg = if train_valid > 0 {
                 train_loss_sum / train_valid as f32
             } else {
                 f32::NAN
             };
+            let elapsed = t_train.elapsed().as_secs_f32();
+            let tps = if elapsed > 0.0 {
+                train_tokens_total as f32 / elapsed
+            } else {
+                0.0
+            };
             println!(
-                "  train {:>4}/{} | avg_loss={:.4} | {:.1}s",
+                "  train {:>4}/{} | avg_loss={:.4} | {:.1}s | TPS={:.1}",
                 i + 1,
                 n_train,
                 avg,
-                t_train.elapsed().as_secs_f32()
+                elapsed,
+                tps
             );
+            #[cfg(feature = "wgpu")]
+            if let Some(gpu) = trainer.gpu_deq.as_ref() {
+                let fw = gpu.read_debug_buffer();
+                for s in 0..trainer.config.h_slots {
+                    let diag_base = 760 + s * 10;
+                    println!(
+                        "  [slot-audit] s{}: r_ent={:.3e} r_max={:.3} ctx_rms={:.3e} r_usage={:.3e} w_allow={:.3e} w_gate={:.3e} cos_max={:.3} r_n={:.0} w_n={:.0}",
+                        s,
+                        fw[diag_base],       // +0 avg read_entropy  (↓ = especialización)
+                        fw[diag_base + 1],   // +1 max read_max_prob (↑ = confía en 1 banco)
+                        fw[diag_base + 2],   // +2 max ctx_rms
+                        fw[diag_base + 3],   // +3 avg read_usage
+                        fw[diag_base + 4],   // +4 avg w_allow
+                        fw[diag_base + 5],   // +5 avg effective_bind_gate
+                        fw[diag_base + 6],   // +6 max cos_similarity
+                        fw[diag_base + 8],   // +8 r_n (contador lecturas)
+                        fw[diag_base + 9],   // +9 w_n (contador escrituras)
+                    );
+                }
+            }
             flush();
         }
     }
@@ -1090,6 +1119,17 @@ fn main() {
             wv_delta,
             delta_rms(&init_wq_assoc, &wq_assoc_now),
         );
+        #[cfg(feature = "wgpu")]
+        if let Some(gpu) = trainer.gpu_deq.as_ref() {
+            let fw = gpu.read_debug_buffer();
+            for s in 0..trainer.config.h_slots {
+                let diag_base = 760 + s * 10;
+                println!(
+                    "  [routing-audit] s{}: logit0={:.3} logit1={:.3} max_logit={:.3} sum_exp={:.3} z={:.3}",
+                    s, fw[diag_base], fw[diag_base + 1], fw[diag_base + 2], fw[diag_base + 3], fw[diag_base + 4]
+                );
+            }
+        }
         #[cfg(feature = "wgpu")]
         if let Some(gpu) = trainer.gpu_deq.as_ref() {
             let hist = gpu.read_hist_params_full();

@@ -1,0 +1,117 @@
+warning: unused import: `Mutex`
+ --> aideen-backbone/src/gpu_deq.rs:9:22
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `hist_selective`
+    --> aideen-backbone/src/gpu_deq.rs:4588:13
+     |
+4588 |         let hist_selective = self.cfg_hist_selective;
+     |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hist_selective`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: fields `assoc_slot_stride_floats`, `cfg_hist_train_carrier`, `cfg_hist_train_alog`, and `cfg_hist_train_delta` are never read
+   --> aideen-backbone/src/gpu_deq.rs:80:5
+    |
+69  | pub struct GpuDeqBackend {
+    |            ------------- fields in this struct
+...
+80  |     assoc_slot_stride_floats: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+193 |     cfg_hist_train_carrier: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+...
+196 |     cfg_hist_train_alog: bool,
+    |     ^^^^^^^^^^^^^^^^^^^
+197 |     cfg_hist_train_delta: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `aideen-backbone` (lib) generated 3 warnings (run `cargo fix --lib -p aideen-backbone` to apply 1 suggestion)
+warning: unused variable: `required_seq_cap`
+   --> aideen-training-lab/src/bin/assoc_recall.rs:812:9
+    |
+812 |     let required_seq_cap = gaps
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_required_seq_cap`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `aideen-training` (bin "assoc_recall") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.40s
+     Running `target/release/assoc_recall --audit`
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=600  n_eval=150  gaps=[0, 64, 128, 256]  pairs_per_seq=1
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  GPU ready.
+
+  Training (600 sequences, gaps=[0, 64, 128, 256])…
+  train   20/600 | avg_loss=3.7685 | 14.9s | TPS=157.2
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train   40/600 | avg_loss=3.6557 | 29.5s | TPS=158.5
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train   60/600 | avg_loss=3.5444 | 44.2s | TPS=158.7
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train   80/600 | avg_loss=3.4182 | 58.9s | TPS=158.9
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  100/600 | avg_loss=3.2933 | 73.2s | TPS=159.9
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  120/600 | avg_loss=3.1695 | 87.8s | TPS=159.9
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  140/600 | avg_loss=3.0200 | 102.6s | TPS=159.7
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  160/600 | avg_loss=2.8787 | 117.3s | TPS=159.6
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  180/600 | avg_loss=2.7483 | 131.6s | TPS=160.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  200/600 | avg_loss=2.6187 | 146.1s | TPS=160.2
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  train  220/600 | avg_loss=2.5124 | 160.5s | TPS=160.3
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=-1000000015047466219876688855040.000 r_n=0 w_n=0

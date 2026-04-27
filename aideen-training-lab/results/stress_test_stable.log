@@ -1,0 +1,95 @@
+warning: unused import: `Mutex`
+ --> aideen-backbone/src/gpu_deq.rs:9:22
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: field `assoc_slot_stride_floats` is never read
+  --> aideen-backbone/src/gpu_deq.rs:80:5
+   |
+69 | pub struct GpuDeqBackend {
+   |            ------------- field in this struct
+...
+80 |     assoc_slot_stride_floats: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `aideen-backbone` (lib) generated 2 warnings (run `cargo fix --lib -p aideen-backbone` to apply 1 suggestion)
+warning: unused variable: `required_seq_cap`
+   --> aideen-training-lab/src/bin/assoc_recall.rs:812:9
+    |
+812 |     let required_seq_cap = gaps
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_required_seq_cap`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `aideen-training` (bin "assoc_recall") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.45s
+     Running `/Users/sergiosolis/Programacion/aideen/target/release/assoc_recall`
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=2000  n_eval=150  gaps=[0, 64, 128, 256]  pairs_per_seq=4
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  GPU ready.
+
+  Training (2000 sequences, gaps=[0, 64, 128, 256])…
+[ASSOC-BWD-STEP] s0: val_rms=1.548e-3 score_grad_max=4.597e-3 wq_step_max=7.009e-4 wk_step_max=4.658e-2 alpha_grad_max=6.988e-8 key_grad_sum=2.092e1 gprev_sum=1.555e-2 write_mass=1.377e-2
+[ASSOC-BWD-STEP] s1: val_rms=5.293e-3 score_grad_max=4.034e-2 wq_step_max=4.881e-3 wk_step_max=2.768e-1 alpha_grad_max=2.429e-7 key_grad_sum=1.826e2 gprev_sum=4.795e-2 write_mass=1.436e-2
+[ASSOC-BWD-STEP] s2: val_rms=1.276e-3 score_grad_max=4.994e-3 wq_step_max=3.482e-6 wk_step_max=5.196e-3 alpha_grad_max=1.209e-8 key_grad_sum=1.184e0 gprev_sum=2.379e-4 write_mass=1.498e-2
+[ASSOC-BWD-STEP] s3: val_rms=1.767e-3 score_grad_max=1.225e-2 wq_step_max=9.188e-6 wk_step_max=8.056e-2 alpha_grad_max=1.053e-7 key_grad_sum=1.975e1 gprev_sum=4.302e-3 write_mass=1.563e-2
+    [90m[GPU-DEBUG] Step  1: hit= 30/40 (  0.0%) contr=1.033 solve=1.713e-1 rs_cg=0.0e0 iters=15.0 cap=12 damp=0.85 mode=NORMAL conv=OK tps=0.0 max_h=1.888969 sig/pre/fh/h=4.200e-3/1.175e0/1.194e0/1.175e0 attn=4.437e-3 attn/sig=1.056e0 attn_scale=4.256e0 i0_err=1.266e-1 i1_err=1.713e-1 i0_a/s=1.056e0 i1_a/s=1.056e0 i0_sc=4.256e0 i1_sc=4.256e0 imax_err=1@tok=2 imax_a=0@tok=7 nscale_max=1.000e0 pre/h=1.004e0 fh/h=1.164e0[0m
+    [90m[FPM-STEP] status=OK err_h=1.713e-1 exit_err_h=7.015e-2 exit_iter=20.00 err_M=1.000e0 z_max=0.121 z_avg=0.118 u2v_max=3.858e-2 memctx_rms=1.294e-5 memctx/sig=3.577e-3 dead=40 sat=0 rescue=0/0 pre_rescue=0 eps=1.000e-4 a_m=0.010 tau=0.50[0m
+    [90m[GPU-SLOTS] s0:Δ=1.71e-1,exit_err=6.59e-2,hit=10,it=20.0,c=1.03,h=1.89e0,exit=0/0/10,band=3.0e-2 | s1:Δ=1.70e-1,exit_err=7.15e-2,hit=10,it=20.0,c=-0.00,h=-4.94e-3,exit=0/0/10,band=3.0e-2 | s2:Δ=-3.19e-4,exit_err=7.09e-2,hit=0,it=0.0,c=0.00,h=1.73e0,exit=0/0/10,band=3.0e-2 | s3:Δ=1.71e-1,exit_err=7.22e-2,hit=10,it=20.0,c=1.03,h=1.77e0,exit=0/0/10,band=3.0e-2[0m
+    [90m[GPU-TOKENS] t00 h=0.000e0 v=0.000e0 a=0.000e0 t01 h=0.000e0 v=0.000e0 a=0.000e0 t02 h=0.000e0 v=0.000e0 a=0.000e0 t03 h=0.000e0 v=0.000e0 a=0.000e0 t04 h=0.000e0 v=0.000e0 a=0.000e0 t05 h=0.000e0 v=0.000e0 a=0.000e0 t06 h=0.000e0 v=0.000e0 a=0.000e0 t07 h=0.000e0 v=0.000e0 a=0.000e0 t08 h=0.000e0 v=0.000e0 a=0.000e0 t09 h=0.000e0 v=0.000e0 a=0.000e0[0m
+[ASSOC-BWD-STEP] s0: val_rms=1.340e-3 score_grad_max=9.855e-3 wq_step_max=2.246e-4 wk_step_max=1.038e-2 alpha_grad_max=3.185e-9 key_grad_sum=3.652e2 gprev_sum=7.841e-3 write_mass=6.853e-4
+[ASSOC-BWD-STEP] s1: val_rms=3.713e-3 score_grad_max=7.138e-3 wq_step_max=2.306e-4 wk_step_max=9.478e-3 alpha_grad_max=8.993e-9 key_grad_sum=5.634e2 gprev_sum=9.579e-3 write_mass=7.422e-4
+[ASSOC-BWD-STEP] s2: val_rms=1.471e-3 score_grad_max=1.195e-2 wq_step_max=0.000e0 wk_step_max=1.664e-2 alpha_grad_max=1.496e-8 key_grad_sum=6.375e2 gprev_sum=0.000e0 write_mass=8.041e-4
+[ASSOC-BWD-STEP] s3: val_rms=2.764e-3 score_grad_max=1.553e-2 wq_step_max=0.000e0 wk_step_max=1.598e-3 alpha_grad_max=6.114e-9 key_grad_sum=1.335e1 gprev_sum=0.000e0 write_mass=8.710e-4
+    [90m[GPU-DEBUG] Step  2: hit=141/296 ( 75.0%) contr=66.056 solve=4.463e0 rs_cg=0.0e0 iters=12.2 cap=16 damp=0.60 mode=EMERG conv=OK tps=42.6 max_h=2.082854 sig/pre/fh/h=4.129e-3/8.952e1/1.604e0/1.399e0 attn=1.760e2 attn/sig=4.263e4 attn_scale=1.479e3 i0_err=1.604e-1 i1_err=2.981e-1 i0_a/s=2.152e4 i1_a/s=9.881e2 i0_sc=1.479e3 i1_sc=1.479e3 imax_err=15@tok=67 imax_a=11@tok=54 nscale_max=1.000e0 pre/h=7.643e1 fh/h=1.577e0[0m
+    [90m[FPM-STEP] status=OK err_h=4.463e0 exit_err_h=4.694e-2 exit_iter=17.16 err_M=1.000e0 z_max=0.121 z_avg=0.118 u2v_max=4.668e-2 memctx_rms=1.201e-3 memctx/sig=3.992e-3 dead=296 sat=0 rescue=0/0 pre_rescue=82 eps=1.000e-4 a_m=0.010 tau=0.50[0m
+    [90m[GPU-SLOTS] s0:Δ=4.46e0,exit_err=4.68e-2,hit=53,it=17.9,c=66.06,h=1.72e0,exit=0/21/53,band=3.0e-2 | s1:Δ=7.21e-1,exit_err=5.87e-2,hit=65,it=18.9,c=-0.06,h=2.00e-1,exit=0/9/65,band=3.0e-2 | s2:Δ=-2.07e-3,exit_err=5.90e-2,hit=0,it=0.0,c=0.00,h=2.08e0,exit=0/1/73,band=3.0e-2 | s3:Δ=7.92e-1,exit_err=2.32e-2,hit=23,it=12.0,c=11.87,h=1.34e0,exit=0/51/23,band=3.0e-2[0m
+[ASSOC-BWD-STEP] s0: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s1: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s2: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s3: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+    [90m[GPU-DEBUG] Step  3: hit=141/296 ( 47.7%) contr=66.056 solve=4.463e0 rs_cg=0.0e0 iters=12.2 cap=16 damp=0.60 mode=EMERG conv=OK tps=45.0 max_h=2.082854 sig/pre/fh/h=4.129e-3/8.952e1/1.604e0/1.399e0 attn=1.760e2 attn/sig=4.263e4 attn_scale=1.479e3 i0_err=1.604e-1 i1_err=2.981e-1 i0_a/s=2.152e4 i1_a/s=9.881e2 i0_sc=1.479e3 i1_sc=1.479e3 imax_err=15@tok=67 imax_a=11@tok=54 nscale_max=1.000e0 pre/h=7.643e1 fh/h=1.577e0[0m
+    [90m[FPM-STEP] status=OK err_h=4.463e0 exit_err_h=4.694e-2 exit_iter=17.16 err_M=1.000e0 z_max=0.121 z_avg=0.118 u2v_max=4.668e-2 memctx_rms=1.201e-3 memctx/sig=3.992e-3 dead=296 sat=0 rescue=0/0 pre_rescue=82 eps=1.000e-4 a_m=0.010 tau=0.50[0m
+    [90m[GPU-SLOTS] s0:Δ=4.46e0,exit_err=4.68e-2,hit=53,it=17.9,c=66.06,h=1.72e0,exit=0/21/53,band=3.0e-2 | s1:Δ=7.21e-1,exit_err=5.87e-2,hit=65,it=18.9,c=0.00,h=0.00e0,exit=0/9/65,band=3.0e-2 | s2:Δ=0.00e0,exit_err=5.90e-2,hit=0,it=0.0,c=0.00,h=2.08e0,exit=0/1/73,band=3.0e-2 | s3:Δ=7.92e-1,exit_err=2.32e-2,hit=23,it=12.0,c=11.87,h=1.34e0,exit=0/51/23,band=3.0e-2[0m
+[ASSOC-BWD-STEP] s0: val_rms=1.505e-3 score_grad_max=1.592e-3 wq_step_max=1.297e-4 wk_step_max=7.194e-3 alpha_grad_max=7.936e-8 key_grad_sum=1.117e1 gprev_sum=1.286e-3 write_mass=6.853e-4
+[ASSOC-BWD-STEP] s1: val_rms=4.968e-3 score_grad_max=1.117e-3 wq_step_max=0.000e0 wk_step_max=6.249e-3 alpha_grad_max=7.060e-8 key_grad_sum=2.777e0 gprev_sum=5.153e-4 write_mass=1.436e-2
+[ASSOC-BWD-STEP] s2: val_rms=1.198e-3 score_grad_max=4.413e-3 wq_step_max=0.000e0 wk_step_max=2.547e-2 alpha_grad_max=4.763e-9 key_grad_sum=1.494e1 gprev_sum=2.365e-3 write_mass=8.041e-4
+[ASSOC-BWD-STEP] s3: val_rms=1.887e-3 score_grad_max=8.342e-3 wq_step_max=0.000e0 wk_step_max=3.842e-2 alpha_grad_max=5.143e-8 key_grad_sum=1.975e1 gprev_sum=4.507e-4 write_mass=8.710e-4
+    [90m[GPU-DEBUG] Step  4: hit= 17/40 ( 47.7%) contr=9.455 solve=1.180e-1 rs_cg=0.0e0 iters=11.8 cap=16 damp=0.60 mode=EMERG conv=OK tps=3.4 max_h=1.883447 sig/pre/fh/h=3.897e-3/1.174e0/1.190e0/1.174e0 attn=4.380e-3 attn/sig=1.124e0 attn_scale=4.169e0 i0_err=8.907e-2 i1_err=1.173e-1 i0_a/s=1.124e0 i1_a/s=1.124e0 i0_sc=4.169e0 i1_sc=4.169e0 imax_err=2@tok=2 imax_a=0@tok=7 nscale_max=1.000e0 pre/h=1.004e0 fh/h=1.115e0[0m
+    [90m[FPM-STEP] status=OK err_h=1.180e-1 exit_err_h=4.032e-2 exit_iter=13.98 err_M=1.000e0 z_max=0.121 z_avg=0.118 u2v_max=4.328e-2 memctx_rms=1.560e-5 memctx/sig=4.093e-3 dead=40 sat=0 rescue=0/0 pre_rescue=22 eps=1.000e-4 a_m=0.010 tau=0.50[0m
+    [90m[GPU-SLOTS] s0:Δ=1.18e-1,exit_err=3.95e-2,hit=5,it=15.6,c=9.46,h=1.85e0,exit=0/5/5,band=3.0e-2 | s1:Δ=1.16e-1,exit_err=5.91e-2,hit=8,it=18.7,c=0.00,h=-4.55e-4,exit=0/2/8,band=3.0e-2 | s2:Δ=4.45e-5,exit_err=2.75e-2,hit=0,it=0.0,c=0.00,h=1.88e0,exit=0/9/1,band=3.0e-2 | s3:Δ=1.16e-1,exit_err=3.52e-2,hit=4,it=13.0,c=1.06,h=1.81e0,exit=0/6/4,band=3.0e-2[0m
+    [90m[GPU-TOKENS] t00 h=0.000e0 v=0.000e0 a=0.000e0 t01 h=0.000e0 v=0.000e0 a=0.000e0 t02 h=0.000e0 v=0.000e0 a=0.000e0 t03 h=0.000e0 v=0.000e0 a=0.000e0 t04 h=0.000e0 v=0.000e0 a=0.000e0 t05 h=0.000e0 v=0.000e0 a=0.000e0 t06 h=0.000e0 v=0.000e0 a=0.000e0 t07 h=0.000e0 v=0.000e0 a=0.000e0 t08 h=0.000e0 v=0.000e0 a=0.000e0 t09 h=0.000e0 v=0.000e0 a=0.000e0[0m
+[ASSOC-BWD-STEP] s0: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s1: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s2: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s3: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+    [90m[GPU-DEBUG] Step  5: hit=374/512 ( 42.5%) contr=68.408 solve=2.002e0 rs_cg=0.0e0 iters=15.0 cap=16 damp=0.60 mode=EMERG conv=OK tps=52.9 max_h=1.703401 sig/pre/fh/h=4.019e-3/3.240e2/1.359e0/1.295e0 attn=3.128e2 attn/sig=7.782e4 attn_scale=9.471e2 i0_err=2.002e0 i1_err=1.648e0 i0_a/s=7.782e4 i1_a/s=1.084e3 i0_sc=9.471e2 i1_sc=9.471e2 imax_err=0@tok=85 imax_a=0@tok=80 nscale_max=1.000e0 pre/h=2.761e2 fh/h=1.795e0[0m
+    [90m[FPM-STEP] status=OK err_h=2.002e0 exit_err_h=7.679e-2 exit_iter=19.73 err_M=1.000e0 z_max=0.121 z_avg=0.118 u2v_max=2.909e-2 memctx_rms=3.944e-3 memctx/sig=3.651e-3 dead=512 sat=0 rescue=0/0 pre_rescue=15 eps=1.000e-4 a_m=0.010 tau=0.50[0m
+    [90m[GPU-SLOTS] s0:Δ=1.65e0,exit_err=7.75e-2,hit=124,it=19.7,c=68.41,h=1.69e0,exit=0/4/124,band=3.0e-2 | s1:Δ=4.97e-1,exit_err=8.06e-2,hit=125,it=19.8,c=-0.09,h=1.17e0,exit=0/3/125,band=3.0e-2 | s2:Δ=-3.84e-2,exit_err=6.65e-2,hit=0,it=0.7,c=0.00,h=1.69e0,exit=0/5/123,band=3.0e-2 | s3:Δ=5.05e-1,exit_err=8.25e-2,hit=125,it=19.9,c=6.69,h=1.70e0,exit=0/3/125,band=3.0e-2[0m
+[ASSOC-BWD-STEP] s0: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s1: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s2: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s3: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s0: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s1: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s2: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s3: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s0: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s1: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s2: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0
+[ASSOC-BWD-STEP] s3: val_rms=0.000e0 score_grad_max=0.000e0 wq_step_max=0.000e0 wk_step_max=0.000e0 alpha_grad_max=0.000e0 key_grad_sum=0.000e0 gprev_sum=0.000e0 write_mass=0.000e0

@@ -1,0 +1,64 @@
+   Compiling aideen-block v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-block)
+   Compiling aideen-backbone v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-backbone)
+warning: unused import: `Mutex`
+ --> aideen-backbone/src/gpu_deq.rs:9:22
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: field `assoc_slot_stride_floats` is never read
+  --> aideen-backbone/src/gpu_deq.rs:80:5
+   |
+69 | pub struct GpuDeqBackend {
+   |            ------------- field in this struct
+...
+80 |     assoc_slot_stride_floats: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+   Compiling aideen-training v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-training-lab)
+warning: `aideen-backbone` (lib) generated 2 warnings (run `cargo fix --lib -p aideen-backbone` to apply 1 suggestion)
+warning: unused variable: `required_seq_cap`
+   --> aideen-training-lab/src/bin/assoc_recall.rs:812:9
+    |
+812 |     let required_seq_cap = gaps
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_required_seq_cap`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `aideen-training` (bin "assoc_recall") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 8.98s
+     Running `target/release/assoc_recall`
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=600  n_eval=150  gaps=[0, 64, 128, 256]  pairs_per_seq=1
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+
+thread 'main' panicked at /Users/sergiosolis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-23.0.1/src/backend/wgpu_core.rs:824:22:
+wgpu error: Validation Error
+
+Caused by:
+  In Device::create_shader_module, label = 'Fused DEQ Update Shader'
+    
+Shader 'Fused DEQ Update Shader' parsing error: no definition in scope for identifier: 'entry_base'
+    ┌─ wgsl:128:41
+    │
+128 │                 let wh = weighted_h_buf[entry_base(entry, d) + dim];
+    │                                         ^^^^^^^^^^ unknown identifier
+
+
+      no definition in scope for identifier: 'entry_base'
+
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

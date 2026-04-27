@@ -1,0 +1,171 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=600  n_eval=150  gaps=[0, 64, 128, 256]  pairs_per_seq=1
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+  GPU ready.
+
+  Training (600 sequences, gaps=[0, 64, 128, 256])…
+  train   20/600 | avg_loss=3.9252 | 444.9s | TPS=5.3
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train   40/600 | avg_loss=3.9180 | 2845.1s | TPS=1.6
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train   60/600 | avg_loss=3.9155 | 5125.2s | TPS=1.4
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train   80/600 | avg_loss=3.9143 | 7465.5s | TPS=1.3
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  100/600 | avg_loss=3.9136 | 9745.7s | TPS=1.2
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  120/600 | avg_loss=3.9131 | 12086.0s | TPS=1.2
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  140/600 | avg_loss=3.9128 | 14426.2s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  160/600 | avg_loss=3.9125 | 16826.4s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  180/600 | avg_loss=3.9123 | 19166.6s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  200/600 | avg_loss=3.9122 | 21506.8s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  220/600 | avg_loss=3.9120 | 23607.0s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  240/600 | avg_loss=3.9119 | 25947.3s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  260/600 | avg_loss=3.9118 | 28167.5s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  280/600 | avg_loss=3.9117 | 30567.8s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  300/600 | avg_loss=3.9117 | 32728.0s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  320/600 | avg_loss=3.9116 | 35008.2s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  340/600 | avg_loss=3.9115 | 37288.4s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  360/600 | avg_loss=3.9115 | 39688.7s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  380/600 | avg_loss=3.9114 | 42028.9s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  400/600 | avg_loss=3.9114 | 44369.1s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  420/600 | avg_loss=3.9114 | 46709.4s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  440/600 | avg_loss=3.9113 | 49109.6s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  460/600 | avg_loss=3.9113 | 51329.9s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  480/600 | avg_loss=3.9113 | 53730.2s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  500/600 | avg_loss=3.9113 | 55950.5s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  520/600 | avg_loss=3.9112 | 58230.9s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  540/600 | avg_loss=3.9112 | 60571.3s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  560/600 | avg_loss=3.9112 | 62791.7s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  580/600 | avg_loss=3.9112 | 64772.1s | TPS=1.0
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  train  600/600 | avg_loss=3.9112 | 66512.5s | TPS=1.1
+  [slot-audit] s0: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s1: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s2: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  [slot-audit] s3: r_ent=0.000e0 r_max=0.000 ctx_rms=0.000e0 r_usage=0.000e0 w_allow=0.000e0 w_gate=0.000e0 cos_max=0.000 r_n=0 w_n=0
+  Training done: avg_loss=3.9112  (66572.5s total)
+
+  Evaluation (eval_mode, no weight updates):
+       gap   answer_loss   random_base  retention
+  ────────────────────────────────────────────────────────
+         0        3.9107        3.9120  100.0% ~ random
