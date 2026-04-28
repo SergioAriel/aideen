@@ -225,13 +225,9 @@ impl FixedPointMemoryReasoning {
     fn default_slot_anchor(config: &ArchitectureConfig) -> DMatrix<f32> {
         let h_slots = config.h_slots;
         let d_r = config.d_r;
-        DMatrix::from_fn(h_slots, d_r, |slot, dim| {
-            // Equal-norm deterministic slot code: break permutation symmetry without giving
-            // edge slots larger amplitude than middle slots.
-            let theta = std::f32::consts::TAU * (slot as f32) / (h_slots.max(1) as f32);
-            let phi0 = 0.061 * dim as f32;
-            let phi1 = 0.113 * dim as f32;
-            1.0e-3f32 * (theta + phi0).sin() + 1.0e-3f32 * (theta + phi1).cos()
+        let mut rng = thread_rng();
+        DMatrix::from_fn(h_slots, d_r, |_, _| {
+            rng.gen_range(-1.0..1.0f32)
         })
     }
 

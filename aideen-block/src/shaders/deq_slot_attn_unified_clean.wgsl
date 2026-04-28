@@ -1477,10 +1477,12 @@ fn deq_slot_coord_unified_main(
                 for (var d = tid; d < d_model; d = d + WG_SIZE) {
                     let h_prev = H_curr[h_base + slot_offset + d];
                     let attn = select(0.0, Scratch[attn_base + d] * slot_attn_scale, recurrent_slot_attn_enabled || iter == 0u);
+                    let assoc_inj_d = select(assoc_inj0, assoc_inj1, d >= WG_SIZE);
                     let pre = Scratch[signal_base + d]
                         + H_SELF_FEEDBACK * h_prev
                         + attn
-                        + AllWeights[slot_anchor_mat_base + d];
+                        + AllWeights[slot_anchor_mat_base + d]
+                        + assoc_inj_d;
                     H_next[h_base_t + slot_offset + d] = pre;
                     local_sumsq = local_sumsq + pre * pre;
                 }
@@ -2429,6 +2431,13 @@ fn deq_slot_coord_unified_main(
 
                 // ── Librarian Stage 3: Competitive Bank Placement ────────────────────
                 // Within the slot, banks compete for the token using cosine similarity.
+                let novelty = 1.0 - max(0.0, best_cos);
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    let bank_base = assoc_slot_base + bank * assoc_bank_stride;
+                    let bank_usage = AssocBuf[bank_base + ASSOC_RANK + d_model];
+                    let empty_bonus = novelty * max(0.0, 1.0 - bank_usage) * 2.0;
+                    bank_scores[bank] = bank_scores[bank] + empty_bonus;
+                }
                 var max_bank_score = -1.0e30;
                 for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                     max_bank_score = max(max_bank_score, bank_scores[bank]);
@@ -2444,15 +2453,18 @@ fn deq_slot_coord_unified_main(
                     bank_probs[bank] = bank_probs[bank] / max(bank_denom, 1.0e-6);
                 }
                 
-                // Hierarchical Decision: Total Write Mass = Relevance * SlotProb * BankProb
-                chosen_bank = best_bank;
-                allow_write = event_gate * p_slot_i * bank_probs[best_bank];
-                if (best_cos < ASSOC_ALLOC_NOVELTY_THRESHOLD && found_empty) {
-                    chosen_bank = empty_bank;
-                    // If novel, we use the allocated slot mass but equally distributed across banks.
-                    allow_write = event_gate * p_slot_i; 
-                    overwrite_bank = 1.0;
+                var final_best_bank = 0u;
+                var highest_prob = -1.0;
+                for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                    if (bank_probs[bank] > highest_prob) {
+                        highest_prob = bank_probs[bank];
+                        final_best_bank = bank;
+                    }
                 }
+                
+                // Hierarchical Decision: Total Write Mass = Relevance * SlotProb * BankProb
+                chosen_bank = final_best_bank;
+                allow_write = event_gate * p_slot_i * bank_probs[final_best_bank];
                 shared_vals[3u * ASSOC_RANK] = f32(chosen_bank);
                 shared_vals[3u * ASSOC_RANK + 1u] = allow_write;
                 shared_vals[3u * ASSOC_RANK + 2u] = best_cos;
@@ -2490,8 +2502,8 @@ fn deq_slot_coord_unified_main(
             let overwrite_bank = AssocHist[assoc_hist_base + assoc_slot_stride + 3u];
             let key_write_mass = effective_write_mass;
             let key_keep_gate = 1.0 - effective_write_mass;
-            let value_write_mass = select(0.0, effective_write_mass, overwrite_bank > 0.5);
-            let value_keep_gate = select(1.0, 1.0 - value_write_mass, overwrite_bank > 0.5);
+            let value_write_mass = effective_write_mass;
+            let value_keep_gate = 1.0 - effective_write_mass;
             if (tid == 0u) {
                 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: write allocation telemetry.
                 // We use a clean snapshot of the last token in the first batch to avoid race-riddled averages.
@@ -2500,11 +2512,11 @@ fn deq_slot_coord_unified_main(
                     DebugLog[assoc_diag_base + 0u] = 0.0; // r_ent (unused)
                     DebugLog[assoc_diag_base + 1u] = 1.0; // r_max (unused)
                     DebugLog[assoc_diag_base + 2u] = 1.0; // ctx_rms (unused)
-                    DebugLog[assoc_diag_base + 3u] = min_usage;
+                    DebugLog[assoc_diag_base + 3u] = shared_vals[3u * ASSOC_RANK + 3u]; // min_usage
                     DebugLog[assoc_diag_base + 4u] = assoc_write_allowed;
                     DebugLog[assoc_diag_base + 5u] = effective_bind_gate;
-                    DebugLog[assoc_diag_base + 6u] = best_cos;
-                    DebugLog[assoc_diag_base + 7u] = p_slot_i;
+                    DebugLog[assoc_diag_base + 6u] = shared_vals[3u * ASSOC_RANK + 2u]; // best_cos
+                    DebugLog[assoc_diag_base + 7u] = 0.0; // p_slot_i (unused in audit)
                     DebugLog[assoc_diag_base + 8u] = 1.0; // r_n marker
                     DebugLog[assoc_diag_base + 9u] = 1.0; // w_n marker
                     

@@ -740,8 +740,8 @@ fn fused_fpm_retain_bwd_main(
                 let dim = lane * dims_per_lane + k;
                 let effective_bind_gate = bind_gate * assoc_write_allowed * assoc_transition_gate;
                 let effective_write_mass = effective_bind_gate * effective_bind_gate;
-                let value_write_mass = select(0.0, effective_write_mass, overwrite_bank > 0.5);
-                let value_keep_gate = select(1.0, 1.0 - value_write_mass, overwrite_bank > 0.5);
+                let value_write_mass = effective_write_mass;
+                let value_keep_gate = 1.0 - effective_write_mass;
                 let val_idx = chosen_bank * assoc_bank_stride + RETAIN_RANK + dim;
                 let g_bank_val_curr = assoc_gb[val_idx];
                 shared_vec[dim] = value_write_mass * g_bank_val_curr;
