@@ -49,14 +49,56 @@ use rand::{Rng, SeedableRng};
 //  17..=32  → VAL tokens
 //      33   → QUERY marker
 //  34..=49  → FILLER (random noise during gap)
-const N_KEYS: u32 = 16;
-const N_VALS: u32 = 16;
-const TOK_KEY_BASE: u32 = 1;
-const TOK_VAL_BASE: u32 = 17;
-const TOK_QUERY: u32 = 33;
-const TOK_FILLER_BASE: u32 = 34;
-const N_FILLER: u32 = 16;
-const VOCAB_SIZE: usize = 50;
+const DEFAULT_N_KEYS: u32 = 16;
+const DEFAULT_N_VALS: u32 = 16;
+const DEFAULT_N_FILLER: u32 = 16;
+
+#[derive(Clone, Copy)]
+struct ArVocab {
+    n_keys: u32,
+    n_vals: u32,
+    n_filler: u32,
+    tok_key_base: u32,
+    tok_val_base: u32,
+    tok_query: u32,
+    tok_filler_base: u32,
+    vocab_size: usize,
+}
+
+impl ArVocab {
+    fn from_env() -> Self {
+        let n_keys = std::env::var("AR_N_KEYS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_N_KEYS)
+            .max(1);
+        let n_vals = std::env::var("AR_N_VALS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_N_VALS)
+            .max(1);
+        let n_filler = std::env::var("AR_N_FILLER")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_N_FILLER)
+            .max(1);
+        let tok_key_base = 1;
+        let tok_val_base = tok_key_base + n_keys;
+        let tok_query = tok_val_base + n_vals;
+        let tok_filler_base = tok_query + 1;
+        let vocab_size = (tok_filler_base + n_filler) as usize;
+        Self {
+            n_keys,
+            n_vals,
+            n_filler,
+            tok_key_base,
+            tok_val_base,
+            tok_query,
+            tok_filler_base,
+            vocab_size,
+        }
+    }
+}
 
 struct ArSequence {
     seq: Vec<u32>,
@@ -66,13 +108,14 @@ struct ArSequence {
 
 // ── Builds one AR sequence ────────────────────────────────────────────────────
 fn make_ar_sequence(
+    vocab: ArVocab,
     key: u32,
     val: u32,
     gap: usize,
     pairs_per_seq: usize,
     rng: &mut StdRng,
 ) -> ArSequence {
-    let pairs_per_seq = pairs_per_seq.clamp(1, N_KEYS as usize);
+    let pairs_per_seq = pairs_per_seq.clamp(1, vocab.n_keys as usize);
     // Format:
     //   pairs=1: KEY_i VAL_i FILLER×gap KEY_i QUERY VAL_i
     //   pairs>1: (KEY_j VAL_j)*N FILLER×gap KEY_q QUERY VAL_q
@@ -83,25 +126,25 @@ fn make_ar_sequence(
     pairs.push((key, val));
     let mut used_keys = vec![key];
     for _ in 1..pairs_per_seq {
-        let mut extra_key = rng.gen_range(0..N_KEYS);
+        let mut extra_key = rng.gen_range(0..vocab.n_keys);
         while used_keys.contains(&extra_key) {
-            extra_key = rng.gen_range(0..N_KEYS);
+            extra_key = rng.gen_range(0..vocab.n_keys);
         }
         used_keys.push(extra_key);
-        let extra_val = rng.gen_range(0..N_VALS);
+        let extra_val = rng.gen_range(0..vocab.n_vals);
         pairs.push((extra_key, extra_val));
     }
     for &(pair_key, pair_val) in &pairs {
-        seq.push(TOK_KEY_BASE + pair_key);
-        seq.push(TOK_VAL_BASE + pair_val);
+        seq.push(vocab.tok_key_base + pair_key);
+        seq.push(vocab.tok_val_base + pair_val);
     }
     for _ in 0..gap {
-        seq.push(TOK_FILLER_BASE + rng.gen_range(0..N_FILLER));
+        seq.push(vocab.tok_filler_base + rng.gen_range(0..vocab.n_filler));
     }
     let (query_key, query_val) = pairs[rng.gen_range(0..pairs.len())];
-    seq.push(TOK_KEY_BASE + query_key);
-    seq.push(TOK_QUERY);
-    seq.push(TOK_VAL_BASE + query_val); // answer token (last)
+    seq.push(vocab.tok_key_base + query_key);
+    seq.push(vocab.tok_query);
+    seq.push(vocab.tok_val_base + query_val); // answer token (last)
     ArSequence { seq, query_key, query_val }
 }
 
@@ -163,7 +206,14 @@ fn effective_full_cap(trainer: &Trainer, ctx_len: usize) -> usize {
     if internal_segment_recurrence_mode() {
         trainer.gpu_sequence_capacity()
     } else {
-        assoc_segment_len(ctx_len).unwrap_or_else(|| trainer.gpu_sequence_capacity())
+        assoc_segment_len(ctx_len).unwrap_or_else(|| {
+            let configured_cap = std::env::var("AIDEEN_SEQ_CAP")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(ctx_len.max(1))
+                .max(ctx_len.max(1));
+            trainer.gpu_sequence_capacity().max(configured_cap)
+        })
     }
 }
 
@@ -321,6 +371,7 @@ fn format_lm_top_debug(
     trainer: &Trainer,
     final_token_index: usize,
     query_key_tok: u32,
+    query_marker_tok: u32,
     target: u32,
 ) -> String {
     let Some(gpu) = trainer.gpu_deq.as_ref() else {
@@ -329,10 +380,17 @@ fn format_lm_top_debug(
     let Some(gpu_lm) = trainer.gpu_lm.as_ref() else {
         return "lm_top=NA".to_string();
     };
+    let Some(gpu_emb) = trainer.gpu_emb.as_ref() else {
+        return "lm_top=NA".to_string();
+    };
     let Ok((w, b, g)) = gpu_lm.read_weights(&gpu.device, &gpu.queue) else {
         return "lm_top=NA".to_string();
     };
+    let Ok(emb_weights) = gpu_emb.read_weights(&gpu.device, &gpu.queue) else {
+        return "lm_top=NA".to_string();
+    };
     let h = gpu.read_hpooled_at(final_token_index);
+    let assoc_h = gpu.read_assoc_pooled_at(final_token_index);
     let h_slots_flat = gpu.read_hnext_seq((final_token_index + 1) as u32);
     let assoc_state = gpu.read_assoc_state();
     let debug = gpu.read_debug_buffer();
@@ -342,20 +400,28 @@ fn format_lm_top_debug(
     let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 16))
         .unwrap_or(1);
     const ASSOC_RANK: usize = 32;
     let assoc_bank_stride = ASSOC_RANK + d + 1;
     let assoc_slot_stride = assoc_banks * assoc_bank_stride;
     if h.len() < d
+        || assoc_h.len() < d
         || h_slots_flat.len() < (final_token_index + 1) * h_slots * d
         || assoc_state.len() < h_slots * assoc_slot_stride
         || w.len() < vocab * d
         || b.len() < vocab
         || g.len() < d
+        || emb_weights.len() < trainer.tokenizer.vocab_size() * d
     {
         return "lm_top=bad-shape".to_string();
     }
-    let compute_logits = |h_vec: &[f32]| -> Vec<f32> {
+    let assoc_lambda = std::env::var("AIDEEN_ASSOC_LOGIT_LAMBDA")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(1.0)
+        .max(0.0);
+    let compute_logits = |h_vec: &[f32], assoc_vec: Option<&[f32]>| -> Vec<f32> {
         let h_rms = (h_vec.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32 + 1e-5).sqrt();
         let mut logits = vec![0.0f32; vocab];
         for v in 0..vocab {
@@ -363,6 +429,13 @@ fn format_lm_top_debug(
             let row = v * d;
             for j in 0..d {
                 acc += w[row + j] * (h_vec[j] / h_rms) * g[j];
+            }
+            if assoc_lambda > 0.0 {
+                if let Some(assoc_vec) = assoc_vec {
+                    for j in 0..d {
+                        acc += assoc_lambda * emb_weights[v * d + j] * assoc_vec[j];
+                    }
+                }
             }
             logits[v] = acc;
         }
@@ -374,7 +447,7 @@ fn format_lm_top_debug(
         for v in 0..trainer.tokenizer.vocab_size() {
             let mut acc = 0.0f32;
             for j in 0..d {
-                acc += trainer.tokenizer.embeddings[(v, j)] * (h_vec[j] / h_rms);
+                acc += emb_weights[v * d + j] * (h_vec[j] / h_rms);
             }
             logits[v] = acc;
         }
@@ -390,14 +463,14 @@ fn format_lm_top_debug(
         let mut e_norm = 0.0f32;
         for j in 0..d {
             let hv = h_vec[j];
-            let ev = trainer.tokenizer.embeddings[(tok_idx, j)];
+            let ev = emb_weights[tok_idx * d + j];
             dot += hv * ev;
             h_norm += hv * hv;
             e_norm += ev * ev;
         }
         dot / (h_norm * e_norm).max(1e-12).sqrt()
     };
-    let logits = compute_logits(&h[..d]);
+    let logits = compute_logits(&h[..d], Some(&assoc_h[..d]));
     let mut top = (0usize, f32::NEG_INFINITY);
     let mut second = (0usize, f32::NEG_INFINITY);
     for (idx, &logit) in logits.iter().enumerate() {
@@ -422,7 +495,7 @@ fn format_lm_top_debug(
     let mut best_slot_target_logit = f32::NEG_INFINITY;
     for slot in 0..h_slots {
         let slot_base = token_base + slot * d;
-        let slot_logits = compute_logits(&h_slots_flat[slot_base..slot_base + d]);
+        let slot_logits = compute_logits(&h_slots_flat[slot_base..slot_base + d], None);
         let slot_mx = slot_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let slot_denom = slot_logits
             .iter()
@@ -476,7 +549,7 @@ fn format_lm_top_debug(
                 continue;
             }
             let bank_value = &assoc_state[value_base..value_base + d];
-            let bank_logits = compute_logits(bank_value);
+            let bank_logits = compute_logits(bank_value, None);
             let bank_mx = bank_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let bank_denom = bank_logits
                 .iter()
@@ -523,12 +596,12 @@ fn format_lm_top_debug(
                     .unwrap_or(f32::NAN);
                 best_bank_target_cos = emb_cos(bank_value, target);
                 best_bank_key_cos = emb_cos(bank_value, query_key_tok);
-                best_bank_query_cos = emb_cos(bank_value, TOK_QUERY);
+                best_bank_query_cos = emb_cos(bank_value, query_marker_tok);
                 let mut fused = h[..d].to_vec();
                 for j in 0..d {
                     fused[j] += bank_value[j];
                 }
-                let fused_logits = compute_logits(&fused);
+                let fused_logits = compute_logits(&fused, Some(&assoc_h[..d]));
                 let fused_mx = fused_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let fused_denom = fused_logits
                     .iter()
@@ -804,18 +877,23 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(150);
+    let ar_vocab = ArVocab::from_env();
     let pairs_per_seq: usize = std::env::var("AR_PAIRS_PER_SEQ")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
-        .clamp(1, N_KEYS as usize);
-    let required_seq_cap = gaps
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        + 2 * pairs_per_seq
-        + 2;
+        .clamp(1, ar_vocab.n_keys as usize);
+    let oracle_write_pos_enabled = std::env::var("AIDEEN_ASSOC_ORACLE_WRITE_POS")
+        .or_else(|_| std::env::var("AIDEEN_ASSOC_ORACLE_WRITE_POSITIONS"))
+        .ok()
+        .map(|v| {
+            let vl = v.trim().to_ascii_lowercase();
+            vl == "1" || vl == "true" || vl == "yes"
+        })
+        .unwrap_or(false);
+    if oracle_write_pos_enabled && std::env::var("AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS").is_err() {
+        std::env::set_var("AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS", pairs_per_seq.to_string());
+    }
     // AIDEEN_SEQ_CAP override removed to enforce strict local learning chunking.
     // The sequence will now be properly split into ctx_len chunks by run_sequence_chunks.
 
@@ -829,24 +907,30 @@ fn main() {
         "FPM+SlotAttn"
     };
 
-    let random_baseline = (VOCAB_SIZE as f32).ln(); // full-vocab LM baseline
+    let random_baseline = (ar_vocab.vocab_size as f32).ln(); // full-vocab LM baseline
 
     println!("╔══════════════════════════════════════════════════════════════════════╗");
     println!("║              AIDEEN  Associative Recall Benchmark                   ║");
     println!("╚══════════════════════════════════════════════════════════════════════╝");
-    println!("  vocab={}  keys={}  vals={}", VOCAB_SIZE, N_KEYS, N_VALS);
+    println!(
+        "  vocab={}  keys={}  vals={}  fillers={}",
+        ar_vocab.vocab_size, ar_vocab.n_keys, ar_vocab.n_vals, ar_vocab.n_filler
+    );
     println!("  ctx_len={}  mode={}", ctx_len, mode_label);
     println!(
         "  n_train={}  n_eval={}  gaps={:?}  pairs_per_seq={}",
         n_train, n_eval, gaps, pairs_per_seq
     );
-    println!("  random_baseline = log(vocab={}) = {:.4}", VOCAB_SIZE, random_baseline);
+    println!(
+        "  random_baseline = log(vocab={}) = {:.4}",
+        ar_vocab.vocab_size, random_baseline
+    );
     println!();
     flush();
 
     // ── Build ONE trainer (one GPU init, one Metal shader compilation) ─────────
     let mut arch = ArchitectureConfig::default();
-    arch.vocab_size = VOCAB_SIZE;
+    arch.vocab_size = ar_vocab.vocab_size;
     arch.d_r = std::env::var("AIDEEN_D_MODEL")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -869,20 +953,20 @@ fn main() {
     // Default is 512, which causes an infinite rejection-sampling loop when
     // vocab_size=50 (can never fill 512 unique indices from a pool of 50).
     // Set to vocab_size to get full softmax over all tokens.
-    arch.num_samples = VOCAB_SIZE;
+    arch.num_samples = ar_vocab.vocab_size;
 
     println!("  d_r={}  h_slots={}", arch.d_r, arch.h_slots);
     println!("  Initializing GPU (Metal shader compilation may take a few minutes)…");
     flush();
 
-    let mut tok = Tokenizer::new_empty(VOCAB_SIZE, arch);
+    let mut tok = Tokenizer::new_empty(ar_vocab.vocab_size, arch);
     // new_empty initialises embeddings to zero → DEQ receives zero input → NaN.
     // Initialise with small random values (same scale as from_text / from_hf).
     {
         let d = tok.embeddings.ncols();
         let scale = (d as f32).sqrt().recip(); // 1/sqrt(d_r) ≈ 0.044 for d=512
         let mut rng_emb = StdRng::seed_from_u64(1234);
-        for v in 0..VOCAB_SIZE {
+        for v in 0..ar_vocab.vocab_size {
             for j in 0..d {
                 tok.embeddings[(v, j)] = rng_emb.gen_range(-scale..scale);
             }
@@ -966,6 +1050,14 @@ fn main() {
     let init_wq_assoc = flatten_mats(&trainer.reasoning.w_q_assoc);
 
     println!("  GPU ready.");
+    if std::env::var("AR_CAP_DEBUG").ok().as_deref() == Some("1") {
+        println!(
+            "  cap_debug: env_AIDEEN_SEQ_CAP={:?} trainer_gpu_sequence_capacity={} effective_full_cap={}",
+            std::env::var("AIDEEN_SEQ_CAP").ok(),
+            trainer.gpu_sequence_capacity(),
+            effective_full_cap(&trainer, ctx_len)
+        );
+    }
     flush();
 
     #[cfg(feature = "wgpu")]
@@ -990,9 +1082,9 @@ fn main() {
     for i in 0..n_train {
         // Cycle through gaps: each n_gaps sequences covers every gap once.
         let gap = gaps[i % n_gaps];
-        let key = rng_train.gen_range(0..N_KEYS);
-        let val = rng_train.gen_range(0..N_VALS);
-        let ar = make_ar_sequence(key, val, gap, pairs_per_seq, &mut rng_train);
+        let key = rng_train.gen_range(0..ar_vocab.n_keys);
+        let val = rng_train.gen_range(0..ar_vocab.n_vals);
+        let ar = make_ar_sequence(ar_vocab, key, val, gap, pairs_per_seq, &mut rng_train);
         #[cfg(feature = "wgpu")]
         let (loss, train_trace) = if assoc_audit {
             train_ar_sequence_with_assoc_trace(&mut trainer, &ar.seq, ctx_len, eps)
@@ -1144,7 +1236,7 @@ fn main() {
                 let hist_gate = h;
                 let slot_anchor = h * d;
                 let w_kv_write = 2 * h * d * rank;
-                let b_delta = d;
+                let b_delta = h * d;
                 let flags = 21usize;
                 let w_gate_hist = h * d;
                 let w_write_gate = h * d;
@@ -1177,17 +1269,27 @@ fn main() {
             };
             let w_v_assoc_base = w_k_assoc_base + h * d * rank;
             let w_q_assoc_base = w_v_assoc_base + h * d * rank;
+            let alpha_assoc_base = w_q_assoc_base + h * d * rank;
+            let w_event_assoc_base = alpha_assoc_base + h;
+            let b_event_assoc_base = w_event_assoc_base + h * d;
             let wk_assoc_gpu_rms = rms(hist.get(w_k_assoc_base..w_v_assoc_base).unwrap_or(&[]));
             let wv_assoc_gpu_rms = rms(hist.get(w_v_assoc_base..w_q_assoc_base).unwrap_or(&[]));
             let wq_assoc_gpu_rms =
                 rms(hist.get(w_q_assoc_base..w_q_assoc_base + h * d * rank).unwrap_or(&[]));
+            let event_w = hist.get(w_event_assoc_base..b_event_assoc_base).unwrap_or(&[]);
+            let event_b = hist.get(b_event_assoc_base..b_event_assoc_base + h).unwrap_or(&[]);
+            let event_w_max = event_w.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+            let event_b_mean = event_b.iter().copied().sum::<f32>() / event_b.len().max(1) as f32;
+            let event_b_min = event_b.iter().copied().fold(f32::INFINITY, f32::min);
+            let event_b_max = event_b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let banks = std::env::var("AR_ASSOC_BANKS_AUDIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or_else(|| {
                     std::env::var("AIDEEN_ASSOC_BANKS")
                         .ok()
-                        .and_then(|s| s.parse().ok())
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .map(|v| v.clamp(1, 16))
                 })
                 .unwrap_or(1usize);
             let bank_stride = rank + d + 1;
@@ -1202,8 +1304,12 @@ fn main() {
             let mut usage_max = 0.0f32;
             let mut usage_n = 0usize;
             let mut usage_head: Vec<f32> = Vec::new();
+            let mut slot_usage_parts: Vec<String> = Vec::with_capacity(h);
             for slot in 0..h {
                 let slot_base = slot * slot_stride;
+                let mut slot_used = 0usize;
+                let mut slot_usage_sum = 0.0f32;
+                let mut slot_usage_max = 0.0f32;
                 for bank in 0..banks {
                     let base = slot_base + bank * bank_stride;
                     for &x in assoc.get(base..base + rank).unwrap_or(&[]) {
@@ -1220,17 +1326,35 @@ fn main() {
                         usage_sum += usage;
                         usage_max = usage_max.max(usage);
                         usage_n += 1;
+                        slot_usage_sum += usage;
+                        slot_usage_max = slot_usage_max.max(usage);
+                        if usage > 1.0e-3 {
+                            slot_used += 1;
+                        }
                         if usage_head.len() < 8 {
                             usage_head.push(usage);
                         }
                     }
                 }
+                slot_usage_parts.push(format!(
+                    "s{}:{}/{} mean={:.3e} max={:.3e}",
+                    slot,
+                    slot_used,
+                    banks,
+                    slot_usage_sum / banks.max(1) as f32,
+                    slot_usage_max
+                ));
             }
             println!(
-                "  [assoc-state] wk_gpu_rms={:.4e} wv_transition_gpu_rms={:.4e} wq_gpu_rms={:.4e} key_rms={:.4e} key_abs_max={:.4e} value_rms={:.4e} value_abs_max={:.4e} usage_mean={:.4e} usage_max={:.4e}",
+                "  [assoc-state] wk_gpu_rms={:.4e} wv_transition_gpu_rms={:.4e} wq_gpu_rms={:.4e} event_w_rms={:.4e} event_w_max={:.4e} event_b_mean={:.4e} event_b_min={:.4e} event_b_max={:.4e} key_rms={:.4e} key_abs_max={:.4e} value_rms={:.4e} value_abs_max={:.4e} usage_mean={:.4e} usage_max={:.4e}",
                 wk_assoc_gpu_rms,
                 wv_assoc_gpu_rms,
                 wq_assoc_gpu_rms,
+                rms(event_w),
+                event_w_max,
+                event_b_mean,
+                event_b_min,
+                event_b_max,
                 (key_ss / key_n.max(1) as f32).sqrt(),
                 key_abs_max,
                 (val_ss / val_n.max(1) as f32).sqrt(),
@@ -1248,19 +1372,21 @@ fn main() {
                     key_head, value_head, usage0, usage_head
                 );
             }
+            println!("  [assoc-occupancy] {}", slot_usage_parts.join(" | "));
             // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after backward learning path is localized.
             let bwd = gpu.read_assoc_bwd_debug();
             let mut bwd_parts = Vec::with_capacity(h);
             for slot in 0..h {
                 let base = slot * 16;
-                if bwd.len() <= base + 14 {
+                if bwd.len() <= base + 15 {
                     continue;
                 }
                 let v_den = bwd[base + 1].max(1.0);
                 bwd_parts.push(format!(
-                    "s{}:v_rms_avg={:.3e},score_abs_sum={:.3e},score_abs_max={:.3e},wq_step_sum={:.3e},wq_step_max={:.3e},wk_step_sum={:.3e},wk_step_max={:.3e},alpha_step_sum={:.3e},alpha_step_max={:.3e},key_grad_sum={:.3e},gprev_sum={:.3e},bind_sum={:.3e}",
+                    "s{}:v_rms_avg={:.3e},event_grad_signed={:.3e},score_abs_sum={:.3e},score_abs_max={:.3e},wq_step_sum={:.3e},wq_step_max={:.3e},wk_step_sum={:.3e},wk_step_max={:.3e},wq_update_sum={:.3e},wq_update_max={:.3e},wk_update_max={:.3e},key_grad_sum={:.3e},gprev_sum={:.3e},bind_sum={:.3e}",
                     slot,
                     bwd[base] / v_den,
+                    bwd[base + 3],
                     bwd[base + 4],
                     bwd[base + 5],
                     bwd[base + 6],
@@ -1269,6 +1395,7 @@ fn main() {
                     bwd[base + 9],
                     bwd[base + 10],
                     bwd[base + 11],
+                    bwd[base + 15],
                     bwd[base + 12],
                     bwd[base + 13],
                     bwd[base + 14],
@@ -1281,7 +1408,7 @@ fn main() {
         {
             trainer.enable_temporary_assoc_debug_sampling(1);
             let mut rng_diag = StdRng::seed_from_u64(777);
-            let diag_ar = make_ar_sequence(0, 0, 0, pairs_per_seq, &mut rng_diag);
+            let diag_ar = make_ar_sequence(ar_vocab, 0, 0, 0, pairs_per_seq, &mut rng_diag);
             trainer.eval_mode = true;
             trainer.frozen_deq = true;
             let diag_loss = eval_answer_loss(&mut trainer, &diag_ar.seq, ctx_len, eps);
@@ -1319,9 +1446,9 @@ fn main() {
         let mut gap_debug_line: Option<String> = None;
 
         for eval_idx in 0..n_eval {
-            let key = rng_eval.gen_range(0..N_KEYS);
-            let val = rng_eval.gen_range(0..N_VALS);
-            let ar = make_ar_sequence(key, val, gap, pairs_per_seq, &mut rng_eval);
+            let key = rng_eval.gen_range(0..ar_vocab.n_keys);
+            let val = rng_eval.gen_range(0..ar_vocab.n_vals);
+            let ar = make_ar_sequence(ar_vocab, key, val, gap, pairs_per_seq, &mut rng_eval);
             let seq = &ar.seq;
             let mut case_trace: Option<Vec<String>> = None;
             #[cfg(feature = "wgpu")]
@@ -1365,9 +1492,14 @@ fn main() {
                 let lm_top =
                     format_lm_top_debug(
                         &trainer,
-                        final_cached_token_index(seq.len() - 1, ctx_len, trainer.gpu_sequence_capacity()),
-                        TOK_KEY_BASE + ar.query_key,
-                        TOK_VAL_BASE + ar.query_val,
+                        final_cached_token_index(
+                            seq.len() - 1,
+                            ctx_len,
+                            effective_full_cap(&trainer, ctx_len),
+                        ),
+                        ar_vocab.tok_key_base + ar.query_key,
+                        ar_vocab.tok_query,
+                        ar_vocab.tok_val_base + ar.query_val,
                     );
                 #[cfg(not(feature = "wgpu"))]
                 let lm_top = "lm_top=NA".to_string();

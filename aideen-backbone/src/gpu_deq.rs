@@ -6,7 +6,7 @@ use aideen_block::deq_bridge::{
 use crate::deq_mode::DeqRuntimeConfig;
 use aideen_core::state::ArchitectureConfig;
 use bytemuck::{Pod, Zeroable};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -29,7 +29,7 @@ struct UpdateUniforms {
     assoc_lr_mult: f32,
     assoc_event_lr_mult: f32,
     assoc_alpha_lr_mult: f32,
-    _pad1: f32,
+    assoc_addr_lr_mult: f32,
 }
 
 #[repr(C)]
@@ -59,10 +59,21 @@ struct SegmentMemoryPromoteParams {
     _pad0: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct AssocHistoryCarryParams {
+    d_model: u32,
+    h_slots: u32,
+    batch_size: u32,
+    full_seq_len: u32,
+    token_start: u32,
+    token_count: u32,
+}
+
 /// Minimal buffers needed by the Picard adjoint path (replaces the old RustCgBridge).
 pub struct AdjointBuffers {
-    pub b_dl: wgpu::Buffer, // ∂L/∂h input for the Picard adjoint (size: ctx_len × d_model)
-    pub b_v_out: wgpu::Buffer, // adjoint state v output       (size: ctx_len × h_slots × d_model)
+    pub b_dl: wgpu::Buffer, // ∂L/∂h input for the Picard adjoint (size: seq_cap × d_model)
+    pub b_v_out: wgpu::Buffer, // adjoint state v output       (size: seq_cap × h_slots × d_model)
 }
 
 /// Abstracción del DEQ vía GPU (WGPU).
@@ -77,7 +88,6 @@ pub struct GpuDeqBackend {
     pub queue: Arc<wgpu::Queue>,
     pub bridge: RustDeqBridge,
     assoc_banks: usize,
-    assoc_slot_stride_floats: usize,
     segment_memory_token: bool,
     assoc_persistent: bool,
     pub adj_bufs: AdjointBuffers,
@@ -106,6 +116,8 @@ pub struct GpuDeqBackend {
     segment_memory_promote_pipeline: wgpu::ComputePipeline,
     assoc_persistent_promote_pipeline: wgpu::ComputePipeline,
     assoc_persistent_load_pipeline: wgpu::ComputePipeline,
+    assoc_history_carry_pipeline: wgpu::ComputePipeline,
+    assoc_history_carry_params_buf: wgpu::Buffer,
     fused_update_stage1a_pipeline: wgpu::ComputePipeline,
     fused_update_stage1b_pipeline: wgpu::ComputePipeline,
     fused_update_stage2_pipeline: wgpu::ComputePipeline,
@@ -128,6 +140,7 @@ pub struct GpuDeqBackend {
     fpm_shared_wx_reduce_pipeline: wgpu::ComputePipeline,
     fpm_retain_bwd_bg0: wgpu::BindGroup,
     fpm_shared_bg0: wgpu::BindGroup,
+    fpm_weights_bg1: wgpu::BindGroup,
     staged_picard_bg: wgpu::BindGroup,
     staged_picard_bg_alt: wgpu::BindGroup,
     staged_picard_bg1: wgpu::BindGroup,
@@ -136,6 +149,7 @@ pub struct GpuDeqBackend {
     segment_memory_promote_bgl: wgpu::BindGroupLayout,
     segment_memory_promote_params_buf: wgpu::Buffer,
     assoc_persistent_promote_bgl: wgpu::BindGroupLayout,
+    assoc_history_carry_bgl: wgpu::BindGroupLayout,
     fused_update_bg0: wgpu::BindGroup,
     fused_update_bg1: wgpu::BindGroup,
     pub fused_update_params_buf: wgpu::Buffer,
@@ -190,11 +204,8 @@ pub struct GpuDeqBackend {
     cfg_attn_uniform: bool,
     cfg_attn_freeze: bool,
     cfg_signal_scale: f32,
-    cfg_hist_train_carrier: bool,
     cfg_hist_train_wx: bool,
     cfg_hist_train_wout: bool,
-    cfg_hist_train_alog: bool,
-    cfg_hist_train_delta: bool,
     cfg_hist_internal_probe: bool,
     cfg_fused_profile: bool,
     cfg_picard_profile: bool,
@@ -288,7 +299,16 @@ impl GpuDeqBackend {
             out.extend_from_slice(slot_anchor);
         }
         out.extend_from_slice(w_kv_write);
-        out.extend_from_slice(b_delta);
+        // GPU shaders address b_delta per slot (h*d). The CPU model still keeps
+        // a shared d-vector, so expand it here to preserve the HistParams layout.
+        if b_delta.len() == d {
+            for _ in 0..h {
+                out.extend_from_slice(b_delta);
+            }
+        } else {
+            debug_assert_eq!(b_delta.len(), h * d);
+            out.extend_from_slice(b_delta);
+        }
         out.push(if self.cfg_hist_selective { 1.0 } else { 0.0 });
         // Warmup factor for alpha_min (0..1). Default to 1.0 so inference is unaffected.
         out.push(1.0);
@@ -348,10 +368,27 @@ impl GpuDeqBackend {
         out.extend_from_slice(w_q_assoc);
         out.extend_from_slice(alpha_assoc);
         // Associative event gate: W_event_assoc (h×d) and b_event_assoc (h).
-        // Bias starts neutral (sigmoid(0)=0.5). The gate is disabled by default;
-        // when enabled, its L1 penalty makes "write everything" non-free.
-        out.extend(std::iter::repeat(0.0).take(h * d));
-        out.extend(std::iter::repeat(0.0).take(h));
+        // Defaults preserve the historical neutral gate. Sparse/non-degenerate
+        // initialization is experimental and must be enabled explicitly.
+        let assoc_event_w_init = std::env::var("AIDEEN_ASSOC_EVENT_W_INIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 2.0);
+        let assoc_event_bias_init = std::env::var("AIDEEN_ASSOC_EVENT_BIAS_INIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(-8.0, 4.0);
+        for slot in 0..h {
+            for dim in 0..d {
+                let hash = ((slot as u32 + 1) * 1_103_515_245u32)
+                    ^ ((dim as u32 + 17) * 2_654_435_761u32);
+                let unit = (hash as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                out.push(assoc_event_w_init * unit);
+            }
+        }
+        out.extend(std::iter::repeat(assoc_event_bias_init).take(h));
         out
     }
 
@@ -362,7 +399,8 @@ impl GpuDeqBackend {
         // hist_mat: 1*d²
         // slot_anchor, hist_scale, hist_bias, hist_gate_query, w_write_gate: 5*h*d
         // hist_gate, b_write_mem: 2*h
-        // b_delta(shared): d
+        // b_delta: h*d in GPU layout. CPU may source it from one shared d-vector,
+        // but the packed buffer must stay slot-major so following offsets match WGSL.
         // flags: 21
         // γ per slot: h
         // w_k_write(h*d*r) + w_v_write(h*r*d): 2*h*d*RETAIN_RANK  (replaces old h*d²)
@@ -561,7 +599,7 @@ impl GpuDeqBackend {
 
         // AdjointBuffers: only the two buffers actually used by the Picard adjoint.
         let adj_batch = forward_batch_cap as u64;
-        let adj_seq_cap = config.ctx_len.max(1) as u64;
+        let adj_seq_cap = forward_seq_cap.max(1) as u64;
         let adj_d = config.d_r as u64;
         let adj_h = config.h_slots as u64;
         let adj_dl_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -885,6 +923,42 @@ impl GpuDeqBackend {
                     },
                 ],
             });
+        let assoc_history_carry_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Assoc History Carry BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
         let assoc_persistent_promote_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Assoc Persistent Promote BGL"),
@@ -1171,7 +1245,9 @@ impl GpuDeqBackend {
             });
 
         // bg1_layout: 10 read_write bindings — used by staged_picard_pl (staged_adjoint_picard_clean.wgsl)
-        // fused_update_bg1_layout: 1 binding — AllWeights for fused_deq_update.wgsl @group(1)
+        // solve_pool_bg1_layout matches the unified forward/update pool:
+        // assoc buffers plus AllWeights/AllGradients. FPM backward uses a separate
+        // weights-only BG1 because its WGSL declares AllWeights at binding 0.
         // Unified Solve Pool Layout (Group 1): Assoc(0..3) + AllWeights(4)
         let solve_pool_bg1_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1290,12 +1366,154 @@ impl GpuDeqBackend {
                 ],
             });
         let bg1_layout = &solve_pool_bg1_layout;
-        let fused_update_bg1_layout = &solve_pool_bg1_layout;
+        let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(1);
+        let env_bool = |name: &str, default: bool| {
+            std::env::var(name)
+                .ok()
+                .map(|v| {
+                    let vl = v.trim().to_ascii_lowercase();
+                    vl == "1" || vl == "true" || vl == "yes"
+                })
+                .unwrap_or(default)
+        };
+
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Fused Update PL"),
             bind_group_layouts: &[&bg0_layout, &solve_pool_bg1_layout],
             push_constant_ranges: &[],
         });
+
+        let segment_memory_token_enabled = std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let assoc_persistent_enabled = std::env::var("AIDEEN_ASSOC_PERSISTENT")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let segment_memory_beta = std::env::var("AIDEEN_SEGMENT_MEMORY_BETA")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.05, 1.0);
+        let assoc_transition_gate = env_bool("AIDEEN_ASSOC_TRANSITION_GATE", false);
+        let assoc_slot_anchor = env_bool("AIDEEN_ASSOC_SLOT_ANCHOR", false);
+        let assoc_reuse_match = env_bool("AIDEEN_ASSOC_REUSE_MATCH", false);
+        let assoc_slot_stripe = env_bool("AIDEEN_ASSOC_SLOT_STRIPE", false);
+        let assoc_slot_owner = env_bool("AIDEEN_ASSOC_SLOT_OWNER", false);
+        let assoc_hash_lane = env_bool("AIDEEN_ASSOC_HASH_LANE", false);
+        let assoc_hash_replica = env_bool("AIDEEN_ASSOC_HASH_REPLICA", false);
+        let assoc_tie_qk = env_bool("AIDEEN_ASSOC_TIE_QK", false);
+        let assoc_conf_read = env_bool("AIDEEN_ASSOC_CONF_READ", false);
+        let assoc_hard_read = env_bool("AIDEEN_ASSOC_HARD_READ", true);
+        let assoc_read_enabled = env_bool("AIDEEN_ASSOC_READ", true);
+        let assoc_event_gate = env_bool("AIDEEN_ASSOC_EVENT_GATE", false);
+        let assoc_protect_occupied = env_bool("AIDEEN_ASSOC_PROTECT_OCCUPIED", true);
+        let assoc_suppress_value_source = env_bool("AIDEEN_ASSOC_SUPPRESS_VALUE_SOURCE", true);
+        let assoc_oracle_write_positions = env_bool("AIDEEN_ASSOC_ORACLE_WRITE_POS", false)
+            || env_bool("AIDEEN_ASSOC_ORACLE_WRITE_POSITIONS", false);
+        let assoc_oracle_force_write = env_bool("AIDEEN_ASSOC_ORACLE_FORCE_WRITE", false);
+        let assoc_oracle_prefix_pairs = std::env::var("AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS")
+            .or_else(|_| std::env::var("AR_PAIRS_PER_SEQ"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(16);
+        let assoc_read_beta = std::env::var("AIDEEN_ASSOC_READ_BETA")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.05, 16.0);
+        let assoc_write_min_mass = std::env::var("AIDEEN_ASSOC_WRITE_MIN_MASS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let mut shader_constants = std::collections::HashMap::new();
+        shader_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
+        shader_constants.insert("ASSOC_RANK".to_string(), 32.0);
+        shader_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
+        shader_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        shader_constants.insert(
+            "SEGMENT_MEMORY_BETA".to_string(),
+            segment_memory_beta as f64,
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_TRANSITION_GATE".to_string(),
+            if assoc_transition_gate { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_SLOT_ANCHOR".to_string(),
+            if assoc_slot_anchor { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_REUSE_MATCH".to_string(),
+            if assoc_reuse_match { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_SLOT_STRIPE".to_string(),
+            if assoc_slot_stripe { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_SLOT_OWNER".to_string(),
+            if assoc_slot_owner { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_HASH_LANE".to_string(),
+            if assoc_hash_lane { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_HASH_REPLICA".to_string(),
+            if assoc_hash_replica { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_TIE_QK".to_string(),
+            if assoc_tie_qk { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_CONF_READ".to_string(),
+            if assoc_conf_read { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_HARD_READ".to_string(),
+            if assoc_hard_read { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_READ".to_string(),
+            if assoc_read_enabled { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_EVENT_GATE".to_string(),
+            if assoc_event_gate { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_PROTECT_OCCUPIED".to_string(),
+            if assoc_protect_occupied { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE".to_string(),
+            if assoc_suppress_value_source { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
+            if assoc_oracle_write_positions { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_ORACLE_FORCE_WRITE".to_string(),
+            if assoc_oracle_force_write { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ASSOC_ORACLE_PREFIX_PAIRS".to_string(),
+            assoc_oracle_prefix_pairs as f64,
+        );
+        let pipeline_options = wgpu::PipelineCompilationOptions {
+            constants: &shader_constants,
+            ..Default::default()
+        };
 
         let fused_update_stage1a_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1303,7 +1521,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage1a_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage1b_pipeline =
@@ -1312,7 +1530,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage1b_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage2_pipeline =
@@ -1321,7 +1539,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage2_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage3_pipeline =
@@ -1330,7 +1548,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage3_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_wo_win_pipeline =
@@ -1339,7 +1557,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_wo_win_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_wq_pipeline =
@@ -1348,7 +1566,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_wq_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_prep_wk_pipeline =
@@ -1357,7 +1575,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_prep_wk_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_prep_wv_pipeline =
@@ -1366,7 +1584,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_prep_wv_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_wk_pipeline =
@@ -1375,7 +1593,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_wk_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_wv_pipeline =
@@ -1384,7 +1602,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_wv_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_stage4_bias_pipeline =
@@ -1393,7 +1611,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_attn_stage4_bias_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_hist_wx_pipeline =
@@ -1402,7 +1620,7 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("fused_hist_stage_wx_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let fused_update_apply_grad_pipeline =
@@ -1411,88 +1629,68 @@ impl GpuDeqBackend {
                 layout: Some(&pl),
                 module: &update_shader,
                 entry_point: Some("apply_grad_update_main"),
-                compilation_options: Default::default(),
+                compilation_options: pipeline_options.clone(),
                 cache: None,
+            });
+
+        let fpm_weights_bg1_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FPM Weights BG1 Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
             });
         let fpm_retain_bwd_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FPM Memory Bwd PL"),
-            bind_group_layouts: &[&fpm_retain_bwd_bg0_layout, &fused_update_bg1_layout],
+            bind_group_layouts: &[&fpm_retain_bwd_bg0_layout, &fpm_weights_bg1_layout],
             push_constant_ranges: &[],
         });
-        let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map(|v| v.clamp(1, 4))
-            .unwrap_or(1);
-        let assoc_transition_gate = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_slot_anchor = std::env::var("AIDEEN_ASSOC_SLOT_ANCHOR")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_reuse_match = std::env::var("AIDEEN_ASSOC_REUSE_MATCH")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_slot_stripe = std::env::var("AIDEEN_ASSOC_SLOT_STRIPE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_slot_owner = std::env::var("AIDEEN_ASSOC_SLOT_OWNER")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_tie_qk = std::env::var("AIDEEN_ASSOC_TIE_QK")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_conf_read = std::env::var("AIDEEN_ASSOC_CONF_READ")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
-        let assoc_read_enabled = std::env::var("AIDEEN_ASSOC_READ")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(true);
-        let assoc_event_gate = std::env::var("AIDEEN_ASSOC_EVENT_GATE")
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(false);
         let assoc_event_l1 = std::env::var("AIDEEN_ASSOC_EVENT_L1")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.005);
+        let fpm_direct_write_scale = std::env::var("AIDEEN_FPM_DIRECT_WRITE_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 200.0);
+        let assoc_librarian_bwd = std::env::var("AIDEEN_ASSOC_LIBRARIAN_BWD")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let fpm_write_bwd = std::env::var("AIDEEN_FPM_WRITE_BWD")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let mut fpm_retain_bwd_constants = std::collections::HashMap::new();
         fpm_retain_bwd_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
+        fpm_retain_bwd_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
+        fpm_retain_bwd_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        fpm_retain_bwd_constants.insert(
+            "FPM_DIRECT_WRITE_SCALE".to_string(),
+            fpm_direct_write_scale,
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_LIBRARIAN_BWD".to_string(),
+            if assoc_librarian_bwd { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_FPM_WRITE_BWD".to_string(),
+            if fpm_write_bwd { 1.0 } else { 0.0 },
+        );
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_TRANSITION_GATE".to_string(),
             if assoc_transition_gate { 1.0 } else { 0.0 },
@@ -1514,6 +1712,14 @@ impl GpuDeqBackend {
             if assoc_slot_owner { 1.0 } else { 0.0 },
         );
         fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_HASH_LANE".to_string(),
+            if assoc_hash_lane { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_HASH_REPLICA".to_string(),
+            if assoc_hash_replica { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_TIE_QK".to_string(),
             if assoc_tie_qk { 1.0 } else { 0.0 },
         );
@@ -1528,6 +1734,18 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_EVENT_GATE".to_string(),
             if assoc_event_gate { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
+            if assoc_oracle_write_positions { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_ORACLE_FORCE_WRITE".to_string(),
+            if assoc_oracle_force_write { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ASSOC_ORACLE_PREFIX_PAIRS".to_string(),
+            assoc_oracle_prefix_pairs as f64,
         );
         fpm_retain_bwd_constants.insert("ASSOC_EVENT_L1".to_string(), assoc_event_l1);
         let fpm_retain_bwd_pipeline =
@@ -1544,7 +1762,7 @@ impl GpuDeqBackend {
             });
         let fpm_shared_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FPM Shared Carrier PL"),
-            bind_group_layouts: &[&fpm_shared_bg0_layout, &fused_update_bg1_layout],
+            bind_group_layouts: &[&fpm_shared_bg0_layout, &fpm_weights_bg1_layout],
             push_constant_ranges: &[],
         });
         let fpm_shared_wout_pipeline =
@@ -1657,26 +1875,6 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-        let segment_memory_token_enabled = std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        let assoc_persistent_enabled = std::env::var("AIDEEN_ASSOC_PERSISTENT")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        let segment_memory_beta = std::env::var("AIDEEN_SEGMENT_MEMORY_BETA")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.5)
-            .clamp(0.05, 1.0);
-        let mut segment_memory_constants = std::collections::HashMap::new();
-        segment_memory_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
-        segment_memory_constants.insert("ASSOC_RANK".to_string(), 32.0);
-        segment_memory_constants.insert(
-            "SEGMENT_MEMORY_BETA".to_string(),
-            segment_memory_beta as f64,
-        );
         let segment_memory_promote_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Segment Memory Promote Pipeline"),
@@ -1687,10 +1885,7 @@ impl GpuDeqBackend {
                 })),
                 module: &segment_memory_promote_shader,
                 entry_point: Some("segment_memory_promote_main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &segment_memory_constants,
-                    ..Default::default()
-                },
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
         let assoc_persistent_promote_pipeline =
@@ -1703,12 +1898,31 @@ impl GpuDeqBackend {
                 })),
                 module: &assoc_persistent_promote_shader,
                 entry_point: Some("assoc_persistent_promote_main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &segment_memory_constants,
-                    ..Default::default()
-                },
+                compilation_options: pipeline_options.clone(),
                 cache: None,
             });
+        let assoc_history_carry_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Assoc History Carry Pipeline"),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Assoc History Carry PL"),
+                    bind_group_layouts: &[&assoc_history_carry_bgl],
+                    push_constant_ranges: &[],
+                })),
+                module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Assoc History Carry Shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("../../aideen-block/src/shaders/assoc_state_carry.wgsl").into()),
+                }),
+                entry_point: Some("assoc_state_carry_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let assoc_history_carry_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc History Carry Params Buf"),
+            size: std::mem::size_of::<AssocHistoryCarryParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let assoc_persistent_load_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Assoc Persistent Load Pipeline"),
@@ -1720,7 +1934,7 @@ impl GpuDeqBackend {
                 module: &assoc_persistent_promote_shader,
                 entry_point: Some("assoc_persistent_load_main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &segment_memory_constants,
+                    constants: &shader_constants,
                     ..Default::default()
                 },
                 cache: None,
@@ -1880,7 +2094,7 @@ impl GpuDeqBackend {
         });
         // Ring buffer: m × max_attn_len floats (segment into <=4 buffers to stay under buffer limits)
         let anderson_attn_len_max = (forward_batch_cap as usize).max(1)
-            * config.ctx_len.max(1)
+            * forward_seq_cap.max(1) as usize
             * config.h_slots
             * config.d_r;
         let anderson_m_alloc = anderson_m_val.max(1);
@@ -1987,7 +2201,7 @@ impl GpuDeqBackend {
                 mapped_at_creation: false,
             });
         let attn_entries =
-            (forward_batch_cap as usize * config.ctx_len.max(1) * config.h_slots * config.d_r)
+            (forward_batch_cap as usize * forward_seq_cap.max(1) as usize * config.h_slots * config.d_r)
                 as u64;
         let fused_mix_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Mix Buffer"),
@@ -2030,7 +2244,10 @@ impl GpuDeqBackend {
             mapped_at_creation: false,
         });
         let gscore_entries =
-            (forward_batch_cap as usize * config.ctx_len.max(1) * config.h_slots * config.h_slots)
+            (forward_batch_cap as usize
+                * forward_seq_cap.max(1) as usize
+                * config.h_slots
+                * config.h_slots)
                 as u64;
         let fused_gscore_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Gscore Buffer"),
@@ -2088,7 +2305,7 @@ impl GpuDeqBackend {
         let fpm_wout_partial_buf = {
             let fpm_block = 64u64;
             let reduce_entries =
-                (forward_batch_cap as u64) * (config.ctx_len.max(1) as u64) * (config.h_slots as u64);
+                (forward_batch_cap as u64) * (forward_seq_cap.max(1) as u64) * (config.h_slots as u64);
             let fpm_blocks = (reduce_entries + fpm_block - 1) / fpm_block;
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("FPM Wout Partial Buffer"),
@@ -2102,7 +2319,7 @@ impl GpuDeqBackend {
         let fpm_wx_partial_buf = {
             let fpm_block = 64u64;
             let reduce_entries =
-                (forward_batch_cap as u64) * (config.ctx_len.max(1) as u64) * (config.h_slots as u64);
+                (forward_batch_cap as u64) * (forward_seq_cap.max(1) as u64) * (config.h_slots as u64);
             let fpm_blocks = (reduce_entries + fpm_block - 1) / fpm_block;
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("FPM Wx Partial Buffer"),
@@ -2510,6 +2727,14 @@ impl GpuDeqBackend {
                 },
             ],
         });
+        let fpm_weights_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FPM Weights BG1"),
+            layout: &fpm_weights_bg1_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bridge.all_weights_buf.as_entire_binding(),
+            }],
+        });
         // FPM memory bwd bg0: uniforms | h_star | scratch(signal) | fpm_m_buf | AllGradients
         // | tbptt_carry | dm_new | m_inner | h_unit | g_x
         let fpm_retain_bwd_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2635,7 +2860,7 @@ impl GpuDeqBackend {
         let cached_fpm_stage = std::env::var("AIDEEN_FPM_STAGE")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(3)
+            .unwrap_or(4)
             .clamp(0, 5);
         let cached_fpm_read_gate_min = std::env::var("AIDEEN_FPM_READ_GATE_MIN")
             .ok()
@@ -2655,9 +2880,6 @@ impl GpuDeqBackend {
         let cfg_hist_train_carrier = bool_flag("AIDEEN_HIST_TRAIN_CARRIER").unwrap_or(false);
         let cfg_hist_train_wx = bool_flag("AIDEEN_HIST_TRAIN_WX").unwrap_or(cfg_hist_train_carrier);
         let cfg_hist_train_wout = bool_flag("AIDEEN_HIST_TRAIN_WOUT").unwrap_or(false);
-        let cfg_hist_train_alog = bool_flag("AIDEEN_HIST_TRAIN_ALOG").unwrap_or(cfg_hist_selective);
-        let cfg_hist_train_delta =
-            bool_flag("AIDEEN_HIST_TRAIN_DELTA").unwrap_or(cfg_hist_selective);
         let cfg_hist_internal_probe = bool_flag("AIDEEN_HIST_INTERNAL_PROBE").unwrap_or(false);
         let cfg_fused_profile = bool_flag("AIDEEN_FUSED_PROFILE").unwrap_or(false);
         let cfg_slot_anchor_zero = bool_flag("AIDEEN_DEQ_SLOT_ANCHOR_ZERO").unwrap_or(false);
@@ -2687,8 +2909,6 @@ impl GpuDeqBackend {
             .unwrap_or(false);
         let cfg_picard_internal_probe = bool_flag("AIDEEN_PICARD_INTERNAL_PROBE").unwrap_or(false);
         let cfg_picard_gscore_fused = bool_flag("AIDEEN_PICARD_GSCORE_FUSED").unwrap_or(false);
-        let assoc_slot_stride_floats = assoc_banks as usize * (32usize + config.d_r + 1usize);
-
         Some(Self {
             config,
             forward_seq_cap,
@@ -2700,7 +2920,6 @@ impl GpuDeqBackend {
             queue: Arc::new(queue),
             bridge,
             assoc_banks: assoc_banks as usize,
-            assoc_slot_stride_floats,
             segment_memory_token: segment_memory_token_enabled,
             assoc_persistent: assoc_persistent_enabled,
             adj_bufs: AdjointBuffers {
@@ -2730,6 +2949,8 @@ impl GpuDeqBackend {
             segment_memory_promote_pipeline,
             assoc_persistent_promote_pipeline,
             assoc_persistent_load_pipeline,
+            assoc_history_carry_pipeline,
+            assoc_history_carry_params_buf,
             fused_update_stage1a_pipeline,
             fused_update_stage1b_pipeline,
             fused_update_stage2_pipeline,
@@ -2752,6 +2973,7 @@ impl GpuDeqBackend {
             fpm_shared_wx_reduce_pipeline,
             fpm_retain_bwd_bg0,
             fpm_shared_bg0,
+            fpm_weights_bg1,
             staged_picard_bg,
             staged_picard_bg_alt,
             staged_picard_bg1,
@@ -2760,6 +2982,7 @@ impl GpuDeqBackend {
             segment_memory_promote_bgl,
             segment_memory_promote_params_buf,
             assoc_persistent_promote_bgl,
+            assoc_history_carry_bgl,
             fused_update_bg0,
             fused_update_bg1,
             fused_update_params_buf,
@@ -2808,11 +3031,8 @@ impl GpuDeqBackend {
             cfg_attn_uniform,
             cfg_attn_freeze,
             cfg_signal_scale,
-            cfg_hist_train_carrier,
             cfg_hist_train_wx,
             cfg_hist_train_wout,
-            cfg_hist_train_alog,
-            cfg_hist_train_delta,
             cfg_hist_internal_probe,
             cfg_fused_profile,
             cfg_picard_profile,
@@ -2986,6 +3206,59 @@ impl GpuDeqBackend {
                 * self.assoc_banks as u32
                 * assoc_bank_stride;
             pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    fn promote_assoc_history_gpu(&self, full_seq_len: u32, token_start: u32, token_count: u32) {
+        let params = AssocHistoryCarryParams {
+            d_model: self.config.d_r as u32,
+            h_slots: self.config.h_slots as u32,
+            batch_size: self.forward_batch_cap,
+            full_seq_len,
+            token_start,
+            token_count,
+        };
+        self.queue.write_buffer(
+            &self.assoc_history_carry_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let promote_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Assoc History Carry BG"),
+            layout: &self.assoc_history_carry_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.assoc_history_carry_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.bridge.hist_ctx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.bridge.mstate_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Assoc History Carry"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Assoc History Carry"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.assoc_history_carry_pipeline);
+            pass.set_bind_group(0, &promote_bg, &[]);
+            pass.dispatch_workgroups(
+                (self.config.d_r as u32).div_ceil(64),
+                self.forward_batch_cap.max(1),
+                1,
+            );
         }
         self.queue.submit(Some(encoder.finish()));
     }
@@ -3681,6 +3954,10 @@ impl GpuDeqBackend {
                 if self.segment_memory_token {
                     self.promote_segment_memory_gpu();
                 }
+                if self.cached_fpm_stage >= 4 {
+                    // Carry over converged state (Assoc History Source)
+                    self.promote_assoc_history_gpu(seq_len, start - count, count);
+                }
                 self.reset_internal_segment_runtime_state();
             }
         }
@@ -3743,7 +4020,7 @@ impl GpuDeqBackend {
             assoc_lr_mult: 1.0,
             assoc_event_lr_mult: 1.0,
             assoc_alpha_lr_mult: 1.0,
-            _pad1: 0.0,
+            assoc_addr_lr_mult: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -4374,7 +4651,7 @@ impl GpuDeqBackend {
             assoc_lr_mult: 1.0,
             assoc_event_lr_mult: 1.0,
             assoc_alpha_lr_mult: 1.0,
-            _pad1: 0.0,
+            assoc_addr_lr_mult: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -4546,6 +4823,7 @@ impl GpuDeqBackend {
         assoc_lr_mult: f32,
         assoc_event_lr_mult: f32,
         assoc_alpha_lr_mult: f32,
+        assoc_addr_lr_mult: f32,
     ) -> Result<(), String> {
         let d = self.config.d_r;
         let h = self.config.h_slots;
@@ -4570,7 +4848,7 @@ impl GpuDeqBackend {
             assoc_lr_mult,
             assoc_event_lr_mult,
             assoc_alpha_lr_mult,
-            _pad1: 0.0,
+            assoc_addr_lr_mult,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -4585,7 +4863,6 @@ impl GpuDeqBackend {
         let hist_gated = self.cfg_hist_gated
             && !deq_only
             && !self.bridge.fpm_enabled;
-        let hist_selective = self.cfg_hist_selective;
         let hist_internal_probe = self.cfg_hist_internal_probe;
         let train_hist_wx = self.cfg_hist_train_wx;
         let stage4_wo_win_pipeline = &self.fused_update_stage4_wo_win_pipeline;
@@ -4736,7 +5013,7 @@ impl GpuDeqBackend {
                 });
                 pass.set_pipeline(&self.fpm_retain_bwd_pipeline);
                 pass.set_bind_group(0, &self.fpm_retain_bwd_bg0, &[]);
-                pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                pass.set_bind_group(1, &self.fpm_weights_bg1, &[]);
                 pass.dispatch_workgroups(hs, 1, 1);
                 drop(pass);
 
@@ -4746,7 +5023,7 @@ impl GpuDeqBackend {
                 });
                 pass.set_pipeline(&self.fpm_shared_wout_pipeline);
                 pass.set_bind_group(0, &self.fpm_shared_bg0, &[]);
-                pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                pass.set_bind_group(1, &self.fpm_weights_bg1, &[]);
                 pass.dispatch_workgroups(d.div_ceil(16), d.div_ceil(16), 1);
                 drop(pass);
 
@@ -4756,7 +5033,7 @@ impl GpuDeqBackend {
                 });
                 pass.set_pipeline(&self.fpm_shared_wx_pipeline);
                 pass.set_bind_group(0, &self.fpm_shared_bg0, &[]);
-                pass.set_bind_group(1, &self.fused_update_bg1, &[]);
+                pass.set_bind_group(1, &self.fpm_weights_bg1, &[]);
                 pass.dispatch_workgroups(d.div_ceil(64), 1, 1);
             }
             if grad_accum_mode == 1 && apply_accum {
@@ -4997,7 +5274,7 @@ impl GpuDeqBackend {
                         "fpm_minner_colsum",
                         &self.fpm_minner_colsum_pipeline,
                         &self.fpm_shared_bg0,
-                        &self.fused_update_bg1,
+                        &self.fpm_weights_bg1,
                         h as u32,
                         d.div_ceil(64) as u32,
                         profile_fused,
@@ -5008,7 +5285,7 @@ impl GpuDeqBackend {
                         "fpm_wout_factored",
                         &self.fpm_wout_factored_pipeline,
                         &self.fpm_shared_bg0,
-                        &self.fused_update_bg1,
+                        &self.fpm_weights_bg1,
                         d.div_ceil(16) as u32,
                         d.div_ceil(16) as u32,
                         profile_fused,
@@ -5024,7 +5301,7 @@ impl GpuDeqBackend {
                     "fpm_shared_wx_partial",
                     &self.fpm_shared_wx_partial_pipeline,
                     &self.fpm_shared_bg0,
-                    &self.fused_update_bg1,
+                    &self.fpm_weights_bg1,
                     d.div_ceil(64) as u32,
                     n_blocks,
                     profile_fused,
@@ -5035,7 +5312,7 @@ impl GpuDeqBackend {
                     "fpm_shared_wx_reduce",
                     &self.fpm_shared_wx_reduce_pipeline,
                     &self.fpm_shared_bg0,
-                    &self.fused_update_bg1,
+                    &self.fpm_weights_bg1,
                     d.div_ceil(64) as u32,
                     1,
                     profile_fused,
@@ -5095,7 +5372,7 @@ impl GpuDeqBackend {
             assoc_lr_mult: 1.0,
             assoc_event_lr_mult: 1.0,
             assoc_alpha_lr_mult: 1.0,
-            _pad1: 0.0,
+            assoc_addr_lr_mult: 0.0,
         };
         self.queue.write_buffer(
             &self.fused_update_params_buf,
@@ -5432,6 +5709,16 @@ impl GpuDeqBackend {
         self.read_storage_buffer(&self.bridge.hpooled_buf, d_r, "H_pooled Readback Staging")
     }
 
+    // TEMPORARY DIAGNOSTIC: read pooled states for a full sequence.
+    pub fn read_hpooled_seq(&self, seq_len: u32) -> Vec<f32> {
+        let n_floats = seq_len as usize * self.config.d_r;
+        self.read_storage_buffer(
+            &self.bridge.hpooled_buf,
+            n_floats,
+            "H_pooled Sequence Readback Staging",
+        )
+    }
+
     // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read one token's pooled state for AR top-logit tracing.
     pub fn read_hpooled_at(&self, token_index: usize) -> Vec<f32> {
         let d_r = self.config.d_r;
@@ -5441,6 +5728,18 @@ impl GpuDeqBackend {
             offset,
             d_r,
             "H_pooled Token Readback Staging",
+        )
+    }
+
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read one token's direct associative LM signal.
+    pub fn read_assoc_pooled_at(&self, token_index: usize) -> Vec<f32> {
+        let d_r = self.config.d_r;
+        let offset = (token_index * d_r * std::mem::size_of::<f32>()) as u64;
+        self.read_storage_buffer_at(
+            &self.bridge.assoc_pooled_buf,
+            offset,
+            d_r,
+            "Assoc_pooled Token Readback Staging",
         )
     }
 
@@ -5589,7 +5888,7 @@ impl GpuDeqBackend {
         };
         let w_hist_stats = stats(&hist_params[hist_mat_base..slot_scale_base]);
         let w_kv_stats = stats(&hist_params[w_kv_write_base..b_delta_base]);
-        let b_delta_stats = stats(&hist_params[b_delta_base..b_delta_base + d]);
+        let b_delta_stats = stats(&hist_params[b_delta_base..b_delta_base + h_slots * d]);
         (w_hist_stats, w_kv_stats, b_delta_stats)
     }
 

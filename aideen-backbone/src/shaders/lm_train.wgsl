@@ -176,11 +176,12 @@ fn lm_probs_main(
     let mx = s_scratch[0];
 
     var local_sum = 0.0;
+    var local_target_exp = 0.0;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
         let v = s_indices_cache[k];
         let e = exp(probs[probs_idx(t, k)] - mx);
         probs[probs_idx(t, k)] = e;
-        if (v == target_v) { s_target_exp = e; }
+        if (v == target_v) { local_target_exp = e; }
         local_sum += e;
     }
     s_scratch[tid] = local_sum;
@@ -190,6 +191,17 @@ fn lm_probs_main(
         workgroupBarrier();
     }
     let sm = max(s_scratch[0], 1e-10);
+
+    s_scratch[tid] = local_target_exp;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { s_scratch[tid] += s_scratch[tid + stride]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) {
+        s_target_exp = s_scratch[0];
+    }
+    workgroupBarrier();
 
     // Normalize to probabilities
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
@@ -329,6 +341,7 @@ fn lm_backprop_h_t_main(
         for (var d = tid; d < d_model; d += WG_SIZE) {
             dl_dh_temp[base + d] = 0.0;
             dl_dh[base + d] = 0.0;
+            s_h_rms[s_h_rms_idx(t, d)] = 0.0;
         }
         return;
     }

@@ -549,10 +549,9 @@ impl GpuLmHeadTrainer {
         let s_h_rms_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM s_h_rms"),
             size: (safe_ctx * d_r * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-
         let dl_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM dL/dh Staging"),
             size: (safe_ctx * d_r * 4) as u64,
@@ -691,7 +690,7 @@ impl GpuLmHeadTrainer {
             cfg_assoc_logit_lambda: std::env::var("AIDEEN_ASSOC_LOGIT_LAMBDA")
                 .ok()
                 .and_then(|s| s.trim().parse::<f32>().ok())
-                .unwrap_or(0.0)
+                .unwrap_or(1.0)
                 .max(0.0),
             last_sampled_indices: Vec::new(),
             last_num_samples: 0,
@@ -929,6 +928,17 @@ impl GpuLmHeadTrainer {
         self.last_num_samples = actual_num_samples;
         // Use last_sampled_indices for the rest of this call.
         let sampled_indices = &self.last_sampled_indices;
+        if self.cfg_lm_debug {
+            let tgt0 = targets.first().copied().unwrap_or(Self::IGNORE_TARGET);
+            let target_pos = sampled_indices.iter().position(|&v| v == tgt0);
+            let preview_len = sampled_indices.len().min(12);
+            eprintln!(
+                "    [LM-DEBUG] buffer_input sampled contains_target={} target_pos={:?} preview={:?}",
+                target_pos.is_some(),
+                target_pos,
+                &sampled_indices[..preview_len]
+            );
+        }
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -1106,6 +1116,17 @@ impl GpuLmHeadTrainer {
         self.last_num_samples = actual_num_samples;
         // Use last_sampled_indices for the rest of this call.
         let sampled_indices = &self.last_sampled_indices;
+        if self.cfg_lm_debug {
+            let tgt0 = targets.first().copied().unwrap_or(Self::IGNORE_TARGET);
+            let target_pos = sampled_indices.iter().position(|&v| v == tgt0);
+            let preview_len = sampled_indices.len().min(12);
+            eprintln!(
+                "    [LM-DEBUG] no_readback sampled contains_target={} target_pos={:?} preview={:?}",
+                target_pos.is_some(),
+                target_pos,
+                &sampled_indices[..preview_len]
+            );
+        }
 
         let params = TrainParams {
             d_model: self.config.d_r as u32,
@@ -1237,6 +1258,9 @@ impl GpuLmHeadTrainer {
             let loss_int = i32::from_le_bytes(data[0..4].try_into().unwrap());
             drop(data);
             self.loss_staging_buf.unmap();
+            if self.cfg_lm_debug {
+                eprintln!("    [LM-DEBUG] no_readback loss_int={}", loss_int);
+            }
             Ok(loss_int as f32 / 10000.0)
         } else {
             Err("Failed to read loss from GPU".to_string())
@@ -1340,6 +1364,65 @@ impl GpuLmHeadTrainer {
             Ok(vec)
         } else {
             Err("LM dl_dh map failed".to_string())
+        }
+    }
+
+    /// TEMPORARY DIAGNOSTIC: read arbitrary prefix of final dL/dh.
+    pub fn read_dl_dh_n(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        n_floats: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.read_buffer_prefix(device, queue, &self.dl_dh_buf, n_floats, "LM dl_dh_n")
+    }
+
+    /// TEMPORARY DIAGNOSTIC: read arbitrary prefix of assoc RHS scratch.
+    pub fn read_assoc_grad_n(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        n_floats: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.read_buffer_prefix(device, queue, &self.s_h_rms_buf, n_floats, "LM assoc_grad_n")
+    }
+
+    fn read_buffer_prefix(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &wgpu::Buffer,
+        n_floats: usize,
+        label: &str,
+    ) -> Result<Vec<f32>, String> {
+        let bytes = (n_floats * std::mem::size_of::<f32>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(label),
+        });
+        encoder.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(Ok(())) = rx.recv() {
+            let data = slice.get_mapped_range();
+            let out = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+            drop(data);
+            staging.unmap();
+            Ok(out)
+        } else {
+            Err(format!("{label} map failed"))
         }
     }
 

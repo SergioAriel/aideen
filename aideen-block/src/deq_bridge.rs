@@ -177,7 +177,7 @@ impl RustDeqBridge {
         let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map(|v| v.clamp(1, 4))
+            .map(|v| v.clamp(1, 16))
             .unwrap_or(1);
         let assoc_transition_gate = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
             .ok()
@@ -214,6 +214,20 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_hash_lane = std::env::var("AIDEEN_ASSOC_HASH_LANE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_hash_replica = std::env::var("AIDEEN_ASSOC_HASH_REPLICA")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let assoc_read_slot_prior = std::env::var("AIDEEN_ASSOC_READ_SLOT_PRIOR")
             .ok()
             .map(|v| {
@@ -241,14 +255,28 @@ impl RustDeqBridge {
                 let vl = v.trim().to_ascii_lowercase();
                 vl == "1" || vl == "true" || vl == "yes"
             })
-            .unwrap_or(false);
+            .unwrap_or(true);
         let assoc_linear_write = std::env::var("AIDEEN_ASSOC_LINEAR_WRITE")
             .ok()
             .map(|v| {
                 let vl = v.trim().to_ascii_lowercase();
                 vl == "1" || vl == "true" || vl == "yes"
             })
-            .unwrap_or(false);
+            .unwrap_or(true);
+        let assoc_protect_occupied = std::env::var("AIDEEN_ASSOC_PROTECT_OCCUPIED")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(true);
+        let assoc_suppress_value_source = std::env::var("AIDEEN_ASSOC_SUPPRESS_VALUE_SOURCE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(true);
         let assoc_post_hstar = std::env::var("AIDEEN_ASSOC_POST_HSTAR")
             .ok()
             .map(|v| {
@@ -270,6 +298,27 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_oracle_write_positions = std::env::var("AIDEEN_ASSOC_ORACLE_WRITE_POS")
+            .or_else(|_| std::env::var("AIDEEN_ASSOC_ORACLE_WRITE_POSITIONS"))
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_oracle_force_write = std::env::var("AIDEEN_ASSOC_ORACLE_FORCE_WRITE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let assoc_oracle_prefix_pairs = std::env::var("AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS")
+            .or_else(|_| std::env::var("AR_PAIRS_PER_SEQ"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(16);
         let segment_memory_token = std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
             .ok()
             .map(|v| {
@@ -585,7 +634,7 @@ impl RustDeqBridge {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(1)
-            .clamp(1, 8);
+            .clamp(1, 16);
         // Slot coordination uses bias only as a structural bootstrap to break permutation
         // symmetry. Training the bias let the router collapse onto the shortcut instead of
         // pushing specialization into W_q/W_k, and disabling bias entirely weakened the
@@ -609,7 +658,20 @@ impl RustDeqBridge {
             if fpm_enabled { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert("FPM_MEM_ITERS".to_string(), fpm_mem_iters as f64);
+        slot_coord_constants.insert("ASSOC_RANK".to_string(), 32.0);
         slot_coord_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
+        let assoc_read_beta = std::env::var("AIDEEN_ASSOC_READ_BETA")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.05, 16.0);
+        let assoc_write_min_mass = std::env::var("AIDEEN_ASSOC_WRITE_MIN_MASS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        slot_coord_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
+        slot_coord_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
         slot_coord_constants.insert(
             "ENABLE_ASSOC_TRANSITION_GATE".to_string(),
             if assoc_transition_gate { 1.0 } else { 0.0 },
@@ -629,6 +691,14 @@ impl RustDeqBridge {
         slot_coord_constants.insert(
             "ENABLE_ASSOC_SLOT_OWNER".to_string(),
             if assoc_slot_owner { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_HASH_LANE".to_string(),
+            if assoc_hash_lane { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_HASH_REPLICA".to_string(),
+            if assoc_hash_replica { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_READ_SLOT_PRIOR".to_string(),
@@ -651,6 +721,14 @@ impl RustDeqBridge {
             if assoc_linear_write { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
+            "ENABLE_ASSOC_PROTECT_OCCUPIED".to_string(),
+            if assoc_protect_occupied { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE".to_string(),
+            if assoc_suppress_value_source { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
             "ENABLE_ASSOC_POST_HSTAR".to_string(),
             if assoc_post_hstar { 1.0 } else { 0.0 },
         );
@@ -669,6 +747,18 @@ impl RustDeqBridge {
         slot_coord_constants.insert(
             "ENABLE_ASSOC_EVENT_GATE".to_string(),
             if assoc_event_gate { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
+            if assoc_oracle_write_positions { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_ORACLE_FORCE_WRITE".to_string(),
+            if assoc_oracle_force_write { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ASSOC_ORACLE_PREFIX_PAIRS".to_string(),
+            assoc_oracle_prefix_pairs as f64,
         );
         let slot_coord_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1114,27 +1204,27 @@ impl RustDeqBridge {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: scratch_buf.as_entire_binding(), // Dummy for mix_buf in forward
+                    resource: hist_ctx_buf.as_entire_binding(), // Matches WGSL binding 8
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: scratch_buf.as_entire_binding(), // Dummy for weighted_h in forward
+                    resource: mstate_buf.as_entire_binding(), // Matches WGSL binding 9
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: scratch_buf.as_entire_binding(), // Dummy for gmix in forward
+                    resource: scratch_buf.as_entire_binding(), // Dummy
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: scratch_buf.as_entire_binding(), // Dummy for gscore in forward
+                    resource: scratch_buf.as_entire_binding(), // Dummy
                 },
                 wgpu::BindGroupEntry {
                     binding: 12,
-                    resource: scratch_buf.as_entire_binding(), // Dummy for qgrad in forward
+                    resource: prev_hstar_buf.as_entire_binding(), // Matches WGSL binding 12
                 },
                 wgpu::BindGroupEntry {
                     binding: 13,
-                    resource: hist_ctx_buf.as_entire_binding(),
+                    resource: scratch_buf.as_entire_binding(), // Dummy
                 },
                 wgpu::BindGroupEntry {
                     binding: 14,

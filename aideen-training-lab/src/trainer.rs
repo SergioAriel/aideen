@@ -204,6 +204,7 @@ pub struct Trainer {
     cfg_assoc_lr_mult: f32,        // AIDEEN_ASSOC_LR_MULT
     cfg_assoc_event_lr_mult: f32,  // AIDEEN_ASSOC_EVENT_LR_MULT
     cfg_assoc_alpha_lr_mult: f32,  // AIDEEN_ASSOC_ALPHA_LR_MULT
+    cfg_assoc_addr_lr_mult: f32,   // AIDEEN_ASSOC_ADDR_LR_MULT
 }
 
 impl Trainer {
@@ -459,6 +460,60 @@ impl Trainer {
 
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
+    }
+
+    fn assoc_banks_from_env() -> usize {
+        std::env::var("AIDEEN_ASSOC_BANKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(1)
+    }
+
+    fn format_assoc_state_summary(assoc: &[f32], h_slots: usize, d_model: usize) -> String {
+        let banks = Self::assoc_banks_from_env();
+        let rank = 32usize;
+        let bank_stride = rank + d_model + 1;
+        let slot_stride = banks * bank_stride;
+        let assoc_slot_start = h_slots / 2;
+        let mut parts = Vec::new();
+        for slot in assoc_slot_start..h_slots {
+            let slot_base = slot * slot_stride;
+            if slot_base + slot_stride > assoc.len() {
+                parts.push(format!("s{slot}:out-of-range"));
+                continue;
+            }
+            let mut used = 0usize;
+            let mut gt005 = 0usize;
+            let mut gt020 = 0usize;
+            let mut gt080 = 0usize;
+            let mut usage_sum = 0.0f32;
+            let mut usage_max = 0.0f32;
+            for bank in 0..banks {
+                let usage_idx = slot_base + bank * bank_stride + rank + d_model;
+                let usage = assoc.get(usage_idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                if usage > 1.0e-4 {
+                    used += 1;
+                }
+                if usage > 0.05 {
+                    gt005 += 1;
+                }
+                if usage > 0.20 {
+                    gt020 += 1;
+                }
+                if usage > 0.80 {
+                    gt080 += 1;
+                }
+                usage_sum += usage;
+                usage_max = usage_max.max(usage);
+            }
+            parts.push(format!(
+                "s{slot}:{used}/{banks} >.05={gt005} >.20={gt020} >.80={gt080} mean={:.3e} max={:.3e}",
+                usage_sum / banks.max(1) as f32,
+                usage_max
+            ));
+        }
+        parts.join(" | ")
     }
 
     fn fixed_history_reference_mode() -> bool {
@@ -1587,6 +1642,9 @@ impl Trainer {
             cfg_assoc_lr_mult: Self::env_f32("AIDEEN_ASSOC_LR_MULT").unwrap_or(1.0),
             cfg_assoc_event_lr_mult: Self::env_f32("AIDEEN_ASSOC_EVENT_LR_MULT").unwrap_or(1.0),
             cfg_assoc_alpha_lr_mult: Self::env_f32("AIDEEN_ASSOC_ALPHA_LR_MULT").unwrap_or(1.0),
+            cfg_assoc_addr_lr_mult: Self::env_f32("AIDEEN_ASSOC_ADDR_LR_MULT")
+                .or_else(|| Self::env_f32("AIDEEN_ASSOC_LR_MULT"))
+                .unwrap_or(0.0),
         };
         trainer.apply_experimental_profile_from_env();
 
@@ -1816,7 +1874,7 @@ impl Trainer {
                 // Para batch > 1 el training loop pasa B*ctx_len tokens — no truncar.
                 let fwd_batch_size_ts: usize = self.cfg_fwd_batch_size.max(1) as usize;
                 let seq_len = tokens.len().min(targets.len());
-                let seq_cap = self.gpu_sequence_capacity();
+                let seq_cap = gpu.forward_seq_cap.max(1) as usize;
                 let actual_ctx_len = if fwd_batch_size_ts > 1 {
                     seq_len
                 } else {
@@ -1942,6 +2000,9 @@ impl Trainer {
         let Some(gpu_lm) = self.gpu_lm.as_mut() else {
             return f32::NAN;
         };
+        let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+            return f32::NAN;
+        };
         let h_offset = (token_index * d * std::mem::size_of::<f32>()) as u64;
         match gpu_lm.train_step_no_readback(
             &gpu.device,
@@ -1950,7 +2011,7 @@ impl Trainer {
             h_offset,
             &gpu.bridge.assoc_pooled_buf,
             h_offset,
-            None,
+            Some(gpu_emb.weights_buffer()),
             &[target],
             0.0,
             step_t,
@@ -2298,6 +2359,49 @@ impl Trainer {
             if lm_lr > 0.0 {
                 self.lm_head_cpu_stale = true;
             }
+            // TEMPORARY DIAGNOSTIC: localize first non-finite source entering clean Picard.
+            if Self::env_flag("AIDEEN_BACKWARD_INPUT_PROBE")
+                && self.cfg_debug_sample_every > 0
+                && self.optimizer.step_count() % self.cfg_debug_sample_every == 0
+            {
+                let n = (per_seq_len as usize) * self.config.d_r;
+                let summarize = |name: &str, xs: &[f32]| {
+                    let mut finite_n = 0usize;
+                    let mut nan_n = 0usize;
+                    let mut inf_n = 0usize;
+                    let mut max_abs = 0.0f32;
+                    let mut sum_sq = 0.0f64;
+                    for &x in xs {
+                        if x.is_nan() {
+                            nan_n += 1;
+                        } else if !x.is_finite() {
+                            inf_n += 1;
+                        } else {
+                            finite_n += 1;
+                            max_abs = max_abs.max(x.abs());
+                            sum_sq += (x as f64) * (x as f64);
+                        }
+                    }
+                    let rms = (sum_sq / finite_n.max(1) as f64).sqrt();
+                    eprintln!(
+                        "[BWD-INPUT-PROBE] {name}: n={} finite={} nan={} inf={} rms={:.3e} max={:.3e}",
+                        xs.len(),
+                        finite_n,
+                        nan_n,
+                        inf_n,
+                        rms,
+                        max_abs
+                    );
+                };
+                let hpooled = gpu.read_hpooled_seq(per_seq_len as u32);
+                summarize("hpooled", &hpooled);
+                if let Ok(dl) = gpu_lm.read_dl_dh_n(&gpu.device, &gpu.queue, n) {
+                    summarize("dl_dh", &dl);
+                }
+                if let Ok(assoc_rhs) = gpu_lm.read_assoc_grad_n(&gpu.device, &gpu.queue, n) {
+                    summarize("assoc_rhs", &assoc_rhs);
+                }
+            }
 
             // 4. Embedding Update from GPU dl_dh buffer (Moved to step 6 to avoid duplication)
 
@@ -2323,6 +2427,39 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
+                // TEMPORARY DIAGNOSTIC: confirm whether clean Picard creates non-finite adjoints.
+                if Self::env_flag("AIDEEN_BACKWARD_INPUT_PROBE")
+                    && self.cfg_debug_sample_every > 0
+                    && self.optimizer.step_count() % self.cfg_debug_sample_every == 0
+                {
+                    let adj = gpu.read_adj_v_out(per_seq_len as u32);
+                    let mut finite_n = 0usize;
+                    let mut nan_n = 0usize;
+                    let mut inf_n = 0usize;
+                    let mut max_abs = 0.0f32;
+                    let mut sum_sq = 0.0f64;
+                    for &x in &adj {
+                        if x.is_nan() {
+                            nan_n += 1;
+                        } else if !x.is_finite() {
+                            inf_n += 1;
+                        } else {
+                            finite_n += 1;
+                            max_abs = max_abs.max(x.abs());
+                            sum_sq += (x as f64) * (x as f64);
+                        }
+                    }
+                    let rms = (sum_sq / finite_n.max(1) as f64).sqrt();
+                    eprintln!(
+                        "[BWD-INPUT-PROBE] adj_v_out: n={} finite={} nan={} inf={} rms={:.3e} max={:.3e}",
+                        adj.len(),
+                        finite_n,
+                        nan_n,
+                        inf_n,
+                        rms,
+                        max_abs
+                    );
+                }
                 if audit_cost {
                     audit_picard_ms += picard_t0.elapsed().as_secs_f64() * 1e3;
                 }
@@ -2348,6 +2485,7 @@ impl Trainer {
                     self.cfg_assoc_lr_mult,
                     self.cfg_assoc_event_lr_mult,
                     self.cfg_assoc_alpha_lr_mult,
+                    self.cfg_assoc_addr_lr_mult,
                 );
                 if audit_cost {
                     audit_update_ms += update_t0.elapsed().as_secs_f64() * 1e3;
@@ -2367,8 +2505,8 @@ impl Trainer {
                             let b = s * 16;
                             if b + 15 < adbg.len() {
                                 eprintln!(
-                                    "[ASSOC-BWD-STEP] s{}: val_rms={:.3e} score_grad_max={:.3e} wq_step_max={:.3e} wk_step_max={:.3e} alpha_grad_max={:.3e} key_grad_sum={:.3e} gprev_sum={:.3e} write_mass={:.3e}",
-                                    s, adbg[b], adbg[b+5], adbg[b+7], adbg[b+9], adbg[b+11], adbg[b+12], adbg[b+13], adbg[b+14]
+                                    "[ASSOC-BWD-STEP] s{}: val_rms={:.3e} bevent_update_max={:.3e} event_grad_signed={:.3e} score_grad_max={:.3e} wq_step_max={:.3e} wk_step_max={:.3e} wq_update_max={:.3e} wk_update_max={:.3e} key_grad_sum={:.3e} gprev_sum={:.3e} write_mass={:.3e}",
+                                    s, adbg[b], adbg[b+2], adbg[b+3], adbg[b+5], adbg[b+7], adbg[b+9], adbg[b+11], adbg[b+15], adbg[b+12], adbg[b+13], adbg[b+14]
                                 );
                             }
                         }
@@ -4416,6 +4554,19 @@ impl Trainer {
                              */
                         }
                     }
+                    if Self::env_flag("AIDEEN_ASSOC_AUDIT") {
+                        if let Some(gpu) = self.gpu_deq.as_ref() {
+                            let assoc = gpu.read_assoc_state();
+                            println!(
+                                "    [ASSOC-STATE] {}",
+                                Self::format_assoc_state_summary(
+                                    &assoc,
+                                    self.config.h_slots,
+                                    self.config.d_r
+                                )
+                            );
+                        }
+                    }
                     // Slot-coord diagnostics (slot attention, active in DEQ_NO_MAMBA mode)
                     if Self::slot_coord_mode_active() && Self::valid_debug_snapshot(&self.cached_debug_buf) {
                         let slot_obs = Self::decode_slot_observability_metrics(
@@ -5101,7 +5252,7 @@ impl Trainer {
                         let slot_anchor_base = hist_gate_base + h_slots;
                         let w_kv_write_base = slot_anchor_base + h_slots * d_r;
                         let b_delta_base = w_kv_write_base + 2 * h_slots * d_r * RETAIN_RANK;
-                        let scalar_base = b_delta_base + d_r;
+                        let scalar_base = b_delta_base + h_slots * d_r;
                         let w_gate_hist_base = scalar_base + 21;
                         let w_write_gate_base = w_gate_hist_base + h_slots * d_r;
                         let b_write_mem_base = w_write_gate_base + h_slots * d_r;
@@ -5150,8 +5301,20 @@ impl Trainer {
                             d_r,
                             &hist[w_kv_write_base + h_slots * d_r * RETAIN_RANK..b_delta_base],
                         );
+                        let b_delta_gpu = &hist[b_delta_base..scalar_base];
+                        let mut b_delta_shared = vec![0.0f32; d_r];
+                        for slot in 0..h_slots {
+                            let slot_base = slot * d_r;
+                            for dim in 0..d_r {
+                                b_delta_shared[dim] += b_delta_gpu[slot_base + dim];
+                            }
+                        }
+                        let inv_slots = 1.0 / h_slots.max(1) as f32;
+                        for v in &mut b_delta_shared {
+                            *v *= inv_slots;
+                        }
                         self.reasoning.b_delta =
-                            nalgebra::DVector::from_column_slice(&hist[b_delta_base..scalar_base]);
+                            nalgebra::DVector::from_column_slice(&b_delta_shared);
                         self.reasoning.w_gate_hist = nalgebra::DMatrix::from_row_slice(
                             h_slots,
                             d_r,

@@ -49,3 +49,6 @@ data/
 # Bench result logs (CSVs kept, raw logs excluded)
 aideen-bench/results/deq_no_mamba_tune*/
 aideen-bench/results/invalid
+
+# Logs for testing trian and assoc_recall
+logs/

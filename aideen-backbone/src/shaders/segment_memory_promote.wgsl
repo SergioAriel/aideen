@@ -22,7 +22,7 @@ fn slot_anchor_base(d: u32, h_slots: u32) -> u32 { return hist_gate_base(d, h_sl
 fn w_k_write_base(d: u32, h: u32) -> u32 { return slot_anchor_base(d, h) + h * d; }
 fn w_v_write_base(d: u32, h: u32) -> u32 { return w_k_write_base(d, h) + h * d * ASSOC_RANK; }
 fn b_delta_base(d: u32, h: u32) -> u32 { return w_v_write_base(d, h) + h * d * ASSOC_RANK; }
-fn hist_selective_flag_base(d: u32, h: u32) -> u32 { return b_delta_base(d, h) + d; }
+fn hist_selective_flag_base(d: u32, h: u32) -> u32 { return b_delta_base(d, h) + h * d; }
 fn hist_gate_query_base(d: u32, h: u32) -> u32 { return hist_selective_flag_base(d, h) + 21u; }
 fn w_write_gate_base(d: u32, h_slots: u32) -> u32 { return hist_gate_query_base(d, h_slots) + h_slots * d; }
 fn b_write_mem_base(d: u32, h_slots: u32) -> u32 { return w_write_gate_base(d, h_slots) + h_slots * d; }

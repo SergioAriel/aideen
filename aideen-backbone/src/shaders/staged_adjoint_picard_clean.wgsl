@@ -193,7 +193,7 @@ fn picard_clean_step_main(
             slot_coord_mode_active,
         );
         let pre = slot_branch + H_SELF_FEEDBACK * H_star[off + dim];
-        let up = params.damping * v_state[off + dim];
+        let up = params.damping * v_state[v_off + dim];
         let rms_term = pre;
         local_sumsq = local_sumsq + rms_term * rms_term;
         local_coeff = local_coeff + up * NormScale[dim] * pre;
@@ -228,7 +228,7 @@ fn picard_clean_step_main(
             slot_coord_mode_active,
         );
         let pre = slot_branch + H_SELF_FEEDBACK * H_star[off + dim];
-        let v_prev = v_state[off + dim];
+        let v_prev = v_state[v_off + dim];
         let norm_grad =
             (NormScale[dim] * inv_rms) * (params.damping * v_prev)
             - pre * coeff_scale;
@@ -1036,11 +1036,12 @@ fn anderson_mix_main(
     // Apply: v_next[entry, dim] = Σ_i β[i] * hist[(k-i+m)%m, entry, dim]
     for (var e = 0u; e < h_slots; e = e + 1u) {
         let entry = token * h_slots + e;
+        let base = v_next_entry_base(entry, d, h_slots);
         for (var dim2 = lane; dim2 < d; dim2 = dim2 + 64u) {
             var mixed = 0.0;
             for (var i = 0u; i < n_res; i = i + 1u) {
                 let hi = (k + m - i) % m;
-                mixed = mixed + anderson_beta[i] * legacy_anderson_read(hi, attn_len, entry * d + dim2);
+                mixed = mixed + anderson_beta[i] * legacy_anderson_read(hi, attn_len, base + dim2);
             }
             v_next[v_next_entry_base(entry, d, h_slots) + dim2] = mixed;
         }

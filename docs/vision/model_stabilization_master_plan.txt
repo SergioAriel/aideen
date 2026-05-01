@@ -1,0 +1,1097 @@
+AIDEEN MODEL STABILIZATION MASTER PLAN
+======================================
+
+Purpose
+-------
+This is the live stabilization task tree. Every investigation, change, validation, rejection, and next action must be recorded here with a short causal explanation.
+
+Operating method
+----------------
+1. Freeze a minimal corridor.
+2. Verify invariants before quality metrics.
+3. Use oracle tests to isolate write/read/output failure surfaces.
+4. Change one causal piece at a time.
+5. Classify every piece: measurement, layout/invariant, architecture, dynamics, diagnostics.
+6. Promote only with evidence across required seeds/profiles.
+
+Current baseline corridor
+-------------------------
+Benchmark: assoc_recall
+Command family:
+AIDEEN_ASSOC_PERSISTENT=1 AIDEEN_DAMPING=0.4 AR_PAIRS_PER_SEQ=2 AR_AUDIT=1 AR_N_TRAIN=12 AR_N_EVAL=1 AIDEEN_DEBUG_SAMPLE=4 AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_BANKS=4 AIDEEN_ASSOC_LIBRARIAN_BWD=1 AIDEEN_ASSOC_LOGIT_LAMBDA=1.0 cargo run -p aideen-training --features wgpu --bin assoc_recall --release
+Logs: logs/assoc_recall/
+
+Root problem statement
+----------------------
+Long-gap associative recall remains near random because finite Assoc banks become contaminated/diffuse over long serialized token streams. The system has also had multiple instrumentation/layout/parity bugs that made some previous conclusions unreliable.
+
+Task tree
+---------
+
+1. Documentation and method discipline
+   1.1. Create complete token circuit document.
+        Status: created, pending expansion through full transitive code review.
+        File: docs/vision/token_circuit_trace.txt
+        Why: prevent partial explanations and keep all path assumptions explicit.
+   1.2. Create live stabilization master plan.
+        Status: created.
+        File: docs/vision/model_stabilization_master_plan.txt
+        Why: record each task/change/validation/rejection with causal rationale.
+   1.3. Create stabilization skill.
+        Status: created.
+        File: .agents/skills/model-stabilization-forensics/SKILL.md
+        Why: persist the workflow as reusable repo-local agent behavior.
+   1.4. Add strict full-path analysis rule to skill.
+        Status: done.
+        Why: user explicitly required that every variable/function in other files be found and analyzed, not assumed.
+
+2. Measurement and logs
+   2.1. Preserve logs under logs/assoc_recall/.
+        Status: active.
+        Why: maintain evidence trail and prevent losing run context.
+   2.2. Fix Wk telemetry.
+        Status: done.
+        Files: aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl, aideen-training-lab/src/trainer.rs, aideen-training-lab/src/bin/assoc_recall.rs
+        Why: wk_step_max=0 was a diagnostic bug, not proof Wk was dead.
+        Evidence: Wk step/update became nonzero in exp_librarian_bwd_wk_update_probe.log.
+        Classification: measurement/default useful.
+   2.3. Event telemetry.
+        Status: active temporary diagnostic.
+        Files: fused_fpm_retain_bwd.wgsl, trainer.rs, assoc_recall.rs
+        Why: observe event gradient, event bias movement, and update magnitude.
+        Caveat: AssocBwdDebug index 2 is temporarily reused for bevent_update_max; val_bad diagnostic must be restored or moved.
+        Classification: diagnostics/pending cleanup.
+
+3. Layout and invariant fixes
+   3.1. Fix b_delta layout mismatch.
+        Status: done.
+        Failure mode: CPU/debug packed b_delta as d, GPU layout uses h*d.
+        Structural rationale: all HistParams offsets after b_delta were shifted unless CPU expands to h*d.
+        Files: aideen-backbone/src/gpu_deq.rs, aideen-training-lab/src/bin/assoc_recall.rs, aideen-training-lab/src/trainer.rs, aideen-backbone/src/shaders/segment_memory_promote.wgsl
+        Evidence: cargo check passed; event_b stats became nonzero after layout correction.
+        Classification: layout/invariant, default stable if no regression appears.
+   3.2. Verify full HistParams offset table.
+        Status: pending.
+        Why: one offset bug invalidated downstream metrics; need systematic parity.
+        Subtasks:
+        - Trace every layout function in Rust and WGSL.
+        - Build an offset table.
+        - Add a parity test/assert if feasible.
+
+4. Forward/backward parity
+   4.1. Fix Assoc forward/backward compile constant mismatch.
+        Status: implemented, validation pending.
+        Failure mode: AIDEEN_ASSOC_EVENT_GATE and related Assoc flags were passed to backward but not forward pipeline constants.
+        Structural rationale: backward optimized event gate while forward still used default event_gate=1, so trained parameters did not affect writes.
+        Anti-patch check: restores equation parity; does not tune around symptoms.
+        File: aideen-backbone/src/gpu_deq.rs
+        Validation plan: run assoc_recall with AIDEEN_ASSOC_EVENT_GATE=1 and confirm event_b movement reduces forward w_allow/w_gate/write_mass compared to previous logs.
+        Classification: layout/equation parity, pending validation.
+   4.2. Validate event gate after parity fix.
+        Status: pending next run.
+        Command: same baseline corridor, log to logs/assoc_recall/exp_forward_event_constant_parity_probe.log
+        Success criteria:
+        - cargo run completes without NaNs.
+        - event_b becomes negative/nonzero.
+        - forward w_allow/w_gate changes relative to no-gate/default probe.
+        - gap128/gap256 improve or at least write contamination metric decreases.
+
+5. Assoc write policy
+   5.1. Diagnose diffuse writes across fillers.
+        Status: observed.
+        Evidence: gap64/gap128/gap256 logs show w_n proportional to token length and nonzero w_allow/w_gate across filler spans.
+        Current interpretation: finite banks act like online EMA over many tokens; binding value becomes diffuse.
+   5.2. Test stronger event L1.
+        Status: rejected as full solution.
+        Log: logs/assoc_recall/exp_event_l1_005_probe.log
+        Result: event_b moved more negative and gap256 improved somewhat in one run, but w_n remained proportional to length and quality remained near random.
+        Classification: dynamics/experimental, not default.
+   5.3. Test dense-local training.
+        Status: rejected as full solution.
+        Log: logs/assoc_recall/exp_dense_local_event_l1_probe.log
+        Result: did not solve selectivity; gap256 worsened in observed run.
+        Classification: training-dynamics/rejected for current corridor.
+   5.4. Oracle write diagnostic.
+        Status: pending.
+        Purpose: prove whether correct sparse writes are sufficient for read/LM path to recall.
+        Subtasks:
+        - Add experimental flag only, not default.
+        - Write only known binding events in assoc_recall corridor if marker info is available in shader or via supplied metadata.
+        - Compare bank_value target logits and answer_loss.
+        Success if gap128/gap256 improve strongly and banks stay less diffuse.
+        Failure means read/output path is also broken.
+
+6. Assoc read and LM head coupling
+   6.1. Oracle read diagnostic.
+        Status: pending after oracle write or if write remains ambiguous.
+        Purpose: test whether selecting the correct bank can influence target logits.
+   6.2. Oracle LM/output diagnostic.
+        Status: pending.
+        Purpose: test whether correct value injected near LM head produces correct answer.
+   6.3. Review AIDEEN_ASSOC_LOGIT_LAMBDA path.
+        Status: pending.
+        Why: direct assoc logit path exists but must be traced fully to determine if it is active, too weak, or diagnostic-only.
+
+7. Backward integrity
+   7.1. Assoc RHS buffer lifecycle.
+        Status: fixed previously, needs documentation in token circuit.
+        Failure mode: s_h_rms_buf reused as assoc_grad_buf under Metal storage limit; stale/ignored targets could contaminate RHS.
+        Fix summary: zero for IGNORE_TARGET and overwrite with dlassoc on active tokens.
+   7.2. Staged adjoint slot-major layout.
+        Status: fixed previously, needs documentation.
+        Failure mode: adjoint layout mismatch could corrupt gradients.
+   7.3. Divergent barrier/reduce NaNs.
+        Status: fixed previously, needs documentation.
+        Failure mode: workgroup barrier inside divergent lane condition caused NaNs.
+
+8. FPM/Assoc role separation
+   8.1. Preserve design intent.
+        Status: active principle.
+        Assoc role: explicit/literal binding persistence.
+        FPM role: slower contextual/general consolidation enriched by Assoc.
+   8.2. Verify FPM is not masking Assoc failure.
+        Status: pending.
+        Subtasks:
+        - Trace FPM direct write scale and disabled/frozen backward flags.
+        - Verify FPM paths are not silently altering Assoc bank evaluation.
+
+9. Cleanup and hygiene
+   9.1. Temporary diagnostics cleanup criteria.
+        Status: pending.
+        Remove or relocate temporary debug slots once:
+        - no NaNs for corridor,
+        - forward/backward parity confirmed,
+        - oracle tests isolate the failure,
+        - permanent metrics are chosen.
+   9.2. Legacy/basura cleanup.
+        Status: ongoing.
+        Rule: do not delete useful diagnostics while stabilization is unresolved; classify and gate experimental paths instead.
+
+Change log
+----------
+
+2026-04-28
+- Created .agents/skills/model-stabilization-forensics/SKILL.md.
+  Why: persist stabilization workflow and mandatory full-path analysis.
+- Created docs/vision/token_circuit_trace.txt.
+  Why: single detailed document for token circuit.
+- Created docs/vision/model_stabilization_master_plan.txt.
+  Why: single task/change/validation ledger.
+- Modified aideen-backbone/src/gpu_deq.rs to pass Assoc forward constants through shader_constants.
+  Why: restore forward/backward parity for event gate and related Assoc flags.
+  Validation: cargo check passed before docs; runtime validation still pending.
+
+Next immediate actions
+----------------------
+1. Validate forward/backward constant parity with exp_forward_event_constant_parity_probe.log.
+2. Expand token_circuit_trace.txt by tracing every referenced variable/function with rg.
+3. Implement oracle write diagnostic only after documenting its gate and out-of-default status.
+
+Runtime validation update - 2026-04-28
+--------------------------------------
+- Ran exp_forward_event_constant_parity_probe.log after passing Assoc constants into forward shader compilation.
+- Command: baseline corridor with AIDEEN_ASSOC_EVENT_GATE=1, AIDEEN_ASSOC_EVENT_LR_MULT=4, AIDEEN_ASSOC_BANKS=4, AIDEEN_ASSOC_LIBRARIAN_BWD=1, AIDEEN_ASSOC_LOGIT_LAMBDA=1.0.
+- Result: completed without NaNs.
+- Evidence: event_b_mean=-3.6726e-4, event_b_min=-7.3454e-4; event gradients and updates nonzero.
+- Forward behavior: w_allow remained around 4e-2 and w_gate around 2e-2 in long chunks; w_n remains proportional to token count.
+- Quality: gap0=3.9000, gap64=3.6230, gap128=3.1498, gap256=3.8472 vs random_base=3.9120.
+- Classification: forward/backward constant parity fix remains default-stable candidate because it restores a real invariant. It is not sufficient to solve write selectivity.
+- Decision: proceed to oracle write/read/LM diagnostics. Stop tuning event LR/L1 until oracle boundary is known.
+
+Next gate - Oracle write diagnostic
+-----------------------------------
+1. Target failure mode: Assoc may be failing because write policy stores too many filler/current-token transitions into finite banks, making bank values diffuse before read.
+2. Structural rationale: Force or select only known binding writes in the assoc_recall corridor to test whether sparse correct writes are sufficient for read + LM path. This isolates write policy from read/output failures.
+3. Anti-patch check: Oracle write is diagnostic-only behind an explicit experimental flag. It is not a proposed default behavior; it tests the causal boundary.
+4. Validation plan: compare logs against exp_forward_event_constant_parity_probe.log. Success means lower long-gap write contamination and strong improvement in bank target logits / answer_loss. Failure means read/output/LM path also needs isolation.
+
+Change gate - AssocHist segmented global indexing
+-------------------------------------------------
+1. Target failure mode: in segmented forward, AssocHist snapshots are written using local segment index `t` and `shape.token_count`, while backward reads them using full-sequence `t` and `params.seq_len`. Long sequences/chunks can therefore train against stale or wrong pre-write banks.
+2. Structural rationale: AssocHist is the forward/backward bridge for associative bank state. Its invariant is: forward snapshot index == backward token index == `(batch * full_seq_len + global_t) * h_slots + slot`. Forward already computes `global_t = shape.token_start + t` for S_in/H/Scratch; AssocHist must use the same global coordinate.
+3. Anti-patch check: this does not tune gates, losses, or scales. It restores the required layout/ownership invariant at the buffer boundary where the mismatch originates, and remains valid across segment lengths, seeds, and profiles.
+4. Validation plan: cargo check; then rerun the baseline corridor log. Success requires no NaNs and changed/cleaner backward behavior without relying on oracle flags. If metric remains random, proceed to oracle write/read/LM diagnostics with the history invariant fixed.
+Classification target: layout/invariant, default-stable candidate if validation passes.
+
+
+Validation - AssocHist segmented global indexing
+------------------------------------------------
+Log: logs/assoc_recall/exp_assoc_hist_global_index_probe.log
+Result: cargo check passed; runtime completed without NaNs.
+Metrics: gap0=3.8315, gap64=3.7056, gap128=3.1570, gap256=3.8280 vs random_base=3.9120.
+Evidence: long-gap write counters remain length-proportional and w_allow/w_gate remain nonzero across filler chunks.
+Classification: layout/invariant default-stable candidate. It fixes a real forward/backward history coordinate mismatch but is not sufficient to solve recall.
+Next decision: implement oracle write diagnostic behind explicit flags to isolate write selectivity from read/output paths.
+
+Change gate - Oracle write position mask/force
+----------------------------------------------
+1. Target failure mode: Assoc finite banks are still updated on nearly every serialized token transition, so key/value banks become diffuse before query even after history indexing is fixed.
+2. Structural rationale: assoc_recall has known binding events in the prefix pairs: value positions are odd indices below `2 * pairs_per_seq`. A diagnostic oracle can mask all non-binding writes, and optionally force valid binding writes, without adding buffers or depending on token IDs. This isolates whether sparse correct writes are enough for existing read + LM coupling.
+3. Anti-patch check: the oracle is disabled by default and controlled by explicit `AIDEEN_ASSOC_ORACLE_WRITE_POS` / `AIDEEN_ASSOC_ORACLE_FORCE_WRITE` constants. It is not promoted architecture; it only creates a causal boundary test. Forward and backward receive matching constants so training diagnostics are not silently inconsistent.
+4. Validation plan: cargo check; run baseline corridor with oracle flags and log to `logs/assoc_recall/exp_oracle_write_positions_force_probe.log`. Success means write counters collapse to prefix binding positions and target answer loss improves materially. Failure means read addressing and/or LM-head coupling must be isolated next.
+Classification target: diagnostic temporary, not default.
+
+
+Oracle implementation correction - forward constants also live in deq_bridge.rs
+-----------------------------------------------------------------------------
+Finding: the first oracle run was invalid as an oracle write test. `gpu_deq.rs` passed oracle constants to the backbone fused pipeline/backward, but the actual `deq_slot_attn_unified_clean.wgsl` forward pipeline is compiled in `aideen-block/src/deq_bridge.rs` with a separate `slot_coord_constants` map.
+Evidence: backward showed `event_grad_signed=0` under oracle stop-grad, but forward trace still had nonzero `w_allow` and length-proportional write counters across filler chunks.
+Target failure mode: diagnostic flag parity failure between forward pipeline creation sites.
+Structural rationale: every WGSL override used by the unified forward shader must be set at the pipeline that compiles that shader, not only in the backbone wrapper.
+Anti-patch check: this does not alter default behavior; it completes the diagnostic flag path at the compile-constant boundary where the mismatch originates.
+Validation plan: cargo check; rerun oracle write force and require forward `w_allow` to collapse outside prefix binding positions before interpreting quality metrics.
+Classification target: measurement/diagnostic infrastructure, default-stable for flag plumbing while oracle behavior remains experimental.
+
+
+Change gate - LM sampled-softmax target loss reduction
+------------------------------------------------------
+1. Target failure mode: assoc_recall answer_loss can report 23.0258 even when full-logit debug shows target probability near random (~0.02). This makes validation metrics unreliable.
+2. Structural rationale: lm_train.wgsl computes `s_target_exp` only in the lane that owns the sampled target index, but loss is emitted by `tid == 0`. If the target sample is not processed by lane 0, `target_prob` becomes zero and the loss saturates at `-log(1e-10)`. The target exponential must be reduced across the workgroup just like the softmax denominator.
+3. Anti-patch check: this fixes the measurement equation at its origin. It does not clamp, tune, or hide model behavior; it computes the same sampled-softmax CE intended by the shader for every target lane.
+4. Validation plan: cargo check; rerun a short assoc_recall oracle/global probe. Success means `answer_loss` aligns with printed `target_p` scale (near random around log(50)=3.912 when target_p~0.02) instead of saturating at 23.0258.
+Classification target: measurement/default stable.
+
+
+Change gate - LM eval sampled-target diagnostic
+-----------------------------------------------
+1. Target failure mode: `answer_loss` still saturates at 23.0258 for some assoc_recall gaps after reducing target exp, while external `lm_top` debug can show nonzero full-vocab target probability. The validation metric may be reading a different target/sample/input path than the debug display.
+2. Structural rationale: `eval_cached_hpooled_token_loss` calls `GpuLmHeadTrainer::train_step_no_readback` with `seq_len=1`; the only valid sampled-softmax invariant is that the requested target is present in `last_sampled_indices`, the shader receives that same target buffer, and the read loss corresponds to that call. A CPU-side diagnostic at sample construction/readback verifies the boundary before changing equations again.
+3. Anti-patch check: this is diagnostic-only under `AIDEEN_LM_DEBUG`; it does not change model behavior, logits, gradients, memory, or defaults. It tests whether the measurement path itself is coherent instead of masking the loss.
+4. Validation plan: cargo check; run a short assoc_recall probe with `AIDEEN_LM_DEBUG=1`. Success means logs show `contains_target=true`, a concrete `target_pos`, and loss values explainable by the sampled target path. If target is missing or loss remains impossible, isolate shader/readback next.
+Classification target: diagnostic temporary; removal criterion is a trusted LM loss path or replacement with permanent metric.
+
+Change gate - assoc_recall pre-GPU sequence-cap planning
+--------------------------------------------------------
+1. Target failure mode: assoc_recall can externally split long prompt/document sequences at `ctx_len` even when `AIDEEN_SEQ_CAP` is set higher. The split decision happens before the lazy GPU backend exists, so `trainer.gpu_sequence_capacity()` falls back to `config.ctx_len`; this prevents a valid full-document/internal-segment test and makes long-gap runs measure outer serialization loss.
+2. Structural rationale: the benchmark chunk planner must use the same declared forward capacity that `GpuDeqBackend` will allocate from `AIDEEN_SEQ_CAP`. Sequence ownership invariant: if the configured forward buffer can hold the full document, the benchmark must pass it as one prompt/document instead of resetting local token coordinates through outer chunks.
+3. Anti-patch check: this is not a model-quality compensation. It fixes the measurement/execution corridor at the benchmark planner boundary, restoring consistency between env-declared capacity and actual sequence slicing. It remains valid across seeds and profiles because it changes only when the declared capacity is larger than ctx_len and local explicit segment mode is not forcing smaller segments.
+4. Validation plan: cargo check; run short assoc_recall with `AIDEEN_SEQ_CAP=512` and verify LM debug for gap128/gap256 uses single calls with seq_len > 128 rather than 128+1 chunks. Quality can remain random; success criterion is correct prompt/document serialization.
+Classification target: measurement/layout corridor fix, default-stable candidate for assoc_recall.
+
+Validation - assoc_recall sequence-cap planner and take_gpu cap fix
+-------------------------------------------------------------------
+Log: logs/assoc_recall/exp_seqcap_takegpu_fix_probe.log
+Result: cargo check passed; runtime completed without NaNs.
+Evidence: `cap_debug` reported env_AIDEEN_SEQ_CAP=512, trainer_gpu_sequence_capacity=512, effective_full_cap=512. After changing train_sequence to read `gpu.forward_seq_cap` while the backend is locally borrowed, gap128 used `seq_len=132` and gap256 used `seq_len=260` instead of being truncated to 128 plus an eval token.
+Classification: measurement/execution-corridor default-stable candidate. It fixes the origin of the outer serialization measurement bug; quality remains random under one training sample, as expected.
+Next decision: rerun oracle write with matching AR_PAIRS_PER_SEQ-derived prefix count and full-document capacity. Do not set AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS unless intentionally overriding the benchmark pair count.
+
+Validation - LM sampled target diagnostic
+-----------------------------------------
+Log: logs/assoc_recall/exp_lm_eval_sample_probe.log and exp_seqcap_takegpu_fix_probe.log
+Result: target is present in sampled indices for active targets; loss no longer saturates at 23.0258 after the sampled target-exp reduction.
+Evidence: `contains_target=true`, target_pos matches target id when vocab-sized sampling is active, and loss_int is near 39120 for random cases.
+Classification: LM loss reduction remains measurement/default-stable candidate; debug prints are diagnostic temporary under AIDEEN_LM_DEBUG.
+
+Change gate - adjoint sequence capacity parity
+----------------------------------------------
+1. Target failure mode: after allowing assoc_recall to pass full long documents with `AIDEEN_SEQ_CAP=512`, training panics in `run_clean_adjoint_picard_no_readback` because `dl_dh_src` for seq_len>ctx_len is copied into `Adjoint b_dl` sized only for `ctx_len`.
+2. Structural rationale: forward h/AssocHist and backward adjoint buffers are one train-step circuit. If forward accepts `forward_seq_cap`, adjoint RHS (`b_dl`) and slot adjoint state (`b_v_out`) must be allocated for the same sequence capacity; otherwise long-sequence training cannot satisfy the buffer ownership/layout invariant.
+3. Anti-patch check: this does not clamp sequence length or hide the panic. It fixes the buffer allocation at the owner where the OOB originates, preserving the same equations for all seq_len <= forward_seq_cap.
+4. Validation plan: cargo check; rerun gap128 with AIDEEN_SEQ_CAP=512 and require no copy OOB panic. Then rerun oracle aligned probe and inspect quality separately.
+Classification target: layout/invariant default-stable candidate.
+
+Change gate - assoc_recall oracle prefix propagation
+----------------------------------------------------
+1. Target failure mode: oracle write diagnostic can be enabled with `AIDEEN_ASSOC_ORACLE_WRITE_POS=1` but still perform zero oracle writes when `AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS` and `AR_PAIRS_PER_SEQ` are absent. assoc_recall knows `pairs_per_seq` locally, but the shader constants are populated only from env vars.
+2. Structural rationale: the oracle write-position function needs the benchmark's prefix pair count to map binding value positions (`global_t` odd and `< 2*pairs`). The benchmark must propagate its local `pairs_per_seq` into the diagnostic constant path before GPU pipeline creation.
+3. Anti-patch check: this affects only the explicit oracle diagnostic flag path and does not alter default model behavior. It fixes the diagnostic boundary so the oracle actually tests sparse binding writes rather than silently disabling them.
+4. Validation plan: cargo check; run audited oracle with no manual prefix override and require nonzero `w_allow`/usage/value on binding positions. If quality remains random after banks contain values, proceed to oracle read/output.
+Classification target: diagnostic infrastructure default-stable for oracle path; oracle behavior remains temporary.
+
+Change gate - enable Assoc read-to-LM logit bridge by default
+-------------------------------------------------------------
+1. Target failure mode: after fixing full-document serialization and oracle writes, Assoc banks can contain/read the correct value, but default answer logits remain random because the LM head decodes mostly `h_pooled`; the explicit Assoc read vector is not visible to the decoder unless `AIDEEN_ASSOC_LOGIT_LAMBDA` is manually set.
+2. Structural rationale: Assoc stores literal token/value evidence in the embedding/source space. The decoder must receive that explicit read as a logit-space evidence term `lambda * <emb_ref[v], assoc_read_t>`; otherwise precise memory can exist and be selected while having no causal path to the output distribution.
+3. Anti-patch check: this restores the intended information-flow invariant between explicit memory and output, rather than tuning gates to make `h_pooled` accidentally carry literal values. The scale remains overrideable, and validation with lambda=1 solved oracle long gaps without tying LM weights.
+4. Validation plan: cargo check; rerun oracle full-document probe without manually setting AIDEEN_ASSOC_LOGIT_LAMBDA. Success means gap128/gap256 remain far below random. Non-oracle write policy remains a separate hypothesis.
+Classification target: architecture/information-flow default-stable candidate if validation passes; still requires non-oracle validation before claiming full stabilization.
+
+Investigation gate - learned temporal write selectivity after oracle boundary
+----------------------------------------------------------------------------
+1. Target failure mode: with full-document capacity and default Assoc->LM logit bridge, oracle write positions solve long gaps, but normal writes contaminate banks by writing fillers/query transitions. Linear write mass improves oracle-mask cases but no-oracle long gaps remain random.
+2. Structural rationale: explicit Assoc memory needs a persistence policy that decides which transitions become durable bindings. The required invariant is not merely nonzero write mass; it is high write mass on binding transitions and low write mass on irrelevant filler/query transitions, while preserving readable bank values.
+3. Anti-patch check: do not tune loss or clamp output to hide contamination. The next change, if any, must affect the write-selection mechanism at its origin or fix an existing selector/gradient path that is currently ineffective.
+4. Validation plan: first inspect existing librarian/owner/reuse/event mechanisms. Then test or implement one selector change behind a flag/default only if structurally justified. Success requires no-oracle gap128/256 materially below random and telemetry showing reduced filler write mass, not just lower loss.
+Classification target: pending architecture/dynamics; no default promotion until no-oracle validation passes.
+
+Change gate - protect occupied Assoc banks from filler overwrites
+-----------------------------------------------------------------
+1. Target failure mode: no-oracle Assoc writes still contaminate long-gap memory because every token transition writes into the finite bank set. With one/few banks, the original key->value binding is overwritten or averaged away by fillers before query.
+2. Structural rationale: explicit Assoc banks are durable literal bindings, not a dense recurrent accumulator. A write into an already occupied bank should require either an empty-bank allocation, a reuse/match decision, or another strong replacement policy. In the absence of that, write mass must be reduced by available capacity `(1-usage)` so occupied banks preserve stored evidence.
+3. Anti-patch check: this fixes the ownership/lifetime invariant of finite banks at the write equation. It does not clamp logits or use benchmark token IDs. It remains valid for generic finite associative memory: preserve occupied bindings unless replacement is justified.
+4. Validation plan: cargo check; run no-oracle full-document probe with linear write and occupied protection. Success requires lower long-gap loss and telemetry showing reduced effective writes after bank occupation. If too conservative, test with multiple banks or replacement threshold rather than disabling the invariant.
+Classification target: architecture/dynamics default candidate only after no-oracle validation.
+
+Change gate - promote linear Assoc write mass
+---------------------------------------------
+1. Target failure mode: with occupied-bank protection active, quadratic write mass (`g*g`) underwrites the initial binding, leaving long-gap recall only partial (~2.9 loss). Linear write mass with the same protection solves no-oracle long gaps (~0.95 loss).
+2. Structural rationale: Assoc is a literal binding memory. Once the selector decides to commit a binding into an empty bank, the write mass should correspond to selector confidence, not confidence squared. Squaring is appropriate as a conservative damping patch, but here it starves the only durable write before the bank becomes protected.
+3. Anti-patch check: this changes the write equation at the origin of underwritten bindings. It does not use token IDs, oracle positions, or output clamps. It remains bounded by bank protection and existing gate factors.
+4. Validation plan: set ENABLE_ASSOC_LINEAR_WRITE default true; cargo check; rerun no-oracle full-document corridor with no `AIDEEN_ASSOC_LINEAR_WRITE` env. Success requires gap0/64/128/256 materially below random and no NaNs.
+Classification target: dynamics/default-stable candidate after validation.
+
+Change gate - suppress writes from already-stored value sources
+---------------------------------------------------------------
+1. Target failure mode: with multiple key/value pairs, occupied-bank protection preserves banks but still stores alternating bad transitions such as value->next_key before banks are full. This consumes finite literal capacity and leaves only a subset of queryable key->value bindings.
+2. Structural rationale: in explicit associative memory, a token/vector already stored as a bank value should not automatically become the source key for another durable binding on the next step. Suppressing writes when the previous source matches an existing bank value prevents value-chain contamination while still allowing new key-like sources to allocate empty banks.
+3. Anti-patch check: this uses only memory geometry (`PrevHStar` vs stored bank values), not benchmark token IDs, positions, or target labels. It restores a role invariant: values are retrievable payloads, not default write addresses, unless a stronger replacement/reuse policy later justifies it.
+4. Validation plan: cargo check; run pairs_per_seq=4 with AIDEEN_ASSOC_BANKS=4 and full-document capacity. Success requires gap128/256 materially below random and audit showing preserved multiple bindings. Also rerun pairs=1 default corridor to ensure no regression.
+Classification target: architecture/dynamics default candidate after validation.
+
+Validation - default Assoc logit bridge, occupied protection, linear write
+-------------------------------------------------------------------------
+Logs:
+- logs/assoc_recall/exp_default_assoc_logit_oracle_probe.log
+- logs/assoc_recall/exp_default_linear_protect_no_oracle_probe.log
+- logs/assoc_recall/exp_protect_occupied_quadratic_default_probe.log
+Result:
+- Oracle full-document with default Assoc->LM bridge solved gap128/gap256 (~0.001 loss), proving the output bridge is now active by default.
+- No-oracle pairs_per_seq=1 with occupied-bank protection + linear write solved gap0/64/128/256 (~0.91-1.00 loss) with no NaNs.
+- Occupied protection with quadratic write stayed partial (~2.9 loss), so linear write is required for sufficient initial binding mass.
+Classification:
+- Assoc->LM logit bridge default: default-stable candidate for this corridor.
+- Occupied-bank protection: default-stable candidate for single-binding corridor; structurally correct finite-bank lifetime invariant.
+- Linear write: default-stable candidate for this corridor.
+
+Validation - multi-binding pairs_per_seq=4
+------------------------------------------
+Logs:
+- logs/assoc_recall/exp_default_pairs4_banks_default_probe.log
+- logs/assoc_recall/exp_default_pairs4_banks4_probe.log
+- logs/assoc_recall/exp_pairs4_banks4_value_source_suppress_probe.log
+Result:
+- Default 1 bank remains insufficient for 4 bindings: gap128/gap256 partial/random.
+- 4 banks alone did not solve; loss remained around 3.4.
+- Suppressing writes from already-stored value sources did not materially improve multi-binding.
+Classification:
+- Multi-binding selector remains pending. The base single-binding stabilization is real, but scaling to multiple bindings needs a better temporal/bank assignment policy, not just capacity.
+Next action:
+- Investigate bank allocation trace for pairs_per_seq=4 to see which exact transitions occupy banks. Candidate next fix: explicit transition role state/refractory write state or learned write salience with a sequence-level sparse budget, but do not promote without oracle-style boundary validation.
+
+Change gate - hard commit mass for selected empty bank
+-----------------------------------------------------
+1. Target failure mode: with multiple bindings and multiple banks, writes into empty banks are diluted by slot and bank soft probabilities (`p_slot_i * bank_prob`), leaving each binding weak (`usage_max < 0.1`, qctx ~0.03) even when a bank is available.
+2. Structural rationale: bank choice is already made as a discrete `final_best_bank`. Once the librarian selects an empty bank, the commit mass should not be attenuated by the softmax probability of that selected bank; soft probabilities are useful for differentiable choice, but the persistent bank update is a hard allocation event.
+3. Anti-patch check: this does not use benchmark positions/tokens. It fixes the mismatch between hard state mutation (one chosen bank is written) and soft probability-scaled update mass, restoring a finite-memory allocation invariant.
+4. Validation plan: under occupied protection, use full event/slot confidence for empty-bank commits and remove bank-prob attenuation from the actual write mass. Run pairs=1 and pairs=4 corridors. Success means stronger usage/qctx and lower multi-binding loss without regressing single-binding.
+Classification target: architecture/dynamics pending validation.
+
+Validation - multi-binding follow-up probes
+-------------------------------------------
+Logs:
+- logs/assoc_recall/exp_pairs4_bank_occupancy_audit.log
+- logs/assoc_recall/exp_pairs4_hard_bank_commit_probe.log
+- logs/assoc_recall/exp_pairs4_hard_commit_hard_read_probe.log
+Results:
+- Audit showed weak multi-binding state: usage/qctx too low and only Assoc slots 2/3 active.
+- Hard commit mass improved pairs=4 from ~3.4 to ~3.02, but still partial/random.
+- Hard read + beta=8 did not solve, so the current bottleneck is not read softness alone.
+Current classification:
+- hard bank commit: experimental useful, not validated as default for multi-binding.
+- value-source suppression: rejected/insufficient as standalone for multi-binding; keep only if later selector needs it, otherwise candidate for revert/gating.
+- occupied protection + linear write + Assoc->LM bridge remain validated for single-binding corridor.
+Next action:
+- Investigate explicit multi-binding allocation: either use all Assoc slots as independent binding lanes, or add a sparse write allocator that commits only queryable key sources and maps distinct source keys to distinct banks/slots. Must be validated by bank occupancy traces, not only loss.
+
+Change gate - normalize Assoc write ownership over active Assoc slots
+---------------------------------------------------------------------
+1. Target failure mode: Assoc writes are diluted by `p_slot_i = 1 / h_slots` even though only slots with `is_assoc_slot` can write. With h_slots=4 only slots 2/3 write, so every durable binding receives half the intended active-slot mass. This is tolerable for one pair but weakens multi-binding occupancy/qctx.
+2. Structural rationale: write ownership probabilities must normalize over eligible Assoc writer slots, not all model slots. Non-Assoc slots are FPM/DEQ slots and cannot participate in Assoc writes, so including them in the denominator violates conservation of write mass across the active writer set.
+3. Anti-patch check: this fixes the normalization at the write allocation equation. It does not use token IDs, positions, or task-specific oracle information, and remains valid for any h_slots where Assoc writers are the upper half.
+4. Validation plan: update default p_slot_i to 1/assoc_writer_count and, if slot-owner is enabled, normalize owner competition over assoc slots only. Run pairs=1 to ensure no regression, then pairs=4/banks=4 to check stronger occupancy/qctx and lower loss.
+Classification target: layout/equation invariant default candidate if validation passes.
+
+Validation - Assoc slot active-writer normalization
+---------------------------------------------------
+Logs:
+- logs/assoc_recall/exp_pairs1_assoc_slot_norm_probe.log
+- logs/assoc_recall/exp_pairs4_assoc_slot_norm_probe.log
+- logs/assoc_recall/exp_pairs4_assoc_slot_norm_audit_short.log
+Result:
+- pairs_per_seq=1 remains solved after normalizing write ownership over active Assoc slots only: gap0=0.1037, gap64=0.1372, gap128=0.1047, gap256=0.0885, random=3.9120. This confirms multislot Assoc (slots 2/3) is not itself the failure mode.
+- pairs_per_seq=4 with AIDEEN_ASSOC_BANKS=4 improved from previous partial/random probes (~3.0-3.4) to gap128=2.2687 and gap256=2.2759, but remains partial. The normalization fixed a real write-mass bug but did not solve multi-binding allocation.
+- Short AR_AUDIT=1 run shows the current failure is still not NaN/explosion. It is poor literal binding specificity: best_bank_target_p stays near random (~0.02) in short audit cases, while read entropy remains high across banks.
+Classification:
+- Active Assoc slot normalization: default-stable candidate for pairs=1; beneficial but insufficient for pairs=4.
+- Current next suspected locus: write-event/allocation policy. With event gate disabled, Assoc tries to store generic adjacent-token transitions; multi-pair sequences need sparse selection of key->value transitions, not every transition until banks fill.
+Next action:
+- Inspect and align forward/backward librarian equations before promoting any allocation dynamics. In particular, the backward allocator still normalizes slot probability over all h slots and still includes bank probability in gradients although forward hard-commit write mass no longer does.
+
+Change gate - forward/backward parity for Assoc librarian allocation
+--------------------------------------------------------------------
+1. Target failure mode: multi-binding stabilization requires activating/validating the Assoc allocation/event router, but the backward librarian path still contains legacy equations: slot ownership normalizes over all slots instead of active Assoc writer slots, and allocation gradients still treat bank soft probability as part of write mass although forward now performs hard bank commit without bank-prob attenuation.
+2. Structural rationale: the trained allocation variables must receive gradients for the same equation executed in forward. Forward write mass is `event_gate * p_assoc_slot` at allocation time, with bank probability only choosing the discrete bank. Backward must therefore normalize `p_slot` over Assoc slots and must not multiply event/slot gradients by `p_bank_best` as if bank probability attenuated the write.
+3. Anti-patch check: this does not tune a metric or clamp a symptom. It restores forward/backward equation parity for an existing path and only affects the librarian backward path when that path is enabled. It remains valid across pair counts because it corrects the owner set and derivative chain, not a benchmark-specific case.
+4. Validation plan: patch `fused_fpm_retain_bwd.wgsl`; run cargo check; rerun pairs=1 default corridor to ensure the validated path does not regress; then run pairs=4 with `AIDEEN_ASSOC_BANKS=4` and, separately, an experimental event/librarian-bwd probe if defaults still stay partial.
+Classification target: layout/equation invariant default-stable for backward parity; event/librarian activation remains experimental until validated.
+
+Validation - Assoc librarian backward parity and event-gate probe
+-----------------------------------------------------------------
+Logs:
+- logs/assoc_recall/exp_pairs1_bwd_librarian_parity_probe.log
+- logs/assoc_recall/exp_pairs4_event_librarian_bwd_probe.log
+Result:
+- Backward parity cleanup compiles and does not regress the validated pairs=1 corridor: gap0=0.1523, gap64=0.0823, gap128=0.0622, gap256=0.0842, no NaNs.
+- Experimental activation `AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_LIBRARIAN_BWD=1` with pairs_per_seq=4, banks=4 regressed to near-random: gap128=3.5076, gap256=3.4205. This is worse than the non-event default after slot normalization (~2.27).
+Classification:
+- Backward parity cleanup: default-stable candidate because it does not alter default active behavior and preserves the pairs=1 corridor.
+- Event gate + librarian activation: rejected as default in current form. It remains experimental only; current initialization/training does not learn sparse key->value selection fast enough and reduces write mass before it has a useful policy.
+Next action:
+- Run an oracle-write multi-binding probe. If forced key->value-position writes solve pairs=4, the remaining defect is allocator/event selection. If oracle writes do not solve, the defect is addressing/read/output despite clean writes.
+
+Validation - default multi-binding scale ladder
+-----------------------------------------------
+Logs:
+- logs/assoc_recall/scale/default_scale_ladder_summary.log
+- logs/assoc_recall/scale/default_pairs1_banks1_gap128.log
+- logs/assoc_recall/scale/default_pairs2_banks2_gap128.log
+- logs/assoc_recall/scale/default_pairs4_banks4_gap128.log
+- logs/assoc_recall/scale/default_pairs8_banks8_gap128.log
+Result:
+- gap128, AR_N_TRAIN=30, AR_N_EVAL=10, banks=pairs: pairs1=0.1243, pairs2=1.5994, pairs4=2.0727, pairs8=23.0258. The degradation is monotonic until pairs8, where loss saturates at the clipped CE ceiling.
+Classification:
+- The current Assoc path is not scalable. It solves single binding and partially handles small multi-binding, but separability collapses as the number of simultaneous bindings grows.
+- This broadens the failure mode beyond a pairs=4 artifact. The next audit must inspect pairs8 for output saturation versus memory/addressing failure.
+Next action:
+- Run AR_AUDIT=1 on a small pairs8 case to inspect LM top logits, selected banks, best-bank target probability, read entropy, and whether values are finite.
+
+Change gate - disable default Assoc-slot direct consolidation into FPM
+---------------------------------------------------------------------
+1. Target failure mode: scale ladder shows pairs8 can collapse to CE ceiling (23.0258) in default hybrid mode, while `AR_ASSOC_ONLY=1` and/or per-step debug/control avoid the ceiling (~2.07). Audit shows FPM write dynamics saturate under high binding density (`z≈0.999`, `sat=582/584`, `u2v≈24`).
+2. Structural rationale: Assoc slots are the literal binding subsystem. After each Assoc bank write, the shader also consolidates the Assoc slot trace into `fpm_m_cache` via `ASSOC_TO_FPM_SCALE=0.02`. With many bindings this creates a second blurred memory inside the same Assoc slots and violates the role split: Assoc holds exact key->value bindings; FPM holds contextual traces in non-Assoc slots. The direct bridge must be explicit/experimental until it has a sparse consolidation policy.
+3. Anti-patch check: this is not hiding loss by clipping or tuning a benchmark token. It removes the mechanism that contaminates literal Assoc slots with dense contextual FPM writes while leaving normal FPM slots active. The bridge remains available behind an override for future validated consolidation.
+4. Validation plan: make `ASSOC_TO_FPM_SCALE` a shader override defaulting to 0.0; plumb `AIDEEN_ASSOC_TO_FPM_SCALE`; cargo check; rerun pairs1 to ensure no regression; rerun scale points pairs4/pairs8 to confirm no CE-ceiling collapse and document remaining multi-binding precision gap separately.
+Classification target: architecture/dynamics default-stable if it removes saturation without regressing single-binding.
+
+Change gate - align Assoc bank capacity clamp across bridge and GPU shader
+-------------------------------------------------------------------------
+1. Target failure mode: scale tests using `AIDEEN_ASSOC_BANKS=8` show unstable/contradictory behavior. Inspection found `aideen-block/src/deq_bridge.rs` clamps `AIDEEN_ASSOC_BANKS` to 1..4 for buffer/layout allocation, while `aideen-backbone/src/gpu_deq.rs` passes the env value directly to shader constants. This allows shader code to address 8 banks against bridge buffers sized for 4 banks.
+2. Structural rationale: Assoc state layout invariant is `assoc_buf_size = h_slots * ASSOC_BANKS * (ASSOC_RANK + d_model + 1)`. Every CPU allocation, GPU shader constant, history carry, and debug read must agree on `ASSOC_BANKS`. A 4-vs-8 mismatch corrupts adjacent state and invalidates any scalability result.
+3. Anti-patch check: this fixes a buffer shape/stride invariant at the origin of the failure. It does not tune loss, gate values, or benchmark-specific outputs. It remains valid for any profile using up to the shader-supported 8-bank local arrays.
+4. Validation plan: change bridge clamp to 1..8; cargo check; rerun pairs1 and pairs8 default scale probes. Success requires no pairs1 regression and no CE-ceiling collapse for pairs8.
+Classification target: layout/invariant default-stable if validation passes.
+
+Validation - layout-fixed pairs8 and read-sharpness probes
+----------------------------------------------------------
+Logs:
+- logs/assoc_recall/scale/default_pairs8_banks8_layout_fixed_gap128.log
+- logs/assoc_recall/scale/default_pairs1_layout_fixed_gap128.log
+- logs/assoc_recall/scale/tie_qk_pairs8_banks8_layout_fixed_gap128.log
+- logs/assoc_recall/scale/hard_read_beta8_pairs8_banks8_layout_fixed_gap128.log
+Results:
+- After aligning `AIDEEN_ASSOC_BANKS` clamp to 8 in `deq_bridge.rs`, pairs8 no longer hits the CE ceiling: loss moved from 23.0258 to 3.3784. This validates the OOB/layout mismatch as the source of the catastrophic collapse.
+- pairs1 remains solved after the layout fix: gap128=0.0945.
+- `AIDEEN_ASSOC_TIE_QK=1` did not solve pairs8: gap128=3.3466, so the failure is not only W_q/W_k divergence.
+- `AIDEEN_ASSOC_HARD_READ=1 AIDEEN_ASSOC_READ_BETA=8` produced low train loss but eval stayed random (3.9359), so read sharpening alone overfits/does not generalize the bank addressing policy.
+Classification:
+- Bank clamp/layout fix: default-stable candidate.
+- Tie-QK for scale: rejected as standalone.
+- Hard read/beta8: rejected as standalone default; may remain diagnostic only.
+Next action:
+- Multi-binding now needs a structural bank/slot assignment policy. The next likely fix is not read temperature, but ensuring distinct key sources allocate stable distinct banks/lanes without duplicating or blurring across both Assoc slots.
+
+Change gate - freeze learned Assoc address residual by default
+--------------------------------------------------------------
+1. Target failure mode: after the bank-layout fix, pairs_per_seq=8 no longer collapses to the CE ceiling but remains weak (gap128=3.3784). Audit shows read entropy near uniform and large Wq/Wk address drift. Setting AIDEEN_ASSOC_LR_MULT=0 improves pairs8 to gap128=2.2186 without changing forward capacity, indicating learned address updates are degrading the literal key geometry.
+2. Structural rationale: Assoc addressing already contains a direct normalized token/source component (`direct_key/direct_src`) plus a learned residual (`W_k_assoc`, `W_q_assoc`). For explicit literal memory, the direct component is the invariant address manifold. Until the bank allocator/event policy is stable, training the residual rotates keys/queries away from that shared manifold across many bindings; freezing the residual preserves address identity while leaving value/event/alpha paths available.
+3. Anti-patch check: this does not clamp loss, hide NaNs, or special-case pair counts. It removes an unvalidated residual dynamics term at the locus where the invariant is broken: key/query address geometry. The learned residual remains opt-in through AIDEEN_ASSOC_ADDR_LR_MULT for future validation.
+4. Validation plan: add a separate `assoc_addr_lr_mult` uniform, default `AIDEEN_ASSOC_ADDR_LR_MULT` to 0.0 while preserving `AIDEEN_ASSOC_LR_MULT` for non-address Assoc parameters. Run cargo check, pairs1 gap128, and pairs8/banks8 gap128. Success requires pairs1 to remain solved and pairs8 to match the freeze probe improvement without CE ceiling.
+Classification target: dynamics default-stable if validation passes; learned address residual remains experimental pending allocator stability.
+
+Validation - default frozen Assoc address residual
+--------------------------------------------------
+Logs:
+- logs/assoc_recall/scale/default_pairs1_addr_frozen_gap128.log
+- logs/assoc_recall/scale/default_pairs8_addr_frozen_gap128.log
+Result:
+- Separating `AIDEEN_ASSOC_ADDR_LR_MULT` from `AIDEEN_ASSOC_LR_MULT` compiles.
+- With address residual frozen by default, pairs1/banks1 gap128 remains solved: 0.0973.
+- pairs8/banks8 gap128 improves from the layout-fixed default 3.3784 to 2.1582, close to the env freeze probe 2.2186 and far below random 3.9120.
+Classification:
+- Frozen learned address residual: default-stable candidate for the current explicit-memory corridor.
+- Remaining failure: not catastrophic layout/NaN and not single-pair capacity; multi-binding still has high bank-read entropy and only partial retention.
+Next action:
+- Run oracle-write with frozen address residual. If forced key->value writes solve pairs8, the remaining locus is write selection/allocation. If not, the remaining locus is read/output geometry.
+
+Change gate - repair oracle-write diagnostic activation
+-------------------------------------------------------
+1. Target failure mode: the pairs8 oracle-write probe reported no improvement, but audit counters matched the default path. Inspection showed the runtime expects `AIDEEN_ASSOC_ORACLE_WRITE_POS`, while the attempted run used `AIDEEN_ASSOC_ORACLE_WRITE_POSITIONS`; additionally `assoc_recall` only auto-sets `AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS` when `AR_PAIRS_PER_SEQ` is absent, which prevents multi-pair oracle activation in the intended scale probes.
+2. Structural rationale: this is a measurement/diagnostic invariant. An oracle-write experiment must force writes exactly at the generated prefix key/value transitions for the configured `pairs_per_seq`; otherwise it cannot distinguish write selection from read/output geometry.
+3. Anti-patch check: this does not alter default model behavior because oracle overrides remain disabled unless an explicit oracle env var is set. It fixes only the activation path for a diagnostic override and preserves both env spellings as aliases.
+4. Validation plan: accept both oracle env names in Rust plumbing; auto-fill prefix pairs from `pairs_per_seq` whenever oracle is enabled and prefix is unset; rerun the oracle pairs8 probe and compare `w_allow/w_gate` and eval loss against the invalid probe.
+Classification target: measurement/diagnostic default-stable.
+
+Validation - repaired oracle-write diagnostic
+---------------------------------------------
+Logs:
+- logs/assoc_recall/scale/oracle_pairs8_addr_frozen_fixed_gap128.log
+Result:
+- After accepting both oracle env spellings and auto-filling `AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS`, forced oracle writes materially improve pairs8/banks8 gap128 to 1.2455, with `w_allow/w_gate` rising to 5.479e-2 and `r_usage` to ~0.931.
+- This invalidates the prior oracle run (`oracle_pairs8_addr_frozen_gap128.log`) as a diagnostic wiring failure.
+Classification:
+- Oracle activation repair: default-stable measurement fix.
+- Remaining model failure: write selection/allocation. The read path and Assoc->LM output bridge are capable of using correctly written banks, but the default allocator does not select the right key->value transitions with high precision under multi-binding serialization.
+Next action:
+- Inspect the benchmark serialization and write allocator. Implement a non-oracle boundary/role rule only if it restores a general invariant of explicit memory rather than using benchmark token IDs.
+
+Change gate - empty-first allocation for novel Assoc bindings
+-------------------------------------------------------------
+1. Target failure mode: default pairs8/banks8 remains partial even with frozen address residual, while valid oracle writes improve strongly. Forward allocator computes `found_empty`/`empty_bank` but then ignores them and chooses `final_best_bank` by softmax over occupied+empty scores. For a novel key, an occupied bank with moderately high cosine can win; occupied protection then zeros `allow_write`, so the binding is dropped although free capacity exists.
+2. Structural rationale: finite explicit associative memory must preserve the invariant `novel key + available empty bank => allocate empty bank`. Similarity competition is only valid after deciding whether the transition is a reuse/update or a new allocation. Free-bank placement should dominate for novel bindings; occupied banks should be reused only when key similarity exceeds the reuse threshold.
+3. Anti-patch check: this does not use AR token IDs, positions, or pair counts. It corrects the allocator state machine: empty capacity must be consumed before rejecting a novel write due to occupied-bank protection. It remains valid for any serialized stream with finite banks.
+4. Validation plan: force `final_best_bank=empty_bank` when `found_empty && best_cos_safe <= 0.85`; cargo check; run pairs1 and pairs8 default. Success requires pairs1 unchanged and pairs8 closer to the valid oracle-write result without oracle flags.
+Classification target: architecture/allocation default-stable if validation passes.
+
+Change gate - full write mass for unowned replicated Assoc slots
+-----------------------------------------------------------------
+1. Target failure mode: after empty-first allocation, pairs8 remains partial with bank usage around 0.46, while valid oracle-force writes raise usage to ~0.93 and loss to 1.2455. The default path uses `p_slot_i=1/assoc_slot_count` even when `ENABLE_ASSOC_SLOT_OWNER=false`, but in that mode Assoc slots execute the same binding lane as replicas rather than a mutually exclusive owner competition.
+2. Structural rationale: slot-probability normalization is required only when slots compete for ownership. Without slot-owner routing, dividing write mass across identical replicas weakens every bank copy and makes literal retrieval diffuse. The invariant should be: unowned replicated Assoc slots write full local binding mass; owned slots use normalized owner probability.
+3. Anti-patch check: this does not use task positions/tokens or increase capacity artificially. It fixes the role of `p_slot_i`: probability only belongs to a competition. When there is no competition, applying it as attenuation is mathematically wrong. Backward parity must match the same default.
+4. Validation plan: set default `p_slot_i=1.0` in forward/backward, retaining normalized softmax only under `ENABLE_ASSOC_SLOT_OWNER`; cargo check; rerun pairs1 and pairs8. Success requires pairs1 unchanged and pairs8 usage/loss closer to oracle-force.
+Classification target: equation invariant default-stable if validation passes.
+
+Validation - full write mass for unowned replicated Assoc slots
+---------------------------------------------------------------
+Logs:
+- logs/assoc_recall/scale/default_pairs1_full_slot_write_gap128.log
+- logs/assoc_recall/scale/default_pairs8_full_slot_write_gap128.log
+Result:
+- pairs1/banks1 gap128 improves to 0.0005 with `r_usage≈0.924` and no NaNs.
+- pairs8/banks8 gap128 improves from 2.0631 after empty-first to 1.0406, with `r_usage≈0.931`, matching the mass level seen in the valid oracle-force probe.
+Classification:
+- Full write mass for unowned replicated Assoc slots: default-stable candidate. It fixes the slot-probability invariant and does not regress the single-binding corridor.
+- Empty-first allocation: still structurally correct but not sufficient alone; keep as allocator invariant because it prevents dropping novel writes when free banks exist.
+Remaining failure:
+- Read entropy remains high (~2.03 for 8 banks), so banks are written strongly but the query does not sharply select the correct bank. Next locus is address separability/read-query geometry, not write mass or LM-head reachability.
+Next action:
+- Test whether sharing the frozen write-key residual for query (`AIDEEN_ASSOC_TIE_QK=1`) sharpens read selection now that slot mass and layout are fixed. If not, inspect fixed key geometry and consider a non-learned literal address basis.
+
+Change gate - make explicit Assoc retrieval winner-take-all by default
+----------------------------------------------------------------------
+1. Target failure mode: with bank layout, address residual, allocation, and slot write mass fixed, pairs8/banks8 still stays around 1.0406 under soft bank mixing and read entropy remains near uniform (~2.03). Enabling hard read with the same writes solves pairs8/gap128 to 0.0001.
+2. Structural rationale: Assoc is the literal binding memory. Once a query address is compared against finite banks, returning a weighted mixture of several bank values contaminates the payload whenever multiple bindings coexist. Literal retrieval requires selecting the best matching bank (winner-take-all) rather than averaging values. FPM remains the subsystem for graded/contextual blending.
+3. Anti-patch check: this is not a loss clamp or benchmark-specific threshold. It restores the role split between explicit memory and contextual FPM: Assoc stores and retrieves discrete key->value bindings; FPM handles continuous summaries. It remains overrideable via `AIDEEN_ASSOC_HARD_READ=0` for experiments that need differentiable soft read.
+4. Validation plan: make `ENABLE_ASSOC_HARD_READ` default true in forward plumbing; cargo check; rerun pairs1 and pairs8 default without env hard-read flags. Success requires pairs1 solved and pairs8 matching the hard-read probe without explicit flags.
+Classification target: architecture/read equation default-stable if validation passes.
+
+Validation - hard-read default
+------------------------------
+Logs:
+- logs/assoc_recall/scale/default_pairs1_hard_read_default_gap128.log
+- logs/assoc_recall/scale/default_pairs8_hard_read_default_gap128.log
+Result:
+- Default pairs1/banks1 gap128 solves at ~0.0000 without explicit hard-read flags.
+- Default pairs8/banks8 gap128 solves at 0.0001 without explicit hard-read flags.
+- Read entropy drops to 0 and read max to 1.0, confirming the previous failure was value mixing across banks rather than inability to store or bridge to LM logits.
+Classification:
+- Hard read default: default-stable candidate for explicit Assoc retrieval.
+- Full unowned-slot write mass and empty-first allocation remain part of the stable causal package.
+Next action:
+- Run the multi-gap pairs8 corridor (0,64,128,256) to verify long-gap stability beyond the single gap128 probe.
+
+Validation - default pairs8 multi-gap stabilized corridor
+---------------------------------------------------------
+Log:
+- logs/assoc_recall/scale/default_pairs8_hard_read_multigap.log
+Result:
+- Default pairs8/banks8 with gaps 0,64,128,256 and no explicit hard-read flag solves all evaluated gaps:
+  - gap0=0.0004
+  - gap64=0.0004
+  - gap128=0.0002
+  - gap256=0.0002
+- Read entropy is 0.0, read max is 1.0, context RMS is 1.0, and bank usage is ~0.952 in active Assoc slots.
+Final classification for this stabilization package:
+- Bank layout clamp 1..8: default-stable layout/invariant fix.
+- Frozen learned Assoc address residual default (`AIDEEN_ASSOC_ADDR_LR_MULT=0`): default-stable dynamics fix for literal address preservation; learned residual remains opt-in.
+- Oracle diagnostic activation repair: default-stable measurement fix.
+- Empty-first allocation for novel bindings: default-stable allocator invariant.
+- Full write mass for unowned replicated Assoc slots: default-stable slot equation invariant.
+- Hard read default for explicit Assoc retrieval: default-stable read equation invariant.
+Residual risks / next validation:
+- Validate beyond synthetic AR: higher pair counts up to bank cap, different seeds, longer train/eval counts, and interaction with `ENABLE_ASSOC_SLOT_OWNER` once real slot ownership is reintroduced.
+- If soft/differentiable read is needed for another task, keep it experimental via `AIDEEN_ASSOC_HARD_READ=0`; do not make it default for literal recall without a non-contaminating sparse mixture rule.
+
+Change gate - clamp GPU Assoc bank count to shader-supported capacity
+---------------------------------------------------------------------
+1. Target failure mode: current WGSL forward/read/write paths use fixed local arrays of length 8 for bank scores/probabilities. `deq_bridge.rs` clamps `AIDEEN_ASSOC_BANKS` to 1..8, but `gpu_deq.rs` still accepts the raw env value. Values above 8 can compile constants that make shader loops index beyond local arrays or desynchronize CPU/GPU layout expectations.
+2. Structural rationale: the capacity invariant is `ASSOC_BANKS <= shader local bank array capacity`. Until the shader arrays and layouts are generalized, every Rust plumbing path must clamp to the same max bank count.
+3. Anti-patch check: this does not hide a model-quality issue. It enforces a memory/layout safety bound at the source of configuration, and preserves all validated behavior for banks <= 8.
+4. Validation plan: clamp `gpu_deq.rs` bank env to 1..8; cargo check; run a small assoc_recall compile/run with `AIDEEN_ASSOC_BANKS=16` and confirm it no longer crashes or indexes beyond supported capacity, while documenting that effective capacity is capped at 8.
+Classification target: layout/invariant default-stable.
+
+Capacity probe - more pairs than literal Assoc banks
+----------------------------------------------------
+Logs:
+- logs/assoc_recall/scale/capacity_pairs8_banks4_gap128.log
+- logs/assoc_recall/scale/capacity_pairs16_banks8_gap128.log
+Result:
+- pairs8/banks4/gap128: eval loss=3.5877, near random baseline 3.9120.
+- pairs16/banks8/gap128: eval loss=6.2753, worse than random because the hard literal read confidently retrieves a stored but wrong binding when the queried pair was not retained.
+Classification:
+- Confirmed capacity invariant: in the current default replicated Assoc path, one bank stores one exact active key->value binding. Exact recall requires active literal bindings <= banks unless a validated replacement, promotion, persistence, or compression policy is introduced.
+Next action:
+- Design capacity hierarchy instead of raising banks blindly: local Assoc banks for exact active segment bindings; persistent Assoc for selected inter-segment literals; FPM for contextual/general compression; optional slot-owner lanes to multiply exact capacity once validated.
+
+Research alignment - external/scalable memory directions
+-------------------------------------------------------
+Sources reviewed:
+- DNC / Neural Turing-style memory: content/location addressing, usage/allocation vectors, explicit external memory.
+- Product-Key Memory: very large key-value memory accessed by structured/exact nearest-neighbor style lookup.
+- kNN-LM / Memorizing Transformer / RETRO / LongMem: external or cached key-value/chunk retrieval for long-tail facts and long context.
+- Transformer-XL / Compressive Transformer: segment recurrence and compressed long-range memory.
+Implication for AIDEEN:
+- Current Assoc hard-read behavior is aligned with kNN/key-value literal retrieval, not with soft attention over values.
+- FPM should remain the graded contextual/compressive memory.
+- The next learning problem is not raw recall but memory management: salience, replacement, promotion, persistence, and learned routing between literal Assoc and contextual FPM.
+
+Capacity roadmap - from replicated Assoc to scalable lanes
+---------------------------------------------------------
+Problem:
+- Current validated corridor uses h_slots=4 and ASSOC_BANKS<=8 with Assoc slots replicated. Exact capacity is therefore banks, not banks × assoc_slots.
+- Larger goals such as 32 banks and 16 slots require distinguishing technical limits from architectural policy.
+Current technical limits:
+- WGSL local bank arrays are fixed length 8, so ASSOC_BANKS>8 is currently unsupported without shader refactor.
+- Assoc slots are the upper half of h_slots. With h_slots=4, there are 2 Assoc slots, but default slot-owner is off, so they replicate the same memory.
+Target architecture:
+- Local exact capacity should become assoc_lanes × banks_per_lane once slot-owner/lane routing is validated.
+- FPM should contextualize/compress over time, not carry every exact binding.
+- Persistent Assoc should promote selected exact bindings across segments.
+Next focus:
+1. Validate slot-owner/lane routing as a capacity multiplier with current 8-bank shader limit.
+2. If lane routing works, test h_slots=8 or 16 with banks<=8 to estimate practical capacity/cost.
+3. Only then refactor shader local arrays to support banks=16/32, with layout checks and performance measurements.
+
+Lane-capacity probe - h_slots=8, banks=8, pairs16
+--------------------------------------------------
+Logs:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_no_owner.log
+- logs/assoc_recall/scale/lanes_h8_b8_p16_owner_anchor.log
+Result:
+- h_slots=8, banks8, pairs16, no owner: eval loss=5.6103. Active Assoc slots 4..7 replicate the same eight-bank capacity; this does not multiply exact capacity.
+- h_slots=8, banks8, pairs16, `AIDEEN_ASSOC_SLOT_OWNER=1 AIDEEN_ASSOC_SLOT_ANCHOR=1`: eval loss=2.6277. This is materially better but still partial. It indicates the owner path can distribute writes across lanes, but current anchor routing is not sufficient for exact lane assignment and retrieval.
+- Performance drops from ~100+ TPS in h_slots=4 corridors to ~30 TPS in h_slots=8/pairs16 probes on M1 Pro, so slot count is an expensive capacity lever.
+Classification:
+- Slot-owner/lane routing: experimental useful, not default-stable.
+- Raising slots without robust routing is not a correct capacity solution.
+Next action:
+- Implement/validate explicit lane assignment policy before increasing slots or banks: stable hash/geometric router, least-used lane router, or learned owner only after backward parity. For exact recall, lane routing must guarantee that query and write choose the same lane.
+
+Change gate - deterministic literal-address lane router
+-------------------------------------------------------
+1. Target failure mode: h_slots=8 with four Assoc lanes and banks8 still cannot recall pairs16 exactly. Without owner, lanes replicate the same eight banks. With anchor owner, eval improves to 2.6277 but remains partial because slot anchors provide a soft learned/geometric prior, not a guaranteed write/read-consistent lane assignment.
+2. Structural rationale: to multiply exact capacity by lanes, the lane identity must be a deterministic function of the literal key address, and the same function must be used on write and read. Then capacity becomes approximately `assoc_lanes * banks_per_lane`, bounded by collisions. Learned slot-owner can be trained later, but a stable hash router is the invariant baseline for exact lane consistency.
+3. Anti-patch check: this does not use token IDs, AR positions, targets, or pair counts. It routes by the same normalized Assoc address vector that already defines bank keys/queries. It is experimental behind `AIDEEN_ASSOC_HASH_LANE=1` and does not alter the validated default h_slots=4 corridor unless explicitly enabled.
+4. Validation plan: add WGSL/Rust plumbing for `ENABLE_ASSOC_HASH_LANE`; under `ENABLE_ASSOC_SLOT_OWNER`, make write/read gate hard to the hash-selected Assoc lane. Run cargo check and compare h_slots=8,banks8,pairs16 with hash lane vs prior anchor owner. Success requires large improvement over 2.6277 and stable no-NaN behavior.
+Classification target: experimental useful; default only after broader validation.
+
+Change gate - conserve Assoc read mass under exclusive hash lanes
+-----------------------------------------------------------------
+1. Target failure mode: deterministic hash-lane routing improves pairs16/h8/b8 to 2.1153 but remains partial. Active lanes show strong per-slot reads, yet only one Assoc lane emits for a queried binding. The previously solved replicated path emitted the same literal context from every active Assoc slot, so downstream slot aggregation received more total Assoc signal.
+2. Structural rationale: lane ownership should affect storage locality, not reduce total read energy. If `assoc_slot_count` replicated lanes are replaced by one exclusive owner lane, the owner lane must carry the aggregate read mass that the replicas previously supplied, otherwise capacity routing trades exact storage for weaker output coupling.
+3. Anti-patch check: this is not a loss clamp or benchmark-specific boost. It restores conservation of Assoc read mass when changing from replicated lanes to exclusive lanes. It is active only with experimental `ENABLE_ASSOC_HASH_LANE` + `ENABLE_ASSOC_SLOT_OWNER`.
+4. Validation plan: multiply `assoc_inj` by `assoc_slot_count` only in hash-lane owner mode; cargo check; rerun h_slots=8,banks8,pairs16 hash-lane. Success requires improvement over 2.1153 without destabilizing compile/runtime.
+Classification target: experimental useful pending validation.
+
+Validation - hash lane and read-mass conservation probe
+-------------------------------------------------------
+Logs:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane.log
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane_mass.log
+Result:
+- Deterministic hash lane routing improved h8/b8/pairs16 from anchor-owner 2.6277 to 2.1153, so stable write/read lane consistency is useful.
+- Read-mass conservation scaling worsened eval to 3.0722 and was reverted. The remaining bottleneck is not merely output-scale dilution.
+Classification:
+- `AIDEEN_ASSOC_HASH_LANE`: experimental useful, not default-stable.
+- Hash-lane read mass scaling: rejected and removed.
+Next action:
+- Investigate collisions/drop directly. The key issue is whether 16 key tokens distribute across four lanes with <=8 per lane and whether every key->value prefix write survives protection. If collisions are acceptable but recall still partial, inspect lane read/output selection; otherwise implement better lane router or replacement policy.
+
+Next focus - scalable pair capacity root-cause split
+---------------------------------------------------
+Goal:
+- Scale the number of exact key->value pairs beyond one local bank set.
+Clarification:
+- Example values like 32 banks / 16 slots are not targets yet. The architectural target is effective scalable capacity.
+Current hypothesis:
+- Exact local capacity should scale as `assoc_lanes * banks_per_lane` only if lane routing is write/read consistent and collisions/drop are controlled.
+Immediate diagnostic split:
+1. Collision/drop: are all prefix key->value writes placed into lanes/banks, and how many land per lane?
+2. Read locality: does the query route to the same lane as the original write?
+3. Output coupling: if the correct lane/bank is selected, does LM output the value?
+Next action:
+- Add/inspect diagnostics to count per-lane occupancy and selected lane during write/read for hash-lane, then run h8/b8/pairs16 with audit.
+
+Change gate - global value-source suppression across hash lanes
+---------------------------------------------------------------
+1. Target failure mode: hash-lane h8/b8/pairs16 remains partial and audit shows target values are often not present in any useful bank. The current `ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE` only checks whether the previous source matches a value already stored in the current lane. In lane-routed mode, a just-written value token can hash to a different lane on the next transition, so `VAL -> next KEY` transitions can consume banks and contaminate exact capacity.
+2. Structural rationale: value-source suppression is a global role invariant, not a lane-local invariant. If any Assoc lane already stores the previous token as a value payload, that token should not become a durable key source in another lane by default. Otherwise lane routing breaks the key/value role separation established by replicated Assoc.
+3. Anti-patch check: this uses only memory geometry across Assoc lanes (`PrevHStar` vs stored bank values), not token IDs, labels, AR positions, or pair counts. It corrects the origin of lane contamination: cross-lane role leakage.
+4. Validation plan: in `ENABLE_ASSOC_SLOT_OWNER && ENABLE_ASSOC_HASH_LANE`, compute best previous-value cosine across all Assoc lanes before suppression. Run cargo check and h8/b8/pairs16 hash-lane. Success requires improvement over 2.1153 and no regression in compile/runtime.
+Classification target: experimental useful; default only if hash-lane corridor validates.
+
+Validation - global value-source suppression across hash lanes
+--------------------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane_global_suppress.log
+Result:
+- h8/b8/pairs16 hash-lane with global value-source suppression produced eval loss=2.3492, worse than hash-lane baseline 2.1153.
+Classification:
+- Global value-source suppression across lanes: rejected for now and reverted. Cross-lane VAL->KEY contamination may exist, but this intervention over-suppresses or does not address the dominant cause.
+Next action:
+- Add/derive a lane occupancy/collision report from AssocState. We need to know whether every key has storage capacity in its lane before designing a new router or replacement policy.
+
+Change gate - hash lane must route on slot-independent direct literal address
+----------------------------------------------------------------------------
+1. Target failure mode: `AIDEEN_ASSOC_HASH_LANE=1` improves h8/b8/pairs16 but remains partial. Inspection shows the hash is computed from `q_self` / `assoc_scratch`, which include `W_k_assoc`/`W_q_assoc` residuals indexed by `slot_idx`. Even with address LR frozen, these residuals are randomly initialized per slot, so different slots can compute different owner lanes for the same literal key.
+2. Structural rationale: lane routing is only a capacity multiplier if write and read compute a slot-independent owner lane from the same literal key address. Therefore hash-lane mode must route and store using the direct normalized source component, not the per-slot residual address. Learned residual addressing can remain for non-hash experiments, but deterministic lanes require invariant direct geometry.
+3. Anti-patch check: this does not use token IDs, labels, or AR positions. It removes slot-local randomness from the lane router at the mathematical origin of inconsistent lane ownership. It is active only under experimental `ENABLE_ASSOC_HASH_LANE`.
+4. Validation plan: in hash-lane mode, set read query/write key candidate to `tanh(direct)` before hashing/storing. Run cargo check, then h8/b8/pairs16 hash-lane. Success requires improvement over 2.1153 and no regression in existing h4/b8 default path.
+Classification target: experimental useful pending validation.
+
+Validation - hash lane direct literal address
+---------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane_direct_addr.log
+Result:
+- h8/b8/pairs16 hash-lane with direct-only read/write address produced eval loss=5.5814, worse than hash-lane baseline 2.1153 and worse than random baseline behavior.
+Classification:
+- Direct-only hash-lane address: rejected and reverted. The residual Assoc projection is not merely slot-noise; it appears to contribute useful address spreading or alignment. Removing it collapses effective lane/bank retrieval.
+Next action:
+- Inspect actual lane/bank occupancy and per-key routing rather than removing the residual blindly. The next causal split is whether failure comes from collisions/drop, read lane mismatch, or LM/output coupling after correct bank selection.
+
+Change gate - AR LM debug must include Assoc direct-logit path
+--------------------------------------------------------------
+1. Target failure mode: `assoc_recall` audit reports `answer_loss` from the GPU LM head but `format_lm_top_debug` computes logits only from `h_pooled`. The actual LM shader also adds `AIDEEN_ASSOC_LOGIT_LAMBDA * Emb[token] dot assoc_pooled`, so audit can falsely classify solved cases as random and misdirect stabilization work.
+2. Structural rationale: the metric/debug invariant is that diagnostic logits must use the same equation as `lm_train.wgsl::lm_probs_main`: `logit_v = b_v + W_v·RMSNorm(h) + lambda * Emb_v·assoc_pooled`. Adding assoc_pooled readback to the diagnostic restores equation parity without changing model behavior.
+3. Anti-patch check: this is a measurement/diagnostic fix only. It does not alter forward, backward, weights, routing, banks, or loss. It corrects the observer at the source of the mismatch rather than hiding model errors.
+4. Validation plan: add a temporary `read_assoc_pooled_at` diagnostic readback and update `format_lm_top_debug`; cargo check; rerun a short `AR_AUDIT=1` hash-lane probe and verify reported target probability aligns qualitatively with low/high `answer_loss` cases.
+Classification target: measurement default-stable / diagnostic temporary readback.
+
+Change gate - AR eval/debug must use current GPU embedding reference
+--------------------------------------------------------------------
+1. Target failure mode: after adding the Assoc direct-logit term, `assoc_recall` audit can still report low `answer_loss` with low CPU-computed target probability. The LM shader uses `emb_ref_buf` copied from `gpu_emb.weights_buffer()`, while the audit used `trainer.tokenizer.embeddings`, which can be stale after GPU embedding updates. `eval_cached_hpooled_token_loss` also did not explicitly refresh `emb_ref_buf` for the one-token eval call.
+2. Structural rationale: the observer/eval invariant is that loss and debug must use the same embedding reference tensor as `lm_train.wgsl`. The source of truth on the GPU path is `gpu_emb.weights_buffer()`, not the CPU tokenizer matrix after training begins.
+3. Anti-patch check: this does not alter model routing, banks, memory writes, or training equations. It restores CPU/GPU measurement parity and prevents stale-buffer evaluation. If metrics change, the old metrics were observing the wrong tensor.
+4. Validation plan: pass `gpu_emb.weights_buffer()` into `eval_cached_hpooled_token_loss`; read GPU embedding weights in `format_lm_top_debug`; cargo check; rerun short AR audit and verify target probability aligns with answer loss direction.
+Classification target: measurement default-stable.
+
+Validation - AR LM audit parity with GPU embedding reference
+-----------------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane_audit_gpu_emb.log
+Result:
+- The diagnostic now aligns with loss direction. Example solved case: loss=0.0001, target=30, target_logit=12.618, target_p=9.998e-1, lm_top=30.
+- Non-solved cases remain near uniform: loss around 3.8, target_p around 2.1e-2.
+Classification:
+- `read_assoc_pooled_at` and GPU-embedding audit path: measurement/default-stable while AR diagnostics are active; readback remains temporary diagnostic.
+- `eval_cached_hpooled_token_loss` now refreshes `emb_ref` from `gpu_emb.weights_buffer()`: measurement correctness fix.
+Next action:
+- With metric parity restored, treat h8/b8/pairs16 partial recall as real Assoc coverage/routing problem. Diagnose whether missed cases lack an owner-lane read, route to the wrong lane/bank, or have insufficient assoc_pooled target contribution.
+
+Validation - hash-lane baseline after metric parity fix
+-------------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane_metric_fixed.log
+Result:
+- h8/b8/pairs16/hash-lane now evaluates at loss=1.4189, 36.3% of random baseline, classified as MEMORY WORKS.
+- The previous ~2.1 partial reading was confounded by stale/incomplete LM audit/eval parity. The model path was stronger than the observer indicated.
+Classification:
+- Hash-lane h8/b8/pairs16: experimental useful and now a stronger capacity baseline.
+Next action:
+- The next scaling blocker is the benchmark itself: AR_N_KEYS is hardcoded to 16 and `pairs_per_seq` clamps to 16. To test scalable pair capacity, make AR vocabulary size configurable while preserving the default 50-token baseline.
+
+Change gate - make AR pair capacity benchmark configurable beyond 16 pairs
+-------------------------------------------------------------------------
+1. Target failure mode: `assoc_recall` cannot test more than 16 key->value pairs because `N_KEYS`, `N_VALS`, token bases, and `VOCAB_SIZE` are compile-time constants and `pairs_per_seq` clamps to `N_KEYS`. This blocks validation of the architecture's scalable pair capacity.
+2. Structural rationale: pair-capacity validation requires the data generator and LM vocab to expose more unique key/value identities. The model capacity question is independent of the old benchmark's 16-key toy vocabulary. Making the token layout env-configurable restores measurement capacity without changing model equations.
+3. Anti-patch check: this is not a model-quality patch. Defaults reproduce the existing 50-token benchmark exactly. Larger vocab/pair counts are explicit experimental profiles via env vars.
+4. Validation plan: introduce an `ArVocab` layout from env (`AR_N_KEYS`, `AR_N_VALS`, `AR_N_FILLER`) with old defaults; cargo check; rerun default/pairs16 smoke; then run a higher-pair probe such as 24 or 32 pairs with sufficient vocab and h_slots.
+Classification target: measurement/benchmark default-stable.
+
+Validation - h_slots=12 capacity probe rejected
+-----------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h12_b8_p24_vocab66_hash_lane.log
+Result:
+- h12/b8/p24 produced train/eval loss=23.0258 and `DEQ-INVALID` during evaluation. Slot audit showed abnormal slot behavior (e.g. s11 r_usage=5.890e0, w_gate=4.000e-1), so raising slot count directly is not a valid capacity fix in the current dynamics/debug layout.
+Classification:
+- h_slots=12 capacity probe: rejected as default path; may need separate DEQ dynamics/layout validation before h>8 is considered supported.
+Next action:
+- Keep h_slots=8 corridor and add occupancy diagnostics to identify whether p24 fails because hash-lane bank occupancy/collisions exceed effective capacity.
+
+Change gate - report per-lane Assoc occupancy for capacity diagnosis
+--------------------------------------------------------------------
+1. Target failure mode: p24/h8 fails, but current audit only reports aggregate Assoc usage. We cannot tell whether failures come from lane imbalance/collisions, empty lanes, or output coupling.
+2. Structural rationale: exact capacity depends on the invariant `active bindings per owner lane <= banks_per_lane` plus correct read routing. Reporting occupied bank counts and usage means per slot directly observes the capacity invariant without changing model behavior.
+3. Anti-patch check: diagnostic-only. It reads `AssocState` after training/eval and prints occupancy; no equations, weights, buffers, or runtime flags are changed.
+4. Validation plan: add per-slot occupancy summary to `AR_AUDIT`; cargo check; rerun p24 audit and inspect whether lanes saturate unevenly or all lanes are full.
+Classification target: diagnostic temporary.
+
+Validation - oracle write positions for p24
+------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p24_vocab66_hash_lane_oracle_write.log
+Result:
+- Oracle prefix write positions did not solve p24; eval loss=7.2135 vs random=4.1897. It reduced effective write gate/usage but did not create reliable recall.
+Classification:
+- Oracle write-position filtering: rejected as sufficient fix. It remains a diagnostic, not architecture.
+Next action:
+- Separate lane routing from bank address geometry. Previous direct-only attempt changed both lane selection and stored/read key geometry and failed. Try direct literal only for owner-lane hash while preserving residual Wq/Wk key/query inside the selected lane.
+
+Change gate - direct literal owner-lane hash with residual bank address
+-----------------------------------------------------------------------
+1. Target failure mode: p24/h8 hash-lane saturates all four Assoc lanes and most failed cases have no strong target contribution in `assoc_pooled`. Earlier direct-only address routing failed because it also removed the residual key/query geometry used for bank matching.
+2. Structural rationale: lane identity and bank address are different invariants. Lane identity must be stable and slot-independent for the same literal key; bank address can still use the learned/residual Assoc projection to spread and match within that lane. Therefore only the owner-lane hash should use the normalized direct previous signal; stored keys/read queries remain `tanh(W_assoc source + direct)`.
+3. Anti-patch check: this does not use AR token IDs, labels, target values, or pair counts. It corrects the routing invariant at the lane-selection level without suppressing the residual geometry that validation showed was useful.
+4. Validation plan: add WGSL direct-source hash for owner selection under `ENABLE_ASSOC_HASH_LANE`; cargo check; rerun p16 and p24 hash-lane corridors. Success requires p16 not to regress materially and p24 to improve over random/previous p24.
+Classification target: experimental useful pending validation.
+
+Validation - direct owner-lane hash with residual bank address
+--------------------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_lane_direct_owner.log
+Result:
+- p16/h8/b8 regressed to eval loss=3.0963 (79.1% of random), worse than the metric-fixed hash-lane baseline. The change failed the no-regression criterion before p24 validation.
+Classification:
+- Direct literal owner-lane hash: rejected and reverted. Residual address geometry is not only useful for bank matching; current owner selection also depends on that geometry in a way the validated corridor needs.
+Next action:
+- Keep current residual hash-lane as experimental baseline. The p24 failure is now best explained by all lanes being full and weak target presence, requiring better write/replacement/salience policy or larger validated bank arrays, not a direct hash-only router.
+
+Change gate - raise Assoc bank cap from 8 to 16 for capacity testing
+--------------------------------------------------------------------
+1. Target failure mode: p24/h8 saturates all four Assoc lanes at 8/8 banks. Current Rust config clamps `AIDEEN_ASSOC_BANKS` to 8 and forward/backward shaders have local bank-score arrays of length 8, preventing direct validation of whether more banks per lane solves pair scaling.
+2. Structural rationale: exact capacity is bounded by `assoc_lanes * banks_per_lane` and by replacement policy. Raising the supported bank cap requires matching Rust clamps and WGSL local arrays so loops over `ASSOC_BANKS` remain in-bounds in forward and backward paths.
+3. Anti-patch check: this is a layout/capacity invariant change, not a quality mask. It does not alter equations for banks<=8 and only enables explicit experimental profiles with banks>8. If p24 improves with 16 banks, it supports the capacity/saturation diagnosis; if not, replacement/routing remains the bottleneck.
+4. Validation plan: update clamps/audit to 16 and bank local arrays to 16; cargo check; rerun p16/b8 to ensure no regression in old cap; run p24/b16/h8 hash-lane.
+Classification target: layout/invariant default-stable for supported cap, architecture experimental for banks>8.
+
+Validation - bank cap 16 p24 probe
+----------------------------------
+Logs:
+- logs/assoc_recall/scale/lanes_h8_b16_p24_vocab66_hash_lane.log
+- logs/assoc_recall/scale/lanes_h8_b16_p24_vocab66_hash_lane_audit.log
+Result:
+- h8/b16/p24 improved to eval loss=2.4274 vs random=4.1897, much better than h8/b8/p24=5.4506 but still partial.
+- Occupancy is uneven: s4=16/16, s5=14/16, s6=16/16, s7=8/16. Some eval cases solve strongly through assoc_pooled; others remain near uniform.
+Classification:
+- Bank cap 16: experimental useful for capacity testing. It supports the capacity/saturation diagnosis but does not fully solve routing.
+Next action:
+- Test deterministic multi-probe hash lanes: write/read to owner lane plus one secondary lane. This is aligned with hashed memory/cuckoo-style redundancy and should reduce lane imbalance while preserving explicit Assoc memory.
+
+Change gate - experimental two-lane hash replication
+----------------------------------------------------
+1. Target failure mode: h8/b16/p24 remains partial with uneven lane occupancy and failed cases where target is not present in the selected read lane. Single-owner hash routing is too brittle under higher pair counts.
+2. Structural rationale: exact hash memories commonly use multi-probe/replicated candidate buckets to reduce collision sensitivity. For AIDEEN, writing a binding to owner lane plus deterministic adjacent lane and reading from the same two lanes preserves the invariant that query and write share deterministic lane choices, while increasing probability that one lane keeps the binding.
+3. Anti-patch check: this does not use labels, target IDs, or AR positions. It changes only the experimental `hash_lane` routing policy behind an explicit flag and remains valid across pair counts as a collision-reduction mechanism.
+4. Validation plan: add `AIDEEN_ASSOC_HASH_REPLICA=1`; cargo check; run p16/b8 or p16/b16 no-regression and p24/b16 target profile. Success requires p24 improvement over 2.4274 without catastrophic p16 regression.
+Classification target: experimental useful pending validation.
+
+Validation - two-lane hash replication p24
+------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b16_p24_vocab66_hash_replica.log
+Result:
+- h8/b16/p24 with `AIDEEN_ASSOC_HASH_REPLICA=1` produced eval loss=0.1293 vs random=4.1897 (3.1% of random), classified MEMORY WORKS.
+- This is a large improvement over h8/b16/p24 single-owner hash lane loss=2.4274 and h8/b8/p24 loss=5.4506.
+Classification:
+- Two-lane hash replication: experimental useful. It validates multi-probe/replicated lane routing as the correct direction for scalable exact Assoc capacity.
+Next validation:
+- Check p16/b8 with replica for no-regression and then run additional seeds/profiles before promoting any default.
+
+Validation - hash replication p16/b8 no-regression failed
+---------------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_replica.log
+Result:
+- p16/b8 with two-lane replication regressed to eval loss=5.7171, worse than random. Replication doubles storage pressure, so it is invalid when banks_per_lane is too small.
+Classification:
+- `AIDEEN_ASSOC_HASH_REPLICA=1` is not safe as a general default. It is experimental and must be paired with enough banks or a smarter adaptive replication policy.
+Next action:
+- Test p16/b16 with replication. If it works, replication is a high-capacity profile, not a low-capacity default.
+
+Validation - hash replication p16/b16
+-------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b16_p16_hash_replica.log
+Result:
+- p16/b16 with replication produced eval loss=2.7617 (70.6% of random), only partial. This means the p24 success is real but the replica policy is not yet a universally stable routing default.
+Classification:
+- Two-lane replication: experimental useful for high-capacity p24/b16 corridor, not default-stable.
+- Bank cap 16: useful layout enabler, but needs further no-regression validation before default promotion.
+Next action:
+- Keep `AIDEEN_ASSOC_HASH_REPLICA` off by default. Next structural work should make replication adaptive or improve write salience/replacement so low-pair corridors do not get over-replicated.
+
+Change gate - adaptive hash replication instead of unconditional replica
+-----------------------------------------------------------------------
+1. Target failure mode: `AIDEEN_ASSOC_HASH_REPLICA=1` solves h8/b16/p24 (loss=0.1293) but breaks smaller-capacity p16/b8 (loss=5.7171) and remains partial on p16/b16. Unconditional duplication doubles write pressure and can consume capacity when the bank budget does not need redundancy.
+2. Structural rationale: replication should be a capacity/collision policy, not a blanket behavior. The invariant is: use single-owner writes when bank budget is tight or pair density is low; use two-lane writes when banks per lane are large enough to absorb duplicate writes and reduce collision risk. A conservative structural gate is `ASSOC_BANKS >= 16`, which preserves banks=8 behavior exactly and keeps the validated p24/b16 path available.
+3. Anti-patch check: this does not tune loss, use AR labels, or depend on target tokens. It restores the capacity invariant by preventing a collision-mitigation mechanism from reducing effective capacity in small-bank profiles. It remains behind `AIDEEN_ASSOC_HASH_REPLICA=1`; default behavior is unchanged.
+4. Validation plan: modify WGSL so `ENABLE_ASSOC_HASH_REPLICA` is effective only when `ASSOC_BANKS >= 16`; cargo check; rerun p16/b8 with replica to verify old behavior no longer regresses; rerun p24/b16 with replica to verify high-capacity benefit remains.
+Classification target: experimental useful / adaptive dynamics pending validation.
+
+Validation - adaptive hash replication
+--------------------------------------
+Logs:
+- logs/assoc_recall/scale/lanes_h8_b8_p16_hash_replica_adaptive.log
+- logs/assoc_recall/scale/lanes_h8_b16_p24_hash_replica_adaptive.log
+Results:
+- h8/b8/p16 with `AIDEEN_ASSOC_HASH_REPLICA=1` and adaptive guard produced eval loss=1.4310 vs random=3.9120. This matches the old small-bank corridor behavior closely enough and confirms the guard prevents the previous catastrophic p16/b8 regression.
+- h8/b16/p24 with adaptive replica produced eval loss=0.8810 vs random=4.1897, classified MEMORY WORKS. It remains much better than single-owner h8/b16/p24 loss=2.4274 and h8/b8/p24 loss=5.4506, but worse than the earlier replica run loss=0.1293.
+Classification:
+- Adaptive hash replication: experimental useful, not default stable. The structural direction is validated: multi-probe/replicated lanes can solve high pair density when enough banks exist, while adaptive gating preserves low-bank behavior.
+- `AIDEEN_ASSOC_HASH_REPLICA` remains off by default. Even with the guard, the p16/b16 partial result and p24 run variance require more validation before promotion.
+- Bank cap 16 remains an experimental capacity enabler, not a mandatory baseline.
+Anti-patch conclusion:
+- The change is not a symptom mask because it corrects the collision/capacity invariant at the routing level: duplicate writes are only allowed when bank capacity can absorb them. It does not depend on AR labels, token positions, or narrow loss thresholds.
+Next action:
+- Move from capacity expansion to write salience/replacement policy. The remaining issue is not merely number of banks; the model needs a principled way to decide which bindings deserve durable slots when lanes approach saturation. Candidate: salience from explicit Assoc evidence plus query/value confidence, with FPM used for contextual consolidation rather than literal replacement.
+
+Validation - p32 capacity edge with adaptive replica
+---------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b16_p32_hash_replica_adaptive.log
+Result:
+- h8/b16/p32 with adaptive replica produced eval loss=0.0941 vs random=4.4067, classified MEMORY WORKS.
+- This profile uses 32 key/value pairs with 4 active Assoc lanes and 16 banks per lane. With two-lane replication, it is near the natural effective capacity edge because each pair can occupy two deterministic lanes.
+Classification:
+- The scalable Assoc capacity corridor is now validated for p24 and p32 under h8/b16/hash-lane/hash-replica.
+- Remaining risk is not the basic token circuit or LM debug metric; it is policy under overflow beyond effective capacity and variance across seeds.
+Next validation:
+- Run p40 or p48 only as an overflow stress test, not as a baseline expectation. If overflow fails, implement salience/replacement rather than adding blind capacity.
+
+Validation - p40 overflow stress with adaptive replica
+-----------------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b16_p40_hash_replica_adaptive.log
+Result:
+- h8/b16/p40 with adaptive replica produced eval loss=4.0964 vs random=4.5850, classified near-random.
+- This contrasts with p32 loss=0.0941 under the same h8/b16/hash-replica geometry.
+Classification:
+- p40 is an overflow failure, not a whole-circuit failure. The model can solve up to p32 in this profile, then degrades when requested bindings exceed effective durable capacity.
+- The next fix should not be more LM-head work or FPM scale tuning. It should target Assoc durable slot policy: salience, eviction/replacement, or larger bank/lane geometry with explicit capacity accounting.
+Root-cause conclusion:
+- Current `ENABLE_ASSOC_PROTECT_OCCUPIED` makes occupied banks effectively immutable unless the new key reuses the same bank. That is correct for exact recall below capacity, but it provides no principled behavior above capacity. The overflow regime needs a salience/replacement invariant, otherwise late or important bindings can be blocked by earlier low-value bindings.
+Next change gate candidate:
+- Add an experimental salience-aware replacement path behind a flag. It must store/update bank salience separately from mere occupancy or reinterpret usage as salience only under the experimental flag. Validation must compare p32 no-regression and p40 improvement.
+
+Change gate - experimental low-usage replacement for Assoc overflow
+------------------------------------------------------------------
+1. Target failure mode: h8/b16/hash-replica solves p32 but p40 falls near random. The circuit works below effective capacity, but once all banks are occupied `ENABLE_ASSOC_PROTECT_OCCUPIED` blocks novel writes unless they reuse an existing key. Overflow has no salience/eviction mechanism.
+2. Structural rationale: below capacity, empty-first placement is correct for exact recall. Above capacity, the required invariant changes: if no empty bank exists and the new key is novel, the system must have a deterministic replacement candidate. The current usage scalar already decays (`ASSOC_USAGE_DECAY`) and is the only per-bank durability metadata available in this layout, so an experimental replacement path can choose `min_usage_bank` only when `found_empty=false` and key similarity is below the reuse threshold.
+3. Anti-patch check: this does not touch LM logits, loss scaling, labels, or AR-specific positions. It changes only the overflow bank-allocation invariant and remains behind `AIDEEN_ASSOC_REPLACE_LOW_USAGE=1`; default behavior stays unchanged.
+4. Validation plan: add a shader override and Rust compile constants; verify `cargo check`; run p32 no-regression and p40 overflow test with the flag. Correct behavior requires p40 improvement without destroying p32.
+Classification target: experimental useful if p40 improves and p32 remains solved; rejected if p32 regresses materially or p40 stays near random.
+
+Validation - low-usage replacement rejected
+-------------------------------------------
+Log:
+- logs/assoc_recall/scale/lanes_h8_b16_p32_replace_low_usage.log
+Result:
+- p32 with experimental low-usage replacement regressed to eval loss=4.1107 vs random=4.4067. Baseline p32 without replacement was eval loss=0.0941.
+Classification:
+- Low-usage replacement as implemented is rejected and removed. The usage scalar is not a valid salience signal for exact Assoc replacement; using it for eviction destroys already-valid bindings.
+Causal lesson:
+- Overflow cannot be solved by reinterpreting occupancy/usage as importance. The model needs a separate salience signal or capacity expansion. A correct salience mechanism must distinguish durable semantic/value importance from mere recency/occupancy before it is allowed to evict a bank.
+Next action:
+- Preserve the validated h8/b16/hash-replica p32 corridor. Future overflow work should add explicit bank metadata for salience or test larger bank geometry; do not reuse `usage` as eviction priority.
+
+Validation - real training throughput for h8/b16 adaptive replica
+-----------------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_replica_ctx512_tinyshakespeare_20chunks.log
+Command summary:
+- release train, tinyshakespeare, batch=4, ctx_len=512, max_chunks=20
+- `AIDEEN_H_SLOTS=8 AIDEEN_ASSOC_BANKS=16 AIDEEN_ASSOC_SLOT_OWNER=1 AIDEEN_ASSOC_HASH_LANE=1 AIDEEN_ASSOC_HASH_REPLICA=1`
+Result:
+- Processed 40,960 tokens in 284.7s, `tps_epoch=143.9`.
+Classification:
+- Throughput is acceptable for research/prototype training on M1 Pro and much better than assoc_recall debug/dev numbers. The corridor is not disqualified by TPS.
+- However, the run does not yet prove good binding selectivity on real text because training logs currently expose FPM diagnostics but not enough Assoc occupancy/write selectivity telemetry in the real train path.
+Next action:
+- Add or expose lightweight real-training Assoc selectivity diagnostics before changing capacity again. We need write attempts, allowed writes, occupied banks per Assoc lane, and overwrite/reuse signals in real text.
+
+Change gate - real-training Assoc selectivity telemetry
+-------------------------------------------------------
+1. Target failure mode: h8/b16 adaptive replica has acceptable real-training TPS, but we cannot judge whether bindings are selective in real text because `train` logs expose FPM diagnostics but not Assoc occupancy/selectivity.
+2. Structural rationale: before changing salience/gating, observe the invariant `useful writes should occupy a bounded subset of banks rather than immediately filling every Assoc lane`. Reading `AssocBuf` occupancy by slot gives a direct low-cost snapshot of bank pressure at progress intervals.
+3. Anti-patch check: diagnostic-only, behind `AIDEEN_ASSOC_AUDIT=1`. It performs a readback and prints occupancy; it does not alter equations, buffers, flags, or default behavior.
+4. Validation plan: cargo check; rerun a short release train with `AIDEEN_ASSOC_AUDIT=1`; verify logs include `[ASSOC-STATE]` and use the occupancy profile to decide whether selectivity is acceptable.
+Classification target: diagnostic temporary.
+
+Validation - real-training Assoc selectivity audit
+--------------------------------------------------
+Log:
+- logs/training_real/h8_b16_replica_ctx512_assoc_audit_4chunks.log
+Result:
+- Short release train, 8,192 tokens, `tps_epoch=140.3`.
+- `[ASSOC-STATE] s4:16/16 mean=9.159e-1 max=9.851e-1 | s5:16/16 mean=9.176e-1 max=9.851e-1 | s6:16/16 mean=9.137e-1 max=9.733e-1 | s7:16/16 mean=9.150e-1 max=9.714e-1`.
+Classification:
+- Throughput remains acceptable with the audit run, but binding selectivity is not acceptable for real training: all Assoc lanes fill rapidly on ordinary text.
+Root-cause conclusion:
+- The current Assoc write path is good enough for controlled recall because capacity and routing are explicit, but it is not selective enough for real text. It stores too many transitions before any semantic/salience policy can decide what deserves durable memory.
+Next action:
+- Do not increase banks as the next primary fix. First add or validate a binding-selection mechanism that prevents filler/common transitions from occupying durable banks. Candidate directions: event/surprise gate, learned salience from Assoc/FPM evidence, or explicit promotion from local transient Assoc to persistent Assoc after a binding proves useful.
+
+Validation - existing event gate on real-training Assoc selectivity
+-------------------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_replica_event_gate_assoc_audit_4chunks.log
+Result:
+- Short release train, 8,192 tokens, `tps_epoch=139.4`.
+- `[ASSOC-STATE] s4:16/16 mean=2.292e-1 max=2.450e-1 | s5:16/16 mean=2.285e-1 max=2.460e-1 | s6:16/16 mean=2.285e-1 max=2.470e-1 | s7:16/16 mean=2.287e-1 max=2.490e-1`.
+Classification:
+- `AIDEEN_ASSOC_EVENT_GATE=1` is helpful but insufficient. It reduces write strength but still admits writes into every bank quickly.
+Root-cause conclusion:
+- The failure is not only write magnitude; it is durable admission. Weak writes still occupy banks because any positive committed mass above the tiny occupied threshold eventually marks banks as used.
+
+Change gate - experimental minimum durable Assoc write mass
+----------------------------------------------------------
+1. Target failure mode: real text fills all h8/b16 Assoc banks in 8,192 tokens even with event gating. Weak writes are treated as durable admissions, so the memory fills with low-confidence transitions.
+2. Structural rationale: continuous write strength and durable admission are different invariants. A binding should enter durable Assoc only if its effective write mass exceeds an explicit admission threshold; otherwise it can influence transient/FPM dynamics without consuming a bank.
+3. Anti-patch check: this is not loss masking or AR-specific filtering. It corrects the memory allocation rule at the point where weak evidence becomes durable storage. It remains behind `AIDEEN_ASSOC_WRITE_MIN_MASS`, default 0.0, so current behavior is unchanged unless explicitly enabled.
+4. Validation plan: add shader override and Rust constants; cargo check; run real-text audit with event gate and min mass; then rerun p32 recall to ensure the threshold does not destroy validated exact recall if considered for promotion.
+Classification target: experimental useful if real-text occupancy drops without p32 regression.
+
+Change gate - sparse non-degenerate event-gate initialization
+------------------------------------------------------------
+1. Target failure mode: `AIDEEN_ASSOC_EVENT_GATE=1` lowers Assoc write mass but still fills every bank because `W_event_assoc=0` and `b_event_assoc=0` initialize the event gate as a constant `sigmoid(0)=0.5`, not as a transition selector.
+2. Structural rationale: a learned durable-binding event gate must start with both a sparse prior and non-degenerate transition features. Bias controls base write probability; event weights let different token transitions produce different logits before learning has already filled memory.
+3. Anti-patch check: this does not filter by labels, positions, token ids, or benchmark structure. It fixes the classifier initialization invariant. Defaults remain exactly neutral (`bias=0`, `w_init=0`) unless `AIDEEN_ASSOC_EVENT_BIAS_INIT` / `AIDEEN_ASSOC_EVENT_W_INIT` are set.
+4. Validation plan: add configurable initialization; cargo check; run real-text audit with sparse event init plus min-mass; validate that occupancy is partial rather than 16/16 or 0/16; later rerun p32 recall before promoting.
+Classification target: experimental useful if it creates nontrivial selectivity.
+
+Validation - sparse event init and min-mass probes
+-------------------------------------------------
+Logs:
+- logs/training_real/h8_b16_replica_event_gate_minmass030_assoc_audit_4chunks.log
+- logs/training_real/h8_b16_replica_event_gate_minmass015_assoc_audit_4chunks.log
+- logs/training_real/h8_b16_replica_event_gate_minmass024_assoc_audit_4chunks.log
+- logs/training_real/h8_b16_replica_sparse_event_w1_b-2_min015_assoc_audit_4chunks.log
+- logs/training_real/h8_b16_replica_sparse_event_w01_b-2_min015_assoc_audit_4chunks.log
+- logs/training_real/h8_b16_replica_sparse_event_w02_b-4_min015_assoc_audit_4chunks.log
+Results:
+- `min_mass=0.30` with zero event weights blocked all writes (`0/16`).
+- `min_mass=0.15` and `0.24` with neutral event init still filled all banks (`16/16`).
+- Sparse event init `w=1.0,b=-2,min=0.15` saturated memory and produced loss=22.9376.
+- `w=0.1,b=-2,min=0.15` and `w=0.2,b=-4,min=0.15` still filled all banks.
+Classification:
+- Fixed min-mass threshold and random sparse event init are rejected as sufficient selectivity mechanisms. Keep the code paths only as experimental knobs with default-neutral behavior; do not promote.
+Root-cause conclusion:
+- Durable admission cannot be solved by a scalar threshold over an uncalibrated event gate. The system needs a budgeted/promotion-based policy: local candidates may be written transiently, but durable Assoc should only promote a bounded number of high-evidence bindings per segment/document.
+Federated-training implication:
+- In federated training, each node seeing different documents makes local write noise more dangerous. If every node fills durable memory with document-local low-salience transitions, weight integration averages incompatible write policies. A document-local promotion budget is a better fit because it bounds each node's memory gradient contribution.
+Next action:
+- Add diagnostics for event/write mass distribution or implement a gated promotion corridor where durable writes are budgeted per segment before scaling banks further.
+
+Validation - thresholded Assoc occupancy audit
+----------------------------------------------
+Log:
+- logs/training_real/h8_b16_replica_event_gate_assoc_audit_thresholds_4chunks.log
+Result:
+- Short release train with event gate, 8,192 tokens, `tps_epoch=141.9`.
+- `[ASSOC-STATE]` showed every Assoc slot at `16/16`, with `>.05=16`, `>.20=15`, `>.80=0` for each slot.
+Classification:
+- The banks are not merely touched by tiny noise; almost all banks receive moderate durable mass around 0.2-0.25. This confirms weak-to-moderate over-admission.
+Next action:
+- Implement budgeted promotion / candidate selection rather than fixed threshold tuning. Desired invariant for federated training: each document/node contributes bounded high-evidence durable writes, not all local transitions.

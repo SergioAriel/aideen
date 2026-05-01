@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model Stabilization Forensics"
+  short_description: "Causal stabilization workflow for AIDEEN model debugging."
+  default_prompt: "Use this skill to stabilize AIDEEN by documenting the token circuit, isolating causal failure modes, validating invariants, and recording every task and change."
