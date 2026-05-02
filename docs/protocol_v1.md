@@ -187,3 +187,11 @@ WebTransport sobre HTTP/3 usa el mismo mecanismo QUIC subyacente. La migración 
 | Versión wire | Cambio principal |
 |---|---|
 | 1 | Inicial: Hello + Delegation + Update + Ack(AckKind) + Discovery + Error |
+
+---
+
+## Appendix A — Distributed inference design note
+
+`ExpertTask` / `ExpertResult` are the v1 MVP wire shape for expert deltas. The current architectural target for distributed inference is broader: experts should preferably return structured memory/context/evidence patches that are locally gated, integrated, and refined before the LMHead decodes.
+
+See [docs/vision/distributed_inference.md](/Users/sergiosolis/Programacion/AIDEEN/docs/vision/distributed_inference.md) for the current design direction. This appendix does not change wire version `1`; richer `ExpertQuery` / `ExpertPatch` messages should be introduced only through an explicit future protocol version.
