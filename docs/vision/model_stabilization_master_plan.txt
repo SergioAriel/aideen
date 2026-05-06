@@ -1828,3 +1828,88 @@ Classification:
 
 Next action:
 - Continue with remaining reproducibility only if it blocks causal comparisons. For model stabilization, the current priority can return to quality/capacity because the uncontrolled CPU RNG sources in the active training path have been removed.
+
+Validation result - Assoc capacity baseline without LM bridge
+------------------------------------------------------------
+Command logs:
+- `logs/assoc_capacity/capacity_p1_g0-64-128-256_train80_eval8.log`
+- `logs/assoc_capacity/capacity_p4_g0-64-128-256_train80_eval8.log`
+- `logs/assoc_capacity/capacity_p8_g0-64-128-256_train80_eval8.log`
+- `logs/assoc_capacity/capacity_p4_oracle_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p4_assoc_only_g0-128-256_train80_eval6.log`
+
+Result:
+- With `AIDEEN_ASSOC_LOGIT_LAMBDA=0`, recall stays near random across 1/4/8 pairs and gaps 0..256.
+- Oracle write positions and assoc-only do not materially improve p4; therefore the first bottleneck is not only bank selection or continuous FPM interference.
+
+Finding:
+- LM shader only injects `assoc_pooled` into sampled logits when `AIDEEN_ASSOC_LOGIT_LAMBDA>0`, and only then writes nonzero `assoc_rhs` for Assoc/FPM backward. With lambda=0, Assoc can write/read locally but the task loss has no direct path through that read signal.
+
+Validation result - fixed Assoc->LM bridge sweep
+-----------------------------------------------
+Command logs:
+- `logs/assoc_capacity/capacity_p4_lambda0p10_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p4_lambda0p25_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p4_lambda0p50_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p4_lambda1p00_g0-128-256_train80_eval6.log`
+
+Result p4 / train80 / eval6:
+- lambda=0.10: gap0=3.0376, gap128=3.2022, gap256=3.3402.
+- lambda=0.25: gap0=2.6707, gap128=3.0281, gap256=3.0826.
+- lambda=0.50: gap0=1.9897, gap128=3.0715, gap256=3.0112.
+- lambda=1.00: gap0=1.4029, gap128=2.5292, gap256=2.5942.
+
+Classification:
+- Fixed Assoc->LM bridge is experimentally useful for associative recall and shows the prior random behavior was largely an output-coupling issue.
+- Not default-stable globally yet: earlier real-text training rejected smaller lambda as default because it worsened broad LM loss. The correct next design is likely a gated/trainable/task-conditioned bridge, not a hard global lambda.
+
+Next action:
+- Test whether lambda=1 scales to more pairs and whether larger lambda saturates or improves p4.
+
+Validation result - bridge scale and training exposure
+-----------------------------------------------------
+Command logs:
+- `logs/assoc_capacity/capacity_p4_l2_lambda2p00_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p8_l1_lambda1p00_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p4_l2_t160_lambda2p00_g0-128-256_train160_eval6.log`
+- `logs/assoc_capacity/capacity_p8_l2_t80_lambda2p00_g0-128-256_train80_eval6.log`
+
+Results:
+- p4 lambda=2 train80: gap0=0.1733, gap128=0.7887, gap256=2.7335.
+- p4 lambda=2 train160: gap0=0.3839, gap128=0.7542, gap256=0.9412. Longer exposure closes the long gap.
+- p8 lambda=1 train80: gap0=2.9835, gap128=2.6045, gap256=2.3160.
+- p8 lambda=2 train80: gap0=2.5430, gap128=1.8057, gap256=2.3164.
+
+Interpretation:
+- Assoc->LM bridge is necessary for the AR task to train the memory read path.
+- p4/gap256 failure at train80 was mostly exposure/training length, not a hard impossibility.
+- p8 remains partial, so the next bottleneck is likely effective write capacity/promotion policy (`WRITE_BUDGET=4`) or bank geometry.
+
+Next action:
+- Test p8 with higher write budget and more banks before changing equations.
+
+Validation result - p8 capacity geometry
+----------------------------------------
+Command logs:
+- `logs/assoc_capacity/capacity_p8_lambda2_b16_budget8_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p8_lambda2_b32_budget8_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p8_lambda2_b32_budget8_g0-128-256_train160_eval6.log`
+
+Results:
+- p8 lambda=2 banks16 budget8 train80: gap0=1.9197, gap128=1.7714, gap256=1.9570. Partial across gaps.
+- p8 lambda=2 banks32 budget8 train80: gap0=1.3083, gap128=2.2514, gap256=1.2426. Capacity helps but exposure is still insufficient.
+- p8 lambda=2 banks32 budget8 train160: gap0=0.0849, gap128=0.0971, gap256=0.5936. Memory works across all tested gaps.
+
+Diagnosis:
+- The stabilized model can learn associative recall beyond local context when three conditions hold:
+  1. The Assoc read path has an output/loss path (`AIDEEN_ASSOC_LOGIT_LAMBDA > 0`).
+  2. Effective write budget is at least on the order of pairs per sequence.
+  3. Bank geometry has enough slack for salience/replacement (`32 banks` outperforms `16` for p8).
+- The earlier random behavior was not proof that Assoc/FPM could not retain information. It was mostly missing/weak LM coupling plus insufficient capacity/exposure for the requested number of pairs.
+
+Current provisional AR corridor:
+- p4: `AIDEEN_ASSOC_LOGIT_LAMBDA=2`, banks=16, budget=4, train160 works through gap256.
+- p8: `AIDEEN_ASSOC_LOGIT_LAMBDA=2`, banks=32, budget=8, train160 works through gap256.
+
+Open architectural issue:
+- Fixed global `AIDEEN_ASSOC_LOGIT_LAMBDA=2` should not become the broad LM default yet, because real-text training previously rejected hard Assoc logit coupling. The structural next step is a gated/trainable bridge so Assoc contributes when read confidence/content selectivity is high, rather than always injecting a fixed-scale vector.
