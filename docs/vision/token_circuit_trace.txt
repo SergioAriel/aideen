@@ -484,3 +484,10 @@ Assoc bank-capacity trace correction
 - Forward bank placement/read local arrays must be at least `ASSOC_BANKS`; current experimental supported cap is 32 banks.
 - Backward Assoc in `fused_fpm_retain_bwd.wgsl` historically copied one full slot state into `assoc_b_state[4096]` and accumulated `assoc_gb[4096]`. Required floats are `ASSOC_BANKS * (ASSOC_RANK + d_model + 1)`. For `d_model=512`, even 16 banks need 8720 floats, so large-bank backward cannot safely use this workgroup cache.
 - Current invariant: scalable bank-count experiments may validate forward memory/layout up to 32 banks, but Assoc backward is skipped when the slot state exceeds 4096 floats. Full scalable training requires storage-backed or tiled Assoc adjoints.
+
+Large-bank Assoc key-write backward
+-----------------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, branch `assoc_slot_stride > ASSOC_BWD_STATE_CAP`.
+Forward source of truth: `deq_slot_attn_unified_clean.wgsl` stores per-token pre-write banks in `AssocHist` plus metadata `[chosen_bank, allow_write, transition_gate, overwrite_bank]` after the full-sequence coordinate fix.
+Backward invariant now covered: large-bank read score gradients write a compact key-only adjoint `assoc_gb[bank * ASSOC_RANK + r]`. For the bank selected by forward metadata, the adjoint is propagated through the active key-write equation into `W_k_assoc` using the same write mass and overwrite keep semantics as forward. This avoids copying `[key|value|usage]` for every bank into the 4096-float workgroup cache.
+Still out of scope: full value adjoint, event/librarian/replacement-policy gradients, and exact `PrevHStarBuf` key-source parity. The current large-bank key backward mirrors the existing backward source convention (`S_in[t-1]`) to avoid adding a new buffer dependency mid-corridor.

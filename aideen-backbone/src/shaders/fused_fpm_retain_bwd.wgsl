@@ -175,6 +175,7 @@ const ASSOC_WRITE_CAP: f32 = 0.95;
 override ASSOC_BANKS: u32 = 1u;
 const ASSOC_ALLOC_THRESHOLD: f32 = 0.05;
 override ASSOC_WRITE_MIN_MASS: f32 = 0.0;
+override ENABLE_ASSOC_LINEAR_WRITE: bool = true;
 const ASSOC_OCCUPIED_THRESHOLD: f32 = 1.0e-4;
 // Experimental multi-bank addressing strength. With ASSOC_BANKS=1 this is
 // behaviorally inactive because the read softmax has a single candidate.
@@ -616,7 +617,14 @@ fn fused_fpm_retain_bwd_main(
             let overwrite_bank = shared_vec[3];
             let effective_bind_gate_dbg =
                 clamp(finite_or(bind_gate * assoc_write_allowed * assoc_transition_gate, 0.0), 0.0, 1.0);
-            let effective_write_mass_dbg = effective_bind_gate_dbg * effective_bind_gate_dbg;
+            var effective_write_mass_dbg = select(
+                effective_bind_gate_dbg * effective_bind_gate_dbg,
+                effective_bind_gate_dbg,
+                ENABLE_ASSOC_LINEAR_WRITE,
+            );
+            if (effective_write_mass_dbg < ASSOC_WRITE_MIN_MASS) {
+                effective_write_mass_dbg = 0.0;
+            }
             var local_bind_grad = 0.0;
             var local_key_grad_abs_dbg = 0.0;
             if (lane < RETAIN_RANK) {
@@ -748,7 +756,12 @@ fn fused_fpm_retain_bwd_main(
             );
 
             // 3. Hierarchical Gradient Chain
-            let d_allow_write = bind_grad * 2.0 * effective_bind_gate_dbg * assoc_transition_gate;
+            let effective_write_mass_deriv = select(
+                2.0 * effective_bind_gate_dbg,
+                1.0,
+                ENABLE_ASSOC_LINEAR_WRITE,
+            ) * select(1.0, 0.0, effective_write_mass_dbg <= 0.0);
+            let d_allow_write = bind_grad * effective_write_mass_deriv * assoc_transition_gate;
             var event_gate_logit_grad = 0.0;
             var slot_logit_grad_i = 0.0;
             var bank_logit_grad_best = 0.0;
@@ -811,7 +824,7 @@ fn fused_fpm_retain_bwd_main(
             var transition_gate_grad = 0.0;
             if (ENABLE_ASSOC_TRANSITION_GATE) {
                 transition_gate_grad =
-                    bind_grad * 2.0 * effective_bind_gate_dbg * assoc_write_allowed * bind_gate
+                    bind_grad * effective_write_mass_deriv * assoc_write_allowed * bind_gate
                     * assoc_transition_gate * (1.0 - assoc_transition_gate);
             }
 
@@ -834,9 +847,16 @@ fn fused_fpm_retain_bwd_main(
                 let g_bank_key_curr = finite_or(assoc_gb[bank_base + lane], 0.0);
                 let effective_bind_gate =
                     clamp(finite_or(bind_gate * assoc_write_allowed * assoc_transition_gate, 0.0), 0.0, 1.0);
-                let effective_write_mass = effective_bind_gate * effective_bind_gate;
+                var effective_write_mass = select(
+                    effective_bind_gate * effective_bind_gate,
+                    effective_bind_gate,
+                    ENABLE_ASSOC_LINEAR_WRITE,
+                );
+                if (effective_write_mass < ASSOC_WRITE_MIN_MASS) {
+                    effective_write_mass = 0.0;
+                }
                 let key_write_mass = effective_write_mass;
-                let key_keep_gate = 1.0 - effective_write_mass;
+                let key_keep_gate = select(1.0 - effective_write_mass, 0.0, overwrite_bank > 0.5);
                 
                 // addressing_grad: dL/d_token_key from write-softmax addressing
                 let key_r = finite_or(assoc_b_state[bank_base + lane], 0.0);
@@ -864,9 +884,16 @@ fn fused_fpm_retain_bwd_main(
                 let dim = lane * dims_per_lane + k;
                 let effective_bind_gate =
                     clamp(finite_or(bind_gate * assoc_write_allowed * assoc_transition_gate, 0.0), 0.0, 1.0);
-                let effective_write_mass = effective_bind_gate * effective_bind_gate;
+                var effective_write_mass = select(
+                    effective_bind_gate * effective_bind_gate,
+                    effective_bind_gate,
+                    ENABLE_ASSOC_LINEAR_WRITE,
+                );
+                if (effective_write_mass < ASSOC_WRITE_MIN_MASS) {
+                    effective_write_mass = 0.0;
+                }
                 let value_write_mass = effective_write_mass;
-                let value_keep_gate = 1.0 - effective_write_mass;
+                let value_keep_gate = select(1.0 - effective_write_mass, 0.0, overwrite_bank > 0.5);
                 let val_idx = chosen_bank * assoc_bank_stride + RETAIN_RANK + dim;
                 let g_bank_val_curr = finite_or(assoc_gb[val_idx], 0.0);
                 shared_vec[dim] = finite_or(value_write_mass * g_bank_val_curr, 0.0);
@@ -1241,9 +1268,43 @@ fn fused_fpm_retain_bwd_main(
                 let has_prev_large = select(0.0, 1.0, t > 0u);
                 let assoc_hist_slot_base_large =
                     ((b * params.seq_len + t) * h + slot) * assoc_hist_slot_stride;
+                var event_gate_large = 0.5;
+                if (t > 0u) {
+                    var local_event_dot_large = 0.0;
+                    var local_prev_sq_e_large = 0.0;
+                    var local_curr_sq_e_large = 0.0;
+                    for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                        let dim = lane * dims_per_lane + k;
+                        let prev_j = finite_or(S_in[(t_abs - 1u) * d + dim], 0.0);
+                        let curr_j = finite_or(S_in[t_abs * d + dim], 0.0);
+                        local_prev_sq_e_large = local_prev_sq_e_large + prev_j * prev_j;
+                        local_curr_sq_e_large = local_curr_sq_e_large + curr_j * curr_j;
+                    }
+                    let prev_event_rms_large =
+                        sqrt(reduce_sum(lane, local_prev_sq_e_large) / max(1.0, f32(d)) + 1.0e-6);
+                    let curr_event_rms_large =
+                        sqrt(reduce_sum(lane, local_curr_sq_e_large) / max(1.0, f32(d)) + 1.0e-6);
+                    for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                        let dim = lane * dims_per_lane + k;
+                        let prev_src_e = finite_or(S_in[(t_abs - 1u) * d + dim], 0.0)
+                            / max(prev_event_rms_large, 1.0e-6);
+                        let curr_src_e = finite_or(S_in[t_abs * d + dim], 0.0)
+                            / max(curr_event_rms_large, 1.0e-6);
+                        local_event_dot_large =
+                            local_event_dot_large
+                            + AllWeights[wevent_assoc_base + dim]
+                                * ((curr_src_e - prev_src_e) + curr_src_e * prev_src_e);
+                    }
+                    let event_logit_large =
+                        reduce_sum(lane, local_event_dot_large) * inv_sqrt_d + AllWeights[bevent_assoc_idx];
+                    let learned_event_gate_large = 1.0 / (1.0 + exp(-event_logit_large));
+                    event_gate_large = select(1.0, learned_event_gate_large, ENABLE_ASSOC_EVENT_GATE);
+                }
+                let bind_gate_large = event_gate_large * has_prev_large;
 
                 if (lane < RETAIN_RANK) {
                     var q_acc_large = 0.0;
+                    var k_acc_large = 0.0;
                     var query_sig_sq_large = 0.0;
                     if (t > 0u) {
                         for (var j = 0u; j < d; j = j + 1u) {
@@ -1262,6 +1323,8 @@ fn fused_fpm_retain_bwd_main(
                         let wq_eff_base = select(wq_assoc_base, wk_assoc_base, ENABLE_ASSOC_TIE_QK);
                         q_acc_large =
                             q_acc_large + AllWeights[wq_eff_base + j * RETAIN_RANK + lane] * prev_src_j;
+                        k_acc_large =
+                            k_acc_large + AllWeights[wk_assoc_base + j * RETAIN_RANK + lane] * prev_src_j;
                     }
                     var direct_src_large = 0.0;
                     if (t > 0u) {
@@ -1269,6 +1332,8 @@ fn fused_fpm_retain_bwd_main(
                             / max(query_sig_rms_large, 1.0e-6);
                     }
                     assoc_q[lane] = finite_or(tanh(q_acc_large + direct_src_large), tanh(direct_src_large));
+                    assoc_gprev[lane] =
+                        finite_or(tanh(k_acc_large + direct_src_large), tanh(direct_src_large));
                     shared_kw[lane] = 0.0;
                 }
                 workgroupBarrier();
@@ -1455,10 +1520,62 @@ fn fused_fpm_retain_bwd_main(
                             ASSOC_READ_BETA * inv_norm * (key_val - (dot_score / q_norm) * q_val),
                             0.0,
                         );
+                        let dscore_dkey = finite_or(
+                            ASSOC_READ_BETA * inv_norm * (q_val - (dot_score / key_norm) * key_val),
+                            0.0,
+                        );
+                        assoc_gb[bank * RETAIN_RANK + lane] =
+                            finite_or(assoc_gb[bank * RETAIN_RANK + lane] + dscore_dkey * score_grad, 0.0);
                         shared_kw[lane] = finite_or(shared_kw[lane] + dscore_dq * score_grad, 0.0);
                     }
                     workgroupBarrier();
                 }
+
+                if (lane == 0u) {
+                    let meta_base_large = assoc_hist_slot_base_large + assoc_slot_stride;
+                    let raw_bank_large = finite_or(AssocHist[meta_base_large + 0u], 0.0);
+                    shared_vec[0u] = clamp(raw_bank_large, 0.0, f32(max(1u, ASSOC_BANKS) - 1u));
+                    shared_vec[1u] = clamp(finite_or(AssocHist[meta_base_large + 1u], 0.0), 0.0, 1.0);
+                    shared_vec[2u] = clamp(finite_or(AssocHist[meta_base_large + 2u], 1.0), 0.0, 1.0);
+                    shared_vec[3u] = clamp(finite_or(AssocHist[meta_base_large + 3u], 0.0), 0.0, 1.0);
+                }
+                workgroupBarrier();
+                let chosen_bank_large = u32(shared_vec[0u]);
+                let assoc_write_allowed_large = shared_vec[1u];
+                let assoc_transition_gate_large = shared_vec[2u];
+                let overwrite_bank_large = shared_vec[3u];
+                let effective_bind_gate_large =
+                    clamp(finite_or(bind_gate_large * assoc_write_allowed_large * assoc_transition_gate_large, 0.0), 0.0, 1.0);
+                var effective_write_mass_large = select(
+                    effective_bind_gate_large * effective_bind_gate_large,
+                    effective_bind_gate_large,
+                    ENABLE_ASSOC_LINEAR_WRITE,
+                );
+                if (effective_write_mass_large < ASSOC_WRITE_MIN_MASS) {
+                    effective_write_mass_large = 0.0;
+                }
+                let key_write_mass_large = effective_write_mass_large;
+                let key_keep_gate_large =
+                    select(1.0 - effective_write_mass_large, 0.0, overwrite_bank_large > 0.5);
+                var local_key_grad_abs_large = 0.0;
+                var local_gprev_abs_large = 0.0;
+                if (lane < RETAIN_RANK) {
+                    let key_adj_idx_large = chosen_bank_large * RETAIN_RANK + lane;
+                    let g_bank_key_curr_large = finite_or(assoc_gb[key_adj_idx_large], 0.0);
+                    local_key_grad_abs_large = abs(g_bank_key_curr_large);
+                    let k_candidate_large = finite_or(assoc_gprev[lane], 0.0);
+                    assoc_raw[lane] =
+                        finite_or(
+                            key_write_mass_large
+                            * g_bank_key_curr_large
+                            * (1.0 - k_candidate_large * k_candidate_large),
+                            0.0,
+                        );
+                    local_gprev_abs_large = abs(assoc_raw[lane]);
+                    assoc_gb[key_adj_idx_large] =
+                        finite_or(key_keep_gate_large * g_bank_key_curr_large, 0.0);
+                }
+                workgroupBarrier();
                 if (lane < RETAIN_RANK) {
                     shared_kw[lane] =
                         shared_kw[lane] * (1.0 - assoc_q[lane] * assoc_q[lane]) * has_prev_large;
@@ -1488,16 +1605,52 @@ fn fused_fpm_retain_bwd_main(
                             AllGradients[wq_eff_base + dim * RETAIN_RANK + r] += step_wq_assoc;
                         }
                     }
-                }
-                let wq_step_abs_large = reduce_sum(lane, local_wq_step_abs_large);
-                let g_alpha_total_large = reduce_sum(lane, local_alpha_grad_large);
-                if (lane == 0u) {
-                    AssocBwdDebug[assoc_debug_base + 6u] =
-                        AssocBwdDebug[assoc_debug_base + 6u] + wq_step_abs_large;
-                    AssocBwdDebug[assoc_debug_base + 7u] =
-                        max(AssocBwdDebug[assoc_debug_base + 7u], wq_step_abs_large);
-                    AllGradients[alpha_assoc_idx] += g_alpha_total_large * alpha_deriv;
-                }
+                    }
+                    let wq_step_abs_large = reduce_sum(lane, local_wq_step_abs_large);
+                    var local_wk_step_abs_large = 0.0;
+                    if (t > 0u) {
+                        var prev_sig_sq_large_wk = 0.0;
+                        for (var j = 0u; j < d; j = j + 1u) {
+                            let prev_sig_j = finite_or(S_in[(t_abs - 1u) * d + j], 0.0);
+                            prev_sig_sq_large_wk = prev_sig_sq_large_wk + prev_sig_j * prev_sig_j;
+                        }
+                        let prev_sig_rms_large_wk =
+                            sqrt(prev_sig_sq_large_wk / max(1.0, f32(d)) + 1.0e-6);
+                        for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                            let dim = lane * dims_per_lane + k;
+                            let prev_src =
+                                finite_or(S_in[(t_abs - 1u) * d + dim], 0.0)
+                                / max(prev_sig_rms_large_wk, 1.0e-6);
+                            for (var r = 0u; r < RETAIN_RANK; r = r + 1u) {
+                                let step_wk_assoc =
+                                    ASSOC_ADDR_GRAD_SCALE * assoc_raw[r] * prev_src;
+                                local_wk_step_abs_large =
+                                    max(local_wk_step_abs_large, abs(step_wk_assoc));
+                                AllGradients[wk_assoc_base + dim * RETAIN_RANK + r] += step_wk_assoc;
+                            }
+                        }
+                    }
+                    let wk_step_abs_large = reduce_sum(lane, local_wk_step_abs_large);
+                    let key_grad_abs_large = reduce_sum(lane, local_key_grad_abs_large);
+                    let gprev_abs_large = reduce_sum(lane, local_gprev_abs_large);
+                    let g_alpha_total_large = reduce_sum(lane, local_alpha_grad_large);
+                    if (lane == 0u) {
+                        AssocBwdDebug[assoc_debug_base + 6u] =
+                            AssocBwdDebug[assoc_debug_base + 6u] + wq_step_abs_large;
+                        AssocBwdDebug[assoc_debug_base + 7u] =
+                            max(AssocBwdDebug[assoc_debug_base + 7u], wq_step_abs_large);
+                        AssocBwdDebug[assoc_debug_base + 8u] =
+                            AssocBwdDebug[assoc_debug_base + 8u] + wk_step_abs_large;
+                        AssocBwdDebug[assoc_debug_base + 9u] =
+                            max(AssocBwdDebug[assoc_debug_base + 9u], wk_step_abs_large);
+                        AssocBwdDebug[assoc_debug_base + 12u] =
+                            AssocBwdDebug[assoc_debug_base + 12u] + key_grad_abs_large;
+                        AssocBwdDebug[assoc_debug_base + 13u] =
+                            AssocBwdDebug[assoc_debug_base + 13u] + gprev_abs_large;
+                        AssocBwdDebug[assoc_debug_base + 14u] =
+                            AssocBwdDebug[assoc_debug_base + 14u] + effective_write_mass_large;
+                        AllGradients[alpha_assoc_idx] += g_alpha_total_large * alpha_deriv;
+                    }
                 workgroupBarrier();
             }
 

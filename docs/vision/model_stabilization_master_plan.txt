@@ -2053,3 +2053,23 @@ Logs:
 - `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-256_train80_eval8_large_read_bwd.log`: train80 sanity passed gap0/gap128 but gap256 stayed random; classified as underexposed, not promoted alone.
 - `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-256_train160_eval8_large_read_bwd.log`: train_avg=0.9651, gap0=0.1262, gap128=1.1067, gap256=0.7092; all gaps MEMORY WORKS; no NaN reported.
 Classification: experimental useful / candidate default for large-bank read-gradient coverage. Remaining gap: storage/tiled write-side Assoc BPTT for `W_k_assoc`, event gate, and replacement policy gradients.
+
+Change gate - scalable large-bank Assoc key-write backward
+----------------------------------------------------------
+1. Target failure mode: after large-bank read backward, future reads can train `W_q_assoc` but do not push gradient back into the key that was written by `W_k_assoc`. Thus large-bank training still lacks the write-key learning path.
+2. Structural rationale: only the bank key has learnable write parameters in the current default Assoc path; bank value is raw token identity. A key-only adjoint needs `ASSOC_BANKS * ASSOC_RANK` floats, which fits the existing workgroup scratch for 32 banks (1024 floats), unlike full `[key|value|usage]` adjoints. Read backward accumulates `dL/d bank_key`; reverse write propagation maps the chosen-bank key adjoint through `bank_key <- keep * prev + write_mass * k_t` into `W_k_assoc`.
+3. Anti-patch check: this restores the actual missing gradient for the active write-key equation. It does not approximate value BPTT or hide instability; it leaves value/event/replacement gradients marked pending where they are not yet structurally covered.
+4. Validation plan: add key-only adjoint in the large branch; cargo check; audit probe must show bounded nonzero `wk_step_sum`; capacity sanity must remain finite and below random.
+
+Validation - scalable large-bank Assoc key-write backward
+---------------------------------------------------------
+Change: storage-backed large-bank read backward now accumulates `dL/d bank_key` and propagates the chosen-bank key adjoint through `bank_key <- keep * prev + write_mass * k_t` into `W_k_assoc`. The same edit also restored write-mass parity for backward: `ENABLE_ASSOC_LINEAR_WRITE=true` uses linear mass and derivative 1; squared mass uses derivative `2 * effective_bind_gate`; writes below `ASSOC_WRITE_MIN_MASS` contribute zero derivative; overwrite uses zero keep gradient.
+Files inspected/changed: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`; forward parity checked against `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl` write equation and `AssocHist` metadata layout.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/assoc_capacity/probe_large_bank_key_write_bwd_audit_p32_train4_eval1_final.log`: finite; no NaN; `wk_step_sum` nonzero on active Assoc slots, e.g. s4=2.994e0, s5=3.276e1, s7=3.851e-1; gap128=0.1404 vs random=4.4067.
+- `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-256_train160_eval8_large_key_write_bwd.log`: finite; train_avg=1.1093; gap0=1.1346, gap128=0.6694, gap256=0.6211, all MEMORY WORKS vs random=4.4067.
+Classification: default stable for the p32/b32 large-bank corridor. Remaining pending: value-source gradient, event/librarian gradients, replacement-policy gradients, and exact forward-source parity for key projection if `PrevHStarBuf` is exposed to this backward pass instead of the current `S_in` approximation.
+Next action: run one real-document/LM corridor with large banks and watch whether `W_k_assoc`/`W_q_assoc` deltas remain nonzero without degrading TPS or LM loss; then decide whether event/librarian backward is needed before real training.
+Small-branch sanity after write-mass derivative parity:
+- `logs/assoc_capacity/sanity_b1_linear_write_bwd_train16_eval4.log`: finite; no NaN; b1/p4 tiny corridor remains below random with partial results (gap0=2.4146, gap32=2.5098 vs random=3.5264). This is not a capacity promotion, only a regression/finite sanity for the low-bank branch.
