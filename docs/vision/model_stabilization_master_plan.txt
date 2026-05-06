@@ -1752,3 +1752,79 @@ Classification:
 Next action:
 - Add a narrow reproducibility audit for remaining nondeterminism: compare early-step LM sampled indices, loss, `dl_dh` checksum, embedding checksum, and FPM/Assoc state checksums under identical seed.
 - Do not tune Assoc/FPM dynamics until the remaining nondeterminism is localized or declared acceptable for non-bitwise GPU training.
+
+Investigation result - remaining nondeterminism source is before LM
+-------------------------------------------------------------------
+Command logs:
+- `logs/training_real/repro_probe_detsample_2chunks_r1.log`
+- `logs/training_real/repro_probe_detsample_2chunks_r2.log`
+
+Result:
+- LM sampled indices match exactly at step 1: preview `[6, 11, 12, 13, 25, 26, 27, 30, 32, 33, 36, 39]`, target position `Some(1)` in both runs.
+- LM probability invariant remains valid in both runs: `row0_sum=1.000000e0`, no negative probabilities, no probabilities >1.
+- Divergence is already present before LM backward: step-1 `hpooled` differs (`rms=2.866e-1` vs `2.798e-1`) and `assoc_pooled` differs (`rms=1.365e-1` vs `1.415e-1`).
+- Therefore the remaining non-bitwise behavior does not originate in sampled-softmax negative selection. It originates upstream in GPU DEQ/FPM/Assoc forward state or execution order.
+
+Classification:
+- LM deterministic sampler remains default-stable.
+- Remaining reproducibility is pending and must be investigated in the forward memory/solve path before changing LM or Assoc dynamics.
+
+Next action:
+- Audit forward shader paths for atomics, order-dependent writes, buffer aliasing, and per-token/per-slot races affecting `hpooled_buf` and `assoc_pooled_buf`.
+
+Change gate - experimental token-serial DEQ forward corridor
+-----------------------------------------------------------
+1. Target failure mode: repeated runs with fixed LM sampled negatives still diverge before LM backward. The first observed mismatch is already in `hpooled`/`assoc_pooled` at step 1, while sampled indices and LM probability invariants match.
+2. Structural rationale: `deq_slot_coord_unified_main` dispatches one workgroup per slot and loops over all tokens inside each workgroup. FPM cross-slot reads use `HistCtx[t-1, ms]` while other slot workgroups may still be writing `HistCtx[t-1, ms]`; WGSL provides no global barrier across workgroups inside one dispatch. The required invariant is token boundary ordering: all slots must finish token `t-1` writes before any slot reads cross-slot memory for token `t`.
+3. Anti-patch check: this does not clamp values, lower LR, disable memory, or hide NaNs. It introduces an explicit experimental execution-order corridor that restores the missing global token boundary. It is not promoted as default because it can reduce TPS and slightly changes the current in-shader local token loop implementation; it exists to validate the race hypothesis causally.
+4. Validation plan: add `AIDEEN_DEQ_TOKEN_SERIAL_FORWARD=1`; keep local Assoc/FPM state across token dispatches; adjust H carry so token-started dispatches do not reinitialize H when `global_t>0`. Run 2-chunk reproducibility probes twice. Success means `hpooled/assoc_pooled` probes align much more closely or bitwise, and stable loss remains finite. If it fails, classify the hypothesis as incomplete and inspect per-token writes/clears next.
+
+Validation result - token-serial forward hypothesis incomplete
+-------------------------------------------------------------
+Command logs:
+- `logs/training_real/repro_probe_tokenserial_ctx64_r1.log`
+- `logs/training_real/repro_probe_tokenserial_ctx64_r2.log`
+- `logs/training_real/repro_probe_tokenserial_nocarry_ctx64_r1.log`
+- `logs/training_real/repro_probe_tokenserial_nocarry_ctx64_r2.log`
+
+Result:
+- Token-serial forward with global dispatch boundaries did not make `hpooled` reproducible.
+- Disabling token carry also did not make `hpooled` reproducible.
+- `assoc_pooled=0` in the 1-chunk ctx64 probe, so the mismatch exists before Assoc read contribution.
+
+Classification:
+- Experimental token-serial corridor: rejected as explanation for the first observed mismatch. Remove the code path rather than keeping a risky inactive branch, because the shader carry tweak can alter internal segmentation semantics.
+- The cross-workgroup `HistCtx[t-1]` race remains a plausible design issue for long-memory semantics, but it is not the first reproducibility source in this probe.
+
+New finding:
+- `FixedPointMemoryReasoning::new_with_seed` still calls `default_slot_anchor`, and `default_slot_anchor` uses `thread_rng`. `slot_anchor` is uploaded into the forward DEQ path and can change `hpooled` before LM.
+
+Change gate - seeded slot_anchor initialization
+----------------------------------------------
+1. Target failure mode: fixed `AIDEEN_TRAIN_SEED` does not reproduce the initial DEQ forward; `hpooled` differs before LM while sampled indices and LM weights match.
+2. Structural rationale: `slot_anchor` participates in the DEQ slot geometry uploaded to GPU. In `new_with_seed`, all initialization must be driven by the provided `StdRng`; using `thread_rng` for `slot_anchor` violates the seed invariant and changes the forward map `f(h,s)` between process runs.
+3. Anti-patch check: this does not clamp, tune, disable slots, or hide nondeterministic outputs. It removes uncontrolled randomness at the parameter initialization source and restores the invariant that a model seed determines the full initial forward path.
+4. Validation plan: revert the failed token-serial experiment; route `slot_anchor` through the same seeded RNG used by `new_with_rng`; cargo check; rerun ctx64 1-chunk reproducibility probes twice without token-serial. Success means `hpooled`, LM probes, and final loss match or become substantially tighter under identical seed.
+
+Validation result - seeded slot_anchor initialization
+----------------------------------------------------
+Command: `cargo check --features wgpu -p aideen-training`.
+Result: passed.
+
+Command logs:
+- `logs/training_real/repro_probe_seeded_anchor_ctx64_r1.log`
+- `logs/training_real/repro_probe_seeded_anchor_ctx64_r2.log`
+- `logs/training_real/h8_b16_budget4_assoc_salience_confread_seeded_anchor_audit_16chunks.log`
+
+Results:
+- ctx64 r1: loss=6.2743, `hpooled.rms=2.846e-1`, `assoc_pooled.rms=1.605e-1`.
+- ctx64 r2: loss=6.2899, `hpooled.rms=2.842e-1`, `assoc_pooled.rms=1.619e-1`.
+- 16-chunk audit: finite, loss=7.3146, tokens=32768, tps=142.5, Assoc occupancy bounded at 4/16 for slots 4-7, no NaN/DEQ-invalid.
+
+Classification:
+- Seeded `slot_anchor` is default-stable: it removes uncontrolled `thread_rng` from `new_with_seed` and keeps the long audit corridor stable.
+- Exact bitwise reproducibility is still pending. The remaining variation is much smaller in RMS-scale probes, so the next source is likely GPU non-bitwise execution/order or another less dominant state path.
+- The rejected token-serial experiment was not kept as code; no default behavior was changed by that failed hypothesis.
+
+Next action:
+- Continue with remaining reproducibility only if it blocks causal comparisons. For model stabilization, the current priority can return to quality/capacity because the uncontrolled CPU RNG sources in the active training path have been removed.

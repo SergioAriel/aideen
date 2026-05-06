@@ -222,13 +222,18 @@ impl FixedPointMemoryReasoning {
         DMatrix::identity(d_r, d_r) * scale + jitter
     }
 
-    fn default_slot_anchor(config: &ArchitectureConfig) -> DMatrix<f32> {
+    fn default_slot_anchor_with_rng<R: Rng + ?Sized>(
+        config: &ArchitectureConfig,
+        rng: &mut R,
+    ) -> DMatrix<f32> {
         let h_slots = config.h_slots;
         let d_r = config.d_r;
-        let mut rng = thread_rng();
-        DMatrix::from_fn(h_slots, d_r, |_, _| {
-            rng.gen_range(-1.0..1.0f32)
-        })
+        DMatrix::from_fn(h_slots, d_r, |_, _| rng.gen_range(-1.0..1.0f32))
+    }
+
+    fn default_slot_anchor(config: &ArchitectureConfig) -> DMatrix<f32> {
+        let mut rng = StdRng::seed_from_u64(0xA1DE_EE51_07A5_10C0);
+        Self::default_slot_anchor_with_rng(config, &mut rng)
     }
 
     pub fn new(config: ArchitectureConfig) -> Self {
@@ -347,7 +352,7 @@ impl FixedPointMemoryReasoning {
             .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
             .collect();
         let w_q_assoc = w_k_assoc.clone();
-        let slot_anchor = Self::default_slot_anchor(&config);
+        let slot_anchor = Self::default_slot_anchor_with_rng(&config, rng);
 
         Self {
             w_q,
