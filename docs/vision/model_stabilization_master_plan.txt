@@ -2241,3 +2241,10 @@ Corridor: same serious-prep baseline as seed42 80-chunk run, but `AIDEEN_TRAIN_S
 Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed7_chunks80.log`.
 Result: finite; no NaN/INVALID; train loss=6.2122; held-out val_loss=6.3091; tps_epoch=134.5; train tokens=81920; held-out tokens=4096.
 Interpretation: the 80-chunk serious-prep baseline is stable across two seeds. Both train and held-out losses improve versus the 20-chunk smoke. This supports scaling to 200 chunks before reintroducing experimental bridges or adding new dynamics.
+
+Validation - duration scale baseline to 200 chunks, seed42
+----------------------------------------------------------
+Corridor: serious-prep baseline, seed42, `corpus_pretrain_minimal.txt` train, `aideen-bench/tinyshakespeare.txt` held-out, batch=4, ctx=256, h_slots=8, banks=32, budget=32, bridges off (`AIDEEN_ASSOC_TO_FPM_SCALE=0.0`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0.0`), `AIDEEN_MAX_CHUNKS=200`, `AIDEEN_HELDOUT_MAX_TOKENS=8192`.
+Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed42_chunks200.log`.
+Result: finite; no NaN/INVALID; train loss=5.7281; held-out val_loss=5.9472; tps_epoch=133.9; train tokens=204800; held-out tokens=8192.
+Interpretation: 200-chunk duration scaling preserved TPS and numerical stability while improving train and held-out loss versus 80 chunks. This is the strongest evidence so far that the promoted no-bridge corridor is stable enough for longer serious-prep training. Next validation: repeat 200 chunks with seed7; if stable, shift focus to the remaining structural Assoc backward gaps before testing bridges.
