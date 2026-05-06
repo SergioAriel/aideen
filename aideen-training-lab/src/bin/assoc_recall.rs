@@ -400,7 +400,7 @@ fn format_lm_top_debug(
     let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .map(|v| v.clamp(1, 16))
+        .map(|v| v.clamp(1, 32))
         .unwrap_or(1);
     const ASSOC_RANK: usize = 32;
     let assoc_bank_stride = ASSOC_RANK + d + 1;
@@ -1289,7 +1289,7 @@ fn main() {
                     std::env::var("AIDEEN_ASSOC_BANKS")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok())
-                        .map(|v| v.clamp(1, 16))
+                        .map(|v| v.clamp(1, 32))
                 })
                 .unwrap_or(1usize);
             let bank_stride = rank + d + 1;

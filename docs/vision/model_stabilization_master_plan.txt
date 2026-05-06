@@ -1987,3 +1987,22 @@ Command: true-b32 p16 budget32 with `AR_N_TRAIN=160`, `AR_N_EVAL=16`.
 Log: `logs/assoc_capacity/capacity_p16_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
 Result: train_avg=0.8224, gap0=0.6721, gap128=0.5165, gap256=0.8816; all gaps MEMORY WORKS; no NaN reported.
 Interpretation: the p16 partial failures seen with eval6 were not reliable enough to justify architectural changes. With stronger eval, true 32 banks plus budget32 supports 16 pairs across gaps 0/128/256. Next scale target is p24 under the same real-capacity corridor.
+
+Change gate - assoc_recall audit clamp correction
+-------------------------------------------------
+1. Target failure mode: `assoc_recall` diagnostic/audit paths still clamp displayed/readback bank count to 16, so logs can misreport or under-inspect true 32-bank runs.
+2. Structural rationale: this is a measurement/layout consistency fix. The model forward path now supports 32 banks; audit readback must use the same cap to inspect the correct state stride.
+3. Anti-patch check: this does not change training/inference equations, gates, or memory writes. It only prevents stale diagnostics from hiding banks 17..32.
+4. Validation plan: change both audit clamps to 32; cargo check; note that prior attempted p24 run was actually p16 because `AR_N_KEYS` default capped `AR_PAIRS_PER_SEQ` at 16.
+
+Correction - attempted p24 run was capped to p16
+-----------------------------------------------
+Finding: `AR_PAIRS_PER_SEQ` is clamped by `ar_vocab.n_keys`; default `AR_N_KEYS=16`, so the first attempted p24 run reported and actually ran `pairs_per_seq=16`. It is rejected as p24 evidence, but remains another p16 pass.
+Measurement fix: `assoc_recall` audit/readback clamps for `AIDEEN_ASSOC_BANKS` were updated from 16 to 32 to match the real bank cap.
+
+Validation - true b32 p24 budget32 train160 eval16
+--------------------------------------------------
+Command: true-b32 budget32 corridor with `AR_N_KEYS=32`, `AR_N_VALS=32`, `AR_PAIRS_PER_SEQ=24`, `AR_N_TRAIN=160`, `AR_N_EVAL=16`.
+Log: `logs/assoc_capacity/capacity_p24_k32v32_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
+Result: random_baseline=4.4067, train_avg=1.1570, gap0=0.8473, gap128=1.0048, gap256=0.7917; all gaps MEMORY WORKS; no NaN reported.
+Interpretation: with a large enough key/value vocabulary, the current real 32-bank/budget32 corridor scales to 24 pairs. Next scale target is p32, which should stress the full per-slot occupancy budget.
