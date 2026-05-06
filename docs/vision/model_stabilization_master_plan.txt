@@ -2073,3 +2073,10 @@ Classification: default stable for the p32/b32 large-bank corridor. Remaining pe
 Next action: run one real-document/LM corridor with large banks and watch whether `W_k_assoc`/`W_q_assoc` deltas remain nonzero without degrading TPS or LM loss; then decide whether event/librarian backward is needed before real training.
 Small-branch sanity after write-mass derivative parity:
 - `logs/assoc_capacity/sanity_b1_linear_write_bwd_train16_eval4.log`: finite; no NaN; b1/p4 tiny corridor remains below random with partial results (gap0=2.4146, gap32=2.5098 vs random=3.5264). This is not a capacity promotion, only a regression/finite sanity for the low-bank branch.
+
+Real-text sanity - large-bank key-write backward
+------------------------------------------------
+Command: `AIDEEN_BATCH_SIZE=4 AIDEEN_MAX_CHUNKS=10 AIDEEN_CTX_LEN=256 AIDEEN_H_SLOTS=8 AIDEEN_ASSOC_BANKS=32 AIDEEN_ASSOC_WRITE_BUDGET=32 AIDEEN_ASSOC_SLOT_OWNER=1 AIDEEN_ASSOC_HASH_LANE=1 AIDEEN_ASSOC_HASH_REPLICA=1 AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_SALIENCE_REPLACE=1 AIDEEN_ASSOC_CONF_READ=1 cargo run --release --features wgpu -p aideen-training --bin train -- --file aideen-bench/tinyshakespeare.txt --epochs 1 --log-every 1 --save-every 0`.
+Log: `logs/real_text/tinyshakespeare_b32_key_write_bwd_chunks10.log`.
+Result: finite; no NaN/INVALID in log; loss=6.7561, tps_epoch=155.5, tokens=10240. Classification: diagnostic sanity only, not quality promotion. It shows the large-bank key-write backward coexists with real-text training without immediate TPS collapse or numerical failure.
+Open issue observed: FPM debug still reports dead token counts and zero retain/write telemetry on slots 4..7; this appears to be slot-role/gating behavior or existing instrumentation, not yet attributed to the new key-write backward. Next real-training stabilization should compare against the pre-key-write or b1 corridor and inspect whether Assoc slots are intentionally excluded from FPM write telemetry.
