@@ -2188,3 +2188,10 @@ Validation:
 - `logs/real_text/heldout_val_file_smoke_chunks2.log`: train tokens=2048, heldout tokens=1024, `[HELDOUT] val_loss=6.8957`, no NaN/INVALID.
 Classification: measurement/default stable. No training behavior changes unless `--val-file` is explicitly provided.
 Omitted-path smoke: `logs/real_text/no_val_file_regression_smoke_chunks1.log` ran without `--val-file`, printed no `[HELDOUT]`, and remained finite (`loss=6.9635`, tokens=1024). This confirms default train behavior is unchanged.
+
+Validation - corpus pretrain smoke with separated held-out
+---------------------------------------------------------
+Corridor: `corpus_pretrain_minimal.txt` train, `aideen-bench/tinyshakespeare.txt` held-out truncated by `AIDEEN_HELDOUT_MAX_TOKENS=2048`, seed42, batch=4, ctx=256, h_slots=8, banks=32, budget=32, no Assoc-to-FPM bridge, no direct Assoc-to-LM bridge, max_chunks=20.
+Log: `logs/real_text/pretrain_minimal_heldout_tiny_smoke_chunks20.log`.
+Result: finite; no NaN/INVALID; train loss=6.7353; held-out val_loss=6.7181; tps_epoch=135.7; train tokens=20480; held-out tokens=2048.
+Interpretation: the current serious-prep corridor can train on the larger pretrain corpus and evaluate a separated held-out text through the same GPU forward circuit. This is still a short smoke, but it removes the previous measurement blocker: we now have a default-off held-out metric suitable for longer serious-training runs.
