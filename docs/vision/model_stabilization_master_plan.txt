@@ -2255,3 +2255,27 @@ Corridor: same serious-prep 200-chunk baseline as seed42, but `AIDEEN_TRAIN_SEED
 Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed7_chunks200.log`.
 Result: finite; no NaN/INVALID; train loss=5.6935; held-out val_loss=5.9443; tps_epoch=135.3; train tokens=204800; held-out tokens=8192.
 Interpretation: 200-chunk serious-prep baseline is stable across two seeds with similar held-out loss and TPS. This upgrades the promoted no-bridge corridor from smoke-stable to duration-stable for short serious-prep training on this hardware/profile. Next structural focus should be the incomplete large-bank Assoc backward pieces: value adjoint, event/librarian/replacement-policy gradients, and exact previous-hstar key-source parity. Experimental bridges remain unnecessary until this baseline is challenged by a causally complete memory-training path.
+
+Structural inspection - remaining large-bank Assoc backward gaps
+----------------------------------------------------------------
+Files inspected:
+- `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`
+- `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`
+
+Finding:
+- The promoted 32-bank corridor uses the large-bank Assoc backward branch because `ASSOC_BANKS * (ASSOC_RANK + d_model + 1)` exceeds the 4096-float workgroup cache cap.
+- Large-bank backward currently accumulates compact key adjoints in `assoc_gb[bank * RETAIN_RANK + r]` and propagates selected key-write gradients into `W_k_assoc` / `W_q_assoc`.
+- It does not store full value adjoints per bank because that would require `ASSOC_BANKS * d_model` storage, which is exactly the layout that no longer fits in workgroup memory.
+- The small-bank branch also computes `g_value_dim` from normalized value write but does not clearly propagate it into a durable upstream source in the inspected section. This means the next fix must be designed as a forward/backward invariant update, not copied blindly from the small-bank branch.
+- `AIDEEN_ASSOC_TRANSITION_GATE` defaults to false in the current serious-prep corridor, so `W_v_assoc` is reserved/inactive for the promoted baseline. Therefore, the immediate missing default-path piece is not `W_v_assoc` training; it is value-source adjoint/utility for the explicit value stored in Assoc banks.
+
+Classification:
+- Current baseline remains valid as duration-stable training evidence.
+- Remaining Assoc backward is `experimental pending`, not default-stable complete. It does not block training stability, but it limits how fully Assoc memory can learn from LM loss.
+
+Next change gate candidate - large-bank Assoc value adjoint design
+------------------------------------------------------------------
+1. Target failure mode: large-bank Assoc write backward trains address/key paths but does not close the value-write adjoint to the value source. The model can store/read values in forward, but the learning signal for what value representation should be stored is incomplete.
+2. Structural rationale: forward value write stores a normalized current value vector into the selected bank with `value_new = keep * value_prev + write_mass * value_current_norm`. Backward must propagate `dL/dvalue_new` through `write_mass`, overwrite keep semantics, and the normalization of `value_current_norm`. Because full per-bank value adjoints do not fit in workgroup memory at 32 banks, the large-bank branch needs either a compact selected-bank value adjoint computed directly from the read-gradient equation, or a tiled/storage-backed value adjoint buffer.
+3. Anti-patch check: do not add a scalar gain or bridge to compensate for missing value learning. The correct locus is the value-write adjoint equation and storage strategy, because the missing mechanism originates at the forward write equation.
+4. Validation plan: implement behind the large-bank branch only; `cargo check`; run short 32-bank assoc-recall and real-text smoke; require no NaN/INVALID, no TPS collapse, and improved/nonzero value-adjoint diagnostics before promoting. Then re-run the 80/200 chunk serious-prep profile.
