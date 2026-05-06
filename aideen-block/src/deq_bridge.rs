@@ -177,7 +177,7 @@ impl RustDeqBridge {
         let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map(|v| v.clamp(1, 16))
+            .map(|v| v.clamp(1, 32))
             .unwrap_or(1);
         let assoc_transition_gate = std::env::var("AIDEEN_ASSOC_TRANSITION_GATE")
             .ok()
@@ -325,7 +325,7 @@ impl RustDeqBridge {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(0)
-            .min(16);
+            .min(32);
         let segment_memory_token = std::env::var("AIDEEN_SEGMENT_MEMORY_TOKEN")
             .ok()
             .map(|v| {
@@ -641,7 +641,7 @@ impl RustDeqBridge {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(1)
-            .clamp(1, 16);
+            .clamp(1, 32);
         // Slot coordination uses bias only as a structural bootstrap to break permutation
         // symmetry. Training the bias let the router collapse onto the shortcut instead of
         // pushing specialization into W_q/W_k, and disabling bias entirely weakened the
@@ -681,7 +681,7 @@ impl RustDeqBridge {
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.0)
-            .clamp(0.0, 16.0);
+            .clamp(0.0, 32.0);
         slot_coord_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         slot_coord_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
         slot_coord_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);

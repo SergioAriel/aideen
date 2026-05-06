@@ -1369,7 +1369,7 @@ impl GpuDeqBackend {
         let assoc_banks = std::env::var("AIDEEN_ASSOC_BANKS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map(|v| v.clamp(1, 16))
+            .map(|v| v.clamp(1, 32))
             .unwrap_or(1);
         let env_bool = |name: &str, default: bool| {
             std::env::var(name)
@@ -1423,7 +1423,7 @@ impl GpuDeqBackend {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(0)
-            .min(16);
+            .min(32);
         let assoc_read_beta = std::env::var("AIDEEN_ASSOC_READ_BETA")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -1438,7 +1438,7 @@ impl GpuDeqBackend {
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.0)
-            .clamp(0.0, 16.0);
+            .clamp(0.0, 32.0);
         let mut shader_constants = std::collections::HashMap::new();
         shader_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
         shader_constants.insert("ASSOC_RANK".to_string(), 32.0);

@@ -2444,7 +2444,7 @@ fn deq_slot_coord_unified_main(
                     let prev_j = PrevHStarBuf[prev_hstar_base + j] / max(prev_source_rms_for_value, 1.0e-6);
                     prev_value_norm = prev_value_norm + prev_j * prev_j;
                 }
-                var bank_scores: array<f32, 16>; 
+                var bank_scores: array<f32, 32>; 
                 for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                     let bank_base = assoc_slot_base + bank * assoc_bank_stride;
                     var key_norm = 0.0;
@@ -2482,7 +2482,7 @@ fn deq_slot_coord_unified_main(
                         found_empty = true;
                     }
                     let cos = finite_or(score / sqrt(max(key_norm * new_key_norm, 1.0e-12)), -1.0);
-                    if (bank < 16u) { bank_scores[bank] = cos; }
+                    bank_scores[bank] = cos;
                     let value_cos =
                         finite_or(value_score / sqrt(max(value_norm * new_value_norm, 1.0e-12)), -1.0);
                     let prev_value_cos =
@@ -2562,7 +2562,7 @@ fn deq_slot_coord_unified_main(
                     max_bank_score = max(max_bank_score, bank_scores[bank]);
                 }
                 var bank_denom = 0.0;
-                var bank_probs: array<f32, 16>;
+                var bank_probs: array<f32, 32>;
                 for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
                     let e = exp(clamp(4.0 * (bank_scores[bank] - max_bank_score), -20.0, 20.0));
                     bank_probs[bank] = e;

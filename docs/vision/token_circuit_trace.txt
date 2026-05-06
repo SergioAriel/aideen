@@ -477,3 +477,10 @@ Validated status:
 - `GpuLmHeadTrainer` now uses `AIDEEN_LM_SAMPLE_SEED`, falling back to `AIDEEN_TRAIN_SEED`, to generate deterministic sampled-softmax negatives from a counter/hash function keyed by `step_t`.
 - The sampled set is no longer drawn from `thread_rng`; this removes an uncontrolled stochastic input from the LM loss and `dl_dh` path.
 - Remaining caveat: 16-chunk repeated runs are stable but not bit-identical, so another non-bitwise path remains outside sampled-negative construction.
+
+Assoc bank-capacity trace correction
+------------------------------------
+- Forward Assoc bank count is controlled by `AIDEEN_ASSOC_BANKS` in `RustDeqBridge` and `GpuDeqBackend`, then passed as WGSL override `ASSOC_BANKS` into `deq_slot_attn_unified_clean.wgsl`.
+- Forward bank placement/read local arrays must be at least `ASSOC_BANKS`; current experimental supported cap is 32 banks.
+- Backward Assoc in `fused_fpm_retain_bwd.wgsl` historically copied one full slot state into `assoc_b_state[4096]` and accumulated `assoc_gb[4096]`. Required floats are `ASSOC_BANKS * (ASSOC_RANK + d_model + 1)`. For `d_model=512`, even 16 banks need 8720 floats, so large-bank backward cannot safely use this workgroup cache.
+- Current invariant: scalable bank-count experiments may validate forward memory/layout up to 32 banks, but Assoc backward is skipped when the slot state exceeds 4096 floats. Full scalable training requires storage-backed or tiled Assoc adjoints.

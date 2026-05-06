@@ -168,6 +168,7 @@ fn assoc_oracle_write_hit(t: u32) -> bool {
 }
 
 const WG_SIZE: u32 = 64u;
+const ASSOC_BWD_STATE_CAP: u32 = 4096u;
 const FPM_RESIDUAL_SCALE: f32 = 0.1;
 const FPM_GATE_BIAS: f32 = -1.5;
 const ASSOC_WRITE_CAP: f32 = 0.95;
@@ -463,7 +464,7 @@ fn fused_fpm_retain_bwd_main(
             // alpha_assoc ya está precalculado con sigmoid arriba.
 
             var local_alpha_grad = 0.0;
-            if (is_assoc_slot) {
+            if (is_assoc_slot && assoc_slot_stride <= ASSOC_BWD_STATE_CAP) {
             let vs_base = adj_v_off(t_abs, slot, d, n_tokens);
             // TEMPORARY ASSOCIATIVE DIAGNOSTIC: v_state magnitude entering assoc read backward.
             var local_v_sq_assoc_dbg = 0.0;
@@ -710,7 +711,7 @@ fn fused_fpm_retain_bwd_main(
 
             // 2. Bank Placement Recomputation (re-estimate bank probs for grad flow)
             var local_max_bank_score = -1.0e30;
-            var local_bank_scores: array<f32, 16>;
+            var local_bank_scores: array<f32, 32>;
             for (var b_idx = 0u; b_idx < ASSOC_BANKS; b_idx = b_idx + 1u) {
                 let bank_base = b_idx * assoc_bank_stride;
                 var local_bank_dot = 0.0;

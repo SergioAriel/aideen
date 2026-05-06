@@ -1913,3 +1913,43 @@ Current provisional AR corridor:
 
 Open architectural issue:
 - Fixed global `AIDEEN_ASSOC_LOGIT_LAMBDA=2` should not become the broad LM default yet, because real-text training previously rejected hard Assoc logit coupling. The structural next step is a gated/trainable bridge so Assoc contributes when read confidence/content selectivity is high, rather than always injecting a fixed-scale vector.
+
+Correction - prior banks32 runs were not true 32-bank runs
+---------------------------------------------------------
+Finding: Rust-side config clamps `AIDEEN_ASSOC_BANKS` to 16 in both `deq_bridge.rs` and `gpu_deq.rs`; the WGSL write-placement path also uses local arrays sized to 16. Therefore previous logs labelled `banks32` did not validate real 32-bank capacity.
+
+Change gate - real >16 Assoc bank support
+-----------------------------------------
+1. Target failure mode: capacity experiments above 16 banks are invalid because the host clamps `ASSOC_BANKS` to 16 and the shader write-placement arrays cannot index more than 16 banks.
+2. Structural rationale: bank count is a layout/invariant parameter. Host buffer sizing, shader override constants, local bank-score arrays, and scratch offsets must agree on the same maximum bank capacity. If any layer stays at 16, larger-bank tests either silently run as 16 banks or risk out-of-bounds local array access.
+3. Anti-patch check: this does not tune memory behavior or hide quality loss. It restores the capacity/layout invariant so `AIDEEN_ASSOC_BANKS=32` means 32 actual banks across allocation, read, write, and replacement code.
+4. Validation plan: raise host clamp and shader local capacity to 32 banks; cargo check; rerun p8 lambda=2 budget8 train80 for banks16 vs banks32. Success means both configurations compile and logs represent real bank counts; quality conclusions must be rewritten from the new measurements.
+
+Additional backward invariant found while implementing:
+- `fused_fpm_retain_bwd.wgsl` caches one full Assoc slot state in workgroup arrays sized 4096. With `d_model=512`, `ASSOC_BANKS=16` already needs `16 * (32 + 512 + 1) = 8720` floats, so the backward Assoc path can corrupt workgroup memory when bank count or dimension exceeds the cache capacity.
+- Classification: layout/invariant. The immediate structural safety fix is to run the Assoc backward block only when `assoc_slot_stride <= 4096`; this preserves forward capacity validation and prevents silent OOB in backward. It is not the final scalable backward design.
+- Next required architecture task: replace the full-slot workgroup cache/adjoint with storage-backed bank adjoints or tiled bank processing, so large-bank Assoc can train through the memory path instead of only being forward-valid.
+
+Validation - true banks16 vs banks32 after capacity invariant fix
+----------------------------------------------------------------
+Command family: `AIDEEN_ASSOC_LOGIT_LAMBDA=2 AR_PAIRS_PER_SEQ=8 AR_GAPS=0,128,256 AR_N_TRAIN=80 AR_N_EVAL=6 AIDEEN_CTX_LEN=256 AIDEEN_H_SLOTS=8 AIDEEN_ASSOC_WRITE_BUDGET=8 AIDEEN_ASSOC_SLOT_OWNER=1 AIDEEN_ASSOC_HASH_LANE=1 AIDEEN_ASSOC_HASH_REPLICA=1 AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_SALIENCE_REPLACE=1 AIDEEN_ASSOC_CONF_READ=1 AIDEEN_TPS_SYNC_EVERY=1`.
+Logs:
+- `logs/assoc_capacity/capacity_p8_lambda2_true_b16_budget8_g0-128-256_train80_eval6.log`
+- `logs/assoc_capacity/capacity_p8_lambda2_true_b32_budget8_g0-128-256_train80_eval6.log`
+Results:
+- true b16: train_avg=1.6259, gap0=1.6980, gap128=2.8896, gap256=1.2556, no NaN reported.
+- true b32: train_avg=1.3517, gap0=1.2733, gap128=2.2576, gap256=1.3011, no NaN reported.
+Interpretation:
+- The previous banks32 result was invalid because the host/shader cap was 16. After fixing the layout cap to 32, real b32 is better than b16 in training average, gap0, and gap128, while gap256 stays similar-good. Capacity helps, but train80 is not enough to close all p8 gaps.
+- Because `d_model=512` makes the backward Assoc workgroup cache exceed 4096 floats for 16+ banks, these results validate forward Assoc capacity plus LM/embedding learning under safe backward guarding, not a complete scalable Assoc backward path.
+Classification:
+- Host/shader bank cap fix: default stable layout/invariant, pending broader profile validation.
+- Backward OOB guard: default stable safety invariant, but marks large-bank Assoc backward as incomplete.
+- Large-bank quality: experimental useful; next validation is b32/train160 under the same corridor.
+
+Validation - true b32 p8 train160
+---------------------------------
+Command: same true-b32 corridor as above with `AR_N_TRAIN=160`.
+Log: `logs/assoc_capacity/capacity_p8_lambda2_true_b32_budget8_g0-128-256_train160_eval6.log`.
+Result: train_avg=1.0078, gap0=0.6171, gap128=0.5549, gap256=0.6153, all marked MEMORY WORKS, no NaN reported.
+Interpretation: p8 does not appear blocked by the serialization path once real 32-bank forward capacity is available and the OOB backward path is guarded. train80 was undertrained/partial; train160 closes the corridor. Next capacity target is p16 with true 32 banks, then decide whether failure is collision/budget/slot allocation or exposure.
