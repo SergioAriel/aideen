@@ -491,3 +491,9 @@ Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, branch `assoc_slo
 Forward source of truth: `deq_slot_attn_unified_clean.wgsl` stores per-token pre-write banks in `AssocHist` plus metadata `[chosen_bank, allow_write, transition_gate, overwrite_bank]` after the full-sequence coordinate fix.
 Backward invariant now covered: large-bank read score gradients write a compact key-only adjoint `assoc_gb[bank * ASSOC_RANK + r]`. For the bank selected by forward metadata, the adjoint is propagated through the active key-write equation into `W_k_assoc` using the same write mass and overwrite keep semantics as forward. This avoids copying `[key|value|usage]` for every bank into the 4096-float workgroup cache.
 Still out of scope: full value adjoint, event/librarian/replacement-policy gradients, and exact `PrevHStarBuf` key-source parity. The current large-bank key backward mirrors the existing backward source convention (`S_in[t-1]`) to avoid adding a new buffer dependency mid-corridor.
+
+FPM vs Assoc slot telemetry split
+---------------------------------
+Path: `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`.
+Invariant: slots `slot_idx < h_slots/2` run the base FPM plastic write block; slots `slot_idx >= h_slots/2` are Assoc slots and skip that base block via `!is_assoc_slot`. Assoc slots can still consolidate a slow contextual trace into FPM state inside the Assoc write block (`ASSOC_TO_FPM_SCALE * effective_write_mass`), but current `[FPM-PATH] write/retain` telemetry is sourced from the base FPM write diagnostics, so zeros on slots 4..7 do not by themselves prove that Assoc-to-FPM consolidation is inactive.
+Failure-risk: real-text logs can look like half the slots are dead if interpreted only through FPM write counters. Need explicit Assoc-to-FPM bridge telemetry before deciding whether contextual consolidation from Assoc slots is weak or merely unobserved.
