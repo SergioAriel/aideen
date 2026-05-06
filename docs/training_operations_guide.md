@@ -205,6 +205,53 @@ Eso sigue siendo obligatorio porque el archivo vuelve al principio en cada epoch
 Cuando el objetivo es evaluar calidad/aprendizaje y no solo throughput, usar el perfil
 de reporting.
 
+### Perfil serio mínimo actual
+
+Este es el corredor recomendado para comparar cambios de estabilización antes de
+promoverlos. Mantiene activos los bancos Assoc escalables, pero deja apagados los
+bridges no validados hacia FPM y LM.
+
+```bash
+cd /Users/sergiosolis/Programacion/AIDEEN && \
+env \
+  AIDEEN_CHECKPOINT_BASE=model_serious_prep \
+  AIDEEN_TRAIN_SEED=42 \
+  AIDEEN_LM_SAMPLE_SEED=42 \
+  AIDEEN_BATCH_SIZE=4 \
+  AIDEEN_CTX_LEN=256 \
+  AIDEEN_H_SLOTS=8 \
+  AIDEEN_ASSOC_BANKS=32 \
+  AIDEEN_ASSOC_WRITE_BUDGET=32 \
+  AIDEEN_ASSOC_SLOT_OWNER=1 \
+  AIDEEN_ASSOC_HASH_LANE=1 \
+  AIDEEN_ASSOC_HASH_REPLICA=1 \
+  AIDEEN_ASSOC_EVENT_GATE=1 \
+  AIDEEN_ASSOC_SALIENCE_REPLACE=1 \
+  AIDEEN_ASSOC_CONF_READ=1 \
+  AIDEEN_ASSOC_TO_FPM_SCALE=0.0 \
+  AIDEEN_ASSOC_LOGIT_LAMBDA=0.0 \
+  AIDEEN_HELDOUT_MAX_TOKENS=2048 \
+  AIDEEN_MAX_CHUNKS=20 \
+  cargo run --release --features wgpu -p aideen-training --bin train -- \
+    --file /Users/sergiosolis/Programacion/AIDEEN/corpus_pretrain_minimal.txt \
+    --val-file /Users/sergiosolis/Programacion/AIDEEN/aideen-bench/tinyshakespeare.txt \
+    --epochs 1 \
+    --log-every 1 \
+    --save-every 0
+```
+
+Baseline smoke registrado:
+
+- `logs/real_text/pretrain_minimal_heldout_tiny_smoke_chunks20.log`
+- train loss `6.7353`
+- held-out `val_loss=6.7181`
+- `135.7 TPS`
+- sin `NaN` / `DEQ-INVALID`
+
+Para pasar de smoke a training serio, subir primero `AIDEEN_MAX_CHUNKS` y luego
+`AIDEEN_HELDOUT_MAX_TOKENS`, manteniendo esos bridges en `0.0` hasta que una
+variante los supere con held-out y TPS.
+
 ### Comando recomendado
 
 ```bash
