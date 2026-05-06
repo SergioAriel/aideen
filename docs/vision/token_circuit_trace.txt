@@ -458,3 +458,22 @@ Assoc write backward parity
 Path: `fused_fpm_retain_bwd.wgsl`, durable associative memory backward.
 Forward invariant: `effective_write_mass = effective_bind_gate` when `ENABLE_ASSOC_LINEAR_WRITE=true`, otherwise `effective_bind_gate^2`; writes below `ASSOC_WRITE_MIN_MASS` become zero; replacement overwrite sets prior keep gate to zero.
 Backward invariant: fused backward now uses the same write mass, the matching derivative `d mass / d effective_bind_gate`, and zero keep gradient when `overwrite_bank=1`.
+
+LM sampled-negative determinism invariant
+-----------------------------------------
+Files:
+- aideen-backbone/src/gpu_lm_head.rs
+- aideen-backbone/src/shaders/lm_train.wgsl
+
+Role:
+- `GpuLmHeadTrainer::build_sampled_indices` constructs the sampled-softmax vocabulary slice consumed by `lm_probs_main`, `lm_backprop_h_t_main`, and `lm_update_main`.
+
+Invariant:
+- For stabilization runs, sampled indices must be reproducible for a fixed LM sample seed, `step_t`, targets, vocabulary size, and sample capacity.
+- The target tokens are always inserted first, sorted/deduped, and negatives fill the remaining capacity without duplication.
+- Any stochasticity in the sampled set changes the LM loss and `dl_dh`, so it is part of the training equation, not just a diagnostic detail.
+
+Validated status:
+- `GpuLmHeadTrainer` now uses `AIDEEN_LM_SAMPLE_SEED`, falling back to `AIDEEN_TRAIN_SEED`, to generate deterministic sampled-softmax negatives from a counter/hash function keyed by `step_t`.
+- The sampled set is no longer drawn from `thread_rng`; this removes an uncontrolled stochastic input from the LM loss and `dl_dh` path.
+- Remaining caveat: 16-chunk repeated runs are stable but not bit-identical, so another non-bitwise path remains outside sampled-negative construction.

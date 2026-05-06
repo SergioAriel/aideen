@@ -1708,3 +1708,47 @@ Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_defaults
 Result: finite run, loss=7.4389 over 16384 tokens, tps=155.0, budget preserved at 4/16 for slots 4-7. No NaNs reported.
 Decision: current recommended corridor is stable for 8 chunks with synchronized GPU execution: `AIDEEN_ASSOC_WRITE_BUDGET=4`, `AIDEEN_ASSOC_SALIENCE_REPLACE=1`, `AIDEEN_ASSOC_CONF_READ=1`, direct Assoc->LM logit bridge disabled, address LR disabled.
 Open next task: replace per-chunk GPU wait with a safer high-TPS mechanism (ring buffers or explicit command dependencies) after model stabilization; do not remove sync until an 8+ chunk validation stays in the 7.x range.
+
+Validation result - 16 chunk default sync corridor
+-------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_defaultsync_nodebug_16chunks.log`.
+Result: finite run, loss=7.2925 over 32768 tokens, tps=136.2, no NaNs reported. This extends the synchronized corridor from 8 to 16 chunks and improves loss with longer exposure.
+Interpretation: the GPU synchronization fix holds beyond the previous 6/8 chunk failure threshold. Remaining validation needed: confirm Assoc occupancy stays bounded at 16 chunks with audit enabled.
+
+Validation result - 16 chunk audit run exposed nondeterministic instability
+--------------------------------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_defaultsync_audit_16chunks.log`.
+Result: run failed at step 11 with `[DEQ-INVALID] err_h=1.082e5`, final loss=22.9376, NaNs in FPM telemetry and Assoc read telemetry. Assoc occupancy still remained bounded at 4/16, so the failure is not bank saturation.
+Interpretation: this contradicts the previous 16-chunk no-audit stable run (`loss=7.2925`) under the same seed/profile. The corridor is not reproducible; before more architectural tuning, locate uncontrolled randomness or execution nondeterminism.
+Next action: audit RNG/sample sources, especially sampled softmax negative sampling.
+
+Change gate - deterministic LM sampled-softmax negatives
+--------------------------------------------------------
+1. Target failure mode: the 16-chunk synchronized corridor is not reproducible: one no-audit run stayed finite (`loss=7.2925`) while the same seed/profile with audit failed at step 11. `GpuLmHeadTrainer::build_sampled_indices` uses `rand::thread_rng()`, so `AIDEEN_TRAIN_SEED` does not fully determine the sampled-softmax loss/gradient path.
+2. Structural rationale: sampled-softmax defines the LM objective over `targets + negatives`. Those negatives are part of the forward loss and backward `dl_dh` equation. For a frozen stabilization corridor, the sampled set must be a deterministic function of seed, optimizer step, target set, vocabulary, and sample capacity; otherwise gradients change between runs before Assoc/FPM can be compared.
+3. Anti-patch check: this does not clamp loss, reduce sample count, disable audit, or tune dynamics. It restores the reproducibility invariant at the origin of the stochastic objective by replacing uncontrolled process RNG with a deterministic counter/hash sampler. The objective remains sampled softmax and remains valid across seeds/profiles because the seed explicitly selects the negative sequence.
+4. Validation plan: cargo check; run the 16-chunk corridor twice with identical `AIDEEN_TRAIN_SEED`/`AIDEEN_LM_SAMPLE_SEED` and compare final loss/log signatures; then rerun 16 chunks with `AIDEEN_ASSOC_AUDIT=1`. Success means repeated no-audit runs match, audit no longer introduces unexplained divergence, and no NaN/DEQ-invalid appears. If audit still diverges with deterministic samples, classify sampling as default-stable invariant fix and investigate audit/readback perturbation next.
+
+Validation result - deterministic sampled-softmax negatives
+----------------------------------------------------------
+Command: `cargo check --features wgpu -p aideen-training`.
+Result: passed.
+
+Command logs:
+- `logs/training_real/h8_b16_budget4_assoc_salience_confread_detsample_nodebug_16chunks_r1.log`
+- `logs/training_real/h8_b16_budget4_assoc_salience_confread_detsample_nodebug_16chunks_r2.log`
+- `logs/training_real/h8_b16_budget4_assoc_salience_confread_detsample_audit_16chunks.log`
+
+Results:
+- no-audit r1: finite, loss=7.2964, tokens=32768, tps=137.3.
+- no-audit r2: finite, loss=7.2415, tokens=32768, tps=137.7.
+- audit: finite, loss=7.2605, tokens=32768, tps=140.3, Assoc occupancy bounded at 4/16 for slots 4-7, no NaN/DEQ-invalid.
+
+Classification:
+- Deterministic LM negative sampling is a default-stable invariant fix: it removes uncontrolled process RNG from the sampled-softmax objective and preserves the 16-chunk corridor including audit.
+- Exact run-to-run equality is still pending. The remaining difference between r1/r2 means another nondeterministic source remains, likely GPU execution/reduction/order or another state path not covered by `AIDEEN_TRAIN_SEED`.
+- The previous 16-chunk audit collapse is not reproduced after this fix, so the immediate instability was trajectory-sensitive rather than bank saturation.
+
+Next action:
+- Add a narrow reproducibility audit for remaining nondeterminism: compare early-step LM sampled indices, loss, `dl_dh` checksum, embedding checksum, and FPM/Assoc state checksums under identical seed.
+- Do not tune Assoc/FPM dynamics until the remaining nondeterminism is localized or declared acceptable for non-bitwise GPU training.

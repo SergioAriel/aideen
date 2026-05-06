@@ -23,6 +23,7 @@ pub struct GpuLmHeadTrainer {
     pub config: ArchitectureConfig,
     pub vocab_size: usize,
     sample_capacity: usize,
+    sample_seed: u64,
     h_buf: wgpu::Buffer,
     w_buf: wgpu::Buffer,
     b_buf: wgpu::Buffer,
@@ -70,7 +71,27 @@ impl GpuLmHeadTrainer {
             .max(1) as u32
     }
 
-    fn build_sampled_indices(&mut self, targets: &[u32]) -> u32 {
+    fn parse_env_seed(name: &str) -> Option<u64> {
+        let raw = std::env::var(name).ok()?;
+        let s = raw.trim();
+        s.strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .map_or_else(|| s.parse::<u64>().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+    }
+
+    fn deterministic_sample_candidate(&self, step_t: u32, draw: u64) -> u32 {
+        let mut x = self.sample_seed
+            ^ ((step_t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ draw.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        (x % self.vocab_size as u64) as u32
+    }
+
+    fn build_sampled_indices(&mut self, targets: &[u32], step_t: u32) -> u32 {
         // MAX_SHADER_SAMPLES must match s_indices_cache and s_logits array sizes in lm_train.wgsl.
         // Exceeding this causes OOB writes to workgroup memory, corrupting probs and gradients.
         const MAX_SHADER_SAMPLES: usize = 2048;
@@ -93,10 +114,10 @@ impl GpuLmHeadTrainer {
 
         let mut seen: std::collections::HashSet<u32> =
             self.sampled_indices_reuse.iter().copied().collect();
-        let mut rng = rand::thread_rng();
+        let mut draw = 0_u64;
         while self.sampled_indices_reuse.len() < desired {
-            use rand::Rng;
-            let candidate = rng.gen_range(0..self.vocab_size as u32);
+            let candidate = self.deterministic_sample_candidate(step_t, draw);
+            draw = draw.wrapping_add(1);
             if seen.insert(candidate) {
                 self.sampled_indices_reuse.push(candidate);
             }
@@ -546,6 +567,9 @@ impl GpuLmHeadTrainer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let sample_seed = Self::parse_env_seed("AIDEEN_LM_SAMPLE_SEED")
+            .or_else(|| Self::parse_env_seed("AIDEEN_TRAIN_SEED"))
+            .unwrap_or(0xA1DE_EE5A_4D5E_ED5E);
         let s_h_rms_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM s_h_rms"),
             size: (safe_ctx * d_r * 4) as u64,
@@ -644,6 +668,7 @@ impl GpuLmHeadTrainer {
             config,
             vocab_size,
             sample_capacity,
+            sample_seed,
             h_buf,
             w_buf,
             b_buf,
@@ -734,7 +759,7 @@ impl GpuLmHeadTrainer {
         // Sampled Softmax: targets + random negatives — reuse buffer to avoid heap alloc per step.
         self.sampled_indices_reuse.clear();
         self.sampled_indices_reuse.reserve(self.sample_capacity);
-        let actual_num_samples = self.build_sampled_indices(targets);
+        let actual_num_samples = self.build_sampled_indices(targets, step_t);
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -912,7 +937,7 @@ impl GpuLmHeadTrainer {
 
         self.sampled_indices_reuse.clear();
         self.sampled_indices_reuse.reserve(self.sample_capacity);
-        let actual_num_samples = self.build_sampled_indices(targets);
+        let actual_num_samples = self.build_sampled_indices(targets, step_t);
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
@@ -1100,7 +1125,7 @@ impl GpuLmHeadTrainer {
 
         self.sampled_indices_reuse.clear();
         self.sampled_indices_reuse.reserve(self.sample_capacity);
-        let actual_num_samples = self.build_sampled_indices(targets);
+        let actual_num_samples = self.build_sampled_indices(targets, step_t);
         if self.cfg_lm_debug {
             let tgt0 = targets.get(0).copied().unwrap_or(0);
             eprintln!(
