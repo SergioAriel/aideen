@@ -2234,3 +2234,10 @@ Corridor: serious-prep baseline, seed42, `corpus_pretrain_minimal.txt` train, `a
 Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed42_chunks80.log`.
 Result: finite; no NaN/INVALID; train loss=6.2927; held-out val_loss=6.3758; tps_epoch=133.3; train tokens=81920; held-out tokens=4096.
 Interpretation: duration scaling from 20 to 80 chunks preserved numerical stability and improved both train and held-out loss versus the 20-chunk smoke (`6.7353` / `6.7181`). This strengthens the promoted no-bridge baseline as the current training-serious corridor. Next validation: repeat 80 chunks with seed7, then scale to 200 chunks if stable.
+
+Validation - duration scale baseline to 80 chunks, seed7
+--------------------------------------------------------
+Corridor: same serious-prep baseline as seed42 80-chunk run, but `AIDEEN_TRAIN_SEED=7`, `AIDEEN_LM_SAMPLE_SEED=7`.
+Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed7_chunks80.log`.
+Result: finite; no NaN/INVALID; train loss=6.2122; held-out val_loss=6.3091; tps_epoch=134.5; train tokens=81920; held-out tokens=4096.
+Interpretation: the 80-chunk serious-prep baseline is stable across two seeds. Both train and held-out losses improve versus the 20-chunk smoke. This supports scaling to 200 chunks before reintroducing experimental bridges or adding new dynamics.
