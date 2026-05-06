@@ -2248,3 +2248,10 @@ Corridor: serious-prep baseline, seed42, `corpus_pretrain_minimal.txt` train, `a
 Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed42_chunks200.log`.
 Result: finite; no NaN/INVALID; train loss=5.7281; held-out val_loss=5.9472; tps_epoch=133.9; train tokens=204800; held-out tokens=8192.
 Interpretation: 200-chunk duration scaling preserved TPS and numerical stability while improving train and held-out loss versus 80 chunks. This is the strongest evidence so far that the promoted no-bridge corridor is stable enough for longer serious-prep training. Next validation: repeat 200 chunks with seed7; if stable, shift focus to the remaining structural Assoc backward gaps before testing bridges.
+
+Validation - duration scale baseline to 200 chunks, seed7
+---------------------------------------------------------
+Corridor: same serious-prep 200-chunk baseline as seed42, but `AIDEEN_TRAIN_SEED=7`, `AIDEEN_LM_SAMPLE_SEED=7`.
+Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed7_chunks200.log`.
+Result: finite; no NaN/INVALID; train loss=5.6935; held-out val_loss=5.9443; tps_epoch=135.3; train tokens=204800; held-out tokens=8192.
+Interpretation: 200-chunk serious-prep baseline is stable across two seeds with similar held-out loss and TPS. This upgrades the promoted no-bridge corridor from smoke-stable to duration-stable for short serious-prep training on this hardware/profile. Next structural focus should be the incomplete large-bank Assoc backward pieces: value adjoint, event/librarian/replacement-policy gradients, and exact previous-hstar key-source parity. Experimental bridges remain unnecessary until this baseline is challenged by a causally complete memory-training path.
