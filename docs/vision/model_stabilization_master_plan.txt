@@ -2006,3 +2006,11 @@ Command: true-b32 budget32 corridor with `AR_N_KEYS=32`, `AR_N_VALS=32`, `AR_PAI
 Log: `logs/assoc_capacity/capacity_p24_k32v32_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
 Result: random_baseline=4.4067, train_avg=1.1570, gap0=0.8473, gap128=1.0048, gap256=0.7917; all gaps MEMORY WORKS; no NaN reported.
 Interpretation: with a large enough key/value vocabulary, the current real 32-bank/budget32 corridor scales to 24 pairs. Next scale target is p32, which should stress the full per-slot occupancy budget.
+
+Validation - true b32 p32 budget32 train160 eval16
+--------------------------------------------------
+Command: true-b32 budget32 corridor with `AR_N_KEYS=32`, `AR_N_VALS=32`, `AR_PAIRS_PER_SEQ=32`, `AR_N_TRAIN=160`, `AR_N_EVAL=16`.
+Log: `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
+Result: random_baseline=4.4067, train_avg=0.9515, gap0=1.3668, gap128=0.6550, gap256=0.7652; all gaps MEMORY WORKS; no NaN reported.
+Interpretation: the current real-capacity corridor supports 32 real pairs with 32 physical banks and budget32. The earlier apparent low ceiling was caused by hidden bank clamps, budget semantics, too-small eval samples, and a default key vocabulary cap, not by the serialization path alone.
+Next: test above budget (`p48`/`p64` with larger key vocab) or implement scalable storage-backed Assoc backward before promoting this as a complete training design.
