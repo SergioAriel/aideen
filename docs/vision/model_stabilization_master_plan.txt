@@ -2136,3 +2136,27 @@ Logs/results:
 - `logs/real_text/sweep_assoc_to_fpm_0p10_seed42_chunks10.log`: loss=6.8126, tps_epoch=28.4.
 Interpretation: this short single-seed sweep does not support increasing the Assoc-to-FPM bridge scale before longer validation. `0.10` is not promoted because it showed no loss benefit and an anomalous TPS collapse in the 10-chunk run, despite being finite in the earlier 2-chunk sanity. `0.00` being best in this tiny corridor suggests the bridge is not yet proven useful for real-text LM loss; keep default conservative and treat scale as experimental until multi-seed/longer evidence exists.
 Next action: prioritize training-serious blockers that do not rely on this bridge: stable real-text loss over longer chunks, Assoc read usefulness under LM objective, and whether `AIDEEN_ASSOC_LOGIT_LAMBDA` should stay 0 for real training until reads are predictive.
+
+Inspection - Direct Assoc-to-LM logit coupling
+----------------------------------------------
+Finding: `AIDEEN_ASSOC_LOGIT_LAMBDA` is wired in the real GPU LM training path, not only in the `assoc_recall` binary. Default is `0.0`, so the serious-training baseline does not use direct Assoc logits unless explicitly enabled.
+Circuit: `gpu.bridge.assoc_pooled_buf` is copied into LM `dl_dh_temp_buf` before `lm_probs_main`; when lambda is positive, logits add `lambda * emb_ref[v,d] * assoc_read[t,d]`. During LM backprop, the shader writes `dlassoc = sum_k (p_k - y_k) * lambda * emb_ref[v,d]` into `s_h_rms`, which Rust exposes as `assoc_grad_buf()` and passes to DEQ adjoint as the Assoc RHS.
+Validation:
+- `logs/real_text/sweep_assoc_logit_0p02_seed42_chunks10.log`: finite; no NaN/INVALID; loss=6.7994; tps_epoch=131.7; config isolated `AIDEEN_ASSOC_TO_FPM_SCALE=0.0`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0.02`.
+- Comparable baseline with both bridges off: `logs/real_text/sweep_assoc_to_fpm_0p00_seed42_chunks10.log`, loss=6.7839, tps_epoch=156.4.
+Interpretation: direct Assoc-to-LM is structurally present and gradient-coupled, but this short real-text corridor does not justify enabling it for serious training. Keep default `0.0`; classify as experimental pending stronger evidence that Assoc reads are predictive under LM objective.
+
+Validation - serious-training prep baseline without unproven bridges
+--------------------------------------------------------------------
+Corridor: tinyshakespeare, seed42, batch=4, ctx=256, h_slots=8, banks=32, budget=32, slot owner, hash lane+replica, event gate, salience replace, conf read, max_chunks=40, `AIDEEN_ASSOC_TO_FPM_SCALE=0.0`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0.0`.
+Log: `logs/real_text/serious_prep_b32_no_bridges_seed42_chunks40.log`.
+Result: finite; no NaN/INVALID; loss=6.5218; tps_epoch=132.5; tokens=40960.
+Interpretation: the current minimum serious-training candidate is numerically stable over a longer real-text smoke when Assoc memory is active but unproven Assoc-to-FPM and Assoc-to-LM bridges are disabled. The loss improves from the 10-chunk baseline (`6.7839`) to 40 chunks (`6.5218`), so the next blocker is not immediate numerical instability. The next causal focus is whether memory utility improves generalization/recall beyond ordinary LM learning, and whether longer runs preserve TPS and loss trend across seeds.
+Next action: run multi-seed/longer baseline before adding more dynamics. Bridges remain experimental until they beat this no-bridge baseline without TPS collapse.
+
+Validation addendum - second seed serious-prep baseline
+------------------------------------------------------
+Corridor: same no-bridge serious-prep baseline, but `AIDEEN_TRAIN_SEED=7`, `AIDEEN_LM_SAMPLE_SEED=7`.
+Log: `logs/real_text/serious_prep_b32_no_bridges_seed7_chunks40.log`.
+Result: finite; no NaN/INVALID; loss=6.4912; tps_epoch=132.2; tokens=40960.
+Interpretation: the no-bridge b32/budget32 corridor is stable across two short real-text seeds at 40 chunks. This strengthens the classification of this corridor as the current minimum serious-training baseline. Remaining risk: 40 chunks is still a smoke test, not a full training proof; next validation should extend duration and add held-out/eval metrics rather than enabling unvalidated bridges.

@@ -508,3 +508,13 @@ Current real-text observation: bridge is wired and finite, but sparse/low-energy
 Assoc-to-FPM scale control
 --------------------------
 `ASSOC_TO_FPM_SCALE` is now a shader override supplied by `AIDEEN_ASSOC_TO_FPM_SCALE` with default `0.02`. It directly multiplies the Assoc contextual consolidation equation and is therefore an explicit experimental control surface, not a hidden default behavior change.
+
+Direct Assoc-to-LM path check
+-----------------------------
+- Real train path: `Trainer` calls `GpuLmHeadTrainer::train_step_no_readback(...)` with `h_src = gpu.bridge.hpooled_buf` and `assoc_src = gpu.bridge.assoc_pooled_buf`.
+- `gpu_lm_head.rs` copies `assoc_src` into LM `dl_dh_temp_buf` before the forward LM probability pass.
+- In `lm_train.wgsl`, direct Assoc logits are disabled by default because `AIDEEN_ASSOC_LOGIT_LAMBDA` defaults to `0.0`.
+- If enabled, the sampled logit equation becomes `logit(v,t) = b[v] + W_lm[v] dot RMSNorm(h_t) + lambda * Emb[v] dot AssocRead_t`.
+- Backward then writes the Assoc RHS into `s_h_rms`/`assoc_grad_buf`: `dL/dAssocRead_t = sum_k (p_k - y_k) * lambda * Emb[k]`.
+- Trainer passes both `dl_dh_buf` and `assoc_grad_buf()` to `run_staged_adjoint_picard_no_readback`, so the direct Assoc LM path is gradient-coupled when lambda is nonzero.
+- Current serious-training baseline keeps this lambda at `0.0` because the first short real-text validation did not beat the no-bridge baseline.
