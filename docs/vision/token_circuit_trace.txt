@@ -518,3 +518,24 @@ Direct Assoc-to-LM path check
 - Backward then writes the Assoc RHS into `s_h_rms`/`assoc_grad_buf`: `dL/dAssocRead_t = sum_k (p_k - y_k) * lambda * Emb[k]`.
 - Trainer passes both `dl_dh_buf` and `assoc_grad_buf()` to `run_staged_adjoint_picard_no_readback`, so the direct Assoc LM path is gradient-coupled when lambda is nonzero.
 - Current serious-training baseline keeps this lambda at `0.0` because the first short real-text validation did not beat the no-bridge baseline.
+
+Current promoted end-to-end training circuit
+--------------------------------------------
+Promoted serious-prep path:
+`token ids -> GPU embeddings -> DEQ slot solve -> FPM slots + Assoc slots -> hpooled/assoc_pooled -> GPU sampled LM head -> loss -> LM backward -> staged DEQ adjoint -> GPU weight/state updates`.
+
+What is active:
+- Embedding training is active unless `--freeze-emb` is explicitly passed; promoted runs do not freeze it.
+- DEQ/FPM/Assoc forward is active on GPU/Metal.
+- LM head forward/backward is active through `GpuLmHeadTrainer::train_step_no_readback`.
+- DEQ adjoint receives `dl_dh_buf` and, when direct Assoc LM lambda is nonzero, `assoc_grad_buf`; in the promoted baseline lambda is zero, so the direct Assoc LM RHS is intentionally inactive.
+- Assoc slots use explicit memory banks in the forward path with 32-bank support in the promoted corridor.
+
+What is intentionally inactive in the promoted baseline:
+- Direct Assoc-to-LM logit contribution: `AIDEEN_ASSOC_LOGIT_LAMBDA=0.0`.
+- Assoc-to-FPM bridge contribution: `AIDEEN_ASSOC_TO_FPM_SCALE=0.0`.
+- Held-out validation updates: skipped by design because `eval_mode=true` sets LM lr to zero and returns before optimizer/adjoint updates.
+
+Known partial areas:
+- Large-bank Assoc backward has scalable key-write coverage, but full value adjoint and replacement/librarian/event gradients remain pending.
+- Base FPM write telemetry intentionally reports zeros on Assoc slots because those slots do not use the base FPM write block; Assoc-specific bridge telemetry is the correct observer for contextual consolidation.

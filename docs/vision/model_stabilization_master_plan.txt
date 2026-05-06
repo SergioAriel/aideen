@@ -2195,3 +2195,35 @@ Corridor: `corpus_pretrain_minimal.txt` train, `aideen-bench/tinyshakespeare.txt
 Log: `logs/real_text/pretrain_minimal_heldout_tiny_smoke_chunks20.log`.
 Result: finite; no NaN/INVALID; train loss=6.7353; held-out val_loss=6.7181; tps_epoch=135.7; train tokens=20480; held-out tokens=2048.
 Interpretation: the current serious-prep corridor can train on the larger pretrain corpus and evaluate a separated held-out text through the same GPU forward circuit. This is still a short smoke, but it removes the previous measurement blocker: we now have a default-off held-out metric suitable for longer serious-training runs.
+
+Current stability assessment - end-to-end serious-prep corridor
+---------------------------------------------------------------
+Question answered: whether the model currently runs end-to-end without skipping the required training circuit, and what stability level is supported by evidence.
+
+End-to-end status for the current promoted corridor:
+- Promoted corridor: batch=4, ctx=256, h_slots=8, assoc_banks=32, assoc_write_budget=32, slot owner, hash lane+replica, event gate, salience replacement, confidence read, `AIDEEN_ASSOC_TO_FPM_SCALE=0.0`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0.0`.
+- The main GPU training path runs end-to-end: token ids -> embeddings -> DEQ/slot solve -> FPM slots + Assoc slots -> hpooled/assoc_pooled -> sampled LM head -> loss -> LM backward -> DEQ adjoint -> GPU parameter/state updates -> optional held-out eval.
+- No training freeze flags are part of the promoted corridor (`--freeze-deq`, `--freeze-emb`, `--freeze-lm` are not used).
+- `--val-file` evaluation is forward-only by design; it skips updates intentionally because it is validation, not training.
+
+Evidence level:
+- `logs/real_text/serious_prep_b32_no_bridges_seed42_chunks40.log`: finite, no NaN/INVALID, loss=6.5218, 132.5 TPS, 40960 tokens.
+- `logs/real_text/serious_prep_b32_no_bridges_seed7_chunks40.log`: finite, no NaN/INVALID, loss=6.4912, 132.2 TPS, 40960 tokens.
+- `logs/real_text/serious_prep_b32_no_bridges_seed42_val10_chunks40.log`: finite, no NaN/INVALID, in-stream eval improves 6.7764 -> 6.6075 -> 6.5065.
+- `logs/real_text/pretrain_minimal_heldout_tiny_smoke_chunks20.log`: finite, no NaN/INVALID, train loss=6.7353, held-out val_loss=6.7181, 135.7 TPS, train tokens=20480, held-out tokens=2048.
+- `cargo check --features wgpu -p aideen-training`: pass after held-out validation support.
+
+Stability classification:
+- Numerical stability: medium-high for short serious-prep runs. Evidence covers two seeds at 40 chunks on tinyshakespeare and one 20-chunk pretrain-corpus smoke with held-out eval. No NaN/Inf/DEQ-INVALID appeared in these logs.
+- Training-loop stability: medium-high for the promoted corridor. Loss decreases across longer smoke and eval windows, and held-out evaluation executes after training without corrupting the run.
+- Quality/generalization stability: early/medium-low. The model learns in the smoke corridor, but this is not yet a long training proof, not a multi-document held-out benchmark, and not a generation-quality guarantee.
+- Memory-utility stability: medium for occupancy and finite operation, pending for proven usefulness. Assoc banks occupy and read/write paths run, but bridge usefulness and long-horizon memory benefit over the baseline are not yet proven by held-out metrics.
+
+Important exclusions / not yet promoted:
+- Direct Assoc-to-LM logits are wired but default-off. First short test with `AIDEEN_ASSOC_LOGIT_LAMBDA=0.02` was finite but did not beat the no-bridge baseline.
+- Assoc-to-FPM bridge is wired and observable, but default serious-prep runs set `AIDEEN_ASSOC_TO_FPM_SCALE=0.0` because scale sweeps did not support promoting it.
+- Large-bank Assoc backward currently covers scalable key-write adjoint; full value adjoint, event/librarian/replacement-policy gradients, and exact previous-hstar key-source parity remain open.
+- CPU fallback paths are not the promoted training path. The evidence here is GPU/Metal path only.
+
+Operational conclusion:
+The current model is stable enough to start longer serious-prep training runs under the documented profile, with bridges off and held-out evaluation enabled. It is not yet stable enough to claim full architecture convergence or final memory-quality success. The next correct validation is duration scaling: increase `AIDEEN_MAX_CHUNKS`, then held-out token count, across at least two seeds, before reintroducing experimental bridges or more dynamics.
