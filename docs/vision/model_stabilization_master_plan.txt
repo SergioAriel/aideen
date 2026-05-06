@@ -2160,3 +2160,15 @@ Corridor: same no-bridge serious-prep baseline, but `AIDEEN_TRAIN_SEED=7`, `AIDE
 Log: `logs/real_text/serious_prep_b32_no_bridges_seed7_chunks40.log`.
 Result: finite; no NaN/INVALID; loss=6.4912; tps_epoch=132.2; tokens=40960.
 Interpretation: the no-bridge b32/budget32 corridor is stable across two short real-text seeds at 40 chunks. This strengthens the classification of this corridor as the current minimum serious-training baseline. Remaining risk: 40 chunks is still a smoke test, not a full training proof; next validation should extend duration and add held-out/eval metrics rather than enabling unvalidated bridges.
+
+Validation - in-stream eval smoke for serious-prep baseline
+----------------------------------------------------------
+Corridor: same seed42 no-bridge b32/budget32 baseline with `AIDEEN_VAL_EVERY=10`, max_chunks=40.
+Log: `logs/real_text/serious_prep_b32_no_bridges_seed42_val10_chunks40.log`.
+Result: finite; no NaN/INVALID; final visible loss=6.4776; tps_epoch=142.5; tokens=40960.
+Eval windows:
+- chunk 10: val_loss=6.7764
+- chunk 20: val_loss=6.6075
+- chunk 30: val_loss=6.5065
+Interpretation: in-stream eval decreases through the run, so the current baseline is learning under forward-only eval windows, not merely reporting a stale train loss. Limitation: this is not a held-out document split; it validates training dynamics and evaluation path, not final generalization.
+Next action: add or use a true held-out evaluation profile before claiming serious-training readiness beyond numerical stability.
