@@ -2126,3 +2126,13 @@ Validation:
 - Scale 0.10 log `logs/real_text/tinyshakespeare_b32_assoc_to_fpm_scale010_chunks2.log`: finite; loss=6.8774; tps_epoch=135.2; bridge max consolidate increases to `2.375e-2` as expected.
 Classification: experimental control surface, default stable because default value is unchanged. This enables serious-training sweeps without code edits.
 Next action: use a fixed longer corridor to compare `AIDEEN_ASSOC_TO_FPM_SCALE=0.0,0.02,0.10` on loss/TPS/bridge energy and then decide whether the default should remain conservative or whether a schedule/gate is needed.
+
+Sweep - Assoc-to-FPM scale, real-text seed42 chunks10
+------------------------------------------------------
+Corridor: tinyshakespeare, `AIDEEN_TRAIN_SEED=42`, `AIDEEN_LM_SAMPLE_SEED=42`, batch=4, ctx=256, h_slots=8, banks=32, budget=32, hash lane+replica, event gate, salience replace, conf read, max_chunks=10, no assoc audit.
+Logs/results:
+- `logs/real_text/sweep_assoc_to_fpm_0p00_seed42_chunks10.log`: loss=6.7839, tps_epoch=156.4.
+- `logs/real_text/sweep_assoc_to_fpm_0p02_seed42_chunks10.log`: loss=6.8174, tps_epoch=141.0.
+- `logs/real_text/sweep_assoc_to_fpm_0p10_seed42_chunks10.log`: loss=6.8126, tps_epoch=28.4.
+Interpretation: this short single-seed sweep does not support increasing the Assoc-to-FPM bridge scale before longer validation. `0.10` is not promoted because it showed no loss benefit and an anomalous TPS collapse in the 10-chunk run, despite being finite in the earlier 2-chunk sanity. `0.00` being best in this tiny corridor suggests the bridge is not yet proven useful for real-text LM loss; keep default conservative and treat scale as experimental until multi-seed/longer evidence exists.
+Next action: prioritize training-serious blockers that do not rely on this bridge: stable real-text loss over longer chunks, Assoc read usefulness under LM objective, and whether `AIDEEN_ASSOC_LOGIT_LAMBDA` should stay 0 for real training until reads are predictive.
