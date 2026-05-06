@@ -1953,3 +1953,37 @@ Command: same true-b32 corridor as above with `AR_N_TRAIN=160`.
 Log: `logs/assoc_capacity/capacity_p8_lambda2_true_b32_budget8_g0-128-256_train160_eval6.log`.
 Result: train_avg=1.0078, gap0=0.6171, gap128=0.5549, gap256=0.6153, all marked MEMORY WORKS, no NaN reported.
 Interpretation: p8 does not appear blocked by the serialization path once real 32-bank forward capacity is available and the OOB backward path is guarded. train80 was undertrained/partial; train160 closes the corridor. Next capacity target is p16 with true 32 banks, then decide whether failure is collision/budget/slot allocation or exposure.
+
+Validation - true b32 p16 budget16 train160
+-------------------------------------------
+Command: true-b32 corridor with `AR_PAIRS_PER_SEQ=16`, `AIDEEN_ASSOC_WRITE_BUDGET=16`, `AR_N_TRAIN=160`.
+Log: `logs/assoc_capacity/capacity_p16_lambda2_true_b32_budget16_g0-128-256_train160_eval6.log`.
+Result: train_avg=0.8413, gap0=1.0702, gap128=1.7151, gap256=1.1016; gap0/gap256 MEMORY WORKS, gap128 partial; no NaN reported.
+Interpretation: increasing from p8 to p16 no longer collapses, so real 32-bank capacity helps. The remaining gap128 weakness points to distribution/budget/slot allocation under denser pair pressure rather than a basic inability to carry across ctx chunks.
+Next: inspect `ASSOC_WRITE_BUDGET` semantics before assuming budget should equal pair count; compare p16 budget variants if the equation suggests over-diffuse writes.
+
+Budget semantics correction
+---------------------------
+Finding: `AIDEEN_ASSOC_WRITE_BUDGET` is not the number of pair bindings in the sequence. In the forward shader it is a per-slot occupancy cap: empty-bank writes are allowed while `occupied_count < ASSOC_WRITE_BUDGET`; once the cap is reached, new writes either reuse a matched bank or use salience replacement. Therefore `ASSOC_BANKS=32` with `WRITE_BUDGET=8/16` does not use all physical banks.
+Implication: earlier b32 runs with budget8/16 validate the 32-bank layout and routing specialization, but their effective per-slot storage cap is the budget value. To test real p16 capacity with 32 physical banks, run `WRITE_BUDGET=32`.
+
+Validation - true b32 p16 budget32 train160
+-------------------------------------------
+Command: true-b32 corridor with `AR_PAIRS_PER_SEQ=16`, `AIDEEN_ASSOC_WRITE_BUDGET=32`, `AR_N_TRAIN=160`.
+Log: `logs/assoc_capacity/capacity_p16_lambda2_true_b32_budget32_g0-128-256_train160_eval6.log`.
+Result: train_avg=0.6905, gap0=0.7404, gap128=1.6795, gap256=0.1735; gap0/gap256 MEMORY WORKS, gap128 partial; no NaN reported.
+Interpretation: raising budget from 16 to 32 improves average, gap0, and especially gap256, so the prior budget was constraining usable storage. The remaining gap128 weakness is not solved by physical bank capacity alone; next check is whether it closes with more exposure or needs routing/read-policy changes.
+
+Validation - true b32 p16 budget32 train240
+-------------------------------------------
+Command: true-b32 p16 budget32 with `AR_N_TRAIN=240`, `AR_N_EVAL=6`.
+Log: `logs/assoc_capacity/capacity_p16_lambda2_true_b32_budget32_g0-128-256_train240_eval6.log`.
+Result: train_avg=0.7321, gap0=0.8595, gap128=1.1463, gap256=1.6895; gap0/gap128 MEMORY WORKS, gap256 partial; no NaN reported.
+Interpretation: more exposure moved the partial failure from gap128 to gap256 instead of monotonically improving every gap. With only 6 eval sequences this may be sampling noise or a real routing/read-policy sensitivity. Next validation should increase eval count before changing equations.
+
+Validation - true b32 p16 budget32 train160 eval16
+--------------------------------------------------
+Command: true-b32 p16 budget32 with `AR_N_TRAIN=160`, `AR_N_EVAL=16`.
+Log: `logs/assoc_capacity/capacity_p16_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
+Result: train_avg=0.8224, gap0=0.6721, gap128=0.5165, gap256=0.8816; all gaps MEMORY WORKS; no NaN reported.
+Interpretation: the p16 partial failures seen with eval6 were not reliable enough to justify architectural changes. With stronger eval, true 32 banks plus budget32 supports 16 pairs across gaps 0/128/256. Next scale target is p24 under the same real-capacity corridor.
