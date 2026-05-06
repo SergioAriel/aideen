@@ -2029,3 +2029,27 @@ Command: true-b32 budget32 corridor with `AR_N_KEYS=64`, `AR_N_VALS=64`, `AR_PAI
 Log: `logs/assoc_capacity/capacity_p64_k64v64_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
 Result: random_baseline=4.9836, train_avg=1.9051, gap0=1.0957, gap128=1.9347, gap256=1.9730; all gaps MEMORY WORKS; no NaN reported.
 Interpretation: AR capacity is no longer the immediate blocker. The real-capacity corridor can solve 64 dense bindings with 32 banks/budget32 under eval16, though margins are weaker on long gaps. Next stabilization focus should shift from synthetic capacity to real-training validity: scalable Assoc backward, gated Assoc-to-LM bridge for real text, and document-level tests.
+
+Change gate - scalable large-bank Assoc read backward
+-----------------------------------------------------
+1. Target failure mode: for `d_model=512` and `ASSOC_BANKS>=16`, `assoc_slot_stride` exceeds the 4096-float workgroup cache in `fused_fpm_retain_bwd.wgsl`, so the safety guard skips the whole Assoc backward block. Large-bank training can use forward Assoc and LM gradients, but `W_q_assoc`/`alpha_assoc` receive no read-path gradient.
+2. Structural rationale: the read path does not require mutable full-slot BPTT state. `AssocHist` stores the pre-write bank state per token. A storage-backed read backward can recompute `q_t`, bank cosine scores, read probabilities, context, `alpha` gradient, and `dscore/dq` directly from `AssocHist`, then accumulate `W_q_assoc` gradients without copying all banks into workgroup memory.
+3. Anti-patch check: this does not mask instability or tune losses. It restores an omitted gradient path at its actual source: read-query parameters participating in the active forward path. It deliberately does not fake write-side BPTT; write-side gradients remain a separate pending storage/tiled task.
+4. Validation plan: add the large-bank read-only branch for `assoc_slot_stride > ASSOC_BWD_STATE_CAP`; cargo check; run a short p32/b32 probe with `AIDEEN_BACKWARD_INPUT_PROBE=1` or assoc debug to confirm nonzero Wq/alpha update telemetry and no NaN; rerun a capacity sanity to ensure no regression.
+
+Validation note - large-bank read backward first probe
+-----------------------------------------------------
+Probe log: `logs/assoc_capacity/probe_large_bank_read_bwd_audit_p32_train4_eval1.log`.
+Result: finite run, avg_loss=1.3548, gap128=0.2617, no NaN reported. Large-bank read branch produced nonzero `wq_step_sum` on Assoc slots, proving the skipped path now receives read-gradient telemetry.
+Issue found: one slot reported an extreme raw `wq_step_sum` (~9.57e8). Cause: cosine-score derivative is ill-conditioned for occupied banks whose stored key norm is near zero. Forward can rank them with a clamped denominator, but backward should not propagate `dscore/dq` through a degenerate key vector.
+Follow-up gate: skip score-gradient contribution when stored key norm or query norm is too small. This is a backward invariant fix for the cosine Jacobian, not a quality patch.
+
+Validation - large-bank read backward stabilized
+------------------------------------------------
+Change: added storage-backed large-bank read backward for `assoc_slot_stride > ASSOC_BWD_STATE_CAP`. It trains `W_q_assoc`/`alpha_assoc` from the active read path without copying the whole bank slot into workgroup memory. Write-side BPTT remains pending.
+Logs:
+- `logs/assoc_capacity/probe_large_bank_read_bwd_audit_p32_train4_eval1.log`: finite but exposed unstable raw `wq_step_sum` (~9.57e8) from degenerate cosine keys.
+- `logs/assoc_capacity/probe_large_bank_read_bwd_audit_p32_train4_eval1_stable_jac.log`: after skipping score-gradient for near-zero key/query norms, raw `wq_step_sum` stayed bounded (~30-52), no NaN.
+- `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-256_train80_eval8_large_read_bwd.log`: train80 sanity passed gap0/gap128 but gap256 stayed random; classified as underexposed, not promoted alone.
+- `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-256_train160_eval8_large_read_bwd.log`: train_avg=0.9651, gap0=0.1262, gap128=1.1067, gap256=0.7092; all gaps MEMORY WORKS; no NaN reported.
+Classification: experimental useful / candidate default for large-bank read-gradient coverage. Remaining gap: storage/tiled write-side Assoc BPTT for `W_k_assoc`, event gate, and replacement policy gradients.
