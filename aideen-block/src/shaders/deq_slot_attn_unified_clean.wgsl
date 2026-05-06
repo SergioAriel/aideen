@@ -610,6 +610,22 @@ fn deq_slot_coord_unified_main(
         DebugLog[assoc_budget_diag_base + 1u] = 0.0;
         DebugLog[assoc_budget_diag_base + 2u] = 0.0;
         DebugLog[assoc_budget_diag_base + 3u] = 0.0;
+        if (is_assoc_slot) {
+            let assoc_bridge_slot = slot_idx - (h_slots / 2u);
+            let assoc_bridge_diag_base = 1024u + assoc_bridge_slot * 10u;
+            if (assoc_bridge_diag_base + 9u < 2048u) {
+            DebugLog[assoc_bridge_diag_base + 0u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 1u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 2u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 3u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 4u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 5u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 6u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 7u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 8u] = 0.0;
+            DebugLog[assoc_bridge_diag_base + 9u] = 0.0;
+            }
+        }
         // TEMPORARY ASSOCIATIVE DIAGNOSTIC: h*(t-1) vs h*(t) separability before key projection.
     }
     workgroupBarrier();
@@ -2735,12 +2751,54 @@ fn deq_slot_coord_unified_main(
                 let h_trace1 = H_curr[h_base + slot_offset + d1] / max(fpm_trace_rms, 1.0e-6);
                 let consolidate =
                     ASSOC_TO_FPM_SCALE * clamp(assoc_write_gate_token, 0.0, ASSOC_WRITE_CAP) * effective_write_mass;
+                let fpm_prev_bridge0 = fpm_m_cache[d0];
+                let fpm_prev_bridge1 = fpm_m_cache[d1];
                 fpm_m_cache[d0] =
                     (1.0 - consolidate) * fpm_m_cache[d0] + consolidate * h_trace0;
                 fpm_m_cache[d1] =
                     (1.0 - consolidate) * fpm_m_cache[d1] + consolidate * h_trace1;
                 HistCtx[h_base_t + slot_offset + d0] = fpm_m_cache[d0];
                 HistCtx[h_base_t + slot_offset + d1] = fpm_m_cache[d1];
+                let bridge_delta0 = fpm_m_cache[d0] - fpm_prev_bridge0;
+                let bridge_delta1 = fpm_m_cache[d1] - fpm_prev_bridge1;
+                shared_vals[tid] = bridge_delta0 * bridge_delta0 + bridge_delta1 * bridge_delta1;
+                workgroupBarrier();
+                for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                    if (tid < stride) {
+                        shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                    }
+                    workgroupBarrier();
+                }
+                if (tid == 0u && debug_on && batch_idx == 0u) {
+                    let assoc_bridge_slot = slot_idx - (h_slots / 2u);
+                    let assoc_bridge_diag_base = 1024u + assoc_bridge_slot * 10u;
+                    if (assoc_bridge_diag_base + 9u < 2048u) {
+                        let bridge_delta_rms = sqrt(shared_vals[0] * inv_d_model);
+                        DebugLog[assoc_bridge_diag_base + 0u] =
+                            DebugLog[assoc_bridge_diag_base + 0u] + effective_write_mass;
+                        DebugLog[assoc_bridge_diag_base + 1u] =
+                            DebugLog[assoc_bridge_diag_base + 1u] + consolidate;
+                        DebugLog[assoc_bridge_diag_base + 2u] =
+                            max(DebugLog[assoc_bridge_diag_base + 2u], consolidate);
+                        DebugLog[assoc_bridge_diag_base + 3u] =
+                            DebugLog[assoc_bridge_diag_base + 3u] + fpm_trace_rms;
+                        DebugLog[assoc_bridge_diag_base + 4u] =
+                            DebugLog[assoc_bridge_diag_base + 4u]
+                            + bridge_delta_rms;
+                        DebugLog[assoc_bridge_diag_base + 5u] =
+                            DebugLog[assoc_bridge_diag_base + 5u] + 1.0;
+                        if (effective_write_mass > 0.0) {
+                            DebugLog[assoc_bridge_diag_base + 6u] =
+                                DebugLog[assoc_bridge_diag_base + 6u] + 1.0;
+                            DebugLog[assoc_bridge_diag_base + 7u] =
+                                DebugLog[assoc_bridge_diag_base + 7u] + effective_write_mass;
+                            DebugLog[assoc_bridge_diag_base + 8u] =
+                                DebugLog[assoc_bridge_diag_base + 8u] + consolidate;
+                            DebugLog[assoc_bridge_diag_base + 9u] =
+                                DebugLog[assoc_bridge_diag_base + 9u] + bridge_delta_rms;
+                        }
+                    }
+                }
             }
             if (tid == 0u) {
                 let prev_usage = AssocBuf[bank_usage_idx];
@@ -2867,6 +2925,28 @@ fn deq_slot_coord_unified_main(
             DebugLog[assoc_budget_diag_base + 2u] / assoc_write_den;
         DebugLog[assoc_budget_diag_base + 3u] =
             DebugLog[assoc_budget_diag_base + 3u] / assoc_write_den;
+        if (is_assoc_slot) {
+            let assoc_bridge_slot = slot_idx - (h_slots / 2u);
+            let assoc_bridge_diag_base = 1024u + assoc_bridge_slot * 10u;
+            if (assoc_bridge_diag_base + 9u < 2048u) {
+            let assoc_bridge_den = max(1.0, DebugLog[assoc_bridge_diag_base + 5u]);
+            let assoc_bridge_active_den = max(1.0, DebugLog[assoc_bridge_diag_base + 6u]);
+            DebugLog[assoc_bridge_diag_base + 0u] =
+                DebugLog[assoc_bridge_diag_base + 0u] / assoc_bridge_den;
+            DebugLog[assoc_bridge_diag_base + 1u] =
+                DebugLog[assoc_bridge_diag_base + 1u] / assoc_bridge_den;
+            DebugLog[assoc_bridge_diag_base + 3u] =
+                DebugLog[assoc_bridge_diag_base + 3u] / assoc_bridge_den;
+            DebugLog[assoc_bridge_diag_base + 4u] =
+                DebugLog[assoc_bridge_diag_base + 4u] / assoc_bridge_den;
+            DebugLog[assoc_bridge_diag_base + 7u] =
+                DebugLog[assoc_bridge_diag_base + 7u] / assoc_bridge_active_den;
+            DebugLog[assoc_bridge_diag_base + 8u] =
+                DebugLog[assoc_bridge_diag_base + 8u] / assoc_bridge_active_den;
+            DebugLog[assoc_bridge_diag_base + 9u] =
+                DebugLog[assoc_bridge_diag_base + 9u] / assoc_bridge_active_den;
+            }
+        }
         let solve_exit_base = 688u + slot_idx * 4u;
         DebugLog[solve_exit_base + 0u] = strict_converged_sum;
         DebugLog[solve_exit_base + 1u] = homeostatic_converged_sum;

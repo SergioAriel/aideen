@@ -2080,3 +2080,32 @@ Command: `AIDEEN_BATCH_SIZE=4 AIDEEN_MAX_CHUNKS=10 AIDEEN_CTX_LEN=256 AIDEEN_H_S
 Log: `logs/real_text/tinyshakespeare_b32_key_write_bwd_chunks10.log`.
 Result: finite; no NaN/INVALID in log; loss=6.7561, tps_epoch=155.5, tokens=10240. Classification: diagnostic sanity only, not quality promotion. It shows the large-bank key-write backward coexists with real-text training without immediate TPS collapse or numerical failure.
 Open issue observed: FPM debug still reports dead token counts and zero retain/write telemetry on slots 4..7; this appears to be slot-role/gating behavior or existing instrumentation, not yet attributed to the new key-write backward. Next real-training stabilization should compare against the pre-key-write or b1 corridor and inspect whether Assoc slots are intentionally excluded from FPM write telemetry.
+
+Change gate - Assoc-to-FPM bridge telemetry
+-------------------------------------------
+1. Target failure mode: real-text training shows base FPM write counters as zero on Assoc slots, but that does not tell whether the Assoc-to-FPM contextual bridge is inactive, weak, or merely unobserved. Without this measurement we cannot decide what is necessary for serious training.
+2. Structural rationale: the active forward bridge computes `consolidate = ASSOC_TO_FPM_SCALE * clamp(assoc_write_gate_token, 0, ASSOC_WRITE_CAP) * effective_write_mass` and updates `fpm_m_cache <- (1-consolidate) * fpm_m_cache + consolidate * h_trace`. Logging write mass, consolidate, trace RMS, and delta RMS observes the exact causal path from explicit Assoc binding to contextual FPM state.
+3. Anti-patch check: this is measurement only. It does not change model dynamics, gates, gradients, loss, or optimizer behavior. It prevents a false architecture conclusion from missing telemetry.
+4. Validation plan: add temporary DebugLog slots for Assoc bridge metrics; decode and print `[ASSOC-BRIDGE]`; cargo check; run short tinyshakespeare b32 corridor and require finite log with nonzero/zero bridge metrics interpretable per slot and no NaN/INVALID.
+
+Measurement correction - Assoc bridge debug collision
+----------------------------------------------------
+Finding: first bridge telemetry log showed `cons_max=2.43e2` on one slot, impossible because `consolidate <= ASSOC_TO_FPM_SCALE * ASSOC_WRITE_CAP`. Cause: bridge debug indices `992..1015` collided with existing debug markers around index 1000 from other GPU paths. This invalidates that one `cons_max` field but not the training run itself.
+Correction plan: increase the DEQ debug buffer from 1024 to 2048 floats, move Assoc bridge telemetry to `1024 + bridge_slot * 6`, and update trainer decoding. Also fix train-side assoc-state bank clamp from 16 to 32 so state summaries match the active `AIDEEN_ASSOC_BANKS=32` corridor.
+Classification: measurement/layout fix. No model equation, gradient, or optimizer behavior changes.
+
+Validation - Assoc-to-FPM bridge telemetry
+------------------------------------------
+Changes:
+- Enlarged DEQ debug buffer from 1024 to 2048 floats and moved bridge metrics to `1024 + assoc_bridge_slot * 10` to avoid collisions with existing debug markers around index 1000.
+- Fixed train-side `AIDEEN_ASSOC_BANKS` summary clamp from 16 to 32.
+- Added `[ASSOC-BRIDGE]` metrics: total-average mass/consolidate/trace/delta, max consolidate, total count, active count, and active-average mass/consolidate/delta.
+- Made `AIDEEN_ASSOC_AUDIT=1` refresh the debug snapshot when the cached one is invalid, so Assoc diagnostics do not depend on `AIDEEN_DEBUG_SAMPLE=1`.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/tinyshakespeare_b32_assoc_bridge_audit_refresh_chunks2.log`: finite; no NaN/INVALID; loss=6.9101; tps_epoch=134.9; `[ASSOC-STATE]` reports true 32-bank occupancy; `[ASSOC-BRIDGE]` prints without debug-sample forcing.
+Evidence:
+- Assoc banks are materially occupied in real text: e.g. s4=26/32, s5=24/32, s6=27/32, s7=26/32 used.
+- Bridge is not absent, but contextual consolidation is sparse/low average: s4 total `cons=1.884e-6`, active `active_cons=1.827e-4`, max `4.750e-3`; s6 similar. This suggests the next serious-training question is not "is the bridge wired?" but "is sparse contextual consolidation strong/useful enough over longer real documents?"
+Classification: measurement/layout default stable. No model dynamics changed.
+Next action: run a longer real-text sanity with audit at low cadence and compare loss/TPS/bridge energy to the same corridor with `AIDEEN_ASSOC_TO_FPM_SCALE` once that scale is made an override, or first add an override if scale experiments are needed.

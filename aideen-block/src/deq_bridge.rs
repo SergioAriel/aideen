@@ -1094,7 +1094,7 @@ impl RustDeqBridge {
 
         let debug_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DEQ Debug Log"),
-            size: 4096, // 1024 floats for slot observability and FPM diagnostics
+            size: 8192, // 2048 floats for slot observability, FPM, and Assoc diagnostics
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,

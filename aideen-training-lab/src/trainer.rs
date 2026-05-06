@@ -466,7 +466,7 @@ impl Trainer {
         std::env::var("AIDEEN_ASSOC_BANKS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|v| v.clamp(1, 16))
+            .map(|v| v.clamp(1, 32))
             .unwrap_or(1)
     }
 
@@ -533,6 +533,41 @@ impl Trainer {
             let occupied = debug[base + 3];
             parts.push(format!(
                 "s{slot}:block={blocked:.3} empty={empty:.3} reuse={reuse:.3} occ={occupied:.2}"
+            ));
+        }
+        Some(parts.join(" | "))
+    }
+
+    fn format_assoc_bridge_debug(debug: &[f32], h_slots: usize) -> Option<String> {
+        if !Self::valid_debug_snapshot(debug) {
+            return None;
+        }
+        let assoc_slot_start = h_slots / 2;
+        let mut parts = Vec::new();
+        for slot in assoc_slot_start..h_slots {
+            let bridge_slot = slot - assoc_slot_start;
+            let base = 1024usize + bridge_slot * 10;
+            if base + 9 >= debug.len() {
+                break;
+            }
+            let n = debug[base + 5];
+            if n <= 0.5 {
+                parts.push(format!("s{slot}:n=0"));
+                continue;
+            }
+            let active_n = debug[base + 6];
+            parts.push(format!(
+                "s{slot}:mass={:.3e} cons={:.3e} cons_max={:.3e} trace={:.3e} delta={:.3e} n={:.0} active={:.0} active_mass={:.3e} active_cons={:.3e} active_delta={:.3e}",
+                debug[base + 0],
+                debug[base + 1],
+                debug[base + 2],
+                debug[base + 3],
+                debug[base + 4],
+                n,
+                active_n,
+                debug[base + 7],
+                debug[base + 8],
+                debug[base + 9],
             ));
         }
         Some(parts.join(" | "))
@@ -4665,6 +4700,13 @@ impl Trainer {
                     if Self::env_flag("AIDEEN_ASSOC_AUDIT") {
                         if let Some(gpu) = self.gpu_deq.as_ref() {
                             let assoc = gpu.read_assoc_state();
+                            if !Self::valid_debug_snapshot(&self.cached_debug_buf) {
+                                let fw_assoc = gpu.read_debug_buffer();
+                                if Self::valid_debug_snapshot(&fw_assoc) {
+                                    self.cached_debug_buf = fw_assoc;
+                                    self.cached_debug_gen = self.cached_debug_gen.wrapping_add(1);
+                                }
+                            }
                             println!(
                                 "    [ASSOC-STATE] {}",
                                 Self::format_assoc_state_summary(
@@ -4682,6 +4724,12 @@ impl Trainer {
                                 Self::format_assoc_read_debug(&self.cached_debug_buf, self.config.h_slots)
                             {
                                 println!("    [ASSOC-READ] {summary}");
+                            }
+                            if let Some(summary) = Self::format_assoc_bridge_debug(
+                                &self.cached_debug_buf,
+                                self.config.h_slots,
+                            ) {
+                                println!("    [ASSOC-BRIDGE] {summary}");
                             }
                         }
                     }
