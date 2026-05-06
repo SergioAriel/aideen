@@ -504,3 +504,7 @@ Path: `deq_slot_attn_unified_clean.wgsl` Assoc write block, after exact key/valu
 Observed equation: `consolidate = ASSOC_TO_FPM_SCALE * clamp(assoc_write_gate_token, 0, ASSOC_WRITE_CAP) * effective_write_mass`; `fpm_m_cache` then moves toward normalized `H_curr` trace by that consolidate amount.
 Telemetry: `[ASSOC-BRIDGE]` now reports total-average and active-average bridge mass/consolidation/delta per Assoc slot. This is necessary because base `[FPM-PATH] write(...)` counters intentionally exclude Assoc slots and therefore cannot diagnose whether the Assoc contextual bridge is active.
 Current real-text observation: bridge is wired and finite, but sparse/low-energy on average. Active writes can reach the configured max consolidate, while total average is dominated by zero/near-zero write mass.
+
+Assoc-to-FPM scale control
+--------------------------
+`ASSOC_TO_FPM_SCALE` is now a shader override supplied by `AIDEEN_ASSOC_TO_FPM_SCALE` with default `0.02`. It directly multiplies the Assoc contextual consolidation equation and is therefore an explicit experimental control surface, not a hidden default behavior change.

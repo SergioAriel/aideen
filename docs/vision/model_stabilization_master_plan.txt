@@ -2109,3 +2109,20 @@ Evidence:
 - Bridge is not absent, but contextual consolidation is sparse/low average: s4 total `cons=1.884e-6`, active `active_cons=1.827e-4`, max `4.750e-3`; s6 similar. This suggests the next serious-training question is not "is the bridge wired?" but "is sparse contextual consolidation strong/useful enough over longer real documents?"
 Classification: measurement/layout default stable. No model dynamics changed.
 Next action: run a longer real-text sanity with audit at low cadence and compare loss/TPS/bridge energy to the same corridor with `AIDEEN_ASSOC_TO_FPM_SCALE` once that scale is made an override, or first add an override if scale experiments are needed.
+
+Change gate - configurable Assoc-to-FPM scale
+---------------------------------------------
+1. Target failure mode: bridge telemetry shows Assoc-to-FPM consolidation is wired but sparse/low average on real text. To evaluate serious-training behavior, we need controlled scale sweeps without code edits or recompilation.
+2. Structural rationale: `ASSOC_TO_FPM_SCALE` is the explicit multiplier in the forward bridge equation. Making it a WGSL override plumbed from `AIDEEN_ASSOC_TO_FPM_SCALE` changes only this documented coupling strength and preserves the default value `0.02`.
+3. Anti-patch check: this does not silently tune the default or hide a bug. It exposes an existing architectural coupling as an experimental axis while keeping the validated default unchanged.
+4. Validation plan: add shader override and Rust pipeline constant; cargo check; run a short audit with default scale to confirm finite bridge telemetry; optional next runs compare `0.0`, `0.02`, and a higher value under the same real-text corridor.
+
+Validation - configurable Assoc-to-FPM scale
+--------------------------------------------
+Change: `ASSOC_TO_FPM_SCALE` is now a WGSL override plumbed from `AIDEEN_ASSOC_TO_FPM_SCALE`, defaulting to the previous value `0.02`.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- Default scale log `logs/real_text/tinyshakespeare_b32_assoc_to_fpm_scale_default_chunks2.log`: finite; loss=6.8915; tps_epoch=138.8; bridge prints with default max consolidate `4.750e-3`.
+- Scale 0.10 log `logs/real_text/tinyshakespeare_b32_assoc_to_fpm_scale010_chunks2.log`: finite; loss=6.8774; tps_epoch=135.2; bridge max consolidate increases to `2.375e-2` as expected.
+Classification: experimental control surface, default stable because default value is unchanged. This enables serious-training sweeps without code edits.
+Next action: use a fixed longer corridor to compare `AIDEEN_ASSOC_TO_FPM_SCALE=0.0,0.02,0.10` on loss/TPS/bridge energy and then decide whether the default should remain conservative or whether a schedule/gate is needed.

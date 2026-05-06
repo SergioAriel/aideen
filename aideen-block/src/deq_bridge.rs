@@ -263,6 +263,11 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(true);
+        let assoc_to_fpm_scale = std::env::var("AIDEEN_ASSOC_TO_FPM_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.02)
+            .clamp(0.0, 1.0);
         let assoc_protect_occupied = std::env::var("AIDEEN_ASSOC_PROTECT_OCCUPIED")
             .ok()
             .map(|v| {
@@ -733,6 +738,7 @@ impl RustDeqBridge {
             "ENABLE_ASSOC_LINEAR_WRITE".to_string(),
             if assoc_linear_write { 1.0 } else { 0.0 },
         );
+        slot_coord_constants.insert("ASSOC_TO_FPM_SCALE".to_string(), assoc_to_fpm_scale);
         slot_coord_constants.insert(
             "ENABLE_ASSOC_PROTECT_OCCUPIED".to_string(),
             if assoc_protect_occupied { 1.0 } else { 0.0 },
