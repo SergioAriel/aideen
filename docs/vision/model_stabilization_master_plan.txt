@@ -2227,3 +2227,10 @@ Important exclusions / not yet promoted:
 
 Operational conclusion:
 The current model is stable enough to start longer serious-prep training runs under the documented profile, with bridges off and held-out evaluation enabled. It is not yet stable enough to claim full architecture convergence or final memory-quality success. The next correct validation is duration scaling: increase `AIDEEN_MAX_CHUNKS`, then held-out token count, across at least two seeds, before reintroducing experimental bridges or more dynamics.
+
+Validation - duration scale baseline to 80 chunks
+-------------------------------------------------
+Corridor: serious-prep baseline, seed42, `corpus_pretrain_minimal.txt` train, `aideen-bench/tinyshakespeare.txt` held-out, batch=4, ctx=256, h_slots=8, banks=32, budget=32, bridges off (`AIDEEN_ASSOC_TO_FPM_SCALE=0.0`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0.0`), `AIDEEN_MAX_CHUNKS=80`, `AIDEEN_HELDOUT_MAX_TOKENS=4096`.
+Log: `logs/real_text/pretrain_minimal_heldout_tiny_baseline_seed42_chunks80.log`.
+Result: finite; no NaN/INVALID; train loss=6.2927; held-out val_loss=6.3758; tps_epoch=133.3; train tokens=81920; held-out tokens=4096.
+Interpretation: duration scaling from 20 to 80 chunks preserved numerical stability and improved both train and held-out loss versus the 20-chunk smoke (`6.7353` / `6.7181`). This strengthens the promoted no-bridge baseline as the current training-serious corridor. Next validation: repeat 80 chunks with seed7, then scale to 200 chunks if stable.
