@@ -477,7 +477,7 @@ impl GpuLmHeadTrainer {
         let rms_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM RMS"),
             size: (safe_ctx * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -529,7 +529,7 @@ impl GpuLmHeadTrainer {
         let lm_scratch_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LM Scratch"),
             size: (scratch_floats * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let dl_dh_temp_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -690,7 +690,7 @@ impl GpuLmHeadTrainer {
             cfg_assoc_logit_lambda: std::env::var("AIDEEN_ASSOC_LOGIT_LAMBDA")
                 .ok()
                 .and_then(|s| s.trim().parse::<f32>().ok())
-                .unwrap_or(1.0)
+                .unwrap_or(0.0)
                 .max(0.0),
             last_sampled_indices: Vec::new(),
             last_num_samples: 0,
@@ -1385,6 +1385,26 @@ impl GpuLmHeadTrainer {
         n_floats: usize,
     ) -> Result<Vec<f32>, String> {
         self.read_buffer_prefix(device, queue, &self.s_h_rms_buf, n_floats, "LM assoc_grad_n")
+    }
+
+    /// TEMPORARY DIAGNOSTIC: read sampled-softmax probabilities/logits prefix.
+    pub fn read_probs_n(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        n_floats: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.read_buffer_prefix(device, queue, &self.lm_scratch_buf, n_floats, "LM probs_n")
+    }
+
+    /// TEMPORARY DIAGNOSTIC: read per-token RMSNorm denominators.
+    pub fn read_rms_n(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        n_floats: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.read_buffer_prefix(device, queue, &self.rms_buf, n_floats, "LM rms_n")
     }
 
     fn read_buffer_prefix(

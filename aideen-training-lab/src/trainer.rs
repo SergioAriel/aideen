@@ -516,6 +516,71 @@ impl Trainer {
         parts.join(" | ")
     }
 
+    fn format_assoc_budget_debug(debug: &[f32], h_slots: usize) -> Option<String> {
+        if !Self::valid_debug_snapshot(debug) {
+            return None;
+        }
+        let assoc_slot_start = h_slots / 2;
+        let mut parts = Vec::new();
+        for slot in assoc_slot_start..h_slots {
+            let base = 960usize + slot * 4;
+            if base + 3 >= debug.len() {
+                return None;
+            }
+            let blocked = debug[base + 0];
+            let empty = debug[base + 1];
+            let reuse = debug[base + 2];
+            let occupied = debug[base + 3];
+            parts.push(format!(
+                "s{slot}:block={blocked:.3} empty={empty:.3} reuse={reuse:.3} occ={occupied:.2}"
+            ));
+        }
+        Some(parts.join(" | "))
+    }
+
+    fn format_assoc_read_debug(debug: &[f32], h_slots: usize) -> Option<String> {
+        if !Self::valid_debug_snapshot(debug) {
+            return None;
+        }
+        let assoc_slot_start = h_slots / 2;
+        let mut parts = Vec::new();
+        for slot in assoc_slot_start..h_slots {
+            let base = 760usize + slot * 10;
+            let qbase = 820usize + slot * 8;
+            let pbase = 940usize + slot * 2;
+            if base + 6 >= debug.len() || qbase + 7 >= debug.len() || pbase + 1 >= debug.len() {
+                return None;
+            }
+            let read_entropy = debug[base + 0];
+            let read_max_prob = debug[base + 1];
+            let ctx_rms = debug[base + 2];
+            let read_usage = debug[base + 3];
+            let write_allow = debug[base + 4];
+            let bind_gate = debug[base + 5];
+            let best_cos = debug[base + 6];
+            let q_marker = debug[qbase + 6];
+            if q_marker <= 0.5 {
+                parts.push(format!(
+                    "s{slot}:H={read_entropy:.3} pmax={read_max_prob:.3} ctx={ctx_rms:.3e} usage={read_usage:.3} w={write_allow:.3} bind={bind_gate:.3} cos={best_cos:.3}"
+                ));
+                continue;
+            }
+            let q_entropy = debug[qbase + 0];
+            let q_max_prob = debug[qbase + 1];
+            let q_ctx_rms = debug[qbase + 2];
+            let q_usage = debug[qbase + 3];
+            let q_spread = debug[qbase + 4];
+            let key_cos = debug[qbase + 5];
+            let q_norm = debug[qbase + 7];
+            let pick_bank = debug[pbase + 0];
+            let pick_prob = debug[pbase + 1];
+            parts.push(format!(
+                "s{slot}:H={read_entropy:.3} pmax={read_max_prob:.3} ctx={ctx_rms:.3e} usage={read_usage:.3} w={write_allow:.3} bind={bind_gate:.3} cos={best_cos:.3} qH={q_entropy:.3} qpmax={q_max_prob:.3} qpick={pick_bank:.0}@{pick_prob:.3} qctx={q_ctx_rms:.3e} qusage={q_usage:.3} spread={q_spread:.3} kcos={key_cos:.3} qnorm={q_norm:.3}"
+            ));
+        }
+        Some(parts.join(" | "))
+    }
+
     fn fixed_history_reference_mode() -> bool {
         Self::env_flag("AIDEEN_DEQ_FIXED_HISTORY_REFERENCE")
     }
@@ -1583,7 +1648,7 @@ impl Trainer {
             cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
+                .unwrap_or(1),
             cfg_grad_accum: std::env::var("AIDEEN_GRAD_ACCUM")
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
@@ -1647,6 +1712,9 @@ impl Trainer {
                 .unwrap_or(0.0),
         };
         trainer.apply_experimental_profile_from_env();
+        if let Some(alpha_init) = Self::env_f32("AIDEEN_ASSOC_ALPHA_INIT") {
+            trainer.reasoning.alpha_assoc.fill(alpha_init);
+        }
 
         #[cfg(feature = "wgpu")]
         if trainer.cfg_fwd_batch_size > 4 {
@@ -2395,11 +2463,53 @@ impl Trainer {
                 };
                 let hpooled = gpu.read_hpooled_seq(per_seq_len as u32);
                 summarize("hpooled", &hpooled);
+                let assoc_pooled = gpu.read_assoc_pooled_seq(per_seq_len as u32);
+                summarize("assoc_pooled", &assoc_pooled);
                 if let Ok(dl) = gpu_lm.read_dl_dh_n(&gpu.device, &gpu.queue, n) {
                     summarize("dl_dh", &dl);
                 }
                 if let Ok(assoc_rhs) = gpu_lm.read_assoc_grad_n(&gpu.device, &gpu.queue, n) {
                     summarize("assoc_rhs", &assoc_rhs);
+                }
+                if let Ok(rms) = gpu_lm.read_rms_n(&gpu.device, &gpu.queue, num_tokens) {
+                    summarize("lm_rms", &rms);
+                }
+                let probs_n = num_tokens.saturating_mul(gpu_lm.last_num_samples() as usize);
+                if probs_n > 0 {
+                    if let Ok(probs) = gpu_lm.read_probs_n(&gpu.device, &gpu.queue, probs_n) {
+                        summarize("lm_probs", &probs);
+                        let samples = gpu_lm.last_num_samples() as usize;
+                        let row0 = probs.iter().take(samples);
+                        let mut row0_sum = 0.0f64;
+                        let mut gt_one = 0usize;
+                        let mut neg = 0usize;
+                        let mut min_v = f32::INFINITY;
+                        let mut max_v = f32::NEG_INFINITY;
+                        for &p in &probs {
+                            if p > 1.0001 {
+                                gt_one += 1;
+                            }
+                            if p < -1.0e-7 {
+                                neg += 1;
+                            }
+                            if p.is_finite() {
+                                min_v = min_v.min(p);
+                                max_v = max_v.max(p);
+                            }
+                        }
+                        for &p in row0 {
+                            row0_sum += p as f64;
+                        }
+                        eprintln!(
+                            "[BWD-INPUT-PROBE] lm_probs_inv: samples={} row0_sum={:.6e} gt1={} neg={} min={:.3e} max={:.3e}",
+                            samples, row0_sum, gt_one, neg, min_v, max_v
+                        );
+                    }
+                }
+                if let Ok((w_lm, b_lm, g_lm)) = gpu_lm.read_weights(&gpu.device, &gpu.queue) {
+                    summarize("lm_w", &w_lm);
+                    summarize("lm_b", &b_lm);
+                    summarize("lm_g", &g_lm);
                 }
             }
 
@@ -3283,9 +3393,7 @@ impl Trainer {
                 #[cfg(feature = "wgpu")]
                 if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0 {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
-                        // Progress cadence is observability, not model math. Use a non-blocking
-                        // drain here so progress reporting does not stall the fused hot path.
-                        gpu.device.poll(wgpu::Maintain::Poll);
+                        gpu.device.poll(wgpu::Maintain::Wait);
                     }
                 }
 
@@ -4031,7 +4139,7 @@ impl Trainer {
                                         && num_chunks % self.cfg_tps_sync_every == 0
                                     {
                                         if let Some(gpu) = self.gpu_deq.as_ref() {
-                                            gpu.device.poll(wgpu::Maintain::Poll);
+                                            gpu.device.poll(wgpu::Maintain::Wait);
                                         }
                                     }
                                     continue;
@@ -4081,7 +4189,7 @@ impl Trainer {
                                     && num_chunks % self.cfg_tps_sync_every == 0
                                 {
                                     if let Some(gpu) = self.gpu_deq.as_ref() {
-                                        gpu.device.poll(wgpu::Maintain::Poll);
+                                        gpu.device.poll(wgpu::Maintain::Wait);
                                     }
                                 }
                             }
@@ -4124,7 +4232,7 @@ impl Trainer {
                         if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0
                         {
                             if let Some(gpu) = self.gpu_deq.as_ref() {
-                                gpu.device.poll(wgpu::Maintain::Poll);
+                                gpu.device.poll(wgpu::Maintain::Wait);
                             }
                         }
                     }
@@ -4565,6 +4673,16 @@ impl Trainer {
                                     self.config.d_r
                                 )
                             );
+                            if let Some(summary) =
+                                Self::format_assoc_budget_debug(&self.cached_debug_buf, self.config.h_slots)
+                            {
+                                println!("    [ASSOC-BUDGET] {summary}");
+                            }
+                            if let Some(summary) =
+                                Self::format_assoc_read_debug(&self.cached_debug_buf, self.config.h_slots)
+                            {
+                                println!("    [ASSOC-READ] {summary}");
+                            }
                         }
                     }
                     // Slot-coord diagnostics (slot attention, active in DEQ_NO_MAMBA mode)

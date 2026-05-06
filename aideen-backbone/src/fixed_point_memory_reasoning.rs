@@ -171,7 +171,7 @@ pub struct FixedPointMemoryReasoning {
     #[cfg(not(feature = "lab"))]
     pub(crate) w_q_assoc: Vec<DMatrix<f32>>,
     #[cfg(feature = "lab")]
-    pub alpha_assoc: DVector<f32>, // [h_slots], residual read mix for assoc branch
+    pub alpha_assoc: DVector<f32>, // [h_slots], logit of residual read mix for assoc branch
     #[cfg(not(feature = "lab"))]
     pub(crate) alpha_assoc: DVector<f32>,
 
@@ -412,7 +412,9 @@ impl FixedPointMemoryReasoning {
                 .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
                 .collect(),
             w_q_assoc,
-            alpha_assoc: DVector::from_element(h_slots, 0.3_f32),
+            // GPU forward/backward applies sigmoid(alpha_assoc). Store logit(0.3)
+            // so the effective initial read mix is the documented 0.3, not 0.574.
+            alpha_assoc: DVector::from_element(h_slots, (0.3_f32 / 0.7_f32).ln()),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: break permutation symmetry with a *shared slot code*,
             // not two independent random tables. If q_bias and k_bias are unrelated,

@@ -1095,3 +1095,616 @@ Classification:
 - The banks are not merely touched by tiny noise; almost all banks receive moderate durable mass around 0.2-0.25. This confirms weak-to-moderate over-admission.
 Next action:
 - Implement budgeted promotion / candidate selection rather than fixed threshold tuning. Desired invariant for federated training: each document/node contributes bounded high-evidence durable writes, not all local transitions.
+
+Change gate - experimental durable Assoc write budget
+-----------------------------------------------------
+1. Target failure mode: real text fills every h8/b16 Assoc bank rapidly because every moderate transition can become durable. Previous scalar thresholds/event init either blocked all writes or still filled all banks, so durable admission lacks a bounded promotion policy.
+2. Structural rationale: durable Assoc banks are scarce exact-memory slots. As a diagnostic first step toward promotion, add an explicit per-slot durable write budget: novel empty-bank writes are admitted only while occupied banks in that lane are below `ASSOC_WRITE_BUDGET`; reuse writes to an existing matching key remain allowed. This tests whether bounded durable admission prevents immediate bank saturation without changing default behavior.
+3. Anti-patch check: the budget is disabled by default (`0 = unlimited`) and does not use labels, token IDs, AR positions, or loss. It does not claim salience is solved; it isolates whether capacity-bounded admission is the missing layer. If it preserves occupancy but stores useless early transitions, the result proves that a ranking/salience selector is required next.
+4. Validation plan: add WGSL override and Rust plumbing for `AIDEEN_ASSOC_WRITE_BUDGET`; cargo check; run a short real-text audit with h8/b16/hash-replica/event-gate and budget values. Success for the diagnostic means occupancy stays below full saturation and no NaNs. Quality/utility requires later salience validation.
+Classification target: experimental diagnostic, not default.
+
+Validation - durable Assoc write budget controls real-text saturation
+---------------------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_replica_event_gate_budget4_assoc_audit_4chunks.log
+Command summary:
+- release train, tinyshakespeare, batch=4, ctx_len=512, max_chunks=4
+- `AIDEEN_H_SLOTS=8 AIDEEN_ASSOC_BANKS=16 AIDEEN_ASSOC_SLOT_OWNER=1 AIDEEN_ASSOC_HASH_LANE=1 AIDEEN_ASSOC_HASH_REPLICA=1 AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_AUDIT=1 AIDEEN_ASSOC_WRITE_BUDGET=4`
+Result:
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- Throughput dropped to `tps_epoch=67.7` for this heavy audited corridor.
+- `[ASSOC-STATE] s4:4/16 >.05=4 >.20=4 >.80=0 mean=5.859e-2 max=2.438e-1 | s5:4/16 >.05=4 >.20=4 >.80=0 mean=5.720e-2 max=2.431e-1 | s6:4/16 >.05=4 >.20=4 >.80=0 mean=5.808e-2 max=2.438e-1 | s7:4/16 >.05=4 >.20=3 >.80=0 mean=5.555e-2 max=2.366e-1`.
+- Loss was high (`gpu_loss_cached=7.3324`), so budget alone is not a quality solution.
+Classification:
+- `AIDEEN_ASSOC_WRITE_BUDGET`: experimental diagnostic useful. It proves bounded durable admission prevents immediate real-text bank saturation.
+- Not default-stable as a standalone policy because it only caps early admissions; it does not decide which transitions are worth preserving.
+Root-cause conclusion:
+- The next missing mechanism is salience/ranking/promotion, not another scalar threshold. A correct policy needs a transient candidate pool or promotion score so the limited durable budget is spent on high-evidence bindings rather than first-arriving ordinary transitions.
+Next action:
+- Add diagnostics or a candidate-promotion path that separates transient local writes from durable Assoc writes. Minimum next diagnostic: measure how many writes are blocked by budget and expose event/write-mass distribution so salience can be designed from evidence, not guessed.
+
+Change gate - Assoc budget admission telemetry
+----------------------------------------------
+1. Target failure mode: `AIDEEN_ASSOC_WRITE_BUDGET=4` prevents full real-text saturation, but the model remains near-random/high-loss. We do not know whether the budget is blocking many meaningful candidates, only ordinary low-salience writes, or mostly allowing reuse. Without this measurement, a promotion policy would be guessed.
+2. Structural rationale: durable Assoc needs a two-stage invariant: candidate generation may be dense/local, but durable admission must be bounded and rankable. The current budget implements the bound; telemetry must expose the admission path variables at the same allocation point: empty-candidate rate, blocked-by-budget rate, reuse rate, occupied count, and pre-protect write intent.
+3. Anti-patch check: this change does not alter equations, thresholds, logits, memory contents, loss, or default runtime behavior. It observes the exact mechanism that decides durable bank admission, so it supports root-cause decomposition instead of hiding the high-loss symptom.
+4. Validation plan: add temporary DebugLog fields and trainer decoding under existing debug/audit flags; cargo check; run a short real-text h8/b16 budgeted audit with `AIDEEN_DEBUG_SAMPLE=1`. Success means logs report finite per-slot admission telemetry alongside `[ASSOC-STATE]`, allowing the next promotion/salience change to be designed from observed distributions.
+Classification target: diagnostic temporary; remove or consolidate after promotion policy is validated.
+
+Change gate - LM head gradient source telemetry
+-----------------------------------------------
+1. Target failure mode: budgeted Assoc forward stays finite, but backward receives `v_state`/`dl_dh` magnitudes around 1e7-1e10, so training signals into Assoc/FPM are unusable and the model remains random.
+2. Structural rationale: before changing Assoc dynamics, isolate the source of the adjoint magnitude. The LM head owns `dl_dh`; if LM `W`/`g` are already huge, the failure is parameter/update scaling. If LM `W`/`g` are normal while `dl_dh` is huge, the failure is in LM backprop formula/layout or an upstream assoc-logit RHS path.
+3. Anti-patch check: this is diagnostic-only under `AIDEEN_BACKWARD_INPUT_PROBE`; it does not clamp gradients, alter learning rates, or mask the explosion. It measures the exact producer of the invalid adjoint.
+4. Validation plan: print LM `W` and `g` stats alongside existing hpooled/dl_dh/assoc_rhs/adj_v probes; run a short GPU corridor. Success means the next fix targets either LM parameter corruption or LM backprop/layout, not Assoc slot policy.
+Classification target: diagnostic temporary.
+
+Change gate - LM sampled-softmax backprop cache capacity parity
+---------------------------------------------------------------
+1. Target failure mode: LM `dl_dh` is finite but absurdly large (`rms≈3.4e7`) while `hpooled`, `W_lm`, `b_lm`, and `g_lm` are normal. This corrupts the Picard adjoint and then Assoc/FPM backward.
+2. Structural rationale: `build_sampled_indices` and LM forward allow up to 2048 sampled logits, and `lm_probs_main` allocates `s_indices_cache`/`s_logits` as 2048-element workgroup arrays. `lm_backprop_h_t_main` cached `probs` into a 512-element workgroup array while iterating `k < params.num_samples`; when `num_samples > 512`, it wrote out of bounds in workgroup memory, corrupting the gradient computation. The required invariant is identical sampled-softmax capacity across forward and backward caches.
+3. Anti-patch check: this does not clamp gradients, lower LR, disable Assoc, or hide exploding values. It restores a shader layout/capacity invariant at the origin of the invalid `dl_dh` producer and remains valid across seeds as long as `MAX_SHADER_SAMPLES=2048`.
+4. Validation plan: change `s_probs_cache` from 512 to 2048; cargo check; rerun the 1-chunk LM weight/backward probe. Success means `dl_dh` and `adj_v_out` fall from ~1e7 to a scale consistent with LM weights (~1e-3 to small finite values), and Assoc backward `val_rms` no longer enters ~1e10.
+Classification target: layout/invariant fix; candidate default stable if validation passes.
+
+Investigation note - LM cache parity not sufficient
+---------------------------------------------------
+Validation log:
+- logs/training_real/h8_b16_budget4_lm_cache_fix_probe_1chunk.log
+- logs/training_real/h8_b16_budget4_lm_debug_after_cache_fix_1chunk.log
+Result:
+- `s_probs_cache` capacity parity fixed and compile passed.
+- `num_samples=2048`, so the active corridor fits the 2048 shader arrays.
+- `dl_dh` remains huge (`rms≈2.5e7`) while `lm_w`, `lm_b`, and `lm_g` are normal.
+Classification:
+- 512->2048 cache fix remains a valid layout/invariant fix, but it is not sufficient to resolve the current gradient explosion.
+Next diagnostic:
+- Read `probs` and `rms_buf` under `AIDEEN_BACKWARD_INPUT_PROBE` to determine whether LM forward softmax/RMS output is already corrupt or whether corruption occurs only in `lm_backprop_h_t_main`.
+
+Change gate - LM sampled-softmax storage-backed probability invariant
+---------------------------------------------------------------------
+1. Target failure mode: after cache-capacity parity, `lm_probs` still reports `max≈1e10` while it should contain normalized probabilities in `[0,1]`. `dl_dh` and `assoc_rhs` remain ~1e7, proving corruption is produced inside the LM sampled-softmax/probability path before the DEQ adjoint.
+2. Structural rationale: LM forward/backward currently rely on module-scope workgroup arrays sized for up to 2048 samples (`s_indices_cache`, `s_logits`, `s_probs_cache`). The probability source of truth is already the storage buffer `probs`; keeping duplicate workgroup caches for a large sampled set creates a second fragile layout/capacity contract and allows corruption of the normalized probability invariant. The structural fix is to make `probs` the single source of truth: initialize logits in `probs`, accumulate logits in `probs`, normalize `probs`, and have backprop read `probs`/`sampled_indices` directly from storage.
+3. Anti-patch check: this does not clamp `dl_dh`, lower learning rates, disable Assoc, or tune thresholds. It removes the duplicated cache mechanism that violates the invariant `0 <= probs[t,k] <= 1` and `sum_k probs[t,k] ≈ 1` before gradients are computed. If correct, the same fix remains valid for any seed/profile using sampled softmax.
+4. Validation plan: remove large sampled workgroup caches; cargo check; rerun `AIDEEN_BACKWARD_INPUT_PROBE` 1-chunk corridor. Success means `lm_probs.max <= 1`, finite `lm_rms`, and `dl_dh` drops to the scale implied by `W_lm` (`~1e-3` to small finite), with Assoc backward no longer seeing `val_rms≈1e10`.
+Classification target: layout/invariant fix; candidate default stable if validation passes.
+
+Change gate - LM sampled-softmax serial normalization corridor
+--------------------------------------------------------------
+1. Target failure mode: `lm_probs` violates probability invariants (`row0_sum≈1.7e13`, `max=1e10`, millions of entries >1) even though `hpooled`, `assoc_pooled`, `lm_rms`, `W_lm`, `b_lm`, and `g_lm` are finite/normal. This produces `dl_dh≈1e7` before the DEQ adjoint.
+2. Structural rationale: logits are finite but the workgroup softmax reduction is producing an invalid denominator (`sm` effectively clamped to `1e-10`). The probability invariant must be restored at the normalization equation itself: for each token, compute `mx=max_k(logit_k)` and `sm=sum_k exp(logit_k-mx)` over the full sampled set, then normalize all `probs[t,k]` by that same scalar. A serial `tid==0` normalization is the minimal correctness corridor because it removes reduction/race ambiguity while preserving the exact softmax equation.
+3. Anti-patch check: this does not clamp probabilities or gradients after the fact. It computes the correct denominator at the origin of the invalid probability distribution. TPS may drop, but this is a stabilization corridor; once validated, the same invariant can be re-parallelized safely.
+4. Validation plan: replace LM softmax max/sum workgroup reductions with serial per-token normalization; cargo check; rerun 1-chunk `AIDEEN_BACKWARD_INPUT_PROBE`. Success means `lm_probs_inv row0_sum≈1`, `gt1=0`, `max<=1`, and `dl_dh` collapses from ~1e7 to a small finite scale.
+Classification target: layout/equation invariant fix; candidate default-correct but performance-sensitive.
+
+Validation - LM serial softmax restores gradient scale
+------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_serial_softmax_probe_1chunk.log
+Result:
+- `assoc_pooled` was normal before LM (`rms=2.016e-1`, `max=1.091e0`), so the Assoc->LM bridge was not the source of the 1e7 gradient.
+- `lm_probs` invariant restored: `row0_sum=1.000019e0`, `gt1=0`, `neg=0`, `max=1.790e-3`.
+- `dl_dh` collapsed from previous `~2.5e7` to `3.032e-6`; `assoc_rhs` collapsed to `4.619e-6`; `adj_v_out` collapsed to `1.018e-6`.
+- Assoc backward `val_rms` collapsed from `~1e10` to `~1.2e-3`. The remaining large `wq_step_max` is diagnostic only because `AIDEEN_ASSOC_ADDR_LR_MULT` defaults to 0.0 and address updates are intentionally frozen in this corridor.
+Classification:
+- LM serial softmax: default-correct equation/invariant fix, performance-sensitive.
+- LM cache-removal/storage source-of-truth: layout/invariant cleanup that simplifies the circuit and removes duplicated sampled-set state.
+- LM/RMS/probs readbacks: temporary diagnostics, keep until the next stable corridor confirms gradients remain finite without debug.
+Root-cause conclusion:
+- A major cause of apparent random/stalled training was not Assoc slot distribution. The LM sampled-softmax denominator path corrupted probabilities, causing invalid `dl_dh`, then invalid Picard adjoints, then unusable Assoc/FPM backward signals. Stabilization must continue from this corrected gradient corridor.
+Next action:
+- Run the same h8/b16/budget4 corridor for 4 chunks without heavy probability readback, confirm no gradient explosion and measure TPS/loss. Then decide whether to re-parallelize softmax safely or keep the serial corridor while investigating Assoc salience/promotion.
+
+Validation - LM serial softmax 4-chunk corridor without heavy LM readback
+-------------------------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_serial_softmax_4chunks.log
+Command summary:
+- release train, tinyshakespeare, batch=4, ctx_len=512, max_chunks=4, seed=42
+- `AIDEEN_H_SLOTS=8 AIDEEN_ASSOC_BANKS=16 AIDEEN_ASSOC_SLOT_OWNER=1 AIDEEN_ASSOC_HASH_LANE=1 AIDEEN_ASSOC_HASH_REPLICA=1 AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_AUDIT=1 AIDEEN_ASSOC_WRITE_BUDGET=4 AIDEEN_DEBUG_SAMPLE=1`
+Result:
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- `tps_epoch=132.8`, `loss=7.6795`, `tokens=8192`.
+- Assoc value-gradient scale stayed finite and small across chunks: active Assoc slots reported `val_rms` around `1.1e-3` to `1.5e-3`, not the previous `~1e10` explosion.
+- `wq_update_max=0` and `wk_update_max=0` by design because address learning remains frozen in this corridor via `AIDEEN_ASSOC_ADDR_LR_MULT=0.0`. Large `wq_step_max` is therefore a diagnostic gradient magnitude, not an applied parameter update.
+- `[ASSOC-STATE]` ended at 4/16 occupied for active Assoc slots s4-s7, confirming the budget still prevents immediate bank saturation.
+- `[ASSOC-BUDGET]` showed uneven admission pressure: s4/s5 had high block rates (`0.371`, `0.419`) and occupancy 4.00; s6/s7 reported near-zero final occupancy in budget telemetry despite `[ASSOC-STATE]` showing 4/16 occupied, which indicates a diagnostic/telemetry lifetime or slot-index interpretation mismatch to inspect before using those fields as policy evidence.
+- FPM remains structurally separated in this corridor: write activity is in slots 0-3, while durable Assoc occupancy is in slots 4-7.
+Classification:
+- LM serial softmax remains validated as the current correctness corridor for sampled-softmax probability invariants and backward gradient scale.
+- Assoc write budget remains experimental useful, not a quality solution.
+- Assoc budget telemetry is diagnostic temporary and now has a suspected inconsistency for s6/s7 that must be resolved before designing promotion from those counters.
+Root-cause conclusion:
+- The previous catastrophic backward instability is resolved at the LM probability denominator equation. The model still being near-random after 8k tokens is no longer explained by NaN/exploding gradients in this corridor; the next causal focus is memory utility: which slots write, which slots are read, whether budget telemetry matches actual memory state, and whether FPM/Assoc role separation prevents useful information from reaching the LM path.
+Next action:
+- Inspect the Assoc budget telemetry indices/lifetime against `[ASSOC-STATE]` decoding, then run a no-debug 4-chunk corridor to measure cleaner TPS/loss. After telemetry parity is fixed, design the promotion/salience policy from reliable counters rather than guessed thresholds.
+
+Validation - LM serial softmax no-debug 4-chunk corridor
+--------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_serial_softmax_nodebug_4chunks.log
+Command summary:
+- Same h8/b16/budget4 real-text corridor as above, but without `AIDEEN_DEBUG_SAMPLE` and without `AIDEEN_BACKWARD_INPUT_PROBE`.
+Result:
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- `loss=7.7492`, `tps_epoch=67.8`, `time=120.89s`, `tokens=8192`.
+- `[ASSOC-STATE]` remained budget-controlled at 4/16 occupied banks for s4-s7.
+Interpretation:
+- Stability holds without the heavy backward/probability probes.
+- Throughput is still low; the serial LM sampled-softmax normalization is now a likely performance bottleneck. This is acceptable as a correctness corridor, not as the long-term training implementation.
+Classification:
+- Serial LM softmax remains validated for correctness but should be optimized behind an invariant-preserving implementation before serious training.
+- The current quality issue (`loss ~7.7` after 8k tokens) should not be treated as evidence against the LM invariant fix; it now points to useful-memory learning/distribution and/or insufficient training exposure.
+Next action:
+- Add an invariant-safe parallel softmax path or a diagnostic compile/env switch that compares serial vs parallel row sums. Do not promote a faster path unless `sum(probs) ~= 1`, `0 <= probs <= 1`, and `dl_dh` scale remains small.
+
+Change gate - LM sampled-softmax invariant-safe parallel normalization
+----------------------------------------------------------------------
+1. Target failure mode: the serial LM softmax restores probability/gradient invariants but drops the corridor to roughly `67.8 TPS` on the no-debug 4-chunk run, making it unsuitable as the long-term training path.
+2. Structural rationale: the softmax equation does not require serial execution; it requires a single correct row max and row denominator over all `params.num_samples`. Keep `probs` as the only logits/probabilities storage, but compute max and sum with workgroup reductions. Use separate workgroup scratch arrays for denominator and target numerator so `sum_k probs[t,k] ~= 1` and target CE remains identical to the serial equation.
+3. Anti-patch check: this does not change LR, sampled count, clamp gradients, reduce capacity, or hide the slow path. It reimplements the same validated equation at the normalization origin while preserving the probability invariant that fixed `dl_dh`.
+4. Validation plan: cargo check; run the 1-chunk `AIDEEN_BACKWARD_INPUT_PROBE` corridor and require `lm_probs_inv row0_sum ~= 1`, `gt1=0`, `neg=0`, `dl_dh` small finite, and active Assoc `val_rms ~1e-3`; then run the no-debug 4-chunk corridor and compare TPS/loss.
+Classification target: equation/layout invariant optimization; promote only if invariant probe matches serial corridor.
+
+Validation - LM parallel softmax invariant probe
+------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_parallel_softmax_probe_1chunk.log
+Result:
+- `cargo check --features wgpu -p aideen-training` passed before runtime validation.
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- Probability invariant held exactly in the probe: `lm_probs_inv samples=2048 row0_sum=1.000000e0 gt1=0 neg=0 min=7.796e-7 max=1.967e-3`.
+- `dl_dh` remained small and finite (`rms=3.094e-6`, `max=9.759e-6`), matching the serial correctness corridor.
+- `assoc_rhs` remained small (`rms=4.687e-6`) and `adj_v_out` remained small (`rms=1.059e-6`).
+- Active Assoc backward `val_rms` stayed around `1.2e-3` to `1.3e-3`, not the previous `~1e10` failure.
+- 1-chunk debug/probe run reported `tps_epoch=114.0` and `loss=7.8825`.
+Classification:
+- LM parallel softmax is validated for the primary probability and gradient invariants in the 1-chunk probe.
+- Keep the storage-backed `probs` source-of-truth and the reduced max/sum denominator. The earlier broken path was not parallelism itself; it was the duplicated/corrupt cache/reduction contract.
+Next action:
+- Run the no-debug 4-chunk corridor with the parallel softmax to compare throughput/loss against the serial no-debug run (`67.8 TPS`).
+
+Validation - LM parallel softmax no-debug 4-chunk corridor
+----------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_parallel_softmax_nodebug_4chunks.log
+Result:
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- `loss=7.7194`, `tps_epoch=137.0`, `time=59.80s`, `tokens=8192`.
+- `[ASSOC-STATE]` remained budget-controlled at 4/16 occupied banks for s4-s7.
+Comparison:
+- Serial no-debug corridor: `67.8 TPS`, `loss=7.7492`.
+- Parallel invariant-safe corridor: `137.0 TPS`, `loss=7.7194`.
+Classification:
+- LM parallel softmax is now the preferred default-correct path over the serial corridor: it preserves the validated probability/gradient invariants and recovers throughput.
+- The serial version remains useful only as a conceptual fallback/reference, not as code in the active shader.
+Root-cause conclusion:
+- The correct structural fix was not changing values. It was removing duplicated sampled-softmax caches, making `probs` the single source of truth, and restoring a row-wise max/sum softmax invariant. Once that invariant held, parallel execution was safe again.
+Next action:
+- Continue stabilization at the memory-utility layer: verify whether the high real-text loss is due to useful bindings not being promoted/read, FPM/Assoc slot-role separation starving the LM path, or insufficient training horizon. Keep LM probability invariant probes available until this corridor survives a longer run.
+
+Diagnostic - Assoc logit contribution ablation
+----------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_parallel_softmax_assoclambda0_nodebug_4chunks.log
+Question:
+- Does the current Assoc-pooled contribution help LM logits in the short real-text corridor, or is it adding non-selective noise while durable memory policy is still immature?
+Command summary:
+- Same h8/b16/budget4 parallel-softmax real-text corridor as the validated baseline, but with `AIDEEN_ASSOC_LOGIT_LAMBDA=0`.
+Baseline comparison:
+- `AIDEEN_ASSOC_LOGIT_LAMBDA=1` default: `loss=7.7194`, `tps_epoch=137.0`.
+- `AIDEEN_ASSOC_LOGIT_LAMBDA=0`: `loss=7.5815`, `tps_epoch=135.2`.
+Result:
+- Disabling Assoc logit contribution improved the short-run loss slightly without materially changing TPS.
+- Assoc durable state still filled the budgeted 4/16 banks per active slot, so this ablation only changes LM use of Assoc, not Assoc writing.
+Classification:
+- Diagnostic evidence, not a default policy change yet.
+Root-cause implication:
+- The current Assoc signal reaching LM logits is probably not selective/useful enough in this real-text corridor. This supports focusing next on Assoc promotion/read utility before amplifying Assoc into LM logits. It also suggests `AIDEEN_ASSOC_LOGIT_LAMBDA=1` may be too aggressive as a default while memory salience is unresolved.
+Next action:
+- Validate whether lowering rather than zeroing the Assoc logit contribution (`0.1` or `0.25`) preserves any useful signal without noise, and inspect whether LM loss is mostly driven by h_pooled alone over this short horizon.
+
+Diagnostic - Assoc logit contribution scale 0.25
+------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_lm_parallel_softmax_assoclambda025_nodebug_4chunks.log
+Command summary:
+- Same h8/b16/budget4 parallel-softmax real-text corridor, but with `AIDEEN_ASSOC_LOGIT_LAMBDA=0.25`.
+Comparison:
+- `lambda=0.00`: `loss=7.5815`, `tps_epoch=135.2`.
+- `lambda=0.25`: `loss=7.6142`, `tps_epoch=67.1`.
+- `lambda=1.00` default: `loss=7.7194`, `tps_epoch=137.0`.
+Result:
+- Loss ordering in this short corridor is monotonic: lower Assoc logit scale is better (`0.00 < 0.25 < 1.00` in loss).
+- The `lambda=0.25` TPS is unexpectedly low relative to both `0.00` and `1.00`; treat this as a runtime/measurement anomaly until repeated. Do not conclude performance from this single datapoint.
+Classification:
+- Diagnostic evidence that current Assoc-pooled logit injection is not yet useful in the short real-text corridor.
+Root-cause implication:
+- The problem is not that Assoc is disconnected; it is connected. The issue is that the current Assoc content/readout appears insufficiently selective, so injecting it into LM logits degrades loss. Stabilization should prioritize Assoc memory utility/promotion before increasing LM logit coupling.
+Next action:
+- For the next stable corridor, use `AIDEEN_ASSOC_LOGIT_LAMBDA=0` as a diagnostic baseline while fixing memory promotion/read quality, but do not hard-code that as the final architecture. After promotion improves, retest positive lambda values.
+
+Change gate - Assoc read utility telemetry printout
+---------------------------------------------------
+1. Target failure mode: current Assoc logit contribution worsens short-run LM loss, but we do not know whether the cause is bad durable content, diffuse reads, weak slot gating, or a bridge scale issue. Existing shader debug fields for read entropy/max probability/context RMS are not printed, so memory utility is opaque.
+2. Structural rationale: before altering promotion/read equations, expose the exact read-path invariants already computed at the retrieval point: bank read entropy, max bank probability, read context RMS, average occupied usage, last-token query spread, selected bank, and selected probability. These determine whether Assoc behaves like explicit addressable memory or a noisy side channel.
+3. Anti-patch check: this is diagnostics-only under existing audit/debug buffers. It does not change AssocBuf, logits, gradients, thresholds, gates, or defaults. It reveals the mechanism instead of masking the degraded loss from positive `AIDEEN_ASSOC_LOGIT_LAMBDA`.
+4. Validation plan: add trainer formatting for DebugLog[760..], [820..], and [940..]; cargo check; run a 1-chunk audited corridor and verify finite per-slot read metrics are printed alongside `[ASSOC-STATE]`.
+Classification target: diagnostic temporary; keep until read/promotion policy is validated.
+
+Validation - Assoc read utility telemetry printout
+--------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assoc_read_telemetry_lambda0_1chunk.log
+Command summary:
+- h8/b16/budget4 audited 1-chunk corridor, `AIDEEN_ASSOC_LOGIT_LAMBDA=0`, `AIDEEN_DEBUG_SAMPLE=1`.
+Result:
+- `cargo check --features wgpu -p aideen-training` passed cleanly after adding the telemetry printout.
+- `[ASSOC-READ]` printed finite read metrics for active Assoc slots.
+- Read entropy was `H=0.000` and `pmax=1.000` across s4-s7, confirming default `AIDEEN_ASSOC_HARD_READ=1` produces winner-take-all bank reads, not diffuse soft mixtures.
+- Read context RMS was around `2.500e-1` where a slot had an active read context, consistent with normalized stored values rather than a tiny/no-op contribution.
+- Last-token effective pick probability was slot-gated: examples included `qpick=0@0.000`, `qpick=3@0.000`, and one active `qpick=0@1.000`. This means only owner/replica lanes may contribute for a given query under hash-lane ownership.
+- Short-run loss with `lambda=0` remained finite (`loss=7.6004`, 2048 tokens) and Assoc backward `val_rms` stayed around `1.2e-3`.
+Classification:
+- Assoc read telemetry printout is diagnostic temporary and useful.
+Root-cause implication:
+- The degraded loss from positive `AIDEEN_ASSOC_LOGIT_LAMBDA` is unlikely to be caused by soft bank blending in the current default corridor, because hard-read is already active. The more likely issue is that the selected binding/value is not semantically/predictively useful for LM logits yet, or that the LM bridge treats normalized literal values as a direct logit feature before promotion/salience is reliable.
+Next action:
+- Measure whether positive Assoc-logit loss degradation is reduced by gating the LM Assoc contribution with reliable read confidence/slot permission, or keep `lambda=0` while improving promotion. Do not change default LM coupling until the selected bindings become predictive.
+
+Change gate - Assoc read telemetry batch isolation
+--------------------------------------------------
+1. Target failure mode: `[ASSOC-READ]` can report internally inconsistent fields, e.g. effective `qpick` near zero while `qctx` is nonzero for the same slot/token. This can happen because some read debug fields are written by all batches, while budget/write diagnostics are batch-isolated.
+2. Structural rationale: diagnostics must observe a single causal path. Restrict Assoc read/query/context DebugLog writes to `batch_idx == 0u`, matching other diagnostics, so entropy, selected bank, selected probability, and context RMS correspond to the same batch lane.
+3. Anti-patch check: this only changes debug writes under `debug_on`; it does not change AssocBuf, AssocReadBuf, H_next, logits, gradients, slot ownership, or any training equation. It fixes measurement provenance rather than masking model behavior.
+4. Validation plan: cargo check; rerun 1-chunk audited corridor and verify `[ASSOC-READ]` fields no longer show impossible combinations like `qpick@0` with nonzero `qctx` for hard gated reads.
+Classification target: measurement/diagnostic fix; candidate stable for diagnostics.
+
+Validation - Assoc read telemetry batch-isolated
+------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assoc_read_telemetry_batch0_lambda0_1chunk.log
+Result:
+- `cargo check --features wgpu -p aideen-training` passed before runtime validation.
+- Batch-isolated `[ASSOC-READ]` no longer showed the impossible combination seen previously: slots with final-token `qpick @0.000` now also report `qctx=0.000e0`.
+- Average read path still shows `H=0.000`, `pmax=1.000`, and `ctx≈2.500e-1` on slots that read during the sequence, confirming hard-read behavior with normalized stored values.
+- Final-token effective slot permission can be zero across Assoc slots in batch 0 (`qpick @0.000`, `qctx=0`), meaning the current hash owner/replica route may provide sparse temporal coverage even when banks are occupied.
+Classification:
+- Batch isolation is a measurement/diagnostic fix and should remain for trustworthy read telemetry.
+Root-cause implication:
+- The positive Assoc-logit degradation is not explained by soft/diffuse bank read. The read is hard, but the selected literal value/coupling is not reliably predictive. The next question is whether Assoc read injection into the DEQ state helps or hurts independently of the LM logit bridge.
+Next action:
+- Run an ablation with `AIDEEN_ASSOC_READ=0` and `AIDEEN_ASSOC_LOGIT_LAMBDA=0` to isolate the effect of Assoc internal read injection from Assoc durable writes and from LM logit coupling.
+
+Diagnostic - Assoc internal read injection ablation
+---------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assocread0_lambda0_nodebug_4chunks.log
+Question:
+- With LM Assoc-logit coupling disabled (`lambda=0`), does Assoc read injection into the DEQ state help or hurt the short real-text corridor?
+Command summary:
+- Same h8/b16/budget4 real-text corridor as the `lambda=0` baseline, but with `AIDEEN_ASSOC_READ=0`.
+Comparison:
+- `AIDEEN_ASSOC_READ=1`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0`: previous 4-chunk loss `7.5815` (`135.2 TPS`) and audited 1-chunk loss around `7.59-7.60`.
+- `AIDEEN_ASSOC_READ=0`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0`: `loss=7.4659`, `tps_epoch=135.0`, `tokens=8192`.
+Result:
+- Disabling internal Assoc read injection improved short-run loss while durable Assoc writes still occurred and remained budget-controlled at 4/16 banks per active slot.
+Classification:
+- Diagnostic evidence that current Assoc read injection is not yet useful in the real-text corridor.
+Root-cause implication:
+- The issue is upstream of the LM logit bridge. Current Assoc reads are hard/narrow, but selected values are injected into the DEQ/FPM path before they are known to be predictive. This can perturb h_pooled and then degrade LM loss. The next stabilization corridor should keep durable Assoc writes enabled but gate/disable Assoc reads until promotion/read utility is validated.
+Next action:
+- Inspect `alpha_assoc`/Assoc injection scale and whether read confidence/slot permission is preserved into `assoc_pooled`. Candidate structural fix should separate "store explicit bindings" from "inject retrieved binding into dynamics" with a confidence/promotion gate, rather than reading every hard-selected binding into the solve.
+
+Change gate - experimental Assoc alpha init override
+----------------------------------------------------
+1. Target failure mode: disabling Assoc read improves short-run loss, suggesting read injection is too strong or semantically premature. `alpha_assoc` is documented as a residual read mix and initialized to `0.3`, but the shader interprets it as a sigmoid logit, producing `sigmoid(0.3)=0.574` before additional read normalization.
+2. Structural rationale: add an experimental initialization override for the stored alpha parameter so we can test the injection-amplitude hypothesis without changing default behavior or rewriting the forward/backward alpha parameterization. This isolates whether lower initial Assoc read mix restores the benefit of keeping reads enabled.
+3. Anti-patch check: the override is opt-in (`AIDEEN_ASSOC_ALPHA_INIT`) and does not clamp gradients, disable reads, or alter memory contents by default. It tests a specific semantic mismatch in the alpha parameter path before any default architectural change.
+4. Validation plan: cargo check; run h8/b16/budget4 with `AIDEEN_ASSOC_READ=1`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0`, and low alpha init values. If lower alpha approaches or beats `AIDEEN_ASSOC_READ=0` loss while preserving stability, the root cause is read injection amplitude/parameter semantics.
+Classification target: experimental diagnostic knob; not default stable until multi-seed validation.
+
+Diagnostic - Low Assoc read alpha init
+--------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assocread_alpha005_lambda0_nodebug_4chunks.log
+Question:
+- Is Assoc read harmful because reads exist at all, or because the initial read injection amplitude is too high?
+Command summary:
+- Same h8/b16/budget4 real-text corridor with `AIDEEN_ASSOC_READ=1`, `AIDEEN_ASSOC_LOGIT_LAMBDA=0`, and `AIDEEN_ASSOC_ALPHA_INIT=-2.944` (`sigmoid≈0.05`).
+Comparison:
+- Default read on, lambda 0: `loss=7.5815`.
+- Read off, lambda 0: `loss=7.4659`.
+- Read on, low alpha, lambda 0: `loss=7.4672`, `tps_epoch=136.3`.
+Result:
+- Lowering Assoc read alpha makes read-on match read-off loss. This supports the hypothesis that current read injection is too strong/premature, not that Assoc storage must be removed.
+Classification:
+- Experimental diagnostic useful. Do not promote `-2.944` as final; it is a low-amplitude corridor proving the failure mechanism.
+Root-cause implication:
+- `alpha_assoc` parameter semantics are inconsistent: model code documents/initializes it like a direct residual mix (`0.3`), while WGSL treats it as a sigmoid logit (`sigmoid(0.3)=0.574`). The next test is the semantic correction `logit(0.3)≈-0.847`.
+Next action:
+- Run `AIDEEN_ASSOC_ALPHA_INIT=-0.847` to test whether intended `alpha≈0.3` is stable, then decide whether to convert initialization/defaults to logit space or keep a low read gate until promotion is validated.
+
+Change gate - Default alpha_assoc logit-space initialization
+------------------------------------------------------------
+1. Target failure mode: default Assoc read injection degrades short-run loss. The model initializes `alpha_assoc=0.3` as if it were a residual mix coefficient, but forward/backward shaders treat it as a sigmoid logit, giving effective alpha `0.574` instead of intended `0.3`.
+2. Structural rationale: align parameter initialization with the equation actually used by GPU forward/backward. If `alpha_effective = sigmoid(alpha_param)`, then an intended initial mix of `0.3` must store `logit(0.3)≈-0.847`. This restores the required invariant: documented/init effective read mix equals shader effective read mix.
+3. Anti-patch check: this does not clamp reads, disable Assoc, reduce banks, lower LR, or hide loss. It corrects the parameter-space mismatch at the source and remains valid across seeds/profiles because it aligns the stored parameter with the sigmoid equation.
+4. Validation plan: change default initialization/comment; cargo check; rerun h8/b16/budget4 with reads/logit lambda default corridor or explicit lambda0/read-on corridor. Success means read-on no longer degrades relative to read-off in the short corridor, while no NaNs and Assoc occupancy remain controlled.
+Classification target: default stable initialization fix if validation passes.
+
+Validation - Default alpha logit init and Assoc logit bridge retest
+-------------------------------------------------------------------
+Logs:
+- logs/training_real/h8_b16_budget4_assoc_alpha_logit_default_lambda0_nodebug_4chunks.log
+- logs/training_real/h8_b16_budget4_assoc_alpha_logit_default_lambdadefault_nodebug_4chunks.log
+Results:
+- With default alpha now initialized in logit-space and `AIDEEN_ASSOC_LOGIT_LAMBDA=0`: `loss=7.5122`, `tps_epoch=140.6`.
+- With default alpha logit-space and default LM Assoc-logit lambda (`1.0`): `loss=7.6755`, `tps_epoch=68.0`.
+Interpretation:
+- Correcting alpha semantics improves internal Assoc read behavior, but direct Assoc contribution to LM logits still degrades this short real-text corridor.
+- The bridge `assoc_pooled -> sampled logits` should remain experimental until Assoc promotion/read utility is validated.
+Classification:
+- Alpha logit-space init: default-stable candidate for initialization semantics.
+- Default positive `AIDEEN_ASSOC_LOGIT_LAMBDA`: rejected as default in the current corridor; keep as explicit experimental knob.
+Next action:
+- Change default `AIDEEN_ASSOC_LOGIT_LAMBDA` to `0.0` while retaining env override, then validate the no-env corridor matches the lambda0 behavior.
+
+Change gate - Disable Assoc LM-logit bridge by default
+------------------------------------------------------
+1. Target failure mode: direct Assoc-pooled contribution to LM logits worsens short-run real-text loss and can add significant runtime cost, even after alpha read injection semantics are corrected.
+2. Structural rationale: Assoc should first affect the model through validated memory read dynamics and later through a confidence/promotion-aware LM bridge. The current LM bridge treats normalized retrieved literal values as direct logit features via embedding dot products without a validated salience/confidence gate, so it couples unproven memory content directly to token prediction.
+3. Anti-patch check: this does not remove Assoc storage, disable Assoc reads, reduce capacity, or hide numerical failure. It changes only the default coupling of an unvalidated auxiliary logit path. The path remains available via `AIDEEN_ASSOC_LOGIT_LAMBDA` for explicit experiments after promotion/read utility improves.
+4. Validation plan: change `GpuLmHeadTrainer` default assoc logit lambda to `0.0`; cargo check; run the h8/b16/budget4 no-env corridor and require no NaNs, controlled Assoc occupancy, and loss/TPS comparable to the explicit lambda0 run.
+Classification target: default stable for current training corridor; experimental bridge retained behind env.
+
+Validation - Assoc LM-logit bridge disabled by default
+------------------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assoc_alpha_logit_lambdadefault0_nodebug_4chunks.log
+Result:
+- `cargo check --features wgpu -p aideen-training` passed.
+- No-env LM Assoc-logit default now uses `cfg_assoc_logit_lambda=0.0`.
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- `loss=7.5376`, `tps_epoch=67.8`, `tokens=8192`; Assoc occupancy remained budget-controlled at 4/16 banks for active slots.
+Interpretation:
+- Loss is in the same corridor as explicit lambda0 runs and much better than the old default positive Assoc-logit bridge. The low TPS in this run differs from earlier lambda0 runs and should be treated as runtime/thermal variance until repeated; do not use this single datapoint for performance conclusions.
+Classification:
+- `cfg_assoc_logit_lambda` default `0.0`: default-stable for the current training corridor. Positive values remain experimental via `AIDEEN_ASSOC_LOGIT_LAMBDA`.
+- `alpha_assoc` logit-space initialization: default-stable candidate; needs longer/multi-seed validation but fixes a clear parameter-space invariant.
+Next action:
+- Continue with Assoc promotion/read utility while keeping the default corridor conservative: durable writes enabled, read alpha semantically correct, direct LM logit bridge off. Next structural focus: selected binding usefulness and promotion policy, not raw numerical stability.
+
+Change gate - Assoc read confidence based on key match, not hard-read probability
+--------------------------------------------------------------------------------
+1. Target failure mode: hard-read Assoc returns a bank with probability 1 even when the query/key match is weak. `ENABLE_ASSOC_CONF_READ` currently gates by `read_max_prob`, which is always 1 under hard-read, so the confidence gate is structurally inert in the default retrieval mode.
+2. Structural rationale: explicit associative memory should inject a retrieved value only in proportion to address confidence. The source invariant is key-query similarity, not post-selection probability. Compute read confidence from the pre-hard-read best address cosine (`max_score / ASSOC_READ_BETA`, clamped to `[0,1]`) and use that when `ENABLE_ASSOC_CONF_READ=1`.
+3. Anti-patch check: this does not disable Assoc, reduce capacity, clamp gradients, or tune loss directly. It corrects an existing gate so it observes the causal matching variable instead of an artifact of winner-take-all selection. The path remains opt-in until validated.
+4. Validation plan: cargo check; run h8/b16/budget4 with `AIDEEN_ASSOC_CONF_READ=1`, lambda0, corrected alpha default. Success means no NaNs, controlled occupancy, and loss not worse than unconfident read-on; if it approaches read-off/low-alpha corridor, confidence gating is a valid structural direction.
+Classification target: experimental dynamics/invariant fix; promote only after validation.
+
+Validation - Experimental Assoc confidence read
+-----------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assoc_confread_lambdadefault0_nodebug_4chunks.log
+Result:
+- `cargo check --features wgpu -p aideen-training` passed.
+- Runtime completed on Apple M1 Pro GPU, no NaNs or shader panic.
+- `AIDEEN_ASSOC_CONF_READ=1` with default conservative LM bridge (`lambda=0`) produced `loss=7.5269`, `tps_epoch=67.2`, `tokens=8192`.
+- Assoc occupancy remained budget-controlled at 4/16 banks for active slots.
+Comparison:
+- New conservative default without confidence read: `loss=7.5376` in one run.
+- Read-off lambda0 earlier: `loss=7.4659`.
+- Alpha semantic override run: `loss=7.4636`.
+Interpretation:
+- Confidence read is directionally plausible but not validated as a default from this single no-debug run. It did not cause instability and slightly improved one comparable default run, but variance/thermal effects are still high.
+Classification:
+- `ENABLE_ASSOC_CONF_READ` corrected semantics: experimental useful.
+- Do not promote default yet; inspect read telemetry under this flag first.
+Next action:
+- Run a 1-chunk audited corridor with `AIDEEN_ASSOC_CONF_READ=1` to inspect whether read confidence meaningfully gates weak matches.
+
+Validation - Assoc confidence-read telemetry
+--------------------------------------------
+Log:
+- logs/training_real/h8_b16_budget4_assoc_confread_telemetry_1chunk.log
+Result:
+- Runtime completed with `AIDEEN_ASSOC_CONF_READ=1`, no NaNs or shader panic.
+- Active read confidence is no longer hard-coded to 1: example s4 last-token `qpmax=0.506`, `qpick=3@0.506`, `qctx=1.266e-1` while raw read context without confidence is around `2.500e-1`.
+- Slots without effective route/match report `pmax=0.000`, `ctx=0`, or `qpick@0`, confirming the corrected confidence gate can suppress weak/non-routed reads.
+- Active Assoc backward `score_grad_max` fell to around `3e-5` in this diagnostic run versus earlier `~1e-4` scale, consistent with reduced read injection pressure.
+Classification:
+- Corrected confidence read semantics are validated as a useful experimental diagnostic/dynamics path.
+- Not promoted as default yet: short 4-chunk loss improved only slightly in one run and remains within noisy corridor variance.
+Root-cause conclusion:
+- The current memory issue is not numerical instability and not soft read blending. The sharper diagnosis is: hard-read was selecting literal banks even when address confidence was weak, and alpha/logit bridge scaling made those selected values too influential. We have now corrected alpha semantics, disabled unvalidated LM logit coupling by default, and made confidence read meaningful when enabled.
+Next action:
+- Continue toward promotion/read utility: design durable promotion so occupied banks contain predictive bindings, then retest `AIDEEN_ASSOC_CONF_READ=1` and positive `AIDEEN_ASSOC_LOGIT_LAMBDA` after selected bindings are useful.
+
+Change gate - experimental Assoc salience replacement
+-----------------------------------------------------
+1. Target failure mode: `ASSOC_WRITE_BUDGET` prevents saturation but spends durable banks on first-arriving transitions; once the budget is full, later potentially useful bindings are blocked.
+2. Structural rationale: above capacity, exact memory needs a separate admission priority. Add an opt-in replacement path where the bank metadata scalar is interpreted as salience instead of mere occupancy. Candidate salience combines novelty against existing keys and value-source surprise, then replaces the lowest-salience occupied bank only when the new candidate is stronger. Default behavior remains unchanged.
+3. Anti-patch check: this is not a threshold-only suppressor and does not use labels/token positions/loss. It changes the overflow policy at the origin: bounded banks should retain higher-evidence bindings instead of first arrivals. It is explicitly behind `AIDEEN_ASSOC_SALIENCE_REPLACE` because reinterpreting metadata needs validation.
+4. Validation plan: add WGSL override/Rust plumbing; cargo check; run h8/b16/budget4 real-text audit. Success for experiment: no NaNs, occupancy remains bounded, budget-blocked falls where replacement occurs, and loss/read telemetry do not regress. Promotion to default requires recall no-regression later.
+Classification target: experimental dynamics, not default.
+
+Implementation note - experimental Assoc salience replacement
+-------------------------------------------------------------
+Files changed: `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`, `aideen-block/src/deq_bridge.rs`, `aideen-backbone/src/gpu_deq.rs`.
+Change: added opt-in `AIDEEN_ASSOC_SALIENCE_REPLACE`. When enabled and `ASSOC_WRITE_BUDGET` is full, write admission can replace the lowest-metadata bank only if candidate salience exceeds current minimum. Candidate salience = key novelty * value-source surprise, both finite/clamped. Under this flag, bank metadata stores salience instead of committed write mass. Forward overwrite now zeros prior key/value contribution when `overwrite_bank=1`, matching the existing backward assumption in `fused_fpm_retain_bwd.wgsl`.
+Classification: experimental dynamics plus forward/backward parity repair for the new experimental overwrite path. Default behavior remains unchanged because override default is false and env plumbing defaults false.
+Pending validation: cargo check and h8/b16/budget4 real-text run with `AIDEEN_ASSOC_SALIENCE_REPLACE=1`.
+
+Validation correction - salience metadata commit invariant
+---------------------------------------------------------
+Observed in `h8_b16_budget4_assoc_salience_replace_nodebug_4chunks.log`: run stayed finite, loss=7.5189, but `ASSOC-STATE` reported 16/16 occupied for slots 4-7 despite `ASSOC_WRITE_BUDGET=4`.
+Diagnosis: not a quality failure yet; salience mode violated the metadata invariant. The old usage path stored `effective_write_mass`, so blocked writes wrote zero metadata. The new salience path stored candidate salience even when `effective_write_mass=0`, marking banks occupied without committed key/value content.
+Fix: salience metadata is now committed only when `effective_write_mass > 0`. This restores the invariant that occupancy metadata means a durable write actually happened.
+Classification: experimental path invariant fix. Previous salience run is invalid for occupancy conclusions.
+Next validation: rerun same corridor with `AIDEEN_ASSOC_SALIENCE_REPLACE=1`, preferably with debug sample enabled to expose budget counters.
+
+Validation correction - replacement target must be occupied
+----------------------------------------------------------
+Observed after metadata-commit fix: loss=7.5042 and no NaNs, but `ASSOC-STATE` still reached 16/16 with budget=4. Budget counters showed no blocking because replacement was selecting `min_usage_bank`, and `min_usage` included empty banks with usage=0. That converted replacement into out-of-budget allocation.
+Fix: track `min_occupied_usage/min_occupied_usage_bank` separately and replacement can only target an already occupied bank. Empty-bank allocation remains governed only by `occupied_count < ASSOC_WRITE_BUDGET`.
+Classification: experimental path invariant fix. Previous salience replacement runs are invalid for budget semantics.
+
+Validation result - salience replacement occupied-only
+-----------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_replace_occupiedonly_debug_4chunks.log`.
+Result: finite run, loss=7.5116, tps=152.0, no NaNs reported. `ASSOC-STATE` preserved budget semantics: slots 4-7 ended at 4/16 occupied. Budget telemetry showed budget blocking on saturated slots (`s6 block=0.397 occ=4.00`, `s7 block=0.386 occ=4.00`) instead of silent over-allocation.
+Interpretation: the experimental salience replacement path now restores the bounded-memory invariant and does not regress short-corridor loss versus recent budgeted baselines. It is not promoted default yet because quality/recall utility needs isolated validation beyond 4 chunks.
+Next action: test interaction with confidence-gated reads (`AIDEEN_ASSOC_CONF_READ=1`) because write admission now has valid bounded semantics and read amplitude should depend on address confidence.
+
+Validation result - salience replacement + confidence read
+----------------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_nodebug_4chunks.log`.
+Result: finite run, loss=7.4752, tps=137.7, budget preserved at 4/16 for slots 4-7. This improves over salience-only loss=7.5116 and over recent confidence-only/budgeted runs in this corridor.
+Interpretation: cleaner bounded write admission and confidence-scaled reads are compatible; read confidence is useful once durable banks are not first-arrival saturated.
+Next action: retest small direct Assoc->LM logit bridge (`AIDEEN_ASSOC_LOGIT_LAMBDA=0.25`) under the improved memory policy. Prior positive lambda was rejected under poorer memory selectivity; this run checks whether the causal condition changed.
+
+Validation result - Assoc->LM logit bridge retest
+-------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_lambda025_nodebug_4chunks.log`.
+Result: finite run, budget preserved at 4/16, but loss worsened to 7.5375 versus 7.4752 with lambda=0.
+Decision: keep direct Assoc->LM logit bridge rejected as default even after improved memory admission. The failure is architectural/dynamic: direct logits inject memory content before the memory has proven predictive alignment with next-token targets. The useful path remains read into hidden/context, not direct vocabulary bias.
+Next action: extend the current best experimental corridor (`salience_replace + conf_read + lambda=0`) to 8 chunks to check drift/stability before considering a code default promotion.
+
+Validation result - 8 chunk drift check
+---------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_nodebug_8chunks.log`.
+Result: finite run, loss=7.4855 over 16384 tokens, tps=136.1, budget preserved at 4/16 for slots 4-7. No NaNs reported.
+Interpretation: `salience_replace + conf_read + lambda=0` survives a longer corridor without occupancy drift. It remains experimental until at least one alternate seed/profile confirms no narrow-seed artifact.
+Next action: run same 4-chunk corridor with alternate seed 123.
+
+Validation result - alternate seed 123
+--------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_seed123_nodebug_4chunks.log`.
+Result: finite run, loss=7.4960, tps=152.4, budget preserved at 4/16 for slots 4-7. Spectral norms remained bounded.
+Decision: `AIDEEN_ASSOC_WRITE_BUDGET=4 + AIDEEN_ASSOC_SALIENCE_REPLACE=1 + AIDEEN_ASSOC_CONF_READ=1 + AIDEEN_ASSOC_LOGIT_LAMBDA=0` is the current best validated experimental corridor. It should not become unconditional default yet because salience changes `usage` semantics and is valid only with an explicit bounded-bank policy. Next promotion option is a named profile or config-level policy, not silent default flips.
+Open issue: Assoc backward diagnostics still show very large `wq_step_max` while `wq_update_max=0`; this looks like a diagnostic/disabled-update path inconsistency, not a current forward instability. Needs audit before enabling full Assoc backward updates.
+
+Change gate - Assoc read backward parity with forward hard/conf read
+-------------------------------------------------------------------
+1. Target failure mode: Assoc backward diagnostics report huge `wq_step_max` while address updates are disabled. Investigation shows the backward read path computes gradients through a softmax/read-max probability even when forward uses hard-read plus address-confidence gating.
+2. Structural rationale: the backward equation must differentiate the active forward read path. Forward with `ENABLE_ASSOC_HARD_READ=true` selects one bank and scales value injection by `slot_read_allowed * read_conf`, where `read_conf = clamp(best_address_score / ASSOC_READ_BETA, 0, 1)` when `ENABLE_ASSOC_CONF_READ=1`. Backward currently uses soft probabilities and `read_max_prob`, so it creates gradient for an inactive soft allocation path.
+3. Anti-patch check: this does not clip or suppress the large diagnostic. It restores forward/backward path parity: hard-read backward no longer invents softmax score gradients, and confidence read uses the same address-confidence scalar as forward. Address LR remains explicitly disabled by default.
+4. Validation plan: add `ENABLE_ASSOC_HARD_READ` to fused backward constants; cargo check; run the current best corridor with `AIDEEN_DEBUG_SAMPLE=1`. Success: no NaNs, loss/occupancy comparable, and `wq_step_max` collapses from ~1e9-1e10 to finite/near-zero under hard read unless a real differentiable confidence path is later added.
+Classification target: backward invariant/parity fix, default-safe because it matches existing forward default hard-read semantics.
+
+Validation result - Assoc read backward hard/conf parity, debug run
+------------------------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_bwdhard_debug_4chunks.log`.
+Result: finite run, no NaNs, budget preserved at 4/16. The target diagnostic was fixed: active Assoc slots now report `score_grad_max=0`, `wq_step_max=0`, `wk_step_max=0`, `key_grad_sum=0`, `gprev_sum=0` under hard-read, instead of previous `wq_step_max~1e9-1e10` from an inactive soft read path. Loss in this debug run was 7.5225, worse than the prior no-debug best corridor (7.4752).
+Interpretation: the previous giant address gradient was confirmed as backward/forward mismatch. However, the old mismatched soft backward may have acted as an implicit surrogate. Since hard-read is non-differentiable, keeping a soft surrogate would need to be explicit and separately justified, not accidental.
+Next action: rerun no-debug best corridor after parity fix to assess quality impact without debug-sample overhead/noise.
+
+Validation result - Assoc read backward parity, no-debug run
+------------------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_bwdhard_nodebug_4chunks.log`.
+Result: finite run, loss=7.4726, budget preserved at 4/16 for slots 4-7. This matches/slightly improves the previous best no-debug corridor loss=7.4752 while removing the ghost address gradient observed in the debug run.
+Decision: hard/conf read backward parity is a default-stable invariant fix for the current hard-read forward path. It also clarifies that trainable address learning will require an explicit, bounded surrogate path later; the accidental soft backward path is rejected.
+Next investigation: forward uses `ENABLE_ASSOC_LINEAR_WRITE=true` by default, while fused backward appears to still assume squared write mass in several terms. Audit and fix if confirmed.
+
+Change gate - Assoc write backward parity with linear/overwrite forward
+-----------------------------------------------------------------------
+1. Target failure mode: forward writes Assoc banks with `ENABLE_ASSOC_LINEAR_WRITE=true` by default and clears prior bank content on salience replacement (`overwrite_bank=1`), but fused backward still assumes squared write mass and propagates gradients through prior bank content even on overwrite.
+2. Structural rationale: forward bank update is `bank' = keep * bank_prev + mass * candidate`, where `mass = e` in linear mode or `e^2` in squared mode, and `keep=0` on overwrite. Backward must use the same `mass`, `d mass / d e`, and `keep` to compute gradients for write gates, bank state, and value/key sources.
+3. Anti-patch check: this is equation parity, not clipping. It removes a real forward/backward mismatch at the bank-update invariant. It remains valid across seeds/profiles because it follows the active compile-time write mode.
+4. Validation plan: add `ENABLE_ASSOC_LINEAR_WRITE` to fused backward constants; update mass/derivative/keep equations; cargo check; rerun current best corridor. Success: finite, budget preserved, no return of ghost address gradients, and loss not materially worse than the current best corridor.
+Classification target: default-stable backward invariant fix.
+
+Build failure note - missing `assoc_linear_write` plumbing in gpu_deq
+--------------------------------------------------------------------
+Command: `cargo check --features wgpu -p aideen-training`.
+Error: `cannot find value assoc_linear_write in this scope` after adding the fused backward constant.
+Cause: `deq_bridge.rs` had `AIDEEN_ASSOC_LINEAR_WRITE` plumbing, but `gpu_deq.rs` forward/backward constants did not define the Rust env variable. Fix is to add `let assoc_linear_write = env_bool("AIDEEN_ASSOC_LINEAR_WRITE", true);` near the other Assoc env flags and pass it to both forward and backward constants.
+
+Composite failure handling - write backward parity
+-------------------------------------------------
+Change package pieces:
+- Default stable: hard/conf read backward parity. It fixed the ghost address gradient and no-debug loss stayed at 7.4726.
+- Pending/experimental: linear-write/overwrite backward parity. It is equation-correct but worsened the 4-chunk corridor to loss=7.5047.
+Decision: do not leave the write-parity piece active by default yet. Gate it behind an explicit experimental override so the validated corridor keeps the stable squared-backward surrogate while preserving the parity implementation for later isolated optimizer/dynamics work.
+Next validation: cargo check and rerun best corridor with default gated write-backward behavior restored.
+
+Validation result - write parity gated off
+------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_bwdreadparity_writegated_nodebug_4chunks.log`.
+Result: finite run, loss=7.4803, tps=136.7, budget preserved at 4/16. This recovers the stable corridor after gating the write-parity piece off by default.
+Decision: keep read-backward hard/conf parity active; keep write-backward linear/overwrite parity available only under `AIDEEN_ASSOC_WRITE_BWD_PARITY=1` until optimizer/dynamics can absorb the exact gradient.
+Next hypothesis: hard-read stabilizes literal retrieval but blocks address learning. Test forward soft-read (`AIDEEN_ASSOC_HARD_READ=0`) with salience+conf to see whether a differentiable read path helps or contaminates memory.
+
+Validation result - soft read forward path
+------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_softread_nodebug_4chunks.log`.
+Result: finite run, loss=7.4778, budget preserved at 4/16. Soft read did not contaminate the short corridor and is comparable to hard read after confidence gating.
+Interpretation: confidence-gated salience memory is robust to hard vs soft read in this short profile. This opens a controlled route to test address learning with soft read, rather than relying on accidental hard-read soft backward mismatch.
+Next action: test small address LR (`AIDEEN_ASSOC_ADDR_LR_MULT=0.01`) with soft read.
+
+Validation result - soft read + address LR 0.01
+-----------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_softread_addrlr001_nodebug_4chunks.log`.
+Result: finite run, loss=7.4840, budget preserved at 4/16. No NaNs.
+Decision: small address LR under soft read is stable but not better than the recommended corridor. Keep address LR disabled by default. If revisited, use explicit soft-read profile plus debug gradients, not hard-read accidental surrogate.
+Next action: run 8-chunk validation of the current recommended corridor after read-backward parity and write-parity gating.
+
+Composite failure handling - read backward parity long corridor
+--------------------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_bwdreadparity_writegated_nodebug_8chunks.log`.
+Result: finite, budget preserved, but loss jumped to 14.9200 over 8 chunks. This refutes promotion of hard-read backward parity as default despite the 4-chunk diagnostic improvement.
+Classification:
+- Measurement/diagnostic value: confirmed the old path generated ghost address gradients from a soft surrogate.
+- Default stable: not validated; 8-chunk quality regression is too large.
+- Experimental useful: hard/conf read backward parity remains useful behind a flag for future exact-gradient work.
+Decision: restore the previous soft backward surrogate as default, but make the exact read-parity path explicit behind `AIDEEN_ASSOC_READ_BWD_PARITY=1`. This avoids accidental promotion while preserving the causal finding.
+Next validation: cargo check, then rerun 8-chunk recommended corridor with read/write parity flags off by default.
+
+Revert decision - backward parity pieces removed from default code path
+----------------------------------------------------------------------
+The read/write backward parity flags did not recover the 8-chunk corridor after gating, so the backward shader section was restored to the previous soft-surrogate/squared-write behavior. The causal finding remains documented, but the code path is rejected for now because the long-corridor regression is severe and repeatable (`loss~14.9`).
+Preserved changes: forward salience replacement, confidence-read semantics, LM softmax fix, alpha/logit defaults, diagnostics.
+Next validation: cargo check and rerun the 8-chunk recommended forward corridor to confirm restoration.
+
+Narrow revert - remove explicit forward `ENABLE_ASSOC_LINEAR_WRITE` specialization
+---------------------------------------------------------------------------------
+Observation: after reverting backward parity code, 8-chunk loss still stayed around 14.9. The remaining active code difference in the DEQ forward specialization path was explicit Rust plumbing for `ENABLE_ASSOC_LINEAR_WRITE`, which had previously relied on the WGSL default. Although semantically expected to be identical, it is not needed for the validated corridor.
+Action: remove explicit `ENABLE_ASSOC_LINEAR_WRITE` insertion from `gpu_deq.rs` forward constants and return to WGSL default behavior.
+Next validation: cargo check and 8-chunk rerun.
+
+Validation note - 8 chunk regression persists after backward reverts
+-------------------------------------------------------------------
+Commands: `h8_b16_budget4_assoc_salience_confread_bwdparityreverted_nodebug_8chunks.log`, `...linearconstreverted_nodebug_8chunks.log`.
+Result: both remain around loss=14.9 with budget preserved. Therefore the long-corridor jump is not explained by the reverted backward parity code or explicit `ENABLE_ASSOC_LINEAR_WRITE` forward constant.
+Hypothesis update: this may be a length/update-count threshold rather than a single code diff. Next run uses 6 chunks to find whether the jump occurs between 4 and 8 updates.
+
+Validation result - progress synchronization exposes GPU queue hazard
+--------------------------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_progress6_nodebug.log`.
+Result: same 6-chunk corridor that previously produced loss~14.94 returned to loss=7.4454 when `AIDEEN_PROGRESS_EVERY=1` forced periodic GPU waits/polls. This strongly suggests the long-run failure is not Assoc quality but GPU queue/buffer reuse synchronization.
+Hypothesis: consecutive train chunks reuse mutable GPU buffers (LM params/targets/sample buffers, DEQ scratch/state, or staging/cached loss) faster than Metal has consumed prior submissions. Periodic progress polling serializes the queue and prevents stale/overwritten inputs. The fix should be a controlled synchronization/ring-buffer policy, not architecture tuning.
+Next action: inspect existing sync knobs and implement/enable a minimal default sync cadence for the unstable multi-chunk path.
+
+Change gate - default GPU chunk synchronization for file training
+-----------------------------------------------------------------
+1. Target failure mode: runs longer than 4 chunks can report/collapse to loss~14.9, while the same 6-chunk corridor returns loss=7.4454 when progress logging forces per-chunk GPU waits.
+2. Structural rationale: the training loop reuses GPU buffers across chunks. Without a synchronization boundary, later CPU writes/submissions can race ahead of previous GPU consumption or cached loss staging in the long serialized path. A per-chunk `Maintain::Wait` restores the invariant that each chunk's mutable GPU buffers are consumed before reuse.
+3. Anti-patch check: this is not loss clipping or tuning. It fixes execution ordering at the buffer-lifetime level. It remains valid across model profiles because it protects shared GPU buffer reuse, independent of Assoc/FPM equations.
+4. Validation plan: default `AIDEEN_TPS_SYNC_EVERY` to 1 and use `Wait`; cargo check; rerun 6/8 chunk corridor without progress logging. Success: loss returns to ~7.4-7.5 and budget remains 4/16. TPS impact is measured explicitly.
+Classification target: default-stable execution invariant fix.
+
+Validation result - default GPU chunk sync
+------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_defaultsync_nodebug_8chunks.log`.
+Result: 8 chunks returned to stable range, loss=7.3785 over 16384 tokens, tps=138.3. This confirms the prior loss~14.9 was an execution-order/synchronization artifact, not Assoc memory quality.
+Decision: default per-chunk GPU `Maintain::Wait` is validated as an execution invariant fix. The natural longer-term optimization is ring-buffering/reusing fewer mutable GPU buffers safely, but correctness comes first.
+Next validation: rerun with `AIDEEN_ASSOC_AUDIT=1` to record final occupancy under the same synchronized corridor.
+
+Validation result - default sync with Assoc audit
+------------------------------------------------
+Command log: `logs/training_real/h8_b16_budget4_assoc_salience_confread_defaultsync_audit_8chunks.log`.
+Result: finite run, loss=7.4389 over 16384 tokens, tps=155.0, budget preserved at 4/16 for slots 4-7. No NaNs reported.
+Decision: current recommended corridor is stable for 8 chunks with synchronized GPU execution: `AIDEEN_ASSOC_WRITE_BUDGET=4`, `AIDEEN_ASSOC_SALIENCE_REPLACE=1`, `AIDEEN_ASSOC_CONF_READ=1`, direct Assoc->LM logit bridge disabled, address LR disabled.
+Open next task: replace per-chunk GPU wait with a safer high-TPS mechanism (ring buffers or explicit command dependencies) after model stabilization; do not remove sync until an 8+ chunk validation stays in the 7.x range.

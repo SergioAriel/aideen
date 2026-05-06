@@ -68,9 +68,6 @@ var<workgroup> s_scratch:    array<f32, WG_SIZE>;
 var<workgroup> s_rms:        f32;
 var<workgroup> s_target_exp: f32;
 var<workgroup> s_h_tile:     array<f32, WG_SIZE>;
-// 2048 = 4 * ctx_len (covers batch_size ≤ 4 with ctx_len=512 without OOB).
-var<workgroup> s_indices_cache: array<u32, 2048>;
-var<workgroup> s_logits: array<f32, 2048>;
 
 // =============================================================================
 // Pipeline 1: lm_probs_main
@@ -120,16 +117,11 @@ fn lm_probs_main(
     workgroupBarrier();
 
     // --- 3. Sampled logits ---
-    // Cache sampled_indices into workgroup memory (avoid repeated storage reads).
-    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        s_indices_cache[k] = sampled_indices[k];
-    }
-    workgroupBarrier();
     if (tid == 0u) { s_target_exp = 0.0; }
-    // Initialize logits with bias.
+    // `probs` is the single source of truth: logits first, probabilities after softmax.
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = s_indices_cache[k];
-        s_logits[k] = b_lm[v];
+        let v = sampled_indices[k];
+        probs[probs_idx(t, k)] = b_lm[v];
     }
     workgroupBarrier();
     // GEMM-style blocking: load H once per tile, reuse for all sampled rows.
@@ -143,7 +135,7 @@ fn lm_probs_main(
         workgroupBarrier();
         let tile_limit = min(WG_SIZE, d_model - tile);
         for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-            let v        = s_indices_cache[k];
+            let v        = sampled_indices[k];
             let row_base = v * d_model + tile;
             var acc = 0.0;
             for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
@@ -155,22 +147,25 @@ fn lm_probs_main(
                     acc += assoc_lambda * emb_ref[assoc_row_base + tj] * dl_dh_temp[base_h + tile + tj];
                 }
             }
-            s_logits[k] = s_logits[k] + acc;
+            let pidx = probs_idx(t, k);
+            probs[pidx] = probs[pidx] + acc;
         }
         workgroupBarrier();
     }
-    var local_max = -3.4e38;
+    // --- 4. Softmax ---
+    // Keep `probs` as the only logits/probabilities storage, but parallelize the
+    // row max and denominator reductions. This preserves the serial invariant:
+    // every row must normalize over the full sampled set exactly once.
+    var local_mx = -3.4e38;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let logit = s_logits[k];
-        probs[probs_idx(t, k)] = logit;
-        local_max = max(local_max, logit);
+        local_mx = max(local_mx, probs[probs_idx(t, k)]);
     }
-
-    // --- 4. Softmax (numerically stable) ---
-    s_scratch[tid] = local_max;
+    s_scratch[tid] = local_mx;
     workgroupBarrier();
     for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { s_scratch[tid] = max(s_scratch[tid], s_scratch[tid + stride]); }
+        if (tid < stride) {
+            s_scratch[tid] = max(s_scratch[tid], s_scratch[tid + stride]);
+        }
         workgroupBarrier();
     }
     let mx = s_scratch[0];
@@ -178,30 +173,28 @@ fn lm_probs_main(
     var local_sum = 0.0;
     var local_target_exp = 0.0;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = s_indices_cache[k];
+        let v = sampled_indices[k];
         let e = exp(probs[probs_idx(t, k)] - mx);
         probs[probs_idx(t, k)] = e;
-        if (v == target_v) { local_target_exp = e; }
-        local_sum += e;
+        if (v == target_v) { local_target_exp = local_target_exp + e; }
+        local_sum = local_sum + e;
     }
     s_scratch[tid] = local_sum;
+    s_h_tile[tid] = local_target_exp;
     workgroupBarrier();
     for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { s_scratch[tid] += s_scratch[tid + stride]; }
-        workgroupBarrier();
-    }
-    let sm = max(s_scratch[0], 1e-10);
-
-    s_scratch[tid] = local_target_exp;
-    workgroupBarrier();
-    for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { s_scratch[tid] += s_scratch[tid + stride]; }
+        if (tid < stride) {
+            s_scratch[tid] = s_scratch[tid] + s_scratch[tid + stride];
+            s_h_tile[tid] = s_h_tile[tid] + s_h_tile[tid + stride];
+        }
         workgroupBarrier();
     }
     if (tid == 0u) {
-        s_target_exp = s_scratch[0];
+        s_scratch[0] = max(s_scratch[0], 1e-10);
+        s_target_exp = s_h_tile[0];
     }
     workgroupBarrier();
+    let sm = s_scratch[0];
 
     // Normalize to probabilities
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
@@ -323,8 +316,6 @@ fn lm_apply_adamw_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Note:     Rust copies dl_dh[0..d_model] to staging, so writes must be
 //           per-token into dl_dh_temp, then reduced to dl_dh.
 // =============================================================================
-var<workgroup> s_probs_cache: array<f32, 512>;
-
 @compute @workgroup_size(256, 1, 1)
 fn lm_backprop_h_t_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
@@ -347,26 +338,14 @@ fn lm_backprop_h_t_main(
     }
     let seq_scale = 1.0 / max(1.0, f32(params.active_targets));
 
-    // Cache probs for this token into workgroup memory
-    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        s_probs_cache[k] = probs[probs_idx(t, k)];
-    }
-    workgroupBarrier();
-
-    // Cache sampled indices (avoid repeated storage reads in the inner loop).
-    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        s_indices_cache[k] = sampled_indices[k];
-    }
-    workgroupBarrier();
-
     // --- dL/dy_d = sum_k (p_k - 1_{v==target}) * W_k[d] ---
     var local_rms_dot = 0.0;
     for (var d = tid; d < d_model; d += WG_SIZE) {
         var dldy = 0.0;
         var dlassoc = 0.0;
         for (var k = 0u; k < params.num_samples; k++) {
-            let v       = s_indices_cache[k];
-            let p       = s_probs_cache[k];
+            let v       = sampled_indices[k];
+            let p       = probs[probs_idx(t, k)];
             let one_hot = select(0.0, 1.0, v == target_v);
             let coeff = p - one_hot;
             dldy += coeff * w_lm[v * d_model + d];

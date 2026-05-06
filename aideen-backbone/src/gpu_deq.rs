@@ -1414,6 +1414,7 @@ impl GpuDeqBackend {
         let assoc_event_gate = env_bool("AIDEEN_ASSOC_EVENT_GATE", false);
         let assoc_protect_occupied = env_bool("AIDEEN_ASSOC_PROTECT_OCCUPIED", true);
         let assoc_suppress_value_source = env_bool("AIDEEN_ASSOC_SUPPRESS_VALUE_SOURCE", true);
+        let assoc_salience_replace = env_bool("AIDEEN_ASSOC_SALIENCE_REPLACE", false);
         let assoc_oracle_write_positions = env_bool("AIDEEN_ASSOC_ORACLE_WRITE_POS", false)
             || env_bool("AIDEEN_ASSOC_ORACLE_WRITE_POSITIONS", false);
         let assoc_oracle_force_write = env_bool("AIDEEN_ASSOC_ORACLE_FORCE_WRITE", false);
@@ -1433,11 +1434,17 @@ impl GpuDeqBackend {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        let assoc_write_budget = std::env::var("AIDEEN_ASSOC_WRITE_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 16.0);
         let mut shader_constants = std::collections::HashMap::new();
         shader_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
         shader_constants.insert("ASSOC_RANK".to_string(), 32.0);
         shader_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         shader_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        shader_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
         shader_constants.insert(
             "SEGMENT_MEMORY_BETA".to_string(),
             segment_memory_beta as f64,
@@ -1497,6 +1504,10 @@ impl GpuDeqBackend {
         shader_constants.insert(
             "ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE".to_string(),
             if assoc_suppress_value_source { 1.0 } else { 0.0 },
+        );
+        shader_constants.insert(
+            "ENABLE_ASSOC_SALIENCE_REPLACE".to_string(),
+            if assoc_salience_replace { 1.0 } else { 0.0 },
         );
         shader_constants.insert(
             "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
@@ -1679,6 +1690,7 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
         fpm_retain_bwd_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         fpm_retain_bwd_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        fpm_retain_bwd_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
         fpm_retain_bwd_constants.insert(
             "FPM_DIRECT_WRITE_SCALE".to_string(),
             fpm_direct_write_scale,
@@ -5716,6 +5728,16 @@ impl GpuDeqBackend {
             &self.bridge.hpooled_buf,
             n_floats,
             "H_pooled Sequence Readback Staging",
+        )
+    }
+
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read direct associative LM signal sequence.
+    pub fn read_assoc_pooled_seq(&self, seq_len: u32) -> Vec<f32> {
+        let n_floats = seq_len as usize * self.config.d_r;
+        self.read_storage_buffer(
+            &self.bridge.assoc_pooled_buf,
+            n_floats,
+            "Assoc_pooled Sequence Readback Staging",
         )
     }
 

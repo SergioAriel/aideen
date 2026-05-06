@@ -277,6 +277,13 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(true);
+        let assoc_salience_replace = std::env::var("AIDEEN_ASSOC_SALIENCE_REPLACE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
         let assoc_post_hstar = std::env::var("AIDEEN_ASSOC_POST_HSTAR")
             .ok()
             .map(|v| {
@@ -670,8 +677,14 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        let assoc_write_budget = std::env::var("AIDEEN_ASSOC_WRITE_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 16.0);
         slot_coord_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         slot_coord_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        slot_coord_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
         slot_coord_constants.insert(
             "ENABLE_ASSOC_TRANSITION_GATE".to_string(),
             if assoc_transition_gate { 1.0 } else { 0.0 },
@@ -727,6 +740,10 @@ impl RustDeqBridge {
         slot_coord_constants.insert(
             "ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE".to_string(),
             if assoc_suppress_value_source { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert(
+            "ENABLE_ASSOC_SALIENCE_REPLACE".to_string(),
+            if assoc_salience_replace { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_POST_HSTAR".to_string(),

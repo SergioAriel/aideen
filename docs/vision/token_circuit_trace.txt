@@ -392,3 +392,69 @@ Capacity edge observation
 - h8/b16 with adaptive two-lane Assoc replication solved p32 (`eval_loss=0.0941`, random=4.4067).
 - This means the current token path can preserve many literal bindings when lane/bank geometry is sufficient.
 - The unresolved problem is now narrower: behavior when requested bindings exceed effective lane/bank capacity, or when salience should decide which bindings persist across longer documents/segments.
+
+LM sampled-softmax probability invariant
+----------------------------------------
+Files:
+- aideen-backbone/src/shaders/lm_train.wgsl
+- aideen-backbone/src/gpu_lm_head.rs
+- aideen-training-lab/src/trainer.rs
+
+Role:
+- Converts pooled hidden state (`hpooled` plus optional Assoc contribution) into sampled logits/probabilities, loss, and `dl_dh` for the DEQ/FPM/Assoc backward path.
+
+Current circuit invariant:
+- For each token row, sampled probabilities must satisfy `0 <= probs[t,k] <= 1` and `sum_k probs[t,k] ~= 1` before `lm_backprop_h_t_main` computes `dl_dh`.
+- `probs` storage is the single source of truth for logits/probabilities in the current correctness corridor.
+- The serial tid0 max/sum normalization is intentionally performance-sensitive but equation-correct; any future parallel version must reproduce the same row-sum/probability invariant before promotion.
+
+Failure mode found:
+- The previous workgroup reduction/cache path produced invalid probabilities (`row sum ~1e13`, many entries >1), while LM weights and pooled inputs were normal. This created huge `dl_dh`, which then poisoned Picard adjoints and Assoc/FPM backward.
+
+Validated observation:
+- Serial normalization restored `row0_sum ~= 1`, removed probabilities >1, and reduced `dl_dh`, `assoc_rhs`, and `adj_v_out` to small finite scales. Four-chunk validation kept active Assoc `val_rms` around `1e-3` without NaNs.
+
+Open trace tasks:
+- Re-parallelize only after adding an invariant check/probe that proves probability rows remain normalized for `num_samples=2048`.
+- Trace why Assoc budget telemetry for s6/s7 can disagree with final `[ASSOC-STATE]` occupancy.
+
+Assoc Read Confidence Path Update
+---------------------------------
+Files:
+- aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+- aideen-training-lab/src/trainer.rs
+- aideen-backbone/src/fixed_point_memory_reasoning.rs
+- aideen-backbone/src/gpu_lm_head.rs
+
+Current invariant:
+- Hard-read bank selection may choose one bank, but read confidence must come from query/key address match, not from the post-hard-read probability. Under `AIDEEN_ASSOC_CONF_READ=1`, the read multiplier is now based on pre-hard-read best address cosine clamped to `[0,1]`.
+- `alpha_assoc` is stored in logit space because GPU forward/backward apply `sigmoid(alpha_assoc)`. Default initialization stores `logit(0.3)`, giving effective read mix 0.3.
+- Direct Assoc-to-LM logit coupling is disabled by default (`AIDEEN_ASSOC_LOGIT_LAMBDA=0`) until promotion/read utility is validated. The env override remains for experiments.
+
+Failure modes found:
+- Previous `alpha_assoc=0.3` produced effective read mix `sigmoid(0.3)=0.574`, stronger than the documented 0.3.
+- Previous `ENABLE_ASSOC_CONF_READ` was inert under hard-read because `read_max_prob=1` for the selected bank even when the address match was weak.
+- Positive Assoc LM-logit coupling degraded the short real-text corridor while memory promotion remains immature.
+
+Open trace tasks:
+- Add durable promotion/salience policy so hard/confident reads select predictive bindings, not merely first-admitted literal transitions.
+- Retest positive Assoc LM-logit coupling only after selected bindings become useful under confidence-gated reads.
+
+Assoc write admission - experimental salience replacement
+---------------------------------------------------------
+Path: `deq_slot_attn_unified_clean.wgsl` write phase, after slot/bank selection and before `AssocHist` metadata is emitted.
+Source values: `best_cos_safe` measures key similarity to existing banks; `best_prev_value_cos` measures whether the candidate value duplicates previous hidden source; `occupied_count` and `min_usage/min_usage_bank` summarize current bank occupancy metadata.
+Invariant: when the experimental salience path is disabled, `usage` remains committed write mass and no replacement occurs. When enabled, metadata is interpreted as salience and replacement uses `overwrite_bank=1`; forward key/value update clears prior bank contribution, matching backward's overwrite handling.
+Failure mode addressed: bounded banks preserved first-arrival bindings even when later bindings had stronger evidence, so long-context memory could become full but not useful.
+
+Assoc read backward parity
+--------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, read-backward section after recovering per-bank address scores.
+Forward invariant: when `ENABLE_ASSOC_HARD_READ=true`, bank weights are one-hot; when `ENABLE_ASSOC_CONF_READ=1`, value injection is scaled by `slot_read_allowed * clamp(best_address_score / ASSOC_READ_BETA, 0, 1)`.
+Backward invariant: the fused backward path now receives `ENABLE_ASSOC_HARD_READ` and mirrors the hard one-hot selection. Confidence uses the same address-score scalar. This avoids training an inactive softmax read allocator when forward is hard-read.
+
+Assoc write backward parity
+---------------------------
+Path: `fused_fpm_retain_bwd.wgsl`, durable associative memory backward.
+Forward invariant: `effective_write_mass = effective_bind_gate` when `ENABLE_ASSOC_LINEAR_WRITE=true`, otherwise `effective_bind_gate^2`; writes below `ASSOC_WRITE_MIN_MASS` become zero; replacement overwrite sets prior keep gate to zero.
+Backward invariant: fused backward now uses the same write mass, the matching derivative `d mass / d effective_bind_gate`, and zero keep gradient when `overwrite_bank=1`.
