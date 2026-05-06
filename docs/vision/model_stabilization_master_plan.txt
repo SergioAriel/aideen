@@ -2014,3 +2014,18 @@ Log: `logs/assoc_capacity/capacity_p32_k32v32_lambda2_true_b32_budget32_g0-128-2
 Result: random_baseline=4.4067, train_avg=0.9515, gap0=1.3668, gap128=0.6550, gap256=0.7652; all gaps MEMORY WORKS; no NaN reported.
 Interpretation: the current real-capacity corridor supports 32 real pairs with 32 physical banks and budget32. The earlier apparent low ceiling was caused by hidden bank clamps, budget semantics, too-small eval samples, and a default key vocabulary cap, not by the serialization path alone.
 Next: test above budget (`p48`/`p64` with larger key vocab) or implement scalable storage-backed Assoc backward before promoting this as a complete training design.
+
+Validation - true b32 p48 budget32 train160 eval16
+--------------------------------------------------
+Command: true-b32 budget32 corridor with `AR_N_KEYS=64`, `AR_N_VALS=64`, `AR_PAIRS_PER_SEQ=48`, `AR_N_TRAIN=160`, `AR_N_EVAL=16`.
+Log: `logs/assoc_capacity/capacity_p48_k64v64_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
+Result: random_baseline=4.9836, train_avg=1.6898, gap0=0.9639, gap128=1.3035, gap256=1.2846; all gaps MEMORY WORKS; no NaN reported.
+Interpretation: the current corridor exceeds the naive 32-pair expectation. Effective capacity is not one physical bank per pair; hash lanes, replica, bounded replacement/reuse, and LM bridge allow useful recall beyond the nominal per-slot bank budget. This supports continuing overflow testing before changing architecture.
+Training-real implication: AR recall validates that exact/local document bindings can survive chunk gaps and influence logits. It does not yet prove full real-document training, because large-bank Assoc backward remains guarded when its workgroup cache would overflow; in real training, weights can still learn through LM/embedding/FPM paths, but scalable Assoc write/read parameter learning needs a storage-backed or tiled backward.
+
+Validation - true b32 p64 budget32 train160 eval16
+--------------------------------------------------
+Command: true-b32 budget32 corridor with `AR_N_KEYS=64`, `AR_N_VALS=64`, `AR_PAIRS_PER_SEQ=64`, `AR_N_TRAIN=160`, `AR_N_EVAL=16`.
+Log: `logs/assoc_capacity/capacity_p64_k64v64_lambda2_true_b32_budget32_g0-128-256_train160_eval16.log`.
+Result: random_baseline=4.9836, train_avg=1.9051, gap0=1.0957, gap128=1.9347, gap256=1.9730; all gaps MEMORY WORKS; no NaN reported.
+Interpretation: AR capacity is no longer the immediate blocker. The real-capacity corridor can solve 64 dense bindings with 32 banks/budget32 under eval16, though margins are weaker on long gaps. Next stabilization focus should shift from synthetic capacity to real-training validity: scalable Assoc backward, gated Assoc-to-LM bridge for real text, and document-level tests.
