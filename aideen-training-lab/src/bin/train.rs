@@ -90,6 +90,7 @@ fn main() {
     // ── Parse args ──────────────────────────────────────────────────────────
     let args: Vec<String> = env::args().collect();
     let mut large_file: Option<String> = None;
+    let mut val_file: Option<String> = None;
     let mut resume_path: Option<String> = None;
     let mut epochs: usize = 1;
     let mut log_every: usize = 3;
@@ -104,6 +105,10 @@ fn main() {
             "--file" | "--train" => {
                 i += 1;
                 large_file = args.get(i).cloned();
+            }
+            "--val-file" | "--validation" => {
+                i += 1;
+                val_file = args.get(i).cloned();
             }
             "--resume" => {
                 i += 1;
@@ -142,6 +147,7 @@ fn main() {
     };
     run_large_file(
         txt_path,
+        val_file,
         resume_path,
         epochs,
         log_every,
@@ -156,6 +162,7 @@ fn main() {
 /// Tokeniza el texto, lo escribe a un .bin temporal y llama train_on_file.
 fn run_large_file(
     txt_path: &str,
+    val_file: Option<String>,
     resume_path: Option<String>,
     epochs: usize,
     log_every: usize,
@@ -215,6 +222,24 @@ fn run_large_file(
     tok.config.train_deq = true;
 
     let vocab_size = tok.vocab_size();
+    let heldout_tokens = val_file.as_ref().map(|path| {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("No se puede leer --val-file {path}: {e}"));
+        let (mut tokens, _) = encode_training_corpus(&tok, &text);
+        if let Some(max_tokens) = env::var("AIDEEN_HELDOUT_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v >= 2)
+        {
+            tokens.truncate(max_tokens);
+        }
+        println!(
+            "  Held-out: {} tokens desde {}",
+            tokens.len(),
+            path
+        );
+        tokens
+    });
 
     // ── Tokenizar y escribir .bin (o reutilizar cache) ─────────────────────
     let bin_path = format!("{txt_path}.tokens.bin");
@@ -347,6 +372,17 @@ fn run_large_file(
             &checkpoint_base,
         )
         .expect("Error durante train_on_file");
+
+    if let Some(tokens) = heldout_tokens.as_ref() {
+        let val_t0 = std::time::Instant::now();
+        let val_loss = trainer.eval_tokens_gpu(tokens);
+        println!(
+            "  [HELDOUT] val_loss={:.4} tokens={} time={:.1}s",
+            val_loss,
+            tokens.len(),
+            val_t0.elapsed().as_secs_f32()
+        );
+    }
 
     println!("\n  Tiempo total: {:.1}s", t0.elapsed().as_secs_f32());
     println!("  Spectral norms: {:?}", trainer.reasoning.spectral_norms());

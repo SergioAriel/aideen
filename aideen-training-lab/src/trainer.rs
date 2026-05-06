@@ -3970,6 +3970,52 @@ impl Trainer {
         }
     }
 
+    /// GPU forward-only validation over token windows, without weight updates.
+    ///
+    /// This uses the same fused training circuit as real training, but with
+    /// `eval_mode=true`, so LM lr is zero and the path returns before adjoint
+    /// and optimizer updates.
+    pub fn eval_tokens_gpu(&mut self, tokens: &[u32]) -> f32 {
+        if tokens.len() < 2 {
+            return f32::NAN;
+        }
+
+        let prev_eval_mode = self.eval_mode;
+        self.eval_mode = true;
+        self.reset_state();
+
+        let ctx_len = self.config.ctx_len.max(1);
+        let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
+        let max_inputs = (batch_size * ctx_len).max(1);
+        let epsilon = self.config.deq_epsilon;
+        let mut offset = 0usize;
+        let mut weighted_loss = 0.0f64;
+        let mut weighted_count = 0usize;
+
+        while offset + 1 < tokens.len() {
+            let end = (offset + max_inputs + 1).min(tokens.len());
+            let inputs = &tokens[offset..end - 1];
+            let targets = &tokens[offset + 1..end];
+            if !inputs.is_empty() && inputs.len() == targets.len() {
+                let loss = self.train_sequence(inputs, targets, false, epsilon);
+                if loss.is_finite() && loss > 0.0 {
+                    weighted_loss += loss as f64 * targets.len() as f64;
+                    weighted_count += targets.len();
+                }
+            }
+            offset += max_inputs;
+        }
+
+        self.eval_mode = prev_eval_mode;
+        self.reset_state();
+
+        if weighted_count == 0 {
+            f32::NAN
+        } else {
+            (weighted_loss / weighted_count as f64) as f32
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Gradient clipping global (L2 norm)
     // ─────────────────────────────────────────────────────────────────────────

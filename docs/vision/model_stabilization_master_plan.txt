@@ -2172,3 +2172,19 @@ Eval windows:
 - chunk 30: val_loss=6.5065
 Interpretation: in-stream eval decreases through the run, so the current baseline is learning under forward-only eval windows, not merely reporting a stale train loss. Limitation: this is not a held-out document split; it validates training dynamics and evaluation path, not final generalization.
 Next action: add or use a true held-out evaluation profile before claiming serious-training readiness beyond numerical stability.
+
+Change gate - held-out validation file for serious training
+----------------------------------------------------------
+1. Target failure mode: current training evidence only has train loss and in-stream eval windows. This cannot distinguish genuine learning/generalization from stream-local loss decrease, so serious-training readiness is under-measured.
+2. Structural rationale: add a validation-only execution path that reuses the existing GPU `train_sequence` forward path with `eval_mode=true`, which sets LM lr to zero and returns before DEQ/embedding/LM updates. This measures the same model circuit without changing weights.
+3. Anti-patch check: this is measurement, not dynamics. It does not tune gates, scales, memory, optimizer, or training equations. It restores the experimental invariant that every serious baseline must have a separated evaluation metric before architecture promotion.
+4. Validation plan: add `--val-file <path>` CLI support plus a bounded `Trainer::eval_tokens_gpu` helper; cargo check; run a short train with `--val-file aideen-bench/tinyshakespeare.txt` as a smoke and require finite `[HELDOUT] val_loss`, no NaN/INVALID, and no behavior change when `--val-file` is omitted.
+
+Validation - held-out validation file smoke
+------------------------------------------
+Change: `train` now accepts `--val-file <path>` and evaluates it after training via `Trainer::eval_tokens_gpu`, a forward-only GPU path with `eval_mode=true`. `AIDEEN_HELDOUT_MAX_TOKENS` can bound smoke-test cost.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/heldout_val_file_smoke_chunks2.log`: train tokens=2048, heldout tokens=1024, `[HELDOUT] val_loss=6.8957`, no NaN/INVALID.
+Classification: measurement/default stable. No training behavior changes unless `--val-file` is explicitly provided.
+Omitted-path smoke: `logs/real_text/no_val_file_regression_smoke_chunks1.log` ran without `--val-file`, printed no `[HELDOUT]`, and remained finite (`loss=6.9635`, tokens=1024). This confirms default train behavior is unchanged.
