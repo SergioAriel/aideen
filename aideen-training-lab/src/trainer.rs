@@ -2572,6 +2572,14 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
+                let emb_grad_uses_deq_adjoint = Self::env_flag("AIDEEN_EMB_USE_DEQ_ADJOINT");
+                if emb_grad_uses_deq_adjoint {
+                    let _ = gpu.reduce_clean_adjoint_to_source_grad_no_readback(
+                        per_seq_len,
+                        self.reasoning.damping,
+                        batch_size,
+                    );
+                }
                 // TEMPORARY DIAGNOSTIC: confirm whether clean Picard creates non-finite adjoints.
                 if Self::env_flag("AIDEEN_BACKWARD_INPUT_PROBE")
                     && self.cfg_debug_sample_every > 0
@@ -2675,12 +2683,17 @@ impl Trainer {
             if !self.frozen_emb {
                 let emb_lr = base_lr * self.training_config.emb_lr_mult;
                 let embed_t0 = std::time::Instant::now();
+                let emb_grad_src = if Self::env_flag("AIDEEN_EMB_USE_DEQ_ADJOINT") {
+                    gpu.source_grad_buf()
+                } else {
+                    &gpu_lm.dl_dh_buf
+                };
                 let _ = gpu_emb.apply_embedding_update_from_buffer(
                     &gpu.device,
                     &gpu.queue,
                     context,
                     self.config.ctx_len,
-                    &gpu_lm.dl_dh_buf,
+                    emb_grad_src,
                     emb_lr,
                     self.optimizer.beta1,
                     self.optimizer.beta2,

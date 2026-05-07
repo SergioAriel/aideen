@@ -559,3 +559,10 @@ Buffer: `AssocValueGrad`, layout `(slot * ASSOC_BANKS + bank) * d_model + dim`, 
 Forward timeline invariant: `read_t` observes the pre-write bank state; `write_t` produces the state consumed by future reads. Therefore, the write backward must consume only adjoints already accumulated from future tokens.
 Backward timeline now used: at reverse token t, selected value write consumes `AssocValueGrad[selected_bank]` as `dL/dM_post_t`, propagates it through `value_keep_gate` into `dL/dM_pre_t`, then the current read equation adds `alpha_assoc * assoc_read_conf * p_bank * v_state * assoc_scale` into every bank's pre-write value adjoint. This avoids the rejected same-token shortcut where `read_t` directly trained `write_t`.
 Default status: path remains disabled unless `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`; promoted baseline behavior is unchanged.
+
+Experimental embedding source adjoint from clean Picard
+-------------------------------------------------------
+Path: `staged_adjoint_picard_clean.wgsl::picard_source_grad_reduce_main`, `GpuDeqBackend::reduce_clean_adjoint_to_source_grad_no_readback`, trainer embedding update.
+Default status: disabled unless `AIDEEN_EMB_USE_DEQ_ADJOINT=1`.
+Circuit correction: LM head writes token-major `dl_dh`; clean Picard expands/solves it into slot-major `v_state`. The new reducer mirrors the clean Picard RMSNorm derivative for the direct slot-branch/source term and reduces slot-major adjoints back into token-major `dL/dS_in`, which is the layout expected by `embedding_train.wgsl`.
+Invariant: embeddings must not consume raw slot-summed `v_state`; source gradients must pass through the same normalization Jacobian used by the clean Picard equation.

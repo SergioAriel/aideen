@@ -2359,3 +2359,52 @@ Interpretation:
 - Quality is neutral/slightly mixed versus the no-value-adjoint 200-chunk seed42 baseline (`5.7281` train, `5.9472` held-out): train improves, held-out is effectively equal (`5.9472 -> 5.9449`).
 Classification: experimental useful / default-candidate, not promoted default until repeated on seed7 and/or longer serious-prep runs. The code remains opt-in behind `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`.
 Next action: repeat 200 chunks with seed7 before considering promotion; if stable, evaluate whether value-source parameter learning or event-gate scaling is the next missing Assoc backward piece.
+
+Validation - temporal value adjoint 200 chunks, seed7
+-----------------------------------------------------
+Corridor: same as seed42 temporal value-adjoint validation, but `AIDEEN_TRAIN_SEED=7`, `AIDEEN_LM_SAMPLE_SEED=7`, `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`.
+Log: `logs/real_text/pretrain_value_state_adj_seed7_chunks200.log`.
+Result: finite; no NaN/INVALID; train loss=5.7083; held-out val_loss=5.9478; tps_epoch=134.5; train tokens=204800; held-out tokens=8192.
+Interpretation: the temporal value-adjoint fix survives the two-seed 200-chunk corridor. Compared with the no-value-adjoint 200-chunk baseline, seed42 is slightly better held-out (`5.9472 -> 5.9449`) and seed7 is slightly worse (`5.9443 -> 5.9478`), so the path is structurally valid and stable but not a proven quality default. Keep opt-in until longer/more representative training proves net utility.
+Classification: experimental useful / default-candidate, not default-promoted.
+
+Inspection - W_v_assoc / value-source role after temporal value adjoint
+-----------------------------------------------------------------------
+Files inspected:
+- `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`
+- `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`
+- `aideen-backbone/src/gpu_deq.rs`
+Finding:
+- In the current promoted corridor, stored `bank_value` is normalized `S_in[t]` literal source, not `W_v_assoc(S_in[t])`.
+- `W_v_assoc` is reserved for `ENABLE_ASSOC_TRANSITION_GATE`: it builds a rank-space auxiliary vector used to modulate `transition_gate`, not the value written into the bank.
+- Therefore the temporal value adjoint currently trains write/event dynamics, not a value projector. This is consistent with the explicit-memory philosophy, but means value representation learning through Assoc is not yet closed to upstream source/embedding/DEQ state.
+Decision:
+- Do not enable/promote `AIDEEN_ASSOC_TRANSITION_GATE` as the next step without isolated validation; it changes forward allocation/write mass and is not required for the stable literal-value Assoc path.
+Next action:
+- The next structural gap is source-adjoint ownership for literal values: decide whether value-write gradients should flow back into `S_in`/embedding/DEQ state, or remain stop-grad so Assoc stays an explicit memory over the current representation.
+
+Change gate - experimental embedding source adjoint from clean Picard
+---------------------------------------------------------------------
+1. Target failure mode: embedding updates currently consume `gpu_lm.dl_dh_buf`, the LM-head gradient at pooled output, while the DEQ Picard adjoint computes a slot-major `v_state` after the reasoning core. This can train embeddings against a gradient that bypasses the DEQ/Assoc/FPM circuit.
+2. Structural rationale: compute `dL/dS_in[token,dim]` from the final clean Picard slot adjoint by mirroring the same RMSNorm Jacobian used in `picard_clean_step_main` for the direct slot-branch/source term, then reduce across slots into the token-major buffer consumed by `embedding_train.wgsl`.
+3. Anti-patch check: do not feed raw summed `v_state` to embeddings. The reducer must apply the clean Picard normalization derivative and slot pooling/source path, restoring the missing gradient ownership at the source-input boundary rather than tuning embedding LR or masking the symptom.
+4. Validation plan: keep behind `AIDEEN_EMB_USE_DEQ_ADJOINT=1`; `cargo check`; run 2-chunk probe to verify finite source gradient and no NaN/INVALID; then 20-chunk held-out smoke before any promotion.
+
+Implementation - experimental embedding source adjoint from clean Picard
+------------------------------------------------------------------------
+Change:
+- Added `picard_source_grad_reduce_main` to `staged_adjoint_picard_clean.wgsl`.
+- Added `GpuDeqBackend::reduce_clean_adjoint_to_source_grad_no_readback`, which writes token-major `dL/dS_in` into the existing adjoint token buffer.
+- Trainer now uses this source gradient for embedding updates only when `AIDEEN_EMB_USE_DEQ_ADJOINT=1`; default embedding behavior remains unchanged.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/emb_deq_adjoint_probe_chunks2.log`: finite; no NaN/INVALID; train loss=6.9312; tps_epoch=126.6.
+- `logs/real_text/pretrain_emb_deq_adjoint_seed42_chunks20.log`: finite; no NaN/INVALID; train loss=6.6542; held-out val_loss=6.6499; tps_epoch=138.6; train tokens=20480.
+- `logs/real_text/pretrain_emb_deq_adjoint_seed42_chunks80.log`: finite; no NaN/INVALID; train loss=6.2782; held-out val_loss=6.3579; tps_epoch=137.4; train tokens=81920.
+- `logs/real_text/pretrain_emb_deq_adjoint_seed7_chunks80.log`: finite; no NaN/INVALID; train loss=6.2871; held-out val_loss=6.3603; tps_epoch=136.3; train tokens=81920.
+Interpretation:
+- This closes a real training-circuit gap for embeddings: token embeddings can now receive a gradient that passed through the DEQ slot circuit instead of only the LM pooled-output gradient.
+- 20-chunk seed42 held-out improved strongly versus default-off 20-chunk corridor (`6.7233 -> 6.6499`).
+- 80-chunk seed42 improves versus baseline (`6.3758 -> 6.3579`), while seed7 regresses versus the previous seed7 no-flag 80 baseline (`6.3091 -> 6.3603`). This is stable but not yet default-promotable.
+Classification: experimental useful / pending. Needs 200-chunk two-seed validation and/or source-gradient scale review before default promotion.
+Next action: test whether combining `AIDEEN_EMB_USE_DEQ_ADJOINT=1` with temporal Assoc value adjoint remains stable, or first run 200 chunks on the embedding-adjoint path alone.

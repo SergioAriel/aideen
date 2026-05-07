@@ -43,6 +43,13 @@ const H_SELF_FEEDBACK: f32 = 1.0;
 var<workgroup> shared_sumsq: array<f32, 64>;
 var<workgroup> shared_coeff: array<f32, 64>;
 
+fn finite_or(x: f32, fallback: f32) -> f32 {
+    if (x == x && abs(x) < 1.0e20) {
+        return x;
+    }
+    return fallback;
+}
+
 fn entry_base(entry: u32, d: u32) -> u32 {
     return entry * d;
 }
@@ -237,6 +244,85 @@ fn picard_clean_step_main(
             + (1.0 - params.damping) * v_prev;
         let rhs = b_in[token * d + dim] * rhs_scale;
         v_next[v_off + dim] = rhs + jac_term;
+    }
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn picard_source_grad_reduce_main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let lane = lid.x;
+    let token = wid.y * CLEAN_ENTRY_GRID_X + wid.x;
+    let d = params.d_model;
+    let h_slots = params.h_slots;
+    let n_tokens = params.batch_size * params.seq_len;
+    if (token >= n_tokens) { return; }
+
+    let dims_per_lane = d / 64u;
+    let slot_coord_mode_active = slot_coord_mode();
+
+    var out_grad: array<f32, 8>;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        out_grad[k] = 0.0;
+    }
+
+    for (var slot = 0u; slot < h_slots; slot = slot + 1u) {
+        let signal_base = token * scratch_stride(d, h_slots) + slot * d;
+        let attn_base = token_attn_base(token, slot, d, h_slots);
+        let anchor_base = slot_anchor_base(d, h_slots) + slot * d;
+        let h_off = entry_base(token * h_slots + slot, d);
+        let v_off = v_next_slot_base(token, slot, d);
+        let attn_scale =
+            select(1.0, slot_coord_attn_scale(token, slot, d, h_slots), slot_coord_mode_active);
+
+        var local_sumsq = 0.0;
+        var local_coeff = 0.0;
+        for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+            let dim = lane * dims_per_lane + k;
+            let slot_branch = select(
+                Scratch[signal_base + dim],
+                Scratch[signal_base + dim] + Scratch[attn_base + dim] * attn_scale + HistParams[anchor_base + dim],
+                slot_coord_mode_active,
+            );
+            let pre = slot_branch + H_SELF_FEEDBACK * H_star[h_off + dim];
+            let up = params.damping * v_state[v_off + dim];
+            local_sumsq = local_sumsq + pre * pre;
+            local_coeff = local_coeff + up * NormScale[dim] * pre;
+        }
+
+        shared_sumsq[lane] = local_sumsq;
+        shared_coeff[lane] = local_coeff;
+        workgroupBarrier();
+        for (var stride = 32u; stride > 0u; stride = stride >> 1u) {
+            if (lane < stride) {
+                shared_sumsq[lane] = shared_sumsq[lane] + shared_sumsq[lane + stride];
+                shared_coeff[lane] = shared_coeff[lane] + shared_coeff[lane + stride];
+            }
+            workgroupBarrier();
+        }
+
+        let rms = sqrt(shared_sumsq[0] / max(1.0, f32(d)) + 1.0e-6);
+        let inv_rms = 1.0 / max(rms, 1.0e-6);
+        let coeff_scale = shared_coeff[0] / max(f32(d) * rms * rms * rms, 1.0e-6);
+        for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+            let dim = lane * dims_per_lane + k;
+            let slot_branch = select(
+                Scratch[signal_base + dim],
+                Scratch[signal_base + dim] + Scratch[attn_base + dim] * attn_scale + HistParams[anchor_base + dim],
+                slot_coord_mode_active,
+            );
+            let pre = slot_branch + H_SELF_FEEDBACK * H_star[h_off + dim];
+            let up = params.damping * v_state[v_off + dim];
+            out_grad[k] = out_grad[k] + (NormScale[dim] * inv_rms) * up - pre * coeff_scale;
+        }
+        workgroupBarrier();
+    }
+
+    for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+        let dim = lane * dims_per_lane + k;
+        b_in[token * d + dim] = finite_or(out_grad[k], 0.0);
     }
 }
 const ACCUM_SHARED_D: u32 = 512u;

@@ -101,6 +101,7 @@ pub struct GpuDeqBackend {
     staged_picard_init_pipeline: wgpu::ComputePipeline,
     staged_picard_clean_init_pipeline: wgpu::ComputePipeline,
     staged_picard_clean_step_pipeline: wgpu::ComputePipeline,
+    staged_picard_source_grad_reduce_pipeline: wgpu::ComputePipeline,
     staged_picard_gcomb_pipeline: wgpu::ComputePipeline,
     staged_picard_gmix_pipeline: wgpu::ComputePipeline,
     staged_picard_gmix_gscore_pipeline: wgpu::ComputePipeline,
@@ -1889,6 +1890,15 @@ impl GpuDeqBackend {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        let staged_picard_source_grad_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Staged Picard Source Grad Reduce Pipeline"),
+                layout: Some(&staged_picard_pl),
+                module: &staged_picard_clean_shader,
+                entry_point: Some("picard_source_grad_reduce_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
         let slot_rhs_expand_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Slot RHS Expand Pipeline"),
@@ -2974,6 +2984,7 @@ impl GpuDeqBackend {
             staged_picard_init_pipeline,
             staged_picard_clean_init_pipeline,
             staged_picard_clean_step_pipeline,
+            staged_picard_source_grad_reduce_pipeline,
             staged_picard_gcomb_pipeline,
             staged_picard_gmix_pipeline,
             staged_picard_gmix_gscore_pipeline,
@@ -4847,6 +4858,64 @@ impl GpuDeqBackend {
         }
         self.queue.submit(Some(enc.finish()));
         Ok(())
+    }
+
+    pub fn reduce_clean_adjoint_to_source_grad_no_readback(
+        &self,
+        seq_len: u32,
+        damping: f32,
+        batch_size: u32,
+    ) -> Result<(), String> {
+        let params = UpdateUniforms {
+            d_model: self.config.d_r as u32,
+            h_slots: self.config.h_slots as u32,
+            lr: 0.0,
+            grad_scale: 0.0,
+            ternary_flag: 0,
+            weight_decay: 0.0,
+            seq_len,
+            damping,
+            residual_alpha: self.cached_residual_alpha,
+            grad_accum_mode: 0,
+            n_accum: 1,
+            n_total_weights: 0,
+            batch_size,
+            apply_accum: 0,
+            _pad0: 0,
+            assoc_lr_mult: 1.0,
+            assoc_event_lr_mult: 1.0,
+            assoc_alpha_lr_mult: 1.0,
+            assoc_addr_lr_mult: 0.0,
+        };
+        self.queue.write_buffer(
+            &self.fused_update_params_buf,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        let n_tokens = batch_size * seq_len;
+        let token_grid_x = n_tokens.min(65535).max(1);
+        let token_grid_y = n_tokens.div_ceil(65535).max(1);
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Clean Adjoint Source Grad Reduce"),
+            });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Clean Adjoint Source Grad Reduce"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.staged_picard_source_grad_reduce_pipeline);
+            pass.set_bind_group(0, &self.staged_picard_bg, &[]);
+            pass.set_bind_group(1, &self.staged_picard_bg1, &[]);
+            pass.dispatch_workgroups(token_grid_x, token_grid_y, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+        Ok(())
+    }
+
+    pub fn source_grad_buf(&self) -> &wgpu::Buffer {
+        &self.adj_bufs.b_dl
     }
 
     pub fn apply_fused_deq_update(
