@@ -551,3 +551,11 @@ Diagnostic: `[ASSOC-BWD-STEP] value_adj_sum` reports nonzero selected value adjo
 Large-bank Assoc value adjoint gating
 -------------------------------------
 `AIDEEN_ASSOC_VALUE_WRITE_BWD=1` enables the experimental selected-bank value-write adjoint. It is off by default after a 200-chunk run produced NaN diagnostics and loss ~22.94. The code path remains as an opt-in diagnostic/experimental branch; the promoted serious-prep circuit keeps it disabled.
+
+Temporal large-bank Assoc value adjoint
+---------------------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl` large-bank branch plus `aideen-backbone/src/gpu_deq.rs` binding 15.
+Buffer: `AssocValueGrad`, layout `(slot * ASSOC_BANKS + bank) * d_model + dim`, cleared per batch/slot before the reverse token scan when `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`.
+Forward timeline invariant: `read_t` observes the pre-write bank state; `write_t` produces the state consumed by future reads. Therefore, the write backward must consume only adjoints already accumulated from future tokens.
+Backward timeline now used: at reverse token t, selected value write consumes `AssocValueGrad[selected_bank]` as `dL/dM_post_t`, propagates it through `value_keep_gate` into `dL/dM_pre_t`, then the current read equation adds `alpha_assoc * assoc_read_conf * p_bank * v_state * assoc_scale` into every bank's pre-write value adjoint. This avoids the rejected same-token shortcut where `read_t` directly trained `write_t`.
+Default status: path remains disabled unless `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`; promoted baseline behavior is unchanged.

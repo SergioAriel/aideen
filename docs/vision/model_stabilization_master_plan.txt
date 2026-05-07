@@ -2333,3 +2333,29 @@ Corridor: default serious-prep profile with `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitt
 Log: `logs/real_text/value_adj_gated_default_pretrain_chunks20.log`.
 Result: finite; no NaN/INVALID; train loss=6.7283; held-out val_loss=6.7233; tps_epoch=135.4; train tokens=20480.
 Interpretation: after gating, the default path is back in the stable corridor. The experimental value adjoint remains available only via `AIDEEN_ASSOC_VALUE_WRITE_BWD=1` and must not be used for serious training until its 200-chunk NaN mechanism is fixed.
+
+Change gate - temporal storage-backed large-bank value adjoint
+-------------------------------------------------------------
+1. Target failure mode: the first large-bank value-adjoint path used the current token read gradient as if it trained the current token write. A write at token t only changes bank state visible to future reads, so the same-token selected-bank shortcut violated the Assoc state timeline and produced a 200-chunk regression with NaN diagnostics/loss ~22.94.
+2. Structural rationale: maintain a per-slot/per-bank/per-dim value-state adjoint buffer during the reverse token scan. At token t, the write equation consumes the adjoint already accumulated from future reads (`dL/dM_post_t`), propagates it through `value_keep_gate` into `dL/dM_pre_t`, and only then adds the current read contribution (`dL/dread_t -> dL/dM_pre_t`). This restores the temporal invariant: read_t observes pre-write state; write_t affects future state.
+3. Anti-patch check: this does not tune a gain, clip the symptom, or disable the failing term. It changes the gradient owner/lifetime to match the forward state equation, so the write gate receives only gradients from future consequences of the write.
+4. Validation plan: add the buffer behind `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`; `cargo check`; run 2-chunk debug and 20-chunk held-out smoke with the flag enabled. Success requires no NaN/INVALID, nonzero `value_adj_sum`, and no default-path behavior change when the flag is off.
+
+Implementation - temporal storage-backed large-bank value adjoint
+-----------------------------------------------------------------
+Change:
+- Added `AssocValueGrad` as a per-slot/per-bank/per-dim storage buffer for the large-bank Assoc backward branch.
+- Kept the path behind `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`; default behavior remains flag-off.
+- Corrected the value-write adjoint timeline: write_t consumes only future accumulated value-state adjoint, propagates it through overwrite/keep semantics, then current read_t adds its value gradient to the pre-write state.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/assoc_value_state_adj_smoke_debug_chunks2.log`: finite; no NaN/INVALID; nonzero `value_adj_sum` on Assoc slots s4-s7.
+- `logs/real_text/pretrain_value_state_adj_seed42_chunks20.log`: finite; no NaN/INVALID; train loss=6.7226; held-out val_loss=6.7218; tps_epoch=141.0; train tokens=20480.
+- `logs/real_text/pretrain_value_state_adj_seed42_chunks80.log`: finite; no NaN/INVALID; train loss=6.2902; held-out val_loss=6.3678; tps_epoch=136.2; train tokens=81920.
+- `logs/real_text/pretrain_value_state_adj_seed42_chunks200.log`: finite; no NaN/INVALID; train loss=5.7024; held-out val_loss=5.9449; tps_epoch=132.2; train tokens=204800.
+- `logs/real_text/value_state_adj_default_off_smoke_chunks2.log`: default flag-off finite; no NaN/INVALID; loss=6.9217; tps_epoch=142.0.
+Interpretation:
+- The previous same-token value-adjoint failure is corrected for the seed42 200-chunk corridor that previously regressed to loss ~22.94/NaN diagnostics.
+- Quality is neutral/slightly mixed versus the no-value-adjoint 200-chunk seed42 baseline (`5.7281` train, `5.9472` held-out): train improves, held-out is effectively equal (`5.9472 -> 5.9449`).
+Classification: experimental useful / default-candidate, not promoted default until repeated on seed7 and/or longer serious-prep runs. The code remains opt-in behind `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`.
+Next action: repeat 200 chunks with seed7 before considering promotion; if stable, evaluate whether value-source parameter learning or event-gate scaling is the next missing Assoc backward piece.

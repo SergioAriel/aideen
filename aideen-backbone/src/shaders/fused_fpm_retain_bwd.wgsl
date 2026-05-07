@@ -74,6 +74,7 @@ struct FpmBwdUniforms {
 // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after backward learning path is localized.
 @group(0) @binding(13) var<storage, read_write> AssocBwdDebug: array<f32>;
 @group(0) @binding(14) var<storage, read> S_in: array<f32>;
+@group(0) @binding(15) var<storage, read_write> AssocValueGrad: array<f32>;
 
 @group(1) @binding(0) var<storage, read_write> AllWeights: array<f32>;
 
@@ -161,6 +162,9 @@ fn fpm_m_off(t_abs: u32, slot: u32, d: u32, h: u32) -> u32 {
 }
 fn adj_v_off(t_abs: u32, slot: u32, d: u32, n_tokens: u32) -> u32 {
     return (slot * n_tokens + t_abs) * d;
+}
+fn assoc_value_grad_off(slot: u32, bank: u32, dim: u32, d: u32) -> u32 {
+    return (slot * ASSOC_BANKS + bank) * d + dim;
 }
 
 fn assoc_oracle_write_hit(t: u32) -> bool {
@@ -335,6 +339,11 @@ fn fused_fpm_retain_bwd_main(
         // Zero out workgroup state gradients (assoc_gb is size 4096)
         for (var i = lane; i < 4096u; i = i + WG_SIZE) {
             assoc_gb[i] = 0.0;
+        }
+        if (is_assoc_slot && ENABLE_ASSOC_VALUE_WRITE_BWD && assoc_slot_stride > ASSOC_BWD_STATE_CAP) {
+            for (var i = lane; i < ASSOC_BANKS * d; i = i + WG_SIZE) {
+                AssocValueGrad[slot * ASSOC_BANKS * d + i] = 0.0;
+            }
         }
         if (lane < 32u) {
             assoc_q[lane] = 0.0;
@@ -1561,6 +1570,7 @@ fn fused_fpm_retain_bwd_main(
                 let key_write_mass_large = effective_write_mass_large;
                 let key_keep_gate_large =
                     select(1.0 - effective_write_mass_large, 0.0, overwrite_bank_large > 0.5);
+                let value_keep_gate_large = key_keep_gate_large;
                 let effective_write_mass_deriv_large = select(
                     2.0 * effective_bind_gate_large,
                     1.0,
@@ -1631,17 +1641,17 @@ fn fused_fpm_retain_bwd_main(
                         );
                     let bank_value_prev_large =
                         select(selected_bank_value, 0.0, overwrite_bank_large > 0.5);
+                    let value_grad_idx_large =
+                        assoc_value_grad_off(slot, chosen_bank_large, dim, d);
                     let g_bank_value_large =
-                        alpha_assoc
-                        * assoc_read_conf_large
-                        * finite_or(shared_dup[chosen_bank_large], 0.0)
-                        * finite_or(v_state[vs_base_large + dim], 0.0)
-                        * assoc_scale_large;
+                        finite_or(AssocValueGrad[value_grad_idx_large], 0.0);
                     local_bind_grad_large =
                         local_bind_grad_large
                         + g_bank_value_large * (curr_value_norm - bank_value_prev_large);
                     local_value_adj_abs_large =
                         local_value_adj_abs_large + abs(g_bank_value_large);
+                    AssocValueGrad[value_grad_idx_large] =
+                        finite_or(value_keep_gate_large * g_bank_value_large, 0.0);
                 }
                 let bind_grad_large = reduce_sum(lane, local_bind_grad_large);
                 let value_adj_abs_large = reduce_sum(lane, local_value_adj_abs_large);
@@ -1701,6 +1711,26 @@ fn fused_fpm_retain_bwd_main(
                         AssocBwdDebug[assoc_debug_base + 3u] + event_gate_logit_grad_large;
                     AssocBwdDebug[assoc_debug_base + 4u] =
                         AssocBwdDebug[assoc_debug_base + 4u] + value_adj_abs_large;
+                }
+                if (ENABLE_ASSOC_VALUE_WRITE_BWD) {
+                    for (var bank = 0u; bank < ASSOC_BANKS; bank = bank + 1u) {
+                        for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                            let dim = lane * dims_per_lane + k;
+                            let value_grad_idx_large =
+                                assoc_value_grad_off(slot, bank, dim, d);
+                            let g_read_value_large =
+                                alpha_assoc
+                                * assoc_read_conf_large
+                                * finite_or(shared_dup[bank], 0.0)
+                                * finite_or(v_state[vs_base_large + dim], 0.0)
+                                * assoc_scale_large;
+                            AssocValueGrad[value_grad_idx_large] =
+                                finite_or(
+                                    AssocValueGrad[value_grad_idx_large] + g_read_value_large,
+                                    0.0,
+                                );
+                        }
+                    }
                 }
                 workgroupBarrier();
                 if (lane < RETAIN_RANK) {

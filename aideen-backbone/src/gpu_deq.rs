@@ -172,6 +172,7 @@ pub struct GpuDeqBackend {
     pub all_gradients_buf: wgpu::Buffer,
     // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after assoc backward path is localized.
     assoc_bwd_debug_buf: wgpu::Buffer,
+    _assoc_value_grad_buf: wgpu::Buffer,
 
     // Anderson acceleration for adjoint Picard
     anderson_m: u32, // ring buffer depth (effective window = m-1)
@@ -996,9 +997,8 @@ impl GpuDeqBackend {
                 ],
             });
 
-        // fpm_retain_bwd_bg0_layout: 9 bindings for the active FPM token-local backward.
-        // bindings 0-9: uniforms, h_star, scratch(signal), fpm_m_buf, AllGradients,
-        // tbptt_carry, dm_new staging, m_inner staging, h_unit staging, g_x staging.
+        // FPM/Assoc backward bindings: uniforms, forward state/history,
+        // gradients, staging buffers, diagnostics, and optional Assoc value adjoint state.
         let fpm_retain_bwd_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("FPM Memory Bwd BG0 Layout"),
@@ -1148,6 +1148,16 @@ impl GpuDeqBackend {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 15,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -2400,6 +2410,15 @@ impl GpuDeqBackend {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let assoc_value_grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Assoc Value Grad State"),
+            size: (config.h_slots as u64)
+                * (assoc_banks as u64)
+                * (config.d_r as u64)
+                * 4u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let fused_update_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Fused Update BG0"),
             layout: &bg0_layout,
@@ -2819,6 +2838,10 @@ impl GpuDeqBackend {
                     binding: 14,
                     resource: bridge.s_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: assoc_value_grad_buf.as_entire_binding(),
+                },
             ],
         });
         let fpm_shared_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3021,6 +3044,7 @@ impl GpuDeqBackend {
             tbptt_carry_buf,
             all_gradients_buf,
             assoc_bwd_debug_buf,
+            _assoc_value_grad_buf: assoc_value_grad_buf,
             anderson_m: anderson_m_val,
             anderson_hist_bufs,
             anderson_slots_per_segment: slots_per_segment as u32,
