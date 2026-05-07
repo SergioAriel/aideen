@@ -1557,6 +1557,12 @@ fn fused_fpm_retain_bwd_main(
                 let key_write_mass_large = effective_write_mass_large;
                 let key_keep_gate_large =
                     select(1.0 - effective_write_mass_large, 0.0, overwrite_bank_large > 0.5);
+                let effective_write_mass_deriv_large = select(
+                    2.0 * effective_bind_gate_large,
+                    1.0,
+                    ENABLE_ASSOC_LINEAR_WRITE,
+                ) * select(1.0, 0.0, effective_write_mass_large <= 0.0);
+                var local_bind_grad_large = 0.0;
                 var local_key_grad_abs_large = 0.0;
                 var local_gprev_abs_large = 0.0;
                 if (lane < RETAIN_RANK) {
@@ -1564,6 +1570,14 @@ fn fused_fpm_retain_bwd_main(
                     let g_bank_key_curr_large = finite_or(assoc_gb[key_adj_idx_large], 0.0);
                     local_key_grad_abs_large = abs(g_bank_key_curr_large);
                     let k_candidate_large = finite_or(assoc_gprev[lane], 0.0);
+                    let bank_key_prev_large =
+                        select(
+                            finite_or(AssocHist[assoc_hist_slot_base_large + chosen_bank_large * assoc_bank_stride + lane], 0.0),
+                            0.0,
+                            overwrite_bank_large > 0.5,
+                        );
+                    local_bind_grad_large =
+                        local_bind_grad_large + g_bank_key_curr_large * (k_candidate_large - bank_key_prev_large);
                     assoc_raw[lane] =
                         finite_or(
                             key_write_mass_large
@@ -1574,6 +1588,115 @@ fn fused_fpm_retain_bwd_main(
                     local_gprev_abs_large = abs(assoc_raw[lane]);
                     assoc_gb[key_adj_idx_large] =
                         finite_or(key_keep_gate_large * g_bank_key_curr_large, 0.0);
+                }
+                workgroupBarrier();
+                var local_curr_value_sq_large = 0.0;
+                for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                    let dim = lane * dims_per_lane + k;
+                    let curr_j = finite_or(S_in[t_abs * d + dim], 0.0);
+                    local_curr_value_sq_large = local_curr_value_sq_large + curr_j * curr_j;
+                }
+                let curr_value_rms_large =
+                    sqrt(reduce_sum(lane, local_curr_value_sq_large) / max(1.0, f32(d)) + 1.0e-6);
+                var local_value_stage_sq_large = 0.0;
+                for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                    let dim = lane * dims_per_lane + k;
+                    let curr_stage =
+                        finite_or(S_in[t_abs * d + dim], 0.0) / max(curr_value_rms_large, 1.0e-6);
+                    local_value_stage_sq_large =
+                        local_value_stage_sq_large + curr_stage * curr_stage;
+                }
+                let assoc_value_rms_large =
+                    sqrt(reduce_sum(lane, local_value_stage_sq_large) / max(1.0, f32(d)) + 1.0e-6);
+                var local_value_adj_abs_large = 0.0;
+                for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                    let dim = lane * dims_per_lane + k;
+                    let curr_stage =
+                        finite_or(S_in[t_abs * d + dim], 0.0) / max(curr_value_rms_large, 1.0e-6);
+                    let curr_value_norm =
+                        curr_stage / max(assoc_value_rms_large, 1.0e-6);
+                    let selected_bank_value =
+                        finite_or(
+                            AssocHist[
+                                assoc_hist_slot_base_large
+                                + chosen_bank_large * assoc_bank_stride
+                                + RETAIN_RANK
+                                + dim
+                            ],
+                            0.0,
+                        );
+                    let bank_value_prev_large =
+                        select(selected_bank_value, 0.0, overwrite_bank_large > 0.5);
+                    let g_bank_value_large =
+                        alpha_assoc
+                        * assoc_read_conf_large
+                        * finite_or(shared_dup[chosen_bank_large], 0.0)
+                        * finite_or(v_state[vs_base_large + dim], 0.0)
+                        * assoc_scale_large;
+                    local_bind_grad_large =
+                        local_bind_grad_large
+                        + g_bank_value_large * (curr_value_norm - bank_value_prev_large);
+                    local_value_adj_abs_large =
+                        local_value_adj_abs_large + abs(g_bank_value_large);
+                }
+                let bind_grad_large = reduce_sum(lane, local_bind_grad_large);
+                let value_adj_abs_large = reduce_sum(lane, local_value_adj_abs_large);
+                var event_gate_logit_grad_large = 0.0;
+                if (ENABLE_ASSOC_EVENT_GATE) {
+                    event_gate_logit_grad_large =
+                        finite_or(
+                            bind_grad_large
+                            * effective_write_mass_deriv_large
+                            * assoc_write_allowed_large
+                            * assoc_transition_gate_large
+                            * event_gate_large
+                            * (1.0 - event_gate_large)
+                            * has_prev_large,
+                            0.0,
+                        );
+                }
+                if (ENABLE_ASSOC_EVENT_GATE && t > 0u) {
+                    var local_prev_event_sq_large = 0.0;
+                    var local_curr_event_sq_large = 0.0;
+                    for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                        let dim = lane * dims_per_lane + k;
+                        let prev_j = finite_or(S_in[(t_abs - 1u) * d + dim], 0.0);
+                        let curr_j = finite_or(S_in[t_abs * d + dim], 0.0);
+                        local_prev_event_sq_large =
+                            local_prev_event_sq_large + prev_j * prev_j;
+                        local_curr_event_sq_large =
+                            local_curr_event_sq_large + curr_j * curr_j;
+                    }
+                    let prev_event_rms_write_large =
+                        sqrt(reduce_sum(lane, local_prev_event_sq_large) / max(1.0, f32(d)) + 1.0e-6);
+                    let curr_event_rms_write_large =
+                        sqrt(reduce_sum(lane, local_curr_event_sq_large) / max(1.0, f32(d)) + 1.0e-6);
+                    for (var k = 0u; k < dims_per_lane; k = k + 1u) {
+                        let dim = lane * dims_per_lane + k;
+                        let prev_src_e =
+                            finite_or(S_in[(t_abs - 1u) * d + dim], 0.0)
+                            / max(prev_event_rms_write_large, 1.0e-6);
+                        let curr_src_e =
+                            finite_or(S_in[t_abs * d + dim], 0.0)
+                            / max(curr_event_rms_write_large, 1.0e-6);
+                        let event_feature =
+                            (curr_src_e - prev_src_e) + curr_src_e * prev_src_e;
+                        AllGradients[wevent_assoc_base + dim] +=
+                            ASSOC_EVENT_GRAD_SCALE
+                            * event_gate_logit_grad_large
+                            * event_feature
+                            * inv_sqrt_d;
+                    }
+                    if (lane == 0u) {
+                        AllGradients[bevent_assoc_idx] +=
+                            ASSOC_EVENT_GRAD_SCALE * event_gate_logit_grad_large;
+                    }
+                }
+                if (lane == 0u) {
+                    AssocBwdDebug[assoc_debug_base + 3u] =
+                        AssocBwdDebug[assoc_debug_base + 3u] + event_gate_logit_grad_large;
+                    AssocBwdDebug[assoc_debug_base + 4u] =
+                        AssocBwdDebug[assoc_debug_base + 4u] + value_adj_abs_large;
                 }
                 workgroupBarrier();
                 if (lane < RETAIN_RANK) {

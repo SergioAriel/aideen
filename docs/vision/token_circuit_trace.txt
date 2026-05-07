@@ -539,3 +539,11 @@ What is intentionally inactive in the promoted baseline:
 Known partial areas:
 - Large-bank Assoc backward has scalable key-write coverage, but full value adjoint and replacement/librarian/event gradients remain pending.
 - Base FPM write telemetry intentionally reports zeros on Assoc slots because those slots do not use the base FPM write block; Assoc-specific bridge telemetry is the correct observer for contextual consolidation.
+
+Large-bank Assoc selected value adjoint
+---------------------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, `assoc_slot_stride > ASSOC_BWD_STATE_CAP` branch.
+Forward equation: selected bank value is updated as `bank_value <- value_keep_gate * bank_value + value_write_mass * normalized_current_value`.
+Backward addition: because full `ASSOC_BANKS * d_model` value adjoints do not fit in workgroup storage at 32 banks, the large-bank branch computes only the forward-selected bank's value adjoint from the read equation: `dL/dbank_value_selected = alpha_assoc * assoc_read_conf * p_selected * g_ctx`. This selected adjoint contributes to the write-mass/event-gate gradient through `(normalized_current_value - previous_bank_value)`.
+Invariant: no full-bank value cache is introduced; storage stays compact and proportional to `d_model + ASSOC_RANK`, not `ASSOC_BANKS * d_model`.
+Diagnostic: `[ASSOC-BWD-STEP] value_adj_sum` reports nonzero selected value adjoint mass on Assoc slots in debug runs.

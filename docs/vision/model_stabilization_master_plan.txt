@@ -2279,3 +2279,29 @@ Next change gate candidate - large-bank Assoc value adjoint design
 2. Structural rationale: forward value write stores a normalized current value vector into the selected bank with `value_new = keep * value_prev + write_mass * value_current_norm`. Backward must propagate `dL/dvalue_new` through `write_mass`, overwrite keep semantics, and the normalization of `value_current_norm`. Because full per-bank value adjoints do not fit in workgroup memory at 32 banks, the large-bank branch needs either a compact selected-bank value adjoint computed directly from the read-gradient equation, or a tiled/storage-backed value adjoint buffer.
 3. Anti-patch check: do not add a scalar gain or bridge to compensate for missing value learning. The correct locus is the value-write adjoint equation and storage strategy, because the missing mechanism originates at the forward write equation.
 4. Validation plan: implement behind the large-bank branch only; `cargo check`; run short 32-bank assoc-recall and real-text smoke; require no NaN/INVALID, no TPS collapse, and improved/nonzero value-adjoint diagnostics before promoting. Then re-run the 80/200 chunk serious-prep profile.
+
+Change gate - compact selected-bank value adjoint for large-bank Assoc
+---------------------------------------------------------------------
+1. Target failure mode: large-bank Assoc backward does not propagate value-read gradients into the selected bank value write. Forward writes `bank_value <- keep * old + write_mass * value_norm`, but backward only keeps compact key adjoints, so value learning from LM loss is incomplete in the 32-bank corridor.
+2. Structural rationale: read backward can compute `dL/dbank_value_b` directly from the read equation without storing all bank value adjoints: for each bank and dimension, `g_value_b_dim = alpha_assoc * assoc_read_conf * p_b * g_ctx_dim`. Accumulate only the chosen forward-write bank's value adjoint into a per-dim scratch vector, then apply the existing value-write adjoint through `write_mass`, overwrite keep, and normalization of `value_norm`.
+3. Anti-patch check: this restores the missing adjoint of the exact forward value write equation. It does not add a bridge, gain, guard, or loss mask, and remains valid across bank counts because it avoids workgroup storage proportional to all bank values.
+4. Validation plan: implement only in the `assoc_slot_stride > ASSOC_BWD_STATE_CAP` branch; add debug counters for selected-bank value adjoint magnitude; `cargo check`; run short real-text smoke with `AIDEEN_DEBUG_SAMPLE=1`; require no NaN/INVALID and nonzero value-adjoint telemetry before longer validation.
+
+Implementation - compact selected-bank value adjoint for large-bank Assoc
+-------------------------------------------------------------------------
+Change:
+- Added a compact selected-bank value adjoint in `fused_fpm_retain_bwd.wgsl` for the `assoc_slot_stride > ASSOC_BWD_STATE_CAP` path.
+- The large-bank read backward now computes `dL/dbank_value` directly from the read equation for the forward-selected bank only: `alpha_assoc * assoc_read_conf * p_bank * g_ctx`.
+- The selected value adjoint contributes to the write-mass/event-gate gradient through `value_norm - previous_bank_value`, matching the forward write equation `bank_value <- keep * old + write_mass * value_norm`.
+- Added `[ASSOC-BWD-STEP] value_adj_sum` telemetry using existing debug slot `+4`.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/assoc_large_value_adj_smoke_debug_chunks2.log`: finite; no NaN/INVALID; `value_adj_sum` nonzero on Assoc slots s4-s7.
+- `logs/real_text/pretrain_value_adj_smoke_seed42_chunks20.log`: finite; no NaN/INVALID; train loss=6.7172; held-out val_loss=6.7238; tps_epoch=134.4; train tokens=20480.
+- `logs/real_text/pretrain_value_adj_baseline_seed42_chunks80.log`: finite; no NaN/INVALID; train loss=6.2889; held-out val_loss=6.3675; tps_epoch=131.6; train tokens=81920.
+- `logs/real_text/pretrain_value_adj_baseline_seed7_chunks80.log`: finite; no NaN/INVALID; train loss=6.2731; held-out val_loss=6.3571; tps_epoch=133.5; train tokens=81920.
+Interpretation:
+- Numerical stability is preserved through 80 chunks on two seeds.
+- The missing value-adjoint path is now active and observable.
+- Quality effect is mixed at 80 chunks: seed42 held-out improved slightly versus previous 80-chunk baseline (`6.3758 -> 6.3675`), while seed7 regressed versus previous seed7 80-chunk baseline (`6.3091 -> 6.3571`). This is not a reason to reject the structural adjoint, but it is not yet a quality promotion. Next validation is 200 chunks on at least seed42 before treating this as the new serious baseline.
+Classification: structural pending/default-candidate. It restores a missing adjoint in the active large-bank path and remains finite, but needs 200-chunk validation before default-stable classification.

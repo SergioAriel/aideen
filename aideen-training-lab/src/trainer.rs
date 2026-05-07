@@ -2650,8 +2650,8 @@ impl Trainer {
                             let b = s * 16;
                             if b + 15 < adbg.len() {
                                 eprintln!(
-                                    "[ASSOC-BWD-STEP] s{}: val_rms={:.3e} bevent_update_max={:.3e} event_grad_signed={:.3e} score_grad_max={:.3e} wq_step_max={:.3e} wk_step_max={:.3e} wq_update_max={:.3e} wk_update_max={:.3e} key_grad_sum={:.3e} gprev_sum={:.3e} write_mass={:.3e}",
-                                    s, adbg[b], adbg[b+2], adbg[b+3], adbg[b+5], adbg[b+7], adbg[b+9], adbg[b+11], adbg[b+15], adbg[b+12], adbg[b+13], adbg[b+14]
+                                    "[ASSOC-BWD-STEP] s{}: val_rms={:.3e} bevent_update_max={:.3e} event_grad_signed={:.3e} value_adj_sum={:.3e} score_grad_max={:.3e} wq_step_max={:.3e} wk_step_max={:.3e} wq_update_max={:.3e} wk_update_max={:.3e} key_grad_sum={:.3e} gprev_sum={:.3e} write_mass={:.3e}",
+                                    s, adbg[b], adbg[b+2], adbg[b+3], adbg[b+4], adbg[b+5], adbg[b+7], adbg[b+9], adbg[b+11], adbg[b+15], adbg[b+12], adbg[b+13], adbg[b+14]
                                 );
                             }
                         }
