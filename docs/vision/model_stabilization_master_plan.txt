@@ -2466,3 +2466,12 @@ Interpretation:
 - Short-run held-out variance is worse than the earlier 20-chunk flag-on result, so promotion is justified by the stronger two-seed 200-chunk evidence already recorded, not by this smoke alone.
 - Temporal Assoc value adjoint remains default-off because the combined 80-chunk run was rejected.
 Classification: default stable candidate for serious training; next validation should be a longer default-on serious run with `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitted/false.
+
+Validation - promoted embedding DEQ-source adjoint default, 80 chunks seed42
+----------------------------------------------------------------------------
+Corridor: default serious-training path after promotion, `AIDEEN_EMB_USE_DEQ_ADJOINT` omitted/default-on, `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitted/default-off, bridges off, seed42, `AIDEEN_MAX_CHUNKS=80`, held-out 4096 tokens.
+Log: `logs/real_text/pretrain_emb_deq_default_seed42_chunks80.log`.
+Result: finite; no NaN/INVALID; train loss=6.1509; held-out val_loss=6.2606; tps_epoch=138.7; train tokens=81920; held-out tokens=4096.
+Interpretation: the promoted default path is not only stable but materially better than the prior no-flag 80-chunk baseline (`6.3758 -> 6.2606`). This strengthens the promotion for serious training.
+Classification: default stable candidate, pending 200-chunk default-on confirmation.
+Next action: run the same default serious-training corridor at 200 chunks, seed42, with temporal Assoc value adjoint still omitted/default-off.
