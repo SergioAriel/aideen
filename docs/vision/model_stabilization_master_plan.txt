@@ -2305,3 +2305,24 @@ Interpretation:
 - The missing value-adjoint path is now active and observable.
 - Quality effect is mixed at 80 chunks: seed42 held-out improved slightly versus previous 80-chunk baseline (`6.3758 -> 6.3675`), while seed7 regressed versus previous seed7 80-chunk baseline (`6.3091 -> 6.3571`). This is not a reason to reject the structural adjoint, but it is not yet a quality promotion. Next validation is 200 chunks on at least seed42 before treating this as the new serious baseline.
 Classification: structural pending/default-candidate. It restores a missing adjoint in the active large-bank path and remains finite, but needs 200-chunk validation before default-stable classification.
+
+Composite change result - large-bank value adjoint gated after 200-chunk regression
+---------------------------------------------------------------------------------
+Failure observed:
+- `logs/real_text/pretrain_value_adj_baseline_seed42_chunks200.log`: train loss=22.9376; held-out val_loss=22.9476; final diagnostics contained NaN entropy/move and saturated `a_delta_max=1.0e12`.
+- This refutes promoting the value-write adjoint as default dynamics in its current form, despite short 20/80 chunk stability.
+
+Piece classification:
+- Measurement: `[ASSOC-BWD-STEP] value_adj_sum` is useful and remains default-stable as telemetry.
+- Layout/invariant: no new large `ASSOC_BANKS * d_model` buffer was introduced; compact selected-bank computation remains structurally useful.
+- Dynamics: using selected value adjoint to train the event/write gate is experimental useful but rejected as default because it destabilized at 200 chunks.
+- Diagnostics: logs above are retained as evidence; removal criterion for telemetry is after a stable normalized value-adjoint design replaces this one.
+
+Action:
+- Added `ENABLE_ASSOC_VALUE_WRITE_BWD` / `AIDEEN_ASSOC_VALUE_WRITE_BWD`, default `false`.
+- Default serious-prep corridor again has the validated no-bridge/no-value-adjoint dynamics.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/value_adj_gated_default_smoke_chunks2.log`: default flag-off smoke finite; no NaN/INVALID; loss=6.9269; tokens=2048.
+Next action:
+- Do not continue tuning this by gain alone. The failure likely means the selected value adjoint needs normalization/clipping through the same optimizer-scale discipline as address/event parameters, or must target a safer value-representation parameter rather than event/write mass directly.

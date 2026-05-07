@@ -1686,6 +1686,7 @@ impl GpuDeqBackend {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let assoc_value_write_bwd = env_bool("AIDEEN_ASSOC_VALUE_WRITE_BWD", false);
         let mut fpm_retain_bwd_constants = std::collections::HashMap::new();
         fpm_retain_bwd_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
         fpm_retain_bwd_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
@@ -1698,6 +1699,10 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_LIBRARIAN_BWD".to_string(),
             if assoc_librarian_bwd { 1.0 } else { 0.0 },
+        );
+        fpm_retain_bwd_constants.insert(
+            "ENABLE_ASSOC_VALUE_WRITE_BWD".to_string(),
+            if assoc_value_write_bwd { 1.0 } else { 0.0 },
         );
         fpm_retain_bwd_constants.insert(
             "ENABLE_FPM_WRITE_BWD".to_string(),

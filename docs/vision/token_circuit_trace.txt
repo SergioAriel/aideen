@@ -547,3 +547,7 @@ Forward equation: selected bank value is updated as `bank_value <- value_keep_ga
 Backward addition: because full `ASSOC_BANKS * d_model` value adjoints do not fit in workgroup storage at 32 banks, the large-bank branch computes only the forward-selected bank's value adjoint from the read equation: `dL/dbank_value_selected = alpha_assoc * assoc_read_conf * p_selected * g_ctx`. This selected adjoint contributes to the write-mass/event-gate gradient through `(normalized_current_value - previous_bank_value)`.
 Invariant: no full-bank value cache is introduced; storage stays compact and proportional to `d_model + ASSOC_RANK`, not `ASSOC_BANKS * d_model`.
 Diagnostic: `[ASSOC-BWD-STEP] value_adj_sum` reports nonzero selected value adjoint mass on Assoc slots in debug runs.
+
+Large-bank Assoc value adjoint gating
+-------------------------------------
+`AIDEEN_ASSOC_VALUE_WRITE_BWD=1` enables the experimental selected-bank value-write adjoint. It is off by default after a 200-chunk run produced NaN diagnostics and loss ~22.94. The code path remains as an opt-in diagnostic/experimental branch; the promoted serious-prep circuit keeps it disabled.

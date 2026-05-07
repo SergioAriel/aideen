@@ -93,6 +93,10 @@ override ENABLE_ASSOC_ORACLE_FORCE_WRITE: bool = false;
 // default path trains selected bank content while treating allocation as
 // stop-grad, avoiding ill-conditioned cosine Jacobians on empty banks.
 override ENABLE_ASSOC_LIBRARIAN_BWD: bool = false;
+// Experimental large-bank value-write adjoint. It restores a missing backward
+// edge but regressed the 200-chunk serious baseline in its first ungated form,
+// so it must remain opt-in until its dynamics are isolated.
+override ENABLE_ASSOC_VALUE_WRITE_BWD: bool = false;
 // FPM write matrices are contextual carriers. In the current associative
 // precision corridor, their token-level BPTT update is too ill-conditioned and
 // corrupts the forward state before Assoc can be evaluated, so keep it
@@ -1642,7 +1646,7 @@ fn fused_fpm_retain_bwd_main(
                 let bind_grad_large = reduce_sum(lane, local_bind_grad_large);
                 let value_adj_abs_large = reduce_sum(lane, local_value_adj_abs_large);
                 var event_gate_logit_grad_large = 0.0;
-                if (ENABLE_ASSOC_EVENT_GATE) {
+                if (ENABLE_ASSOC_VALUE_WRITE_BWD && ENABLE_ASSOC_EVENT_GATE) {
                     event_gate_logit_grad_large =
                         finite_or(
                             bind_grad_large
@@ -1655,7 +1659,7 @@ fn fused_fpm_retain_bwd_main(
                             0.0,
                         );
                 }
-                if (ENABLE_ASSOC_EVENT_GATE && t > 0u) {
+                if (ENABLE_ASSOC_VALUE_WRITE_BWD && ENABLE_ASSOC_EVENT_GATE && t > 0u) {
                     var local_prev_event_sq_large = 0.0;
                     var local_curr_event_sq_large = 0.0;
                     for (var k = 0u; k < dims_per_lane; k = k + 1u) {
@@ -1692,7 +1696,7 @@ fn fused_fpm_retain_bwd_main(
                             ASSOC_EVENT_GRAD_SCALE * event_gate_logit_grad_large;
                     }
                 }
-                if (lane == 0u) {
+                if (lane == 0u && ENABLE_ASSOC_VALUE_WRITE_BWD) {
                     AssocBwdDebug[assoc_debug_base + 3u] =
                         AssocBwdDebug[assoc_debug_base + 3u] + event_gate_logit_grad_large;
                     AssocBwdDebug[assoc_debug_base + 4u] =
