@@ -2475,3 +2475,34 @@ Result: finite; no NaN/INVALID; train loss=6.1509; held-out val_loss=6.2606; tps
 Interpretation: the promoted default path is not only stable but materially better than the prior no-flag 80-chunk baseline (`6.3758 -> 6.2606`). This strengthens the promotion for serious training.
 Classification: default stable candidate, pending 200-chunk default-on confirmation.
 Next action: run the same default serious-training corridor at 200 chunks, seed42, with temporal Assoc value adjoint still omitted/default-off.
+
+Validation - promoted embedding DEQ-source adjoint default, 200 chunks seed42
+-----------------------------------------------------------------------------
+Corridor: default serious-training path after promotion, `AIDEEN_EMB_USE_DEQ_ADJOINT` omitted/default-on, `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitted/default-off, bridges off, seed42, `AIDEEN_MAX_CHUNKS=200`, held-out 8192 tokens.
+Logs: `logs/real_text/pretrain_emb_deq_default_seed42_chunks200_hung_init.log` (aborted before epoch output; preserved as invalid run) and `logs/real_text/pretrain_emb_deq_default_seed42_chunks200.log` (valid rerun).
+Result: valid rerun finite; no NaN/INVALID; train loss=5.7297; held-out val_loss=5.9535; tps_epoch=137.8; train tokens=204800; held-out tokens=8192.
+Interpretation: the default-on path is numerically stable but does not pass default-promotion quality criteria at 200 chunks. It regresses versus both the no-flag seed42 200 baseline (`5.9472 -> 5.9535`) and the earlier explicit flag-on seed42 200 run (`5.9305 -> 5.9535`). The 80-chunk improvement is therefore insufficient for default promotion.
+Classification: promotion rejected as default; implementation remains experimental useful behind explicit flag.
+Next action: demote `AIDEEN_EMB_USE_DEQ_ADJOINT` back to opt-in and keep the serious-training default on the last non-regressing corridor.
+
+Change gate - demote embedding DEQ-source adjoint back to opt-in
+-----------------------------------------------------------------
+1. Target failure mode: the promoted default path is stable but regresses held-out loss at the required 200-chunk serious-training validation, so leaving it default would degrade the established baseline.
+2. Structural rationale: restore the invariant that default training only uses paths that do not degrade the baseline. Keep the DEQ-source-adjoint reducer available behind `AIDEEN_EMB_USE_DEQ_ADJOINT=1` because the implementation is structurally useful and previously validated as experimental.
+3. Anti-patch check: this does not hide NaNs or tune around instability. It corrects the default-policy error exposed by validation: unvalidated/mixed dynamics must not be default. The causal implementation remains available for isolated future work.
+4. Validation plan: `cargo check --features wgpu -p aideen-training`; run a short default smoke with `AIDEEN_EMB_USE_DEQ_ADJOINT` omitted to ensure the opt-in demotion compiles and remains finite.
+
+Implementation - embedding DEQ-source adjoint demoted to opt-in
+---------------------------------------------------------------
+Change:
+- `AIDEEN_EMB_USE_DEQ_ADJOINT` no longer defaults to enabled.
+- The DEQ-source-adjoint reducer remains implemented and available only with explicit `AIDEEN_EMB_USE_DEQ_ADJOINT=1`.
+- Removed the now-unneeded defaulted env-flag helper from the trainer.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/pretrain_default_after_emb_adjoint_demote_seed42_chunks2.log`: finite GPU/Metal smoke; no NaN/INVALID; train loss=6.9544; held-out val_loss=6.9039; tps_epoch=138.7.
+Classification:
+- Serious-training default: back to default stable baseline corridor.
+- Embedding DEQ-source adjoint: experimental useful / opt-in, not default.
+- Temporal Assoc value adjoint: experimental useful / opt-in, not default.
+Next action: for serious training readiness, validate the baseline/default corridor at 200 chunks after the demotion, then decide whether remaining blockers are only scale/seed coverage or if another structural path must be fixed.

@@ -458,16 +458,6 @@ impl Trainer {
             .unwrap_or(false)
     }
 
-    fn env_flag_default(name: &str, default: bool) -> bool {
-        std::env::var(name)
-            .ok()
-            .map(|v| {
-                let vl = v.trim().to_ascii_lowercase();
-                vl == "1" || vl == "true" || vl == "yes"
-            })
-            .unwrap_or(default)
-    }
-
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
     }
@@ -2583,8 +2573,7 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
-                emb_grad_uses_deq_adjoint =
-                    Self::env_flag_default("AIDEEN_EMB_USE_DEQ_ADJOINT", true);
+                emb_grad_uses_deq_adjoint = Self::env_flag("AIDEEN_EMB_USE_DEQ_ADJOINT");
                 if emb_grad_uses_deq_adjoint {
                     let _ = gpu.reduce_clean_adjoint_to_source_grad_no_readback(
                         per_seq_len,
