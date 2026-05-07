@@ -2424,3 +2424,22 @@ Result: finite; no NaN/INVALID; train loss=5.6973; held-out val_loss=5.9413; tps
 Interpretation: the embedding DEQ-source adjoint path is stable across two 200-chunk seeds and improves held-out versus the no-flag 200-chunk baselines on both seeds: seed42 `5.9472 -> 5.9305`; seed7 `5.9443 -> 5.9413`. This is now the strongest training-circuit improvement found in this pass.
 Classification: default-candidate, still flag-gated until one combined test with temporal Assoc value adjoint and one default-off smoke after the commits.
 Next action: test the combined corridor `AIDEEN_EMB_USE_DEQ_ADJOINT=1` + `AIDEEN_ASSOC_VALUE_WRITE_BWD=1` at 20/80 chunks before deciding promotion order.
+
+Validation - combined embedding DEQ adjoint + temporal value adjoint, 20 chunks seed42
+------------------------------------------------------------------------------------
+Corridor: `AIDEEN_EMB_USE_DEQ_ADJOINT=1`, `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`, bridges off, seed42, `AIDEEN_MAX_CHUNKS=20`, held-out 2048 tokens.
+Log: `logs/real_text/pretrain_combo_emb_deq_value_adj_seed42_chunks20.log`.
+Result: finite on GPU/Metal; no NaN/INVALID; train loss=6.7281; held-out val_loss=6.7201; tps_epoch=121.5; train tokens=20480.
+Interpretation: the combination is numerically stable but does not inherit the 20-chunk benefit from embedding DEQ-source adjoint alone (`6.6499`). Temporal value adjoint appears to interfere with the embedding-source-adjoint benefit at this short horizon. Next validation: 80 chunks only to confirm whether this is a short-run interaction or persistent regression.
+
+Validation - combined embedding DEQ adjoint + temporal value adjoint, 80 chunks seed42
+------------------------------------------------------------------------------------
+Corridor: `AIDEEN_EMB_USE_DEQ_ADJOINT=1`, `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`, bridges off, seed42, `AIDEEN_MAX_CHUNKS=80`, held-out 4096 tokens.
+Log: `logs/real_text/pretrain_combo_emb_deq_value_adj_seed42_chunks80.log`.
+Result: rejected as default; `DEQ-INVALID` at steps 71 and 81; train loss=10.5176; held-out val_loss=6.4260; FPM diagnostics showed NaN `move`, NaN retain averages, `a_delta_max=1.0e12` on slots 0 and 2.
+Interpretation: the combined path is not stable as a serious-training corridor. The embedding DEQ-source adjoint alone is stable/improving at 200 chunks across two seeds, while temporal Assoc value adjoint alone is stable but quality-neutral/mixed. Their combination destabilizes the FPM/DEQ dynamics by 80 chunks.
+Classification:
+- `AIDEEN_EMB_USE_DEQ_ADJOINT=1`: default-candidate.
+- `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`: experimental useful, not default.
+- Combined path: rejected as default; do not continue scaling.
+Next action: keep temporal value adjoint disabled for serious training and decide whether to promote embedding DEQ-source adjoint as the next default after one default-off smoke and/or a default-on smoke.
