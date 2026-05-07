@@ -2415,3 +2415,12 @@ Corridor: `AIDEEN_EMB_USE_DEQ_ADJOINT=1`, bridges off, value adjoint off, seed42
 Log: `logs/real_text/pretrain_emb_deq_adjoint_seed42_chunks200.log`.
 Result: finite; no NaN/INVALID; train loss=5.6950; held-out val_loss=5.9305; tps_epoch=133.6; train tokens=204800; held-out tokens=8192.
 Interpretation: the source-adjoint embedding path scales to 200 chunks on seed42 and improves held-out versus the promoted no-flag seed42 200 baseline (`5.9472 -> 5.9305`). Next validation is seed7 200 chunks before any default-promotion discussion.
+
+Validation - embedding DEQ-source adjoint 200 chunks, seed7
+-----------------------------------------------------------
+Corridor: same as seed42 200-chunk embedding-source-adjoint run, but `AIDEEN_TRAIN_SEED=7`, `AIDEEN_LM_SAMPLE_SEED=7`.
+Log: `logs/real_text/pretrain_emb_deq_adjoint_seed7_chunks200.log`.
+Result: finite; no NaN/INVALID; train loss=5.6973; held-out val_loss=5.9413; tps_epoch=136.6; train tokens=204800; held-out tokens=8192.
+Interpretation: the embedding DEQ-source adjoint path is stable across two 200-chunk seeds and improves held-out versus the no-flag 200-chunk baselines on both seeds: seed42 `5.9472 -> 5.9305`; seed7 `5.9443 -> 5.9413`. This is now the strongest training-circuit improvement found in this pass.
+Classification: default-candidate, still flag-gated until one combined test with temporal Assoc value adjoint and one default-off smoke after the commits.
+Next action: test the combined corridor `AIDEEN_EMB_USE_DEQ_ADJOINT=1` + `AIDEEN_ASSOC_VALUE_WRITE_BWD=1` at 20/80 chunks before deciding promotion order.
