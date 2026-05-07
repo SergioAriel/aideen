@@ -458,6 +458,16 @@ impl Trainer {
             .unwrap_or(false)
     }
 
+    fn env_flag_default(name: &str, default: bool) -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(default)
+    }
+
     fn env_f32(name: &str) -> Option<f32> {
         std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
     }
@@ -2555,6 +2565,7 @@ impl Trainer {
                 return self.last_gpu_loss;
             }
 
+            let mut emb_grad_uses_deq_adjoint = false;
             if !self.frozen_deq && !invalid_fixed_point {
                 // ⑥ Backward DEQ — Picard Adjoint (GPU, siempre).
                 // Skip when DEQ diverged (invalid_fixed_point): gradients from a non-converged
@@ -2572,7 +2583,8 @@ impl Trainer {
                     true, // clear fused_hist_ctx_buf (rhs_slot) before adjoint — eliminates hist rerun
                     batch_size,
                 );
-                let emb_grad_uses_deq_adjoint = Self::env_flag("AIDEEN_EMB_USE_DEQ_ADJOINT");
+                emb_grad_uses_deq_adjoint =
+                    Self::env_flag_default("AIDEEN_EMB_USE_DEQ_ADJOINT", true);
                 if emb_grad_uses_deq_adjoint {
                     let _ = gpu.reduce_clean_adjoint_to_source_grad_no_readback(
                         per_seq_len,
@@ -2683,7 +2695,7 @@ impl Trainer {
             if !self.frozen_emb {
                 let emb_lr = base_lr * self.training_config.emb_lr_mult;
                 let embed_t0 = std::time::Instant::now();
-                let emb_grad_src = if Self::env_flag("AIDEEN_EMB_USE_DEQ_ADJOINT") {
+                let emb_grad_src = if emb_grad_uses_deq_adjoint {
                     gpu.source_grad_buf()
                 } else {
                     &gpu_lm.dl_dh_buf

@@ -2443,3 +2443,26 @@ Classification:
 - `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`: experimental useful, not default.
 - Combined path: rejected as default; do not continue scaling.
 Next action: keep temporal value adjoint disabled for serious training and decide whether to promote embedding DEQ-source adjoint as the next default after one default-off smoke and/or a default-on smoke.
+
+Change gate - promote embedding DEQ-source adjoint as default training path
+---------------------------------------------------------------------------
+1. Target failure mode: serious training default still updates embeddings from LM pooled-output gradient only, bypassing the DEQ/Assoc/FPM reasoning circuit even though the DEQ source adjoint is validated.
+2. Structural rationale: make the validated source-adjoint reducer the default embedding gradient owner when DEQ backward actually runs. Keep fallback to LM `dl_dh` when DEQ is frozen/skipped/eval, preserving valid behavior outside the full training circuit.
+3. Anti-patch check: this promotes the corrected gradient path at the source-input boundary; it does not tune LR, add clipping, or hide instability. The value adjoint remains disabled because its combination was causally rejected.
+4. Validation plan: `cargo check`; GPU default-on smoke without setting `AIDEEN_EMB_USE_DEQ_ADJOINT`; require no NaN/INVALID and metrics consistent with prior flag-on corridor. Also allow opt-out with `AIDEEN_EMB_USE_DEQ_ADJOINT=0` for ablation.
+
+Implementation - embedding DEQ-source adjoint promoted as default
+-----------------------------------------------------------------
+Change:
+- `AIDEEN_EMB_USE_DEQ_ADJOINT` now defaults to enabled for full GPU training.
+- The source-adjoint reducer only feeds embeddings when DEQ backward actually runs; if DEQ is frozen/skipped/invalid, embeddings fall back to LM `dl_dh` to avoid stale source gradients.
+- `AIDEEN_EMB_USE_DEQ_ADJOINT=0` remains an explicit ablation/opt-out.
+Validation:
+- `cargo check --features wgpu -p aideen-training`: pass.
+- `logs/real_text/pretrain_emb_deq_default_seed42_chunks20.log`: finite GPU/Metal run; no NaN/INVALID; train loss=6.7350; held-out val_loss=6.7112; tps_epoch=136.8.
+- `logs/real_text/pretrain_emb_deq_explicit_after_default_seed42_chunks20.log`: finite GPU/Metal explicit flag-on run; no NaN/INVALID; train loss=6.7307; held-out val_loss=6.7350; tps_epoch=135.3.
+Interpretation:
+- The promoted default path is numerically stable in short smoke.
+- Short-run held-out variance is worse than the earlier 20-chunk flag-on result, so promotion is justified by the stronger two-seed 200-chunk evidence already recorded, not by this smoke alone.
+- Temporal Assoc value adjoint remains default-off because the combined 80-chunk run was rejected.
+Classification: default stable candidate for serious training; next validation should be a longer default-on serious run with `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitted/false.
