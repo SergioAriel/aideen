@@ -2326,3 +2326,10 @@ Validation:
 - `logs/real_text/value_adj_gated_default_smoke_chunks2.log`: default flag-off smoke finite; no NaN/INVALID; loss=6.9269; tokens=2048.
 Next action:
 - Do not continue tuning this by gain alone. The failure likely means the selected value adjoint needs normalization/clipping through the same optimizer-scale discipline as address/event parameters, or must target a safer value-representation parameter rather than event/write mass directly.
+
+Validation addendum - gated value adjoint restores default 20-chunk corridor
+---------------------------------------------------------------------------
+Corridor: default serious-prep profile with `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitted/false, seed42, `AIDEEN_MAX_CHUNKS=20`, `AIDEEN_HELDOUT_MAX_TOKENS=2048`.
+Log: `logs/real_text/value_adj_gated_default_pretrain_chunks20.log`.
+Result: finite; no NaN/INVALID; train loss=6.7283; held-out val_loss=6.7233; tps_epoch=135.4; train tokens=20480.
+Interpretation: after gating, the default path is back in the stable corridor. The experimental value adjoint remains available only via `AIDEEN_ASSOC_VALUE_WRITE_BWD=1` and must not be used for serious training until its 200-chunk NaN mechanism is fixed.
