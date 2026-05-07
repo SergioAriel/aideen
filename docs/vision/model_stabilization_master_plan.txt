@@ -2408,3 +2408,10 @@ Interpretation:
 - 80-chunk seed42 improves versus baseline (`6.3758 -> 6.3579`), while seed7 regresses versus the previous seed7 no-flag 80 baseline (`6.3091 -> 6.3603`). This is stable but not yet default-promotable.
 Classification: experimental useful / pending. Needs 200-chunk two-seed validation and/or source-gradient scale review before default promotion.
 Next action: test whether combining `AIDEEN_EMB_USE_DEQ_ADJOINT=1` with temporal Assoc value adjoint remains stable, or first run 200 chunks on the embedding-adjoint path alone.
+
+Validation - embedding DEQ-source adjoint 200 chunks, seed42
+------------------------------------------------------------
+Corridor: `AIDEEN_EMB_USE_DEQ_ADJOINT=1`, bridges off, value adjoint off, seed42, `AIDEEN_MAX_CHUNKS=200`, held-out 8192 tokens.
+Log: `logs/real_text/pretrain_emb_deq_adjoint_seed42_chunks200.log`.
+Result: finite; no NaN/INVALID; train loss=5.6950; held-out val_loss=5.9305; tps_epoch=133.6; train tokens=204800; held-out tokens=8192.
+Interpretation: the source-adjoint embedding path scales to 200 chunks on seed42 and improves held-out versus the promoted no-flag seed42 200 baseline (`5.9472 -> 5.9305`). Next validation is seed7 200 chunks before any default-promotion discussion.
