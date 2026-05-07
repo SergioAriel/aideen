@@ -2506,3 +2506,12 @@ Classification:
 - Embedding DEQ-source adjoint: experimental useful / opt-in, not default.
 - Temporal Assoc value adjoint: experimental useful / opt-in, not default.
 Next action: for serious training readiness, validate the baseline/default corridor at 200 chunks after the demotion, then decide whether remaining blockers are only scale/seed coverage or if another structural path must be fixed.
+
+Validation - default serious-training corridor after embedding-adjoint demotion, 200 chunks seed42
+-------------------------------------------------------------------------------------------------
+Corridor: `AIDEEN_EMB_USE_DEQ_ADJOINT` omitted/default-off, `AIDEEN_ASSOC_VALUE_WRITE_BWD` omitted/default-off, bridges off, seed42, `AIDEEN_MAX_CHUNKS=200`, held-out 8192 tokens.
+Log: `logs/real_text/pretrain_default_after_emb_adjoint_demote_seed42_chunks200.log`.
+Result: finite; no NaN/INVALID; train loss=5.6279; held-out val_loss=5.8978; tps_epoch=137.2; train tokens=204800; held-out tokens=8192.
+Interpretation: the serious-training default is stable after demoting the embedding DEQ-source adjoint. This run also beats the earlier no-flag seed42 baseline (`5.9472 -> 5.8978`) and the rejected promoted-default run (`5.9535 -> 5.8978`). Because the run uses the default-off corridor, the improvement should be treated as validation of the current clean baseline, not as evidence for the demoted adjoint.
+Classification: default stable for seed42 200-chunk corridor.
+Next action: run the same post-demotion default corridor on seed7 before declaring the serious-training default seed-stable.
