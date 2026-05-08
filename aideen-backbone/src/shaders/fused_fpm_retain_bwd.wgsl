@@ -779,7 +779,13 @@ fn fused_fpm_retain_bwd_main(
             var slot_logit_grad_i = 0.0;
             var bank_logit_grad_best = 0.0;
             let oracle_librarian_stop_grad = ENABLE_ASSOC_ORACLE_WRITE_POSITIONS;
-            if (ENABLE_ASSOC_LIBRARIAN_BWD && !oracle_librarian_stop_grad) {
+            // [FIX] event_gate_logit_grad is independent of LIBRARIAN_BWD.
+            // The event gate decides *when* to write; the librarian decides *where*.
+            // Keeping this gated behind LIBRARIAN_BWD was the root cause of
+            // event_b_mean=0 even when ENABLE_ASSOC_EVENT_GATE=1.
+            // Slot/bank logit grads remain unchanged inside; they are internally
+            // gated by ENABLE_ASSOC_SLOT_OWNER so no behavior change for them.
+            if (/* ENABLE_ASSOC_LIBRARIAN_BWD && */ !oracle_librarian_stop_grad) {
                 event_gate_logit_grad = finite_or(
                     d_allow_write * p_slot_i_wg
                     * event_gate_bwd * (1.0 - event_gate_bwd) * has_prev_hstar
@@ -805,7 +811,10 @@ fn fused_fpm_retain_bwd_main(
             }
 
             // 4. Update Librarian Weights (Accumulate into AllGradients)
-            if (ENABLE_ASSOC_LIBRARIAN_BWD && !oracle_librarian_stop_grad && t > 0u) {
+            // [FIX] Apply event gate gradient whenever ENABLE_ASSOC_EVENT_GATE is active,
+            // not only when LIBRARIAN_BWD is on. Restores the missing backward edge
+            // for W_event / b_event.
+            if (ENABLE_ASSOC_EVENT_GATE && /* ENABLE_ASSOC_LIBRARIAN_BWD && */ !oracle_librarian_stop_grad && t > 0u) {
                 for (var k = 0u; k < dims_per_lane; k = k + 1u) {
                     let dim = lane * dims_per_lane + k;
                     let prev_src_e = (S_in[(t_abs - 1u) * d + dim] + select(0.0, AllWeights[slot_anchor_root + dim], ENABLE_ASSOC_SLOT_ANCHOR)) / max(prev_event_rms, 1.0e-6);
