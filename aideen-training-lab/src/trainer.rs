@@ -2681,7 +2681,7 @@ impl Trainer {
                 }
             }
 
-            if !self.frozen_emb {
+            if !self.frozen_emb && !invalid_fixed_point {
                 let emb_lr = base_lr * self.training_config.emb_lr_mult;
                 let embed_t0 = std::time::Instant::now();
                 let emb_grad_src = if emb_grad_uses_deq_adjoint {
