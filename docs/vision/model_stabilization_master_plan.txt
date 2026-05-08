@@ -44,6 +44,10 @@ Task tree
    1.4. Add strict full-path analysis rule to skill.
         Status: done.
         Why: user explicitly required that every variable/function in other files be found and analyzed, not assumed.
+   1.5. Create pre-training diagnostics checklist.
+        Status: created.
+        File: docs/vision/pretraining_diagnostics_checklist.txt
+        Why: centralize "Levels of Certainty" and log interpretation to prevent expensive training failures.
 
 2. Measurement and logs
    2.1. Preserve logs under logs/assoc_recall/.
@@ -2524,3 +2528,10 @@ Result: rejected; train loss=22.9376; held-out val_loss=22.9476; tps_epoch=137.1
 Interpretation: the default serious-training corridor is not seed-stable at 200 chunks in the current code state. Seed42 passed, seed7 explodes, so serious training is not ready. This failure is not caused by the embedding DEQ-source adjoint being default-on, because the rerun omitted `AIDEEN_EMB_USE_DEQ_ADJOINT` after demotion.
 Classification: default corridor pending / failing seed-stability requirement.
 Next action: bisect the seed7 horizon with shorter default-off runs to identify when the FPM/DEQ state becomes corrupt, before any corrective code change.
+
+Change gate - skip embedding update on invalid fixed point
+----------------------------------------------------------
+1. Target failure mode: seed7 default training reports `DEQ-INVALID` by step 11 and later collapses to NaN/FPM-dead state by 80 chunks. Current code disables LM LR and skips DEQ weight update on `invalid_fixed_point`, but still updates embeddings from `dl_dh` produced by the invalid forward state.
+2. Structural rationale: if the DEQ solve did not produce a valid fixed point, gradients that depend on that state are not reliable. The same invariant used to skip implicit DEQ gradients must apply to token embeddings, because their update consumes the LM gradient through the invalid DEQ output path.
+3. Anti-patch check: this is not NaN masking or clipping. It prevents an invalid solver state from becoming a parameter update at the exact boundary where corruption enters persistent weights. Valid fixed-point steps continue to train normally; invalid steps are treated as no-update recovery windows.
+4. Validation plan: `cargo check`; seed7 20 chunks should remain finite and not corrupt embeddings after the step-11 invalid event; seed7 80 chunks should no longer collapse to NaN/FPM-dead state. Compare against seed42 smoke to ensure no broad regression.
