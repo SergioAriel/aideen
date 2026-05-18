@@ -1,21 +1,18 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2025-2026 Sergio Ariel Solis and Juan Patricio Marchetto
-
-//! bench_harness — AIDEEN (DEQ+SSM) vs Transformer: benchmark defensible.
+//! bench_harness — AIDEEN (DEQ+SSM) vs Transformer: a defensible benchmark.
 //!
 //! Three coordinated experiments:
 //!   EXP 1 · Iso-data  : same tokens seen → compares val_loss and efficiency
-//!   EXP 2 · Iso-time  : same wall time → compares tokens achieved and val_loss
-//!   EXP 3 · Inference : teacher-forcing NLL + throughput (on EXP 1 checkpoints)
+//!   EXP 2 · Iso-time  : same wall-clock time → compares tokens reached and val_loss
+//!   EXP 3 · Inference : teacher-forcing NLL + throughput (over EXP 1 checkpoints)
 //!
 //! Protocol guarantees:
-//!   • eval_*() is pure &self — does not mutate weights, optimizer, or state
+//!   • eval_*() is pure &self — does not mutate weights, optimizer or states
 //!   • Both models see the same batches in the same order
-//!   • tokens_seen counted exactly: tokens_in.len() per step
-//!   • training wall_clock accumulated separately from eval time
-//!   • Declared limitation: AIDEEN does T micro-steps Adam per batch
+//!   • tokens_seen is counted exactly: tokens_in.len() per step
+//!   • training wall_clock is accumulated separately from eval time
+//!   • Declared limitation: AIDEEN does T Adam micro-steps per batch
 //!
-//! Uso:
+//! Usage:
 //!   cargo run -p aideen-bench --release
 
 mod dataset;
@@ -33,18 +30,18 @@ use rand::{Rng, SeedableRng};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use transformer_candle::{CandleBackend, CandleTransformer, CandleTransformerConfig};
 
-// ── Experiment budget ────────────────────────────────────────────────────────
+// ── Experiment budget ─────────────────────────────────────────────────────────
 /// Context per batch — both models see the same length.
 const CTX_LEN: usize = 128;
 /// DEQ hidden dimension → ~283 K params with vocab=65.
 const D_R_AIDEEN: usize = 192;
 /// Shared learning rate.
 const LR: f32 = 1e-3;
-/// Iso-data: tokens que ve cada modelo (EXP 1).
+/// Iso-data: tokens each model sees (EXP 1).
 const TOTAL_TOKENS: usize = 1_000_000;
-/// Iso-time: segundos de pared por experimento (EXP 2).
+/// Iso-time: wall-clock seconds per experiment (EXP 2).
 const ISO_TIME_SECS: u64 = 600;
-/// Evaluar val_loss cada N tokens de training.
+/// Evaluate val_loss every N training tokens.
 const EVAL_EVERY: usize = 20_000;
 /// Validation tokens per checkpoint (teacher-forcing).
 const VAL_TOKENS: usize = 16_384;
@@ -129,7 +126,7 @@ struct InferenceMetrics {
     tf_tps: f64,
 }
 
-// ── Estructuras de métricas ───────────────────────────────────────────────────
+// ── Metrics structures ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct EvalPoint {
@@ -137,7 +134,7 @@ struct EvalPoint {
     wall_secs: f64,
     val_loss: f32,
     train_loss: f32,
-    tps: f32, // tokens/s de training (sin contar tiempo de eval)
+    tps: f32, // training tokens/s (excluding eval time)
 }
 
 struct ModelRun {
@@ -147,7 +144,7 @@ struct ModelRun {
     best_val: f32,
     tokens_total: usize,
     updates_total: usize,
-    secs_train: f64, // solo tiempo de training, excluye eval
+    secs_train: f64, // training time only, excludes eval
 }
 
 impl ModelRun {
@@ -164,18 +161,18 @@ impl ModelRun {
     }
 }
 
-// ── Model construction ───────────────────────────────────────────────────────
+// ── Model construction ────────────────────────────────────────────────────────
 
 fn build_aideen(vocab_size: usize, vocab: Vec<char>, seed: u64, backend: Backend) -> Trainer {
     let mut cfg = ArchitectureConfig::default();
     cfg.d_r = D_R_AIDEEN;
     cfg.vocab_size = vocab_size;
     cfg.ctx_len = CTX_LEN;
-    cfg.max_deq_iters = 16; // match training defaults (was 6, too low to converge from random)
-    cfg.adj_iters = 6;
+    cfg.max_deq_iters = 6;
+    cfg.adj_iters = 4;
     cfg.train_deq = true;
     cfg.deq_grad_scale = 0.01;
-    cfg.renorm_every_steps = 4; // match training defaults (was 50, spectral norm applied too infrequently)
+    cfg.renorm_every_steps = 50;
 
     let mut tok = Tokenizer::new_empty(vocab_size, cfg.clone());
     tok.vocab = vocab;
@@ -226,10 +223,10 @@ fn tf_candle_config(vocab_size: usize) -> CandleTransformerConfig {
     }
 }
 
-// ── Eval puro — &self garantizado, no muta nada ───────────────────────────────
+// ── Pure eval — guaranteed &self, mutates nothing ─────────────────────────────
 
-/// Evaluates AIDEEN on VAL_CHUNKS windows of the val set.
-/// Uses `eval_loss` which is `&self` (forward DEQ without backprop, without optimizer.tick()).
+/// Evaluates AIDEEN over VAL_CHUNKS windows of the val set.
+/// Uses `eval_loss`, which is `&self` (forward DEQ without backprop, without optimizer.tick()).
 fn eval_aideen(trainer: &Trainer, val: &[u32]) -> f32 {
     let stride = CTX_LEN + 1;
     let n_target = (VAL_TOKENS / CTX_LEN).max(1);
@@ -244,8 +241,8 @@ fn eval_aideen(trainer: &Trainer, val: &[u32]) -> f32 {
     sum / n as f32
 }
 
-/// Evaluates Transformer on VAL_CHUNKS windows.
-/// Uses `val_loss` which is `&self` (forward_only, without optimizer.tick()).
+/// Evaluates the Transformer over VAL_CHUNKS windows.
+/// Uses `val_loss`, which is `&self` (forward_only, without optimizer.tick()).
 fn eval_tf(tf: &CandleTransformer, val: &[u32]) -> f32 {
     let stride = CTX_LEN + 1;
     let n_target = (VAL_TOKENS / CTX_LEN).max(1);
@@ -263,7 +260,7 @@ fn eval_tf(tf: &CandleTransformer, val: &[u32]) -> f32 {
     sum / n as f32
 }
 
-// ── Stop condition ───────────────────────────────────────────────────────────
+// ── Stopping condition ────────────────────────────────────────────────────────
 
 enum Budget {
     Tokens(usize),
@@ -271,10 +268,10 @@ enum Budget {
     Time(Duration),
 }
 
-// ── Shared training loop ────────────────────────────────────────────────────
+// ── Shared training loop ─────────────────────────────────────────────────────
 //
 // Both models receive the same batches in the same order.
-// Eval time is excluded from secs_train for each model.
+// Eval time is excluded from each model's secs_train.
 
 fn train_loop(
     eval_every: usize,
@@ -317,7 +314,7 @@ fn train_loop(
             break;
         }
 
-        // Mismo batch para ambos modelos
+        // Same batch for both models
         let max_off = n_train.saturating_sub(stride + 1);
         if max_off == 0 {
             break;
@@ -428,7 +425,7 @@ fn train_loop(
     }
 }
 
-// ── Salida de curvas ──────────────────────────────────────────────────────────
+// ── Curve output ──────────────────────────────────────────────────────────────
 
 fn print_curve(ai: &ModelRun, tf: &ModelRun, x_is_tokens: bool) {
     let x_label = if x_is_tokens { "tokens" } else { "wall(s)" };
@@ -550,7 +547,7 @@ fn inference_bench(aideen: &Trainer, tf: &CandleTransformer, val: &[u32]) {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("  • forward-only (&self): no sampling, no backprop, no tick");
     println!(
-        "  • Same chunks from the val set (target_tokens={}, stride=CTX_LEN+1)",
+        "  • Same chunks of the val set (target_tokens={}, stride=CTX_LEN+1)",
         VAL_TOKENS
     );
     println!();
@@ -580,7 +577,7 @@ fn inference_bench(aideen: &Trainer, tf: &CandleTransformer, val: &[u32]) {
     );
     println!();
     let speedup = m.tf_tps / m.ai_tps.max(1e-9);
-    println!("  Speedup inferencia Transformer/AIDEEN : {:.1}×", speedup);
+    println!("  Inference speedup Transformer/AIDEEN : {:.1}×", speedup);
     let nll_delta = m.tf_nll - m.ai_nll;
     if nll_delta > 0.005 {
         println!(
@@ -729,7 +726,7 @@ fn paired_t_test_and_effect(ai: &[f64], tf: &[f64]) -> Option<(f64, f64, f64)> {
     let dof = n - 1.0;
     let dist = StudentsT::new(0.0, 1.0, dof).ok()?;
     let p = 2.0 * (1.0 - dist.cdf(t_stat.abs()));
-    // Cohen's dz para muestras pareadas.
+    // Cohen's dz for paired samples.
     let dz = mean_d / sd_d;
     Some((t_stat, p, dz))
 }
@@ -794,40 +791,8 @@ fn run_single_seed(
         Backend::Gpu => CandleBackend::Metal,
     };
 
-    // ── Spectral warm-up phase (DEQ only) ─────────────────────────────────
-    // DEQ requires spectral pre-conditioning before convergence.
-    // Warm-up is NOT counted in the iso-data comparison.
-    let warmup_steps: usize = std::env::var("AIDEEN_BENCH_WARMUP_STEPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut aideen1 = build_aideen(vocab_size, ds.vocab.clone(), seed, ai_backend);
-    if warmup_steps > 0 {
-        println!(
-            "  [WARM-UP] DEQ spectral conditioning: {warmup_steps} steps (not counted in comparison)"
-        );
-        let mut rng_wu = StdRng::seed_from_u64(seed ^ 0x0A41_0000);
-        for step in 0..warmup_steps {
-            let start = rng_wu.gen_range(0..ds.train.len().saturating_sub(CTX_LEN + 1));
-            let tokens_in = &ds.train[start..start + CTX_LEN];
-            let targets = &ds.train[start + 1..start + CTX_LEN + 1];
-            let _loss =
-                aideen1.train_sequence(tokens_in, targets, true, aideen1.config.deq_epsilon);
-            if step % 200 == 0 {
-                if let Some(ref gpu) = aideen1.gpu_deq {
-                    let fw = gpu.read_debug_buffer();
-                    let contr = if fw.len() > 21 { fw[21] } else { 0.0 };
-                    let iters = if fw.len() > 13 { fw[13] } else { 0.0 };
-                    println!(
-                        "    [WARM-UP] step {step}: contractivity={contr:.3}, avg_iters={iters:.1}"
-                    );
-                }
-            }
-        }
-        println!("  [WARM-UP] Complete. DEQ pre-conditioned for benchmark.");
-    }
-
     // EXP 1: iso-data
+    let mut aideen1 = build_aideen(vocab_size, ds.vocab.clone(), seed, ai_backend);
     let mut tf1 =
         CandleTransformer::new(cfg_tf.clone(), LR as f64, tf_cb).expect("tf candle init exp1");
     let mut ai1 = ModelRun::new("AIDEEN", aideen_params(vocab_size));
@@ -926,7 +891,7 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Protocol guarantees:");
-    println!("  ✓ eval_*() is pure &self — does not mutate weights, optimizer, or state");
+    println!("  ✓ eval_*() is pure &self — does not mutate weights, optimizer or state");
     println!("  ✓ Both models see the same batches in the same order");
     println!("  ✓ tokens_seen counted exactly (tokens_in.len() per step)");
     println!("  ✓ training wall_clock accumulated WITHOUT counting eval time");
@@ -953,7 +918,7 @@ fn main() {
     }
     if ai_backend != tf_backend && allow_mixed {
         println!(
-            "  [WARN] Mixed backend comparison ({} vs {}). For symmetric benchmark use CPUvsCPU.",
+            "  [WARN] Mixed backend comparison ({} vs {}). For a symmetric benchmark use CPUvsCPU.",
             ai_backend.as_str(),
             tf_backend.as_str()
         );
@@ -985,7 +950,7 @@ fn main() {
     );
     let param_diff_pct = 100.0 * (ai_p as f32 - tf_p as f32).abs() / tf_p as f32;
     println!(
-        "  Difference : {:.1}%  (target iso-params <{:.1}%)",
+        "  Difference : {:.1}%  (iso-params target <{:.1}%)",
         param_diff_pct, PARAM_TOLERANCE_PCT
     );
     if param_diff_pct > PARAM_TOLERANCE_PCT {
@@ -1037,7 +1002,7 @@ fn main() {
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  Aggregated summary (mean ± std, multi-seed)                 ║");
+    println!("║  Aggregate summary (mean ± std, multi-seed)                 ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!(
         "EXP1 Iso-Data best_val:   AIDEEN {:.4} ± {:.4} | TF {:.4} ± {:.4}",

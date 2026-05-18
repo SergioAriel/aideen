@@ -1,6 +1,6 @@
-/// Dataset: TinyShakespeare with char-level tokenizer.
+/// Dataset: TinyShakespeare with a char-level tokenizer.
 ///
-/// Downloads ~1MB from GitHub, builds 65-char vocab,
+/// Downloads ~1MB from GitHub, builds a vocab of 65 chars,
 /// and returns train/val splits as Vec<u32>.
 
 const URL: &str =
@@ -38,7 +38,7 @@ impl Dataset {
 }
 
 fn load_text() -> String {
-    // 1. Try to read from local cache
+    // 1. Try to read from the local cache
     if let Ok(text) = std::fs::read_to_string(CACHE) {
         if text.len() > 100_000 {
             println!("  Dataset: local cache ({} chars)", text.len());
@@ -46,7 +46,7 @@ fn load_text() -> String {
         }
     }
 
-    // 2. Download with curl (available by default on macOS)
+    // 2. Download with curl (available on macOS by default)
     println!("  Dataset: downloading TinyShakespeare...");
     let output = std::process::Command::new("curl")
         .args(["-sL", "--max-time", "30", URL])
@@ -54,7 +54,7 @@ fn load_text() -> String {
         .expect("curl not available");
 
     if !output.status.success() || output.stdout.len() < 100_000 {
-        panic!("Error downloading TinyShakespeare. Check internet connection.");
+        panic!("Error downloading TinyShakespeare. Check your internet connection.");
     }
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -70,7 +70,7 @@ fn load_text() -> String {
 }
 
 fn build(text: String) -> Dataset {
-    // Build sorted char-level vocab
+    // Build a sorted char-level vocab
     let mut vocab: Vec<char> = text
         .chars()
         .collect::<std::collections::BTreeSet<_>>()
