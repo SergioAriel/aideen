@@ -17,8 +17,8 @@ pub struct PeerEntry {
     pub tls_fingerprint: Option<[u8; 32]>,
 }
 
-/// Update incremental del directorio de peers.
-/// El camino normal (no bootstrap): un nodo entra/sale → 1 registro, no full-push.
+/// Incremental update of the peer directory.
+/// The normal path (not bootstrap): a node joins/leaves → 1 record, not a full-push.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PeerDelta {
     /// Monotonic. `apply_delta` rejects if epoch <= registry.epoch.

@@ -12,7 +12,7 @@ use aideen_core::{
 /// AIDEEN Node: orchestrates the full cycle without knowing concrete implementations.
 /// The network is external to the DEQ loop — messages are emitted from outside tick().
 pub struct AideenNode<R, C, E, M, B> {
-    // Estado cognitivo global [S_M | S_R | S_C | S_E | S_sim]
+    // Global cognitive state [S_M | S_R | S_C | S_E | S_sim]
     pub state: DVector<f32>,
 
     // Cognitive contracts (core)
@@ -129,7 +129,7 @@ where
     B: aideen_core::compute::ComputeBackend,
 {
     /// Constitutional Attractor Definition (AIDEEN):
-    /// h* es atractor <=> ||h_{t+1} - h_t|| < epsilon AND Q(h*) >= Q_MIN_WRITE
+    /// h* is an attractor <=> ||h_{t+1} - h_t|| < epsilon AND Q(h*) >= Q_MIN_WRITE
     pub fn is_attractor_state(&self, delta_norm: f32, q: f32) -> bool {
         delta_norm < self.epsilon && q >= Q_MIN_WRITE
     }
@@ -249,7 +249,7 @@ where
                     oscillation_var,
                 );
 
-                // --- GATING N2 (Física Cognitiva) ---
+                // --- GATING N2 (Cognitive Physics) ---
                 let is_attractor = self.is_attractor_state(delta_norm, quality.q_total);
 
                 if !is_attractor {
@@ -282,7 +282,7 @@ where
                 }
 
                 let energy_r = energy_sq_r.sqrt();
-                let energy_total = energy_r; // S_sim no cambia con H*
+                let energy_total = energy_r; // S_sim does not change with H*
 
                 if self.ethics.violates(&proposed) {
                     return Some(TickMetrics {

@@ -2,7 +2,7 @@ pub mod agent;
 pub mod doc_memory;
 pub mod memory;
 
-// Módulos nativos: dependen de tokio, QUIC y backbone, no compilan en wasm32.
+// Native modules: depend on tokio, QUIC and backbone, do not compile on wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod critic;
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,14 +17,14 @@ pub mod runner;
 pub mod system;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod update;
-// capabilities: sin cfg — tiene implementación native y WASM
+// capabilities: no cfg — has both native and WASM implementations
 pub mod capabilities;
-// artifacts: native-only (store/policy local, no necesario en browser)
+// artifacts: native-only (local store/policy, not needed in the browser)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod artifacts;
-// peers: directorio indexado de peers (native-only, no dial en wasm)
+// peers: indexed peer directory (native-only, no dialing on wasm)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod peers;
-// security: TOFU + pinning de fingerprints TLS (native-only)
+// security: TOFU + TLS fingerprint pinning (native-only)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod security;

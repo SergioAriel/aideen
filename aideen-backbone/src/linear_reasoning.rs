@@ -12,7 +12,7 @@ pub struct LinearReasoning {
 impl LinearReasoning {
     pub fn new(config: ArchitectureConfig) -> Self {
         let d_r = config.d_r;
-        // Inicialización simple y estable
+        // Simple and stable initialization
         let weights = DMatrix::identity(d_r, d_r) * 0.9;
         Self { weights, config }
     }
@@ -45,7 +45,7 @@ impl Reasoning for LinearReasoning {
         let h_slots = self.config.h_slots;
         for k in 0..h_slots {
             let h_r = h.slot(k);
-            // Proyección lineal + tanh por slot
+            // Linear projection + tanh per slot
             let mut next_r = &self.weights * &h_r;
             for v in next_r.iter_mut() {
                 *v = v.tanh();

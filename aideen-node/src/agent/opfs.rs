@@ -29,7 +29,7 @@ pub struct OpfsAgentStore {
 }
 
 impl OpfsAgentStore {
-    /// Abre o crea el store bajo `<agent_id>/` en OPFS.
+    /// Opens or creates the store under `<agent_id>/` in OPFS.
     /// Loads prefs and the latest events from disk.
     pub async fn open(agent_id: &str) -> Result<Self, String> {
         let dir = agent_dir(agent_id).await?;
@@ -74,7 +74,7 @@ impl AgentStore for OpfsAgentStore {
         }
         self.recent.push_back(event.clone());
 
-        // Serializar frame [u32 LE len][bincode(event)]
+        // Serialize frame [u32 LE len][bincode(event)]
         let payload = bincode::serialize(&event).map_err(|e| e.to_string())?;
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -149,7 +149,7 @@ async fn write_full(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), St
         .dyn_into()
         .map_err(|_| "OPFS write_full: not FileSystemFileHandle".into())?;
 
-    // keepExistingData: false (por defecto) → trunca al abrir
+    // keepExistingData: false (default) → truncates on open
     let writable: FileSystemWritableFileStream = JsFuture::from(fh.create_writable())
         .await
         .map_err(|e| format!("OPFS createWritable({}): {:?}", name, e))?
@@ -184,7 +184,7 @@ async fn append_bytes(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), 
         .dyn_into()
         .map_err(|_| "OPFS append: not FileSystemFileHandle".into())?;
 
-    // Leer tamaño actual para seek al EOF
+    // Read current size to seek to EOF
     let file: web_sys::File = JsFuture::from(fh.get_file())
         .await
         .map_err(|e| format!("OPFS getFile({}): {:?}", name, e))?
@@ -192,7 +192,7 @@ async fn append_bytes(agent_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), 
         .map_err(|_| "OPFS append: not File".into())?;
     let eof = file.size() as u64;
 
-    // keepExistingData: true → no trunca; seek al EOF para append puro
+    // keepExistingData: true → does not truncate; seek to EOF for a pure append
     let create_opts = FileSystemCreateWritableOptions::new();
     create_opts.set_keep_existing_data(true);
     let writable: FileSystemWritableFileStream =
@@ -246,7 +246,7 @@ fn parse_events(bytes: &[u8]) -> VecDeque<AgentEvent> {
         }
         cursor += len;
     }
-    // Conservar solo los últimos RECENT_CAP (si el log creció más allá del cap)
+    // Keep only the last RECENT_CAP (if the log grew beyond the cap)
     while events.len() > RECENT_CAP {
         events.pop_front();
     }

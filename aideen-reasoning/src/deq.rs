@@ -13,7 +13,7 @@ impl<R: Reasoning> GeneralDEQ<R> {
     }
 }
 
-// Un DEQ es simplemente un wrapper que expone la lógica iterativa
+// A DEQ is simply a wrapper that exposes the iterative logic
 impl<R: Reasoning> Reasoning for GeneralDEQ<R> {
     fn config(&self) -> &aideen_core::state::ArchitectureConfig {
         self.inner_model.config()

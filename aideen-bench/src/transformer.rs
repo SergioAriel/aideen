@@ -73,7 +73,7 @@ impl LayerNorm {
         (out, mean, inv_std, x_c)
     }
 
-    /// Backward: retorna (dx, dscale, dbias).
+    /// Backward: returns (dx, dscale, dbias).
     fn backward(
         &self,
         dout: &DVector<f32>,
@@ -105,7 +105,7 @@ pub struct MiniAdam {
     beta2: f32,
     eps: f32,
     t: usize,
-    // Momenta: guardados como Vec<f32> aplanados
+    // Momenta: stored as flattened Vec<f32>
     m: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
 }
@@ -141,7 +141,7 @@ impl MiniAdam {
     }
 }
 
-// ─── Capa Transformer ─────────────────────────────────────────────────────────
+// ─── Transformer layer ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct TransformerLayer {
@@ -186,7 +186,7 @@ fn gelu_grad(x: f32) -> f32 {
     0.5 * (1.0 + t) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x)
 }
 
-// ─── Transformer principal ────────────────────────────────────────────────────
+// ─── Main Transformer ─────────────────────────────────────────────────────────
 
 pub struct Transformer {
     cfg: TransformerConfig,
@@ -234,7 +234,7 @@ impl Transformer {
     }
 
     /// Trains a batch of tokens, returns loss.
-    /// tokens: secuencia de longitud T, targets = tokens[1..]
+    /// tokens: sequence of length T, targets = tokens[1..]
     pub fn train_step(&mut self, tokens: &[u32], opt: &mut MiniAdam) -> f32 {
         if tokens.len() < 2 {
             return 0.0;
@@ -260,7 +260,7 @@ impl Transformer {
         cross_entropy_loss(&logits_rows, targets)
     }
 
-    /// Genera texto caracter a caracter.
+    /// Generates text character by character.
     pub fn generate(&self, seed: &[u32], max_new: usize, temperature: f32) -> Vec<u32> {
         let mut tokens = seed.to_vec();
         let mut rng = rand::thread_rng();
@@ -278,19 +278,19 @@ impl Transformer {
 
 // ─── Forward + Backward ───────────────────────────────────────────────────────
 
-// Cache por layer para backward
+// Per-layer cache for backward
 struct LayerCache {
-    x_in: Vec<DVector<f32>>,         // input de la capa
-    x_c1: Vec<DVector<f32>>,         // x_centered de ln1
+    x_in: Vec<DVector<f32>>,         // layer input
+    x_c1: Vec<DVector<f32>>,         // x_centered of ln1
     inv_std1: Vec<f32>,
-    qkv: Vec<DMatrix<f32>>,          // [T × 3d] concatenado
+    qkv: Vec<DMatrix<f32>>,          // [T × 3d] concatenated
     attn_weights: DMatrix<f32>,      // [T × T]
     attn_out: Vec<DVector<f32>>,     // [T × d]
     x_after_attn: Vec<DVector<f32>>, // residual post-attn
-    x_c2: Vec<DVector<f32>>,         // x_centered de ln2
+    x_c2: Vec<DVector<f32>>,         // x_centered of ln2
     inv_std2: Vec<f32>,
-    pre_gelu: Vec<DVector<f32>>,     // [T × d_ff] antes de GELU
-    ffn_out: Vec<DVector<f32>>,      // [T × d_ff] después de GELU
+    pre_gelu: Vec<DVector<f32>>,     // [T × d_ff] before GELU
+    ffn_out: Vec<DVector<f32>>,      // [T × d_ff] after GELU
 }
 
 struct Grads {

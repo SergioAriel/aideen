@@ -3,7 +3,7 @@
 //! Trains identical sequences to measure real throughput in (tokens/s)
 //! using full implicit differentiation with Conjugate Gradient.
 //!
-//! Uso:
+//! Usage:
 //!   cargo run --release --features wgpu -p aideen-training --bin benchmark
 
 use std::time::Instant;
@@ -54,9 +54,9 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
         println!("  FULL mode (default): complete dataset");
     }
 
-    let mut trainer = Trainer::from_tokenizer(tok, 0.05); // LR elevado para overfit rápido
+    let mut trainer = Trainer::from_tokenizer(tok, 0.05); // high LR for fast overfit
     trainer.config.train_deq = true;
-    trainer.training_config.epochs = if quick_bench { 8 } else { 200 }; // 200 épocas
+    trainer.training_config.epochs = if quick_bench { 8 } else { 200 }; // 200 epochs
     trainer.config.max_deq_iters = if quick_bench { 4 } else { 18 };
     trainer.config.adj_iters = if quick_bench { 4 } else { 15 };
     trainer.config.deq_epsilon = if quick_bench { 1e-4 } else { 1e-4 };
@@ -93,7 +93,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
             return;
         }
     } else {
-        println!("  Hardware Backend: Rust CPU (Secuencial) 💻");
+        println!("  Hardware Backend: Rust CPU (Sequential) 💻");
     }
 
     println!("  Training context: {} tokens", train_tokens.len());
@@ -102,7 +102,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
     let epochs = trainer.training_config.epochs;
     let tokens_per_epoch = train_tokens.len();
 
-    // Warmup iterativo (Sequence Fusing)
+    // Iterative warmup (Sequence Fusing)
     let warmup_epochs = if quick_bench { 0 } else { 1 };
     if warmup_epochs > 0 {
         println!("  [Warmup of {} epoch to settle shaders...]", warmup_epochs);
@@ -127,9 +127,9 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
         let mut epoch_loss = 0.0;
         let mut num_steps = 0;
 
-        // Dataloader Autoregresivo (Sliding Window)
+        // Autoregressive Dataloader (Sliding Window)
         let ctx_len = trainer.config.ctx_len;
-        let step = ctx_len / 2; // 50% solapamiento para mejor aprendizaje de transiciones
+        let step = ctx_len / 2; // 50% overlap for better learning of transitions
 
         for i in (0..train_tokens.len().saturating_sub(ctx_len)).step_by(step) {
             let window_tokens = &train_tokens[i..i + ctx_len];
@@ -139,7 +139,7 @@ fn run_training_benchmark(use_gpu: bool, title: &str) {
             num_steps += 1;
         }
 
-        // Si la secuencia es muy corta y no entró en el loop, o para el resto final:
+        // If the sequence is very short and did not enter the loop, or for the final remainder:
         if num_steps == 0 && train_tokens.len() >= 2 {
             epoch_loss = trainer.train_sequence(train_tokens, targets, false, 1e-4);
             num_steps = 1;

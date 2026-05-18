@@ -32,7 +32,7 @@ impl RustRouterBridge {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    // binding(1) mamba in
+                    // binding(1) fpm in
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {

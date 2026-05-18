@@ -1,34 +1,34 @@
 # AIDEEN Bench Matrix
 
-Perfiles fijos para comparar estabilidad/convergencia del training DEQ en GPU.
+Fixed profiles to compare stability/convergence of DEQ training on GPU.
 
-## Archivos
+## Files
 
-- `profiles.csv`: ladder de configuraciones (`512 -> 1024`)
-- `run_matrix.sh`: ejecuta `stress_test` por perfil y consolida métricas
+- `profiles.csv`: ladder of configurations (`512 -> 1024`)
+- `run_matrix.sh`: runs `stress_test` per profile and consolidates metrics
 
-## Ejecutar
+## Run
 
-Desde la raíz del repo:
+From the repo root:
 
 ```bash
 ./aideen-bench/bench/run_matrix.sh
 ```
 
-Opcional:
+Optional:
 
 ```bash
 ./aideen-bench/bench/run_matrix.sh ./aideen-bench/bench/profiles.csv ./aideen-bench/bench/results/manual_run
 ```
 
-## Salida
+## Output
 
-Genera:
+Generates:
 
-- logs por perfil: `results/<timestamp>/<profile>.log`
-- tabla resumen: `results/<timestamp>/summary.csv`
+- logs per profile: `results/<timestamp>/<profile>.log`
+- summary table: `results/<timestamp>/summary.csv`
 
-Columnas clave:
+Key columns:
 
 - `iter20_loss`
 - `hit_ratio_pct`
@@ -39,20 +39,19 @@ Columnas clave:
 - `rs_cg`
 - `shared`
 
-## Criterio de promoción
+## Promotion criterion
 
-Promover al siguiente `d_r` solo si:
+Promote to the next `d_r` only if:
 
 - `conv=OK`
 - `hit_ratio_pct <= 5`
-- `mode=NORMAL` la mayor parte del run
-- `contractivity <= 1.0` sin picos sostenidos
+- `mode=NORMAL` for most of the run
+- `contractivity <= 1.0` without sustained spikes
 
-## Perfil v2 (tuning convergencia)
+## v2 profile (convergence tuning)
 
-Para intentar mover `d_r=768` a `conv=OK`:
+To try to move `d_r=768` to `conv=OK`:
 
 ```bash
 ./aideen-bench/bench/run_matrix.sh ./aideen-bench/bench/profiles_v2.csv
 ```
-

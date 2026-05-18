@@ -45,7 +45,7 @@ pub struct ExpertPipeline {
 
 impl ExpertPipeline {
     /// Queries selected peers in parallel (MVP: sequential) and aggregates deltas.
-    /// `h_k_slice`: slice del subespacio S_R del estado actual (len = D_R = 1024).
+    /// `h_k_slice`: slice of the S_R subspace of the current state (len = D_R = 1024).
     /// Returns RunResult ready for `apply_expert_result`.
     pub fn run(&mut self, h_k_slice: &[f32]) -> Result<RunResult, String> {
         // Deterministic order via BTreeMap natural ordering
@@ -93,9 +93,9 @@ impl ExpertPipeline {
         // Outlier detection (hard drop)
         let mut drops_count = 0u32;
         if let Some(factor) = self.outlier_factor {
-            // micro B: factor <= 1.0 es config peligrosa — skip
+            // micro B: factor <= 1.0 is a dangerous config — skip
             if factor > 1.0 && results.len() >= 2 {
-                // Normas: NaN → INFINITY para que sean dropeados (micro A)
+                // Norms: NaN → INFINITY so they get dropped (micro A)
                 let norms: Vec<f32> = results
                     .iter()
                     .map(|msg| {
@@ -112,7 +112,7 @@ impl ExpertPipeline {
                     })
                     .collect();
 
-                // Mediana: k=2 → promedio; k≥3 → mediana-low
+                // Median: k=2 → average; k≥3 → low-median
                 let mut sorted_norms = norms.clone();
                 sorted_norms.sort_by(|a, b| a.total_cmp(b)); // micro A: total_cmp
                 let median = if sorted_norms.len() == 2 {
@@ -121,7 +121,7 @@ impl ExpertPipeline {
                     sorted_norms[(sorted_norms.len() - 1) / 2]
                 };
 
-                // Guard median≈0: si todos los deltas son casi cero, skip
+                // Guard median≈0: if all deltas are nearly zero, skip
                 if median > 1e-6 {
                     for (i, &n) in norms.iter().enumerate() {
                         if n > factor * median {

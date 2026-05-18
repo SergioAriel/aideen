@@ -1,0 +1,68 @@
+AIDEEN PRE-TRAINING DIAGNOSTICS CHECKLIST
+=======================================
+
+Purpose
+-------
+Prevent expensive and time-consuming training failures by identifying structural, mathematical, or architectural issues in minimal corridors (short, controlled runs) before committing to a full training run.
+
+Levels of Certainty
+-------------------
+
+### Level 0: Invariant Sanity (1 - 5 Minutes)
+Check these telemetry metrics in the first few tokens/chunks of ANY run. If any of these fail, the training is mathematically broken and will NOT recover.
+
+| Metric | Fail Condition | Why? |
+|---|---|---|
+| dead | [256, 256, ...] | DEQ solver is not converging. Adjoints will be corrupt. |
+| exit_iter | Close to max (20.00/50.00) | Numerical instability or high contractivity. |
+| row_sum (LM) | >> 1.0 (e.g., 1e10) | Exploding softmax probabilities. Gradient dL/dh will be huge. |
+| event_b / w_update | Exactly 0.0 | Backward path is not reaching parameters. Check constant parity. |
+| NaNs / Inf | Any occurrence | Fatal numerical collapse. |
+
+### Level 1: Synthetic Recall (5 - 10 Minutes)
+Test if the memory circuit can store and retrieve a single literal binding over long gaps.
+Command: `cargo run --bin assoc_recall -- pairs=1 gap=128`
+
+*   **Success Criterion:** `gap128 loss < 1.0` (Random is ~3.9).
+*   **Fail Condition:** `gap128 loss > 2.0`. If it can't solve 1 pair, it won't solve real text.
+
+### Level 2: Scalable Capacity (30 Minutes)
+Test if the lane routing and bank allocation handle multiple simultaneous bindings.
+Command: `cargo run --bin assoc_recall -- pairs=8 banks=8 gap=128`
+
+*   **Success Criterion:** `gap128 loss < 0.1` (with current stabilized corridor).
+*   **Fail Condition:** `loss > 1.0`. Indicates collisions, routing mismatch, or memory contamination.
+
+### Level 3: Micro-Corpus Overfit (1 Hour)
+Verify that the full DEQ/FPM/Assoc stack can "memorize" a small real-text snippet.
+Command: `target/release/train --file docs/vision/micro_corpus.txt --epochs 20`
+
+*   **Success Criterion:** `loss` drops monotonically and hits < 1.0.
+*   **Fail Condition:** `loss` plateaus at high values (e.g., 6.0). Indicates forward/backward circuit is not expressive enough or gradient flow is blocked.
+
+### [ASSOC-BRIDGE]
+*   **consolidate:** Mass moving from Assoc to FPM. If 0.0, the contextual bridge is inactive.
+
+Causal Hierarchy of Failure (The "Onion" Analogy)
+-------------------------------------------------
+When debugging AIDEEN, you must resolve failures from the outside in. Do not attempt to fix Level 2 (Capacity) if Level 0 (Invariants) is broken.
+
+1.  **Level 0: Physical/Mathematical Layer (The "Cables")**
+    *   *Failure:* `dead=256`, `NaN`, `row_sum >> 1`.
+    *   *Impact:* The BPTT (learning signal) is literally cut or corrupted.
+    *   *Rule:* If the DEQ doesn't converge, the gradients are noise. **Fix this first.**
+
+2.  **Level 1: Role/Parity Layer (The "Logic")**
+    *   *Failure:* `event_b_mean = 0.0` despite being enabled.
+    *   *Impact:* Asymmetry between Forward and Backward. The model predicts with a gate but learns as if it doesn't exist.
+    *   *Rule:* Forward and Backward must be bit-identical in logic.
+
+3.  **Level 2: Selection Policy (The "Bouncer")**
+    *   *Failure:* High `loss` but low `dead` counts.
+    *   *Impact:* The `event_gate` is active but "uncalibrated". It lets filler noise into finite banks.
+    *   *Rule:* You cannot tune the bouncer (`event_gate`) if the floor is covered in noise from Level 0/1.
+
+4.  **Level 3: Capacity/Scaling (The "Warehouse")**
+    *   *Failure:* Solves 1 pair but fails 8 pairs.
+    *   *Impact:* Finite bank collisions or routing errors.
+    *   *Rule:* Only increase `ASSOC_BANKS` or `h_slots` after the selection policy is proven to work on 1 pair.

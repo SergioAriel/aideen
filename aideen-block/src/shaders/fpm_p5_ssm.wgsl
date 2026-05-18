@@ -1,4 +1,4 @@
-// Loxi V8 — Mamba Pass 5: SSM step + D skip + SiLU gate → y_inner
+// Loxi V8 — Fpm Pass 5: SSM step + D skip + SiLU gate → y_inner
 //
 // Computes the core SSM recurrence for a single token (h_prev = 0):
 //
@@ -23,11 +23,11 @@
 //
 // Dispatch: ceil(d_inner / 256) workgroups × 256 threads. Each thread handles one d-channel.
 
-struct MambaShape {
+struct FpmShape {
     D: u32, d_inner: u32, d_state: u32, d_conv: u32, dt_rank: u32,
 };
 
-@group(0) @binding(0) var<uniform>             shape:    MambaShape;
+@group(0) @binding(0) var<uniform>             shape:    FpmShape;
 @group(0) @binding(1) var<storage, read>       x_act:    array<f32>; // [d_inner]
 @group(0) @binding(2) var<storage, read>       xz:       array<f32>; // [2*d_inner] — z is second half
 @group(0) @binding(3) var<storage, read>       delta:    array<f32>; // [d_inner]

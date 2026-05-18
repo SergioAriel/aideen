@@ -215,7 +215,7 @@ fn run_current(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
     summarize("current_deq", &rows)
 }
 
-fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
+fn run_pure_plus_external_fpm(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
     let mut m_state = DVector::zeros(trainer.config.d_r);
     let mut rows = Vec::<TokenMetrics>::new();
 
@@ -224,7 +224,7 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
         let target = tokens[t + 1];
         let q = trainer.tokenizer.embed_context(ctx, trainer.config.ctx_len);
 
-        // h0 initialized from external Mamba memory state (broadcast to slots)
+        // h0 initialized from external Fixed-Point Memory memory state (broadcast to slots)
         let h0 = HSlots::from_broadcast(&m_state, &trainer.config);
         let (h_star, iters, max_delta, contr) = run_picard_pure(trainer, &h0, &q);
 
@@ -239,7 +239,7 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
             loss,
         });
 
-        // External Mamba state update across tokens: m_t = a*m_{t-1} + (1-a)*W_x*h_pool
+        // External Fixed-Point Memory state update across tokens: m_t = a*m_{t-1} + (1-a)*W_x*h_pool
         // Use slot-0 decay (single shared state, legacy diagnostic mode).
         let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
             1.0 / (1.0 + trainer.reasoning.a_log[(0, d)].exp())
@@ -250,7 +250,7 @@ fn run_pure_plus_external_mamba(trainer: &Trainer, tokens: &[u32]) -> RunSummary
         m_state = &trainer.reasoning.w_out * m_state;
     }
 
-    summarize("pure_deq_ext_mamba", &rows)
+    summarize("pure_deq_ext_fpm", &rows)
 }
 
 fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
@@ -263,7 +263,7 @@ fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
         let target = tokens[t + 1];
         let q = trainer.tokenizer.embed_context(ctx, trainer.config.ctx_len);
 
-        // h0: cada slot arranca desde su propio estado Mamba cross-token
+        // h0: each slot starts from its own cross-token Fixed-Point Memory state
         let mut h0 = HSlots::zeros(&trainer.config);
         for k in 0..h_slots {
             h0.set_slot(k, &m_states[k]);
@@ -281,7 +281,7 @@ fn run_pure_per_slot(trainer: &Trainer, tokens: &[u32]) -> RunSummary {
             loss,
         });
 
-        // Update each Mamba state per slot independently
+        // Update each per-slot Fixed-Point Memory state independently
         for k in 0..h_slots {
             let a = nalgebra::DVector::from_fn(trainer.config.d_r, |d, _| {
                 1.0 / (1.0 + trainer.reasoning.a_log[(k, d)].exp())
@@ -303,7 +303,7 @@ fn run_sweep(trainer: &mut Trainer, tokens: &[u32]) {
     let iters_list: &[usize] = &[12, 16, 20];
 
     println!();
-    println!("SWEEP: residual_alpha × damping × max_iters  (pure_deq + ext_mamba per_slot)");
+    println!("SWEEP: residual_alpha × damping × max_iters  (pure_deq + ext_fpm per_slot)");
     println!(
         "{:<8} {:<6} {:<6}  {:<8} {:<10} {:<8} {:<8}",
         "alpha", "damp", "iters", "loss", "maxΔ", "contr", "conv%"
@@ -363,7 +363,7 @@ fn run_init_sweep(cfg: &ArchitectureConfig, tokens: &[u32]) {
 
     for &threshold in thresholds {
         for &alpha in alphas {
-            // Trainer fresco con la misma semilla para cada punto del sweep
+            // Fresh trainer with the same seed for each sweep point
             let mut t = make_cpu_trainer(2026, cfg);
             t.reasoning.damping = damping;
             t.reasoning.residual_alpha = alpha;
@@ -412,14 +412,14 @@ fn print_summary(s: &RunSummary) {
 fn main() {
     let cfg = make_config();
     let mut trainer = make_cpu_trainer(2026, &cfg);
-    // v14 defaults: sin residual dentro del DEQ, damping moderado
+    // v14 defaults: no residual inside the DEQ, moderate damping
     trainer.reasoning.damping = 0.70;
     trainer.reasoning.residual_alpha = 0.0;
 
     let tokens = synth_tokens(512, cfg.vocab_size);
 
     let cur = run_current(&trainer, &tokens);
-    let pure = run_pure_plus_external_mamba(&trainer, &tokens);
+    let pure = run_pure_plus_external_fpm(&trainer, &tokens);
     let per_slot = run_pure_per_slot(&trainer, &tokens);
 
     println!();

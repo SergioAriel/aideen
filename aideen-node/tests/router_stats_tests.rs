@@ -66,7 +66,7 @@ fn test_accumulator_q_stats() {
     }
 }
 
-// ── Test 4: expert_hits ordenados determinísticamente ────────────────────────
+// ── Test 4: expert_hits sorted deterministically ─────────────────────────────
 
 #[test]
 fn test_accumulator_expert_hits_sorted() {
@@ -78,10 +78,10 @@ fn test_accumulator_expert_hits_sorted() {
 
     match acc.flush(NODE_ID).unwrap() {
         NetMsg::RouterStats { expert_hits, .. } => {
-            // Verificar orden lexicográfico
+            // Verify lexicographic order
             let keys: Vec<&str> = expert_hits.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(keys, vec!["a_expert", "m_expert", "z_expert"]);
-            // Verificar conteos
+            // Verify counts
             let z_count = expert_hits.iter().find(|(k, _)| k == "z_expert").unwrap().1;
             assert_eq!(z_count, 2);
         }

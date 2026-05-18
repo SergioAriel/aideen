@@ -2,8 +2,8 @@ use aideen_backbone::ffn_reasoning::{FfnReasoning, ReplayGuard};
 use aideen_core::agent::{AgentEvent, AgentStore, NullAgentStore};
 use aideen_core::protocol::{KeyDelegation, ModelBundleManifest, SignedUpdate};
 
-// En native: Send requerido por tokio::spawn / QUIC.
-// En WASM:   single-threaded, Send no aplica (OpfsAgentStore puede usar Rc internamente).
+// On native: Send required by tokio::spawn / QUIC.
+// On WASM:   single-threaded, Send does not apply (OpfsAgentStore may use Rc internally).
 #[cfg(not(target_arch = "wasm32"))]
 type AgentStoreBox = Box<dyn AgentStore + Send>;
 #[cfg(target_arch = "wasm32")]
@@ -32,7 +32,7 @@ impl UpdateManager {
         }
     }
 
-    /// Builder: inyectar un backend de agente concreto (FsAgentStore, InMemory, etc.).
+    /// Builder: inject a concrete agent backend (FsAgentStore, InMemory, etc.).
     pub fn with_agent_store(mut self, store: AgentStoreBox) -> Self {
         self.agent_store = store;
         self
@@ -48,7 +48,7 @@ impl UpdateManager {
         self.current_epoch = d.epoch;
         self.current_critic_pk = Some(d.critic_pk);
 
-        // Emitir evento de telemetría (ignora error del store)
+        // Emit telemetry event (ignores store error)
         let critic_pk_hash = {
             use sha2::{Digest, Sha256};
             Sha256::digest(&d.critic_pk).into()
@@ -105,13 +105,13 @@ impl UpdateManager {
             return Err("bundle_hash mismatch".into());
         }
 
-        // 2) Requerir Critic PK válida
+        // 2) Require a valid Critic PK
         let pk = self.critic_pk()?;
 
-        // 3) Aplica en backbone
+        // 3) Apply to the backbone
         expert.apply_signed_update(update, &pk, &mut self.guard)?;
 
-        // Emitir evento de telemetría.
+        // Emit telemetry event.
         // update_hash() is based on signing_bytes() (see aideen-core/src/protocol.rs:91-96).
         let update_hash = update.update_hash();
         let _ = self.agent_store.append_event(AgentEvent::UpdateApplied {
@@ -124,7 +124,7 @@ impl UpdateManager {
         Ok(())
     }
 
-    /// Enrutador principal de nivel 6 (Transporte Escalable). Consumido por clientes WASM o Nativos al recibir un NetMsg del Coordinator.
+    /// Main level-6 router (Scalable Transport). Consumed by WASM or Native clients when receiving a NetMsg from the Coordinator.
     pub fn on_message(
         &mut self,
         expert: &mut FfnReasoning,
@@ -153,7 +153,7 @@ impl UpdateManager {
                 }
             }
             NetMsg::Ping => Ok(NetMsg::Pong),
-            _ => Err("Mensaje no procesable por UpdateManager en este contexto".into()),
+            _ => Err("Message not processable by UpdateManager in this context".into()),
         }
     }
 }

@@ -129,7 +129,7 @@ impl RouterStatsAccumulator {
     }
 }
 
-// ── Tipos públicos ────────────────────────────────────────────────────────────
+// ── Public types ──────────────────────────────────────────────────────────────
 
 /// Result of a tick with document context injection.
 ///
@@ -179,10 +179,10 @@ pub struct NodeRunner<R, C, E, M, B> {
     pub trust_store: TrustStore,
     /// Circuit breakers per NodeId — exponential backoff on dial failures.
     pub peer_failures: PeerFailures,
-    // 5M — telemetría operativa:
+    // 5M — operational telemetry:
     /// Counters from the last reconcile cycle. Local diagnostics only.
     pub last_reconcile_stats: ReconcileStats,
-    delegated: bool, // gate Zero-Trust: Delegation instalada
+    delegated: bool, // Zero-Trust gate: Delegation installed
 }
 
 impl<R, C, E, M, B> NodeRunner<R, C, E, M, B>
@@ -374,7 +374,7 @@ where
         self.doc_memory.search(query, k)
     }
 
-    /// Offsets byte-exactos de `needle` en el documento raw.
+    /// Byte-exact offsets of `needle` in the raw document.
     pub fn locate(&self, doc_id: DocId, needle: &[u8], limit: usize) -> Vec<(u64, u64)> {
         self.doc_memory.locate(doc_id, needle, limit)
     }
@@ -427,7 +427,7 @@ where
         }
     }
 
-    // ── Tick con contexto + Discovery ─────────────────────────────────────────
+    // ── Tick with context + Discovery ─────────────────────────────────────────
 
     /// Tick with document context injection.
     ///
@@ -453,13 +453,13 @@ where
         let features = build_context_features(&ctx, d_sim);
         self.node.set_context(&features);
 
-        // 2. Tick base (emite TickAttractor si aplica)
+        // 2. Base tick (emits TickAttractor if applicable)
         let metrics = self.tick()?;
 
         // 3. Discovery gate: allow_learning && delegated
         let discovery = if metrics.allow_learning && self.delegated {
             if let Some(ref h_star) = metrics.h_star {
-                // Hashes: solo viajan hashes, nunca h* raw (Zero-Trust)
+                // Hashes: only hashes travel, never raw h* (Zero-Trust)
                 let h_flat = h_star.to_flat();
                 let h_bytes: Vec<u8> = h_flat.iter().flat_map(|f| f.to_le_bytes()).collect();
                 let h_star_hash: [u8; 32] = Sha256::digest(&h_bytes).into();
@@ -503,7 +503,7 @@ where
     }
 }
 
-// ── Helpers privados ──────────────────────────────────────────────────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 fn mean_or_zero(v: &[f32]) -> f32 {
     if v.is_empty() {

@@ -12,13 +12,13 @@ fn test_trust_store_persist_roundtrip() {
     let id = [7u8; 32];
     let fp = [0xBBu8; 32];
 
-    // Crear, TOFU, flush
+    // Create, TOFU, flush
     let mut store = TrustStore::new();
     let r = store.verify_or_tofu(id, fp, None).unwrap();
     assert!(matches!(r, TrustDecision::TofuStored));
     store.flush(&path).expect("flush must succeed");
 
-    // Load desde disco — peer debe ser reconocido
+    // Load from disk — peer must be recognized
     let mut store2 = TrustStore::load(&path).expect("load must succeed");
     let r2 = store2.verify_or_tofu(id, fp, None).unwrap();
     assert!(
@@ -26,7 +26,7 @@ fn test_trust_store_persist_roundtrip() {
         "loaded store must recognize known peer"
     );
 
-    // Verificar que load() con path inexistente devuelve store vacío (no error)
+    // Verify that load() with a nonexistent path returns an empty store (no error)
     let store3 = TrustStore::load(std::path::Path::new("/tmp/aideen_nonexistent_path_xyz.bin"))
         .expect("nonexistent path must return empty store");
     assert!(

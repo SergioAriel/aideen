@@ -1,13 +1,13 @@
 # AIDEEN Network Protocol v1
 
-> **Status**: Frozen — compatible con `aideen-core >= 0.3`
+> **Status**: Frozen — compatible with `aideen-core >= 0.3`
 > **Wire version**: `Hello.protocol = 1`
 
 ---
 
 ## 1. Framing
 
-Todos los mensajes usan el mismo framing binario, tanto en QUIC como en WebTransport:
+All messages use the same binary framing, both in QUIC and in WebTransport:
 
 ```
 ┌──────────────┬────────────────────────────────────┐
@@ -16,19 +16,19 @@ Todos los mensajes usan el mismo framing binario, tanto en QUIC como en WebTrans
 └──────────────┴────────────────────────────────────┘
 ```
 
-- **4 bytes**: longitud del payload en little-endian (`u32`).
-- **Payload**: `bincode::serialize(&NetMsg)` — no versioning propio, el discriminante de enum actúa como type tag.
-- Sin padding. Sin delimitador final.
+- **4 bytes**: payload length in little-endian (`u32`).
+- **Payload**: `bincode::serialize(&NetMsg)` — no versioning of its own, the enum discriminant acts as the type tag.
+- No padding. No final delimiter.
 
-### Transporte
+### Transport
 
-| Transporte | Stream     | Dirección        |
+| Transport | Stream     | Direction        |
 |------------|------------|------------------|
-| QUIC       | uni stream | C→S: client abre; S→C: server abre |
-| WebTransport (futuro) | unidirectional stream | igual |
+| QUIC       | uni stream | C→S: client opens; S→C: server opens |
+| WebTransport (future) | unidirectional stream | same |
 | InProcess (tests)  | `sync_channel(64)` | — |
 
-Dos uni streams independientes eliminan el deadlock de inicialización: cada parte abre su propio stream saliente y acepta el del otro lado, independientemente de quién escribe primero.
+Two independent uni streams eliminate the initialization deadlock: each side opens its own outgoing stream and accepts the one from the other side, regardless of who writes first.
 
 ---
 
@@ -37,13 +37,13 @@ Dos uni streams independientes eliminan el deadlock de inicialización: cada par
 ### `Hello`
 ```
 Hello {
-    node_id:        [u8; 32],   // Clave pública efímera del nodo
-    protocol:       u32,        // = 1 para esta versión
-    bundle_version: u64,        // Bundle de modelos instalado
-    bundle_hash:    [u8; 32],   // SHA-256 del bundle (alineación topológica)
+    node_id:        [u8; 32],   // Ephemeral public key of the node
+    protocol:       u32,        // = 1 for this version
+    bundle_version: u64,        // Installed model bundle
+    bundle_hash:    [u8; 32],   // SHA-256 of the bundle (topological alignment)
 }
 ```
-Primer mensaje del cliente al abrir sesión. El servidor responde con `Delegation`.
+First message from the client when opening a session. The server responds with `Delegation`.
 
 ### `Delegation(KeyDelegation)`
 ```
@@ -52,35 +52,35 @@ KeyDelegation {
     critic_pk:           [u8; 32],
     valid_from_unix:     u64,
     valid_to_unix:       u64,
-    signature_by_root:   Vec<u8>,   // ed25519 sobre signing_bytes()
+    signature_by_root:   Vec<u8>,   // ed25519 over signing_bytes()
 }
 ```
-El coordinator delega la llave operativa del Critic actual. La firma se verifica contra la `root_pk` embebida en el nodo. Solo se acepta si `epoch > current_epoch` (anti-rollback).
+The coordinator delegates the operational key of the current Critic. The signature is verified against the `root_pk` embedded in the node. It is only accepted if `epoch > current_epoch` (anti-rollback).
 
 ### `Ack`
 ```
 Ack {
     kind:    AckKind,   // Delegation | Update | Discovery
-    version: u64,       // epoch (Delegation) o version (Update/Discovery)
+    version: u64,       // epoch (Delegation) or version (Update/Discovery)
     ok:      bool,
 }
 ```
-Confirmación tipificada. El campo `kind` permite al coordinator verificar que el cliente confirmó el mensaje correcto sin ambigüedad.
+Typed confirmation. The `kind` field lets the coordinator verify that the client confirmed the correct message without ambiguity.
 
 ### `Update(SignedUpdate)`
 ```
 SignedUpdate {
     version:          u64,
-    target_id:        String,      // expert que recibe el delta
+    target_id:        String,      // expert that receives the delta
     bundle_version:   u64,
     bundle_hash:      [u8; 32],
-    base_model_hash:  [u8; 32],    // snapshot sobre el cual aplica el delta
-    prev_update_hash: [u8; 32],    // encadenado anti-fork
+    base_model_hash:  [u8; 32],    // snapshot the delta applies to
+    prev_update_hash: [u8; 32],    // anti-fork chaining
     payload:          Vec<u8>,     // zstd( bincode( Vec<QuantizedDelta> ) )
-    signature:        Vec<u8>,     // ed25519 sobre signing_bytes()
+    signature:        Vec<u8>,     // ed25519 over signing_bytes()
 }
 ```
-El cliente verifica firma + `base_model_hash` + anti-replay (`version > last_seen_version`) antes de aplicar.
+The client verifies signature + `base_model_hash` + anti-replay (`version > last_seen_version`) before applying.
 
 ### `Discovery`
 ```
@@ -90,19 +90,19 @@ Discovery {
     q_total:        f32,
     iters:          u32,
     stop:           u8,          // 0 = Q_MIN_WRITE gate, 1 = Epsilon gate
-    h_star_hash:    [u8; 32],    // SHA-256 de h* serializado en LE
-    context_hash:   [u8; 32],    // SHA-256 del s_context
+    h_star_hash:    [u8; 32],    // SHA-256 of h* serialized in LE
+    context_hash:   [u8; 32],    // SHA-256 of s_context
     bundle_version: u64,
 }
 ```
-Señal de calidad enviada por el nodo cuando `Q >= Q_MIN_LEARN`. **No contiene `h*` completo** — solo hashes para correlación, dedup y anti-spam. El Architect decide si solicita más información al nodo.
+Quality signal sent by the node when `Q >= Q_MIN_LEARN`. **It does not contain the full `h*`** — only hashes for correlation, dedup and anti-spam. The Architect decides whether to request more information from the node.
 
 ### `ExpertTask` / `ExpertResult`
 ```
 ExpertTask {
     task_id:        [u8; 16],
     target_id:      String,
-    s_r:            Vec<f32>,    // subespacio de razonamiento (~8KB)
+    s_r:            Vec<f32>,    // reasoning subspace (~8KB)
     bundle_version: u64,
 }
 
@@ -115,28 +115,28 @@ ExpertResult {
     stop:     u8,
 }
 ```
-Routing de tareas de inferencia peer-to-peer entre nodos expertos.
+Peer-to-peer inference task routing between expert nodes.
 
 ### `Metrics`
 ```
 Metrics { q_total: f32, iters: u32, stop: u8 }
 ```
-Telemetría ligera, no genera Discovery. Se usa para monitoreo sin activar el ciclo de aprendizaje.
+Lightweight telemetry, does not generate Discovery. Used for monitoring without triggering the learning cycle.
 
 ### `Error`
 ```
 Error { code: u32, msg: String }
 ```
-Códigos:
-- `400` — mensaje inesperado en el estado actual de sesión.
-- `403` — Discovery recibido sin Delegation previa (Zero-Trust).
+Codes:
+- `400` — unexpected message in the current session state.
+- `403` — Discovery received without a prior Delegation (Zero-Trust).
 
 ### `Ping` / `Pong`
-Heartbeat. El coordinator responde `Pong` a cualquier `Ping` en cualquier estado.
+Heartbeat. The coordinator responds with `Pong` to any `Ping` in any state.
 
 ---
 
-## 3. Máquina de estados del Coordinator
+## 3. Coordinator state machine
 
 ```
         Hello
@@ -148,42 +148,50 @@ Heartbeat. El coordinator responde `Pong` a cualquier `Ping` en cualquier estado
                           [Delegated]
                            │        │
                     Discovery       Ack(Update)
-                     → Ack       → sesión completa
+                     → Ack       → session complete
 ```
 
-Transiciones fuera de secuencia generan `Error { code: 400 }` y cierran la sesión.
+Out-of-sequence transitions generate `Error { code: 400 }` and close the session.
 
 ---
 
-## 4. Invariantes del protocolo
+## 4. Protocol invariants
 
-1. **No `h*` en wire**: `Discovery` solo transporta `h_star_hash` (SHA-256). El vector completo nunca sale del nodo por esta ruta.
+1. **No `h*` on the wire**: `Discovery` only carries `h_star_hash` (SHA-256). The full vector never leaves the node via this route.
 
-2. **Anti-replay en Delegation**: `epoch` debe ser estrictamente mayor que `current_epoch`. El nodo rechaza delegaciones con epoch igual o menor.
+2. **Anti-replay in Delegation**: `epoch` must be strictly greater than `current_epoch`. The node rejects delegations with an equal or lower epoch.
 
-3. **Anti-replay en Update**: `version` debe ser mayor que la última versión aplicada para ese `target_id`. El `ReplayGuard` mantiene el mapa por target.
+3. **Anti-replay in Update**: `version` must be greater than the last version applied for that `target_id`. The `ReplayGuard` keeps the per-target map.
 
-4. **Encadenado de updates**: `prev_update_hash` crea una cadena que el Critic puede verificar para detectar forks o reordenamientos maliciosos.
+4. **Update chaining**: `prev_update_hash` creates a chain that the Critic can verify to detect forks or malicious reorderings.
 
-5. **Zero-Trust**: `Discovery` antes de `Delegation` → `Error { code: 403 }`. El coordinator no acepta inteligencia sin autorización criptográfica previa.
+5. **Zero-Trust**: `Discovery` before `Delegation` → `Error { code: 403 }`. The coordinator does not accept intelligence without prior cryptographic authorization.
 
-6. **Firma doble**: Delegation (firmado por root_sk) + Update (firmado por critic_sk delegado). El nodo verifica ambas cadenas antes de aplicar cambios.
-
----
-
-## 5. Compatibilidad futura con WebTransport
-
-WebTransport sobre HTTP/3 usa el mismo mecanismo QUIC subyacente. La migración requiere:
-
-- Reemplazar `quinn::SendStream` / `RecvStream` por `web_transport::SendStream` / `RecvStream`.
-- El framing (u32 LE + bincode) permanece **idéntico** — no hay cambio de protocolo.
-- El discriminante `Hello.protocol = 1` permite negociar versiones futuras sin romper compatibilidad.
-- En WASM, WebTransport reemplaza QUIC nativo; el `NetMsg` enum y el framing son los mismos.
+6. **Double signature**: Delegation (signed by root_sk) + Update (signed by the delegated critic_sk). The node verifies both chains before applying changes.
 
 ---
 
-## 6. Registro de versiones
+## 5. Future compatibility with WebTransport
 
-| Versión wire | Cambio principal |
+WebTransport over HTTP/3 uses the same underlying QUIC mechanism. The migration requires:
+
+- Replacing `quinn::SendStream` / `RecvStream` with `web_transport::SendStream` / `RecvStream`.
+- The framing (u32 LE + bincode) remains **identical** — there is no protocol change.
+- The `Hello.protocol = 1` discriminant allows negotiating future versions without breaking compatibility.
+- In WASM, WebTransport replaces native QUIC; the `NetMsg` enum and the framing are the same.
+
+---
+
+## 6. Version log
+
+| Wire version | Main change |
 |---|---|
-| 1 | Inicial: Hello + Delegation + Update + Ack(AckKind) + Discovery + Error |
+| 1 | Initial: Hello + Delegation + Update + Ack(AckKind) + Discovery + Error |
+
+---
+
+## Appendix A — Distributed inference design note
+
+`ExpertTask` / `ExpertResult` are the v1 MVP wire shape for expert deltas. The current architectural target for distributed inference is broader: experts should preferably return structured memory/context/evidence patches that are locally gated, integrated, and refined before the LMHead decodes.
+
+See [docs/vision/distributed_inference.md](/Users/sergiosolis/Programacion/AIDEEN/docs/vision/distributed_inference.md) for the current design direction. This appendix does not change wire version `1`; richer `ExpertQuery` / `ExpertPatch` messages should be introduced only through an explicit future protocol version.

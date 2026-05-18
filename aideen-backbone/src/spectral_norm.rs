@@ -128,7 +128,7 @@ mod tests {
     fn normalize_if_needed_only_triggers_above_threshold() {
         let mut w = DMatrix::<f32>::identity(32, 32) * 0.5_f32;
         normalize_if_needed(&mut w, 1.0, 20);
-        // σ = 0.5 < threshold=1.0, no debería cambiar
+        // σ = 0.5 < threshold=1.0, should not change
         let sigma = spectral_norm(&w, 20);
         assert!(
             (sigma - 0.5).abs() < 0.05,

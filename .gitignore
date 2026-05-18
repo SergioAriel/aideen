@@ -64,14 +64,18 @@ docs/ChatGPT-*
 build_val_set.py
 download_corpus.py
 prepare_training_corpus.py
+prepare_training_corpora.py
 check_training.sh
 resume_training.sh
 scaling_experiment.sh
+report_checkpoint.sh
+train_learning_ladder.sh
 fit_scaling_law.py
 
 # Dataset source files
 aideen-backbone/dataset_genesis.txt
 aideen-backbone/dataset_genesis.txt.tokens.bin
+docs/vision/micro_corpus_real.txt
 aideen-backbone/dataset.txt.tokens.bin
 # Agent skills (local tooling)
 .agents/

@@ -1,4 +1,4 @@
-// Bucle del sistema (Orquestador)
-// Regla: SÍ puede importar `engine` y `network`
+// System loop (Orchestrator)
+// Rule: MAY import `engine` and `network`
 
 pub mod node;

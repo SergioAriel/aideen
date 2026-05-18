@@ -14,7 +14,7 @@ fn make_peer(id: u8, domains: &[&str]) -> PeerEntry {
     }
 }
 
-// ── Test 1: set_snapshot indexa correctamente ─────────────────────────────────
+// ── Test 1: set_snapshot indexes correctly ────────────────────────────────────
 
 #[test]
 fn test_registry_snapshot_indexed() {
@@ -54,57 +54,57 @@ fn test_registry_delta_upsert_remove() {
         upserts: vec![make_peer(3, &["chemistry"])],
         removes: vec![[2u8; 32]],
     };
-    reg.apply_delta(delta).expect("delta debe aplicarse");
+    reg.apply_delta(delta).expect("delta must be applied");
 
-    assert_eq!(reg.len(), 2, "peer_2 eliminado, peer_3 agregado");
+    assert_eq!(reg.len(), 2, "peer_2 removed, peer_3 added");
     assert!(reg.get(&[3u8; 32]).is_some());
     assert!(reg.get(&[2u8; 32]).is_none());
 
-    // math solo debe tener peer 1 ahora
+    // math must now only have peer 1
     let math_ids = reg.node_ids_for_domain("math");
     assert_eq!(math_ids, vec![[1u8; 32]]);
 
-    // chemistry debe tener peer 3
+    // chemistry must have peer 3
     let chem_ids = reg.node_ids_for_domain("chemistry");
     assert_eq!(chem_ids, vec![[3u8; 32]]);
 }
 
-// ── Test 3: apply_delta stale rechazado ──────────────────────────────────────
+// ── Test 3: stale apply_delta rejected ───────────────────────────────────────
 
 #[test]
 fn test_registry_delta_stale_rejected() {
     let mut reg = PeerRegistry::new();
     reg.set_snapshot(5, vec![make_peer(1, &["math"])]);
 
-    // epoch igual → rechazado
+    // equal epoch → rejected
     let err = reg.apply_delta(PeerDelta {
         epoch: 5,
         upserts: vec![],
         removes: vec![],
     });
-    assert!(err.is_err(), "epoch igual debe rechazarse");
+    assert!(err.is_err(), "equal epoch must be rejected");
 
-    // epoch menor → rechazado
+    // lower epoch → rejected
     let err = reg.apply_delta(PeerDelta {
         epoch: 3,
         upserts: vec![],
         removes: vec![],
     });
-    assert!(err.is_err(), "epoch anterior debe rechazarse");
+    assert!(err.is_err(), "earlier epoch must be rejected");
 
-    // estado no alterado
+    // state unaltered
     assert_eq!(reg.epoch(), 5);
     assert_eq!(reg.len(), 1);
 }
 
-// ── Test 4: domain index consistente en upsert/remove ────────────────────────
+// ── Test 4: domain index consistent on upsert/remove ─────────────────────────
 
 #[test]
 fn test_registry_domain_index_consistent() {
     let mut reg = PeerRegistry::new();
     reg.set_snapshot(1, vec![make_peer(1, &["math"])]);
 
-    // Upsert peer 1 con dominios cambiados: de "math" a "physics"
+    // Upsert peer 1 with changed domains: from "math" to "physics"
     let delta = PeerDelta {
         epoch: 2,
         upserts: vec![PeerEntry {
@@ -118,17 +118,17 @@ fn test_registry_domain_index_consistent() {
     };
     reg.apply_delta(delta).unwrap();
 
-    // "math" ya no debe tener ningún peer
+    // "math" must no longer have any peer
     assert!(
         reg.node_ids_for_domain("math").is_empty(),
-        "math debe estar vacío tras upsert sin ese dominio"
+        "math must be empty after an upsert without that domain"
     );
 
-    // "physics" debe tener peer 1
+    // "physics" must have peer 1
     assert_eq!(reg.node_ids_for_domain("physics"), vec![[1u8; 32]]);
 }
 
-// ── Test 5: NodeRunner API de peers ──────────────────────────────────────────
+// ── Test 5: NodeRunner peers API ──────────────────────────────────────────────
 
 mod runner_peer_api {
     use aideen_node::peers::{PeerDelta, PeerEntry};
@@ -251,7 +251,7 @@ mod runner_peer_api {
         let ids = runner.peer_ids_for_domain("math");
         assert_eq!(ids, vec![[10u8; 32]]);
 
-        // apply_delta: añadir peer 11 en "science"
+        // apply_delta: add peer 11 in "science"
         runner
             .apply_peer_delta(PeerDelta {
                 epoch: 2,
@@ -299,7 +299,7 @@ fn test_pipeline_with_registry_wiring() {
         }
     }
 
-    // Construcción del registry con 1 peer en "math"
+    // Build the registry with 1 peer in "math"
     let mut reg = PeerRegistry::new();
     let peer_id: NodeId = [42u8; 32];
     reg.set_snapshot(
@@ -313,12 +313,12 @@ fn test_pipeline_with_registry_wiring() {
         }],
     );
 
-    // Obtener los ids del dominio "math"
+    // Get the ids for the "math" domain
     let domain_ids = reg.node_ids_for_domain("math");
     assert_eq!(domain_ids, vec![peer_id]);
 
     let config_clone = config.clone();
-    // Servidor expert en thread
+    // Expert server in a thread
     let (client_ch, mut server_ch) = InProcessChannel::pair();
     std::thread::spawn(move || {
         let svc = ExpertService {
@@ -355,6 +355,6 @@ fn test_pipeline_with_registry_wiring() {
     assert_eq!(
         result.delta.len(),
         config.h_slots * config.d_r,
-        "delta debe tener dim H_SLOTS*D_R"
+        "delta must have dim H_SLOTS*D_R"
     );
 }

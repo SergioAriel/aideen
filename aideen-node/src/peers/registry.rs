@@ -33,7 +33,7 @@ impl PeerRegistry {
         }
     }
 
-    /// Update incremental. Rechaza si `delta.epoch <= self.epoch` (stale / replay).
+    /// Incremental update. Rejects if `delta.epoch <= self.epoch` (stale / replay).
     pub fn apply_delta(&mut self, delta: PeerDelta) -> Result<(), String> {
         if delta.epoch <= self.epoch {
             return Err(format!(
@@ -76,7 +76,7 @@ impl PeerRegistry {
         self.epoch
     }
 
-    // ── Privados ──────────────────────────────────────────────────────────────
+    // ── Private ───────────────────────────────────────────────────────────────
 
     fn insert(&mut self, mut p: PeerEntry) {
         // C: normalize domains to lowercase on insert (avoids fragmentation "Math" vs "math")
@@ -108,7 +108,7 @@ impl PeerRegistry {
             for d in &old.domains {
                 if let Some(set) = self.by_domain.get_mut(d) {
                     set.remove(id);
-                    // B: limpiar key vacío
+                    // B: clean empty key
                     if set.is_empty() {
                         self.by_domain.remove(d);
                     }

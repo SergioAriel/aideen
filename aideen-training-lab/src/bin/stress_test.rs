@@ -26,7 +26,13 @@ fn main() {
 
     let force_global = env::var("AIDEEN_STRESS_FORCE_GLOBAL").ok().as_deref() == Some("1");
     let _deq_only = env::var("AIDEEN_DEQ_ONLY").ok().as_deref() == Some("1");
-    let _no_mamba = env::var("AIDEEN_DEQ_NO_MAMBA").ok().as_deref() == Some("1");
+    let _no_fpm = env::var("AIDEEN_DEQ_NO_FPM").ok().as_deref() == Some("1");
+    let gpu_debug_on = env::var("AIDEEN_DEQ_GPU_DEBUG").ok().as_deref() == Some("1");
+    if !gpu_debug_on {
+        // Avoid GPU→CPU debug readback in stress runs when debug is off.
+        // This keeps TPS measurement clean (no device.poll on debug buffer).
+        env::set_var("AIDEEN_DEBUG_SAMPLE", "1000000000");
+    }
 
     let mut config = ArchitectureConfig::default();
     config.d_r =
@@ -168,9 +174,9 @@ fn main() {
         }
     }
 
-    println!("\n[STRESS-TEST] Audit Complete. Check the [GPU-ORACLE] logs above.");
-    println!("  - Si 'mode' es NORMAL/BOOST y 'conv' es OK -> El Sync de Memoria Global funciona.");
-    println!("  - Si 'rs_cg' es bajo -> La escalabilidad del CG Solver funciona.");
-    println!("  - Para forzar d_r=1024: AIDEEN_STRESS_FORCE_GLOBAL=1");
+    println!("\n[STRESS-TEST] Audit Finished. Review the [GPU-ORACLE] logs above.");
+    println!("  - If 'mode' is NORMAL/BOOST and 'conv' is OK -> Global Memory Sync works.");
+    println!("  - If 'rs_cg' is low -> CG Solver scalability works.");
+    println!("  - To force d_r=1024: AIDEEN_STRESS_FORCE_GLOBAL=1");
     println!("  - Overrides: AIDEEN_STRESS_DR, AIDEEN_STRESS_HSLOTS, AIDEEN_STRESS_MAX_ITERS, AIDEEN_STRESS_ADJ_ITERS, AIDEEN_STRESS_EPS, AIDEEN_STRESS_LR, AIDEEN_STRESS_ITERS");
 }

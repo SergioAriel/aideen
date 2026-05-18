@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-// ── Tipos internos (solo en disco, no forman parte del contrato público) ──────
+// ── Internal types (disk-only, not part of the public contract) ───────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkOffset {
@@ -31,12 +31,12 @@ struct DocRecord {
 
 // ── FsDocMemory ───────────────────────────────────────────────────────────────
 
-/// Memoria documental persistente en disco (native only).
+/// Persistent on-disk document memory (native only).
 ///
 /// Layout:
 ///   <base_dir>/<agent_id>/docs/
 ///     manifest.bin          — bincode(Vec<DocRecord>)
-///     raw/<doc_id>.bin      — bytes originales
+///     raw/<doc_id>.bin      — original bytes
 ///     chunks/<doc_id>.chunks — [u32 LE len][chunk_bytes]*
 ///     index/<doc_id>.index  — bincode(HashMap<String, Vec<Posting>>)
 pub struct FsDocMemory {
@@ -87,7 +87,7 @@ impl FsDocMemory {
         self
     }
 
-    // ── Rutas ─────────────────────────────────────────────────────────────────
+    // ── Paths ─────────────────────────────────────────────────────────────────
 
     fn manifest_path(&self) -> PathBuf {
         self.dir.join("manifest.bin")
@@ -102,7 +102,7 @@ impl FsDocMemory {
         self.dir.join("index").join(format!("{}.index", id))
     }
 
-    // ── Persistencia interna ──────────────────────────────────────────────────
+    // ── Internal persistence ──────────────────────────────────────────────────
 
     fn flush_manifest(&self) -> Result<(), String> {
         let bytes = bincode::serialize(&self.manifest).map_err(|e| e.to_string())?;
@@ -196,7 +196,7 @@ impl FsDocMemory {
         None
     }
 
-    // ── Indexado ──────────────────────────────────────────────────────────────
+    // ── Indexing ──────────────────────────────────────────────────────────────
 
     fn tokenize(text: &str) -> Vec<String> {
         text.chars()
@@ -209,7 +209,7 @@ impl FsDocMemory {
             })
             .collect::<String>()
             .split_whitespace()
-            .filter(|s| s.len() >= 2) // ignorar tokens de 1 char (ruido)
+            .filter(|s| s.len() >= 2) // ignore 1-char tokens (noise)
             .map(|s| s.to_string())
             .collect()
     }
@@ -266,14 +266,14 @@ impl DocMemory for FsDocMemory {
         self.next_doc_id += 1;
         meta.len_bytes = bytes.len() as u64;
 
-        // 1) Persistir raw
+        // 1) Persist raw
         std::fs::write(self.raw_path(doc_id), &bytes).map_err(|e| e.to_string())?;
 
-        // 2) Chunk + persistir chunks file
+        // 2) Chunk + persist chunks file
         let chunks = self.split_into_chunks(&bytes);
         self.write_chunks_file(doc_id, &chunks)?;
 
-        // 3) Extraer offsets para manifest
+        // 3) Extract offsets for the manifest
         let chunk_offsets = chunks
             .iter()
             .map(|(cid, bs, be, _)| ChunkOffset {
@@ -331,7 +331,7 @@ impl DocMemory for FsDocMemory {
             }
         }
 
-        // Top-k por score
+        // Top-k by score
         let mut items: Vec<_> = scores.into_iter().collect();
         items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         items.truncate(k);
@@ -376,7 +376,7 @@ impl DocMemory for FsDocMemory {
                 if out.len() >= limit {
                     break;
                 }
-                i += needle.len(); // sin overlapping matches
+                i += needle.len(); // no overlapping matches
             } else {
                 i += 1;
             }

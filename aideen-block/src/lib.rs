@@ -3,7 +3,7 @@
 
 pub mod async_bridge;
 pub mod deq_bridge;
-pub mod mamba;
+pub mod fixed_point_memory;
 pub mod model;
 pub mod moe;
 pub mod router;
@@ -41,6 +41,13 @@ impl ComputeState {
                 return None;
             }
         };
+
+        let subgroup_supported = adapter.features().contains(wgpu::Features::SUBGROUP);
+        if subgroup_supported {
+            eprintln!("[ComputeState] SUBGROUP supported.");
+        } else {
+            eprintln!("[ComputeState] SUBGROUP not supported; falling back to portable path.");
+        }
 
         let (device, queue) = match adapter
             .request_device(

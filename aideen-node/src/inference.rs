@@ -204,7 +204,7 @@ where
         } else {
             h_next
         };
-        // ── fin K-checkpoint ─────────────────────────────────────────────────
+        // ── end K-checkpoint ─────────────────────────────────────────────────
 
         // Convergence over the full flat vector
         let flat_next = h_next.to_flat();
@@ -299,7 +299,7 @@ mod tests {
     fn test_encode_query_produces_nonzero() {
         let config = ArchitectureConfig::default();
         let d_r = config.d_r;
-        let q = encode_query("¿qué es el DEQ?", d_r);
+        let q = encode_query("what is the DEQ?", d_r);
         assert_eq!(q.len(), d_r);
         assert!(
             q.iter().any(|&x| x.abs() > 1e-6),
@@ -350,7 +350,7 @@ mod tests {
 
         // We only check that the result has the correct fields if there is convergence
         let _result = run(
-            "test query para aideen",
+            "test query for aideen",
             &mut reasoning,
             &mut backend,
             None,

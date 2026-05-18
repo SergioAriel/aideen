@@ -16,7 +16,7 @@ use aideen_node::runner::{NodeRunner, RouterStatsAccumulator};
 use aideen_node::system::node::AideenNode;
 use nalgebra::DVector;
 
-// ── Mocks comunes ─────────────────────────────────────────────────────────────
+// ── Common mocks ──────────────────────────────────────────────────────────────
 
 struct MockB;
 impl ComputeBackend for MockB {
@@ -135,8 +135,8 @@ fn spawn_fixed_delta_server(delta_fill: f32, config: ArchitectureConfig) -> Box<
 
 // ── Test 1: outlier hard drop — 3 peers, peer_c outlier ──────────────────────
 //
-// Con k=3: sorted=[32, 32, 3200], mediana-low = sorted[1] = 32
-// factor * mediana = 2.0 * 32 = 64. peer_c (norm=3200) > 64 → dropeado.
+// With k=3: sorted=[32, 32, 3200], median-low = sorted[1] = 32
+// factor * median = 2.0 * 32 = 64. peer_c (norm=3200) > 64 → dropped.
 
 #[test]
 fn test_outlier_hard_drop_two_peers() {
@@ -146,9 +146,9 @@ fn test_outlier_hard_drop_two_peers() {
     let peer_c: [u8; 32] = [3u8; 32];
 
     let client = ExpertClient::new(vec![
-        (peer_a, spawn_fixed_delta_server(1.0, config.clone())), // norma ≈ 32 (si d_r=1024?) No, config.d_r default=512.
-        (peer_b, spawn_fixed_delta_server(1.0, config.clone())), // norma ≈ sqrt(512*1^2) ≈ 22.6
-        (peer_c, spawn_fixed_delta_server(100.0, config.clone())), // norma ≈ sqrt(512*100^2) ≈ 2262
+        (peer_a, spawn_fixed_delta_server(1.0, config.clone())), // norm ≈ 32 (if d_r=1024?) No, config.d_r default=512.
+        (peer_b, spawn_fixed_delta_server(1.0, config.clone())), // norm ≈ sqrt(512*1^2) ≈ 22.6
+        (peer_c, spawn_fixed_delta_server(100.0, config.clone())), // norm ≈ sqrt(512*100^2) ≈ 2262
     ]);
 
     let mut pipeline = ExpertPipeline {
@@ -164,9 +164,9 @@ fn test_outlier_hard_drop_two_peers() {
 
     assert_eq!(
         result.drops_count, 1,
-        "peer_c debe ser dropeado como outlier"
+        "peer_c must be dropped as an outlier"
     );
-    // Con peer_c excluido, delta ≈ [1.0; 512], norma ≈ 22.6
+    // With peer_c excluded, delta ≈ [1.0; 512], norm ≈ 22.6
     let norm: f32 = result.delta.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         norm < 200.0,
@@ -200,11 +200,11 @@ fn test_outlier_disabled_when_factor_none() {
 
     assert_eq!(
         result.drops_count, 0,
-        "sin outlier_factor, drops_count debe ser 0"
+        "without outlier_factor, drops_count must be 0"
     );
 }
 
-// ── Test 3: k=1 → outlier check imposible → drops_count == 0 ─────────────────
+// ── Test 3: k=1 → outlier check impossible → drops_count == 0 ────────────────
 
 #[test]
 fn test_single_peer_no_outlier_check() {
@@ -227,18 +227,18 @@ fn test_single_peer_no_outlier_check() {
 
     assert_eq!(
         result.drops_count, 0,
-        "k=1: sin comparación posible → drops_count == 0"
+        "k=1: no comparison possible → drops_count == 0"
     );
 }
 
-// ── Test 4: β se reduce con delta_norm grande ─────────────────────────────────
+// ── Test 4: β decreases with large delta_norm ─────────────────────────────────
 
 #[test]
 fn test_beta_reduces_with_large_delta() {
     let mut runner = build_runner();
     let config = ArchitectureConfig::default();
 
-    // delta_norm=50, q_mean=1.0 → β_raw = 1.0 / 51 ≈ 0.0196 → clampeado a beta_min
+    // delta_norm=50, q_mean=1.0 → β_raw = 1.0 / 51 ≈ 0.0196 → clamped to beta_min
     let big_norm = RunResult {
         delta: vec![0.0f32; config.d_r],
         q_mean: 1.0,
@@ -258,22 +258,22 @@ fn test_beta_reduces_with_large_delta() {
 
     assert!(
         beta_big < beta_small,
-        "β(norm=50) debe ser < β(norm=0); got big={beta_big}, small={beta_small}"
+        "β(norm=50) must be < β(norm=0); got big={beta_big}, small={beta_small}"
     );
     assert!(
         (beta_small - 1.0).abs() < 1e-5,
-        "β(norm=0, q=1) debe == beta_max=1.0; got {beta_small}"
+        "β(norm=0, q=1) must == beta_max=1.0; got {beta_small}"
     );
 }
 
-// ── Test 5: β se reduce con q_mean baja ──────────────────────────────────────
+// ── Test 5: β decreases with low q_mean ──────────────────────────────────────
 
 #[test]
 fn test_beta_reduces_with_low_quality() {
     let mut runner = build_runner();
     let config = ArchitectureConfig::default();
 
-    // q_mean=0 → β_raw=0 → clampeado a beta_min=0.05
+    // q_mean=0 → β_raw=0 → clamped to beta_min=0.05
     let zero_quality = RunResult {
         delta: vec![0.0f32; config.d_r],
         q_mean: 0.0,
@@ -283,7 +283,7 @@ fn test_beta_reduces_with_low_quality() {
     let beta_zero_q = runner.apply_expert_result(&zero_quality);
     assert!(
         (beta_zero_q - runner.beta_min).abs() < 1e-5,
-        "β(q=0) debe == beta_min={}; got {beta_zero_q}",
+        "β(q=0) must == beta_min={}; got {beta_zero_q}",
         runner.beta_min
     );
 
@@ -297,12 +297,12 @@ fn test_beta_reduces_with_low_quality() {
     let beta_full_q = runner.apply_expert_result(&full_quality);
     assert!(
         (beta_full_q - runner.beta0).abs() < 1e-5,
-        "β(q=1, norm=0) debe == beta0={}; got {beta_full_q}",
+        "β(q=1, norm=0) must == beta0={}; got {beta_full_q}",
         runner.beta0
     );
 }
 
-// ── Test 6: RouterStatsAccumulator flush con campos Stability Pack ────────────
+// ── Test 6: RouterStatsAccumulator flush with Stability Pack fields ──────────
 
 #[test]
 fn test_stats_acc_expert_flush() {
@@ -316,7 +316,7 @@ fn test_stats_acc_expert_flush() {
 
     let msg = acc
         .flush([0u8; 32])
-        .expect("debe producir RouterStats tras 2 ticks");
+        .expect("must produce RouterStats after 2 ticks");
 
     match msg {
         NetMsg::RouterStats {
@@ -329,20 +329,20 @@ fn test_stats_acc_expert_flush() {
         } => {
             assert!(
                 (delta_norm_mean - 4.0).abs() < 1e-4,
-                "delta_norm_mean debe ≈ 4.0; got {delta_norm_mean}"
+                "delta_norm_mean must ≈ 4.0; got {delta_norm_mean}"
             );
             assert!(
                 (delta_norm_min - 3.0).abs() < 1e-4,
-                "delta_norm_min debe ≈ 3.0; got {delta_norm_min}"
+                "delta_norm_min must ≈ 3.0; got {delta_norm_min}"
             );
             assert!(
                 (delta_norm_max - 5.0).abs() < 1e-4,
-                "delta_norm_max debe ≈ 5.0; got {delta_norm_max}"
+                "delta_norm_max must ≈ 5.0; got {delta_norm_max}"
             );
-            assert_eq!(drops_count, 1, "drops_count debe == 1");
+            assert_eq!(drops_count, 1, "drops_count must == 1");
             assert!(
                 (beta_mean - 0.85).abs() < 1e-4,
-                "beta_mean debe ≈ 0.85; got {beta_mean}"
+                "beta_mean must ≈ 0.85; got {beta_mean}"
             );
         }
         _ => panic!("expected RouterStats"),

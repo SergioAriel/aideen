@@ -9,7 +9,7 @@ use futures::channel::oneshot;
 ///    timeouts, or AtomicBool polling. Chrome fires the callback as a microtask once
 ///    the GPU work is complete — the await resumes one tick later.
 ///
-/// 2. STUB PATTERN: All unimplemented passes (Mamba, Attention, MoE, Projection)
+/// 2. STUB PATTERN: All unimplemented passes (Fixed-Point Memory, Attention, MoE, Projection)
 ///    use identity passthrough: they return the input buffer unchanged.
 ///    → Zero tensors never enter the pipeline.
 ///    → Real embedding values flow through to lm_head, producing meaningful results.
@@ -68,7 +68,7 @@ impl AideenForwardPass {
     }
 
     /// Full async forward pass.
-    /// Flow: token_ids → embedding → [mamba → attn → moe] × N layers → lm_head → argmax token
+    /// Flow: token_ids → embedding → [fpm → attn → moe] × N layers → lm_head → argmax token
     pub async fn run_async(
         &self,
         device: &Arc<wgpu::Device>,
@@ -222,7 +222,7 @@ impl AideenForwardPass {
     ) -> Result<wgpu::Buffer, BlockError> {
         // Layers are residual within blocks. Inter-block projections are handled in run_layers.
 
-        let hidden = self.mamba_pass(device, queue, hidden, weight_buffers, layer)?;
+        let hidden = self.fpm_pass(device, queue, hidden, weight_buffers, layer)?;
 
         let hidden = if layer.attn_dims.is_some() {
             self.attention_pass(device, queue, hidden, weight_buffers, layer, seq_len)?
@@ -328,7 +328,7 @@ impl AideenForwardPass {
         Ok(out_buf)
     }
 
-    fn mamba_pass(
+    fn fpm_pass(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -348,10 +348,10 @@ impl AideenForwardPass {
         macro_rules! w {
             ($key:expr) => {
                 weight_buffers
-                    .get(&format!("layers.{}.mamba.{}", layer_idx, $key))
+                    .get(&format!("layers.{}.fpm.{}", layer_idx, $key))
                     .ok_or_else(|| {
                         block_err!(&format!(
-                            "mamba layer {}: weight '{}' not found in VRAM",
+                            "fpm layer {}: weight '{}' not found in VRAM",
                             layer_idx, $key
                         ))
                     })?
@@ -378,7 +378,7 @@ impl AideenForwardPass {
             dt_rank as u32,
         ];
         let shape_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mamba_shape"),
+            label: Some("fpm_shape"),
             contents: bytemuck::cast_slice(&shape_data),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -395,12 +395,12 @@ impl AideenForwardPass {
             })
         };
         let proj_out_size = dt_rank + 2 * d_state;
-        let xz = mk_buf("mamba_xz", 2 * d_inner);
-        let x_act = mk_buf("mamba_x_act", d_inner);
-        let proj_bcd = mk_buf("mamba_proj_bcd", proj_out_size);
-        let delta = mk_buf("mamba_delta", d_inner);
-        let y_inner = mk_buf("mamba_y_inner", d_inner);
-        let output = mk_buf("mamba_output", d);
+        let xz = mk_buf("fpm_xz", 2 * d_inner);
+        let x_act = mk_buf("fpm_x_act", d_inner);
+        let proj_bcd = mk_buf("fpm_proj_bcd", proj_out_size);
+        let delta = mk_buf("fpm_delta", d_inner);
+        let y_inner = mk_buf("fpm_y_inner", d_inner);
+        let output = mk_buf("fpm_output", d);
 
         // ── Dispatch helper ───────────────────────────────────────────────
         let dispatch = |label: &str,
@@ -470,7 +470,7 @@ impl AideenForwardPass {
         });
         dispatch(
             "m_p1",
-            include_str!("../shaders/mamba_p1_norm_proj.wgsl"),
+            include_str!("../shaders/fpm_p1_norm_proj.wgsl"),
             "rms_norm_in_proj",
             bgl1,
             bg1,
@@ -519,7 +519,7 @@ impl AideenForwardPass {
         });
         dispatch(
             "m_p2",
-            include_str!("../shaders/mamba_p2_conv.wgsl"),
+            include_str!("../shaders/fpm_p2_conv.wgsl"),
             "conv1d_silu",
             bgl2,
             bg2,
@@ -563,7 +563,7 @@ impl AideenForwardPass {
         });
         dispatch(
             "m_p3",
-            include_str!("../shaders/mamba_p3_x_proj.wgsl"),
+            include_str!("../shaders/fpm_p3_x_proj.wgsl"),
             "x_proj",
             bgl3,
             bg3,
@@ -612,7 +612,7 @@ impl AideenForwardPass {
         });
         dispatch(
             "m_p4",
-            include_str!("../shaders/mamba_p4_dt_proj.wgsl"),
+            include_str!("../shaders/fpm_p4_dt_proj.wgsl"),
             "dt_proj_softplus",
             bgl4,
             bg4,
@@ -676,7 +676,7 @@ impl AideenForwardPass {
         });
         dispatch(
             "m_p5",
-            include_str!("../shaders/mamba_p5_ssm.wgsl"),
+            include_str!("../shaders/fpm_p5_ssm.wgsl"),
             "ssm_step_gate",
             bgl5,
             bg5,
@@ -725,7 +725,7 @@ impl AideenForwardPass {
         });
         dispatch(
             "m_p6",
-            include_str!("../shaders/mamba_p6_out_proj.wgsl"),
+            include_str!("../shaders/fpm_p6_out_proj.wgsl"),
             "out_proj_residual",
             bgl6,
             bg6,

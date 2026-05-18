@@ -190,7 +190,7 @@ fn pseudo_uniform(t: u64, n: usize) -> f32 {
     let frac = (bits >> 11) as f32 / (1u64 << 53) as f32;
     // Adjust to [0, n) and back to [0, 1) relative to n (for softmax cumulative)
     // In practice for select we use frac directly as uniform [0,1)
-    let _ = n; // n se usa en el caller para bounds
+    let _ = n; // n is used by the caller for bounds
     frac
 }
 

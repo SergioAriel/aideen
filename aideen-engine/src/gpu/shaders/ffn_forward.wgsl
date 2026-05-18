@@ -1,6 +1,6 @@
 // ffn_forward.wgsl
-// Función PURA: (inputs, weights) -> outputs
-// Sin estado persistente ni mutación de pesos.
+// PURE function: (inputs, weights) -> outputs
+// No persistent state, no weight mutation.
 
 @group(0) @binding(0)
 var<storage, read> inputs: array<f32>;

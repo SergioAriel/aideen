@@ -1,11 +1,11 @@
-# Módulo local: `network` (Red P2P y Transporte)
+# Local module: `network` (P2P Network and Transport)
 
-## 📌 Responsabilidades
-*   Manejar los sockets de comunicación (WebSocket, WebRTC, o libp2p).
-*   Implementar la lógica del streaming y transporte P2P (Chunked Prefill de ≈1.6MB por envío).
-*   Manejar the backpressure de la red.
+## 📌 Responsibilities
+*   Handle the communication sockets (WebSocket, WebRTC, or libp2p).
+*   Implement the streaming and P2P transport logic (Chunked Prefill of ≈1.6MB per send).
+*   Handle the network backpressure.
 
-## 🚫 Restricciones (Constitucionales)
-*   **NO** toca el estado cognitivo ni el `State`.
-*   **NO** llama directamente a funciones matemáticas o razonamiento.
-*   **NO** importa dependencias del módulo `system` (el flujo va de `system` hacia `network`, no al revés).
+## 🚫 Restrictions (Constitutional)
+*   Does **NOT** touch the cognitive state nor the `State`.
+*   Does **NOT** directly call mathematical or reasoning functions.
+*   Does **NOT** import dependencies from the `system` module (the flow goes from `system` to `network`, not the other way around).
