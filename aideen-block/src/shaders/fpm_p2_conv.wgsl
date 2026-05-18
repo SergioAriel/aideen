@@ -1,4 +1,4 @@
-// Loxi V8 — Mamba Pass 2: conv1d + SiLU
+// Loxi V8 — Fpm Pass 2: conv1d + SiLU
 //
 // Applies causal depthwise conv1d to x_ssm (first half of xz).
 // For single-token inference with zero state:
@@ -12,11 +12,11 @@
 //
 // Dispatch: ceil(d_inner / 256) workgroups × 256 threads
 
-struct MambaShape {
+struct FpmShape {
     D: u32, d_inner: u32, d_state: u32, d_conv: u32, dt_rank: u32,
 };
 
-@group(0) @binding(0) var<uniform>             shape:    MambaShape;
+@group(0) @binding(0) var<uniform>             shape:    FpmShape;
 @group(0) @binding(1) var<storage, read>       xz:       array<f32>; // [2*d_inner]
 @group(0) @binding(2) var<storage, read>       conv1d_w: array<f32>; // [d_inner * d_conv]
 @group(0) @binding(3) var<storage, read>       conv1d_b: array<f32>; // [d_inner]

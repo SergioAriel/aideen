@@ -29,23 +29,27 @@ fn deq_sgd_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
 
     if (idx < params.mat_len) {
-        let g = grad_mat[idx];
-        let clamped_g = clamp(g, -1.0, 1.0);
+        let g_raw = grad_mat[idx];
+        let g = select(0.0, g_raw, (g_raw == g_raw) && (abs(g_raw) < 1.0e30));
+        let clamped_g = clamp(g, -0.1, 0.1);
         let delta = params.lr * clamped_g;
-        W_q[idx] = W_q[idx] - delta;
-        W_k[idx] = W_k[idx] - delta;
-        W_v[idx] = W_v[idx] - delta;
-        W_o[idx] = W_o[idx] - delta;
-        W_in[idx] = W_in[idx] - delta;
-        W_x[idx] = W_x[idx] - delta;
-        W_out[idx] = W_out[idx] - delta;
+        
+        W_q[idx] = clamp(W_q[idx] - delta, -10.0, 10.0);
+        W_k[idx] = clamp(W_k[idx] - delta, -10.0, 10.0);
+        W_v[idx] = clamp(W_v[idx] - delta, -10.0, 10.0);
+        W_o[idx] = clamp(W_o[idx] - delta, -10.0, 10.0);
+        W_in[idx] = clamp(W_in[idx] - delta, -10.0, 10.0);
+        W_x[idx] = clamp(W_x[idx] - delta, -10.0, 10.0);
+        W_out[idx] = clamp(W_out[idx] - delta, -10.0, 10.0);
     }
 
     if (idx < params.vec_len) {
-        let g = grad_vec[idx];
-        let clamped_g = clamp(g, -1.0, 1.0);
+        let g_raw = grad_vec[idx];
+        let g = select(0.0, g_raw, (g_raw == g_raw) && (abs(g_raw) < 1.0e30));
+        let clamped_g = clamp(g, -0.1, 0.1);
         let delta = params.lr * clamped_g;
-        A_log[idx] = A_log[idx] - delta;
-        NormScale[idx] = NormScale[idx] - delta;
+        
+        A_log[idx] = clamp(A_log[idx] - delta, -10.0, 10.0);
+        NormScale[idx] = clamp(NormScale[idx] - delta, -10.0, 10.0);
     }
 }

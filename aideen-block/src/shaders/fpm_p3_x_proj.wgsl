@@ -1,4 +1,4 @@
-// Loxi V8 — Mamba Pass 3: x_proj GEMV
+// Loxi V8 — Fpm Pass 3: x_proj GEMV
 //
 // Computes: proj_bcd = x_act @ x_proj_w^T
 // proj_bcd layout: [delta_raw[dt_rank] | B[d_state] | C[d_state]]
@@ -8,11 +8,11 @@
 //
 // Dispatch: ceil((dt_rank + 2*d_state) / 256) workgroups × 256 threads
 
-struct MambaShape {
+struct FpmShape {
     D: u32, d_inner: u32, d_state: u32, d_conv: u32, dt_rank: u32,
 };
 
-@group(0) @binding(0) var<uniform>             shape:     MambaShape;
+@group(0) @binding(0) var<uniform>             shape:     FpmShape;
 @group(0) @binding(1) var<storage, read>       x_act:     array<f32>; // [d_inner]
 @group(0) @binding(2) var<storage, read>       x_proj_w:  array<f32>; // [(dt_rank+2*d_state)*d_inner]
 @group(0) @binding(3) var<storage, read_write> proj_bcd:  array<f32>; // [dt_rank+2*d_state]

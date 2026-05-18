@@ -78,7 +78,7 @@ pub struct AideenEngine {
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
     device_name: String,
-    /// GPU buffers keyed by tensor name (e.g. "layers.0.mamba.A_log")
+    /// GPU buffers keyed by tensor name (e.g. "layers.0.fpm.A_log")
     weight_buffers: std::collections::HashMap<String, wgpu::Buffer>,
 }
 
@@ -104,6 +104,15 @@ impl AideenEngine {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .ok_or_else(|| JsValue::from_str("Failed to find a WebGPU adapter in this browser."))?;
+
+        let subgroup_supported = adapter.features().contains(wgpu::Features::SUBGROUP);
+        if subgroup_supported {
+            web_sys::console::log_1(&JsValue::from_str("SUBGROUP supported."));
+        } else {
+            web_sys::console::log_1(&JsValue::from_str(
+                "SUBGROUP not supported; using portable path.",
+            ));
+        }
 
         let (device, queue) = adapter
             .request_device(

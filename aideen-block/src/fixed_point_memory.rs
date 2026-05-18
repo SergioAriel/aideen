@@ -1,24 +1,26 @@
-// Rust orchestrator for the Mamba WGSL Compute Shader.
-// Binds the PyTorch aligned C buffers to the A, B, C, and dt matrices for the parallel scan.
+// Rust orchestrator for the Fixed-Point Memory WGSL Compute Shader.
+// Binds the aligned C buffers to the A, B, C, and dt matrices for the parallel scan.
 
 use wgpu;
 
-pub struct RustMambaBridge {
+pub struct FixedPointMemoryBridge {
     pub pipeline: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
 }
 
-impl RustMambaBridge {
+impl FixedPointMemoryBridge {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Loxi Mamba SSM Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mamba.wgsl").into()),
+            label: Some("Fixed-Point Memory SSM Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/fixed_point_memory.wgsl").into(),
+            ),
         });
 
-        // The exact memory layout bindings for Mamba variables
+        // The exact memory layout bindings for Fixed-Point Memory variables
         // (Shape, X, dt, A, B, C, Y_out)
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Mamba Bind Group Layout"),
+            label: Some("Fixed-Point Memory Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -94,16 +96,16 @@ impl RustMambaBridge {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Mamba Pipeline Layout"),
+            label: Some("Fixed-Point Memory Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Mamba Pipeline"),
+            label: Some("Fixed-Point Memory Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some("mamba_parallel_scan"),
+            entry_point: Some("fpm_parallel_scan"),
             compilation_options: Default::default(),
             cache: None,
         });
