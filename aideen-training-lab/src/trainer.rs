@@ -17,10 +17,10 @@ use aideen_core::{
 use std::collections::VecDeque;
 use std::io::Write;
 
-use crate::optimizer::Adam;
+use crate::{loss, optimizer::Adam};
 use aideen_backbone::{
-    deq_mode::DeqRuntimeConfig, lm_head::LmHead, fixed_point_memory_reasoning::FixedPointMemoryReasoning,
-    tokenizer::Tokenizer,
+    deq_mode::DeqRuntimeConfig, fixed_point_memory_reasoning::FixedPointMemoryReasoning,
+    lm_head::LmHead, tokenizer::Tokenizer,
 };
 
 #[cfg(feature = "wgpu")]
@@ -63,6 +63,28 @@ impl Default for TrainingConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct FullVocabEvalMetrics {
+    pub count: usize,
+    pub ce: f32,
+    pub top1_acc: f32,
+    pub top5_acc: f32,
+    pub mean_rank: f32,
+    pub mean_target_logit: f32,
+    pub mean_top_logit: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExactForwardProbeMetrics {
+    pub positions: usize,
+    pub vocab: usize,
+    pub cpu_ms: f32,
+    pub gpu_ms: f32,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+    pub max_rel_diff: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct FpmHealthMetrics {
     max_err_h: f32,
     max_mem_update: f32,
@@ -99,6 +121,21 @@ impl SolveStatus {
     }
 }
 
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Debug)]
+struct ExactGpuCheckpointWeights {
+    w_q: Vec<f32>,
+    w_k: Vec<f32>,
+    w_v: Vec<f32>,
+    w_o: Vec<f32>,
+    w_in: Vec<f32>,
+    w_x: Vec<f32>,
+    w_out: Vec<f32>,
+    a_log: Vec<f32>,
+    norm_scale: Vec<f32>,
+    hist_params: Vec<f32>,
+}
+
 pub struct Trainer {
     pub config: ArchitectureConfig,
     pub training_config: TrainingConfig,
@@ -119,6 +156,8 @@ pub struct Trainer {
     gpu_emb_weights_uploaded: bool,
     #[cfg(feature = "wgpu")]
     lm_head_cpu_stale: bool,
+    #[cfg(feature = "wgpu")]
+    exact_gpu_checkpoint_weights: Option<ExactGpuCheckpointWeights>,
     pub lm_head: LmHead,
     pub tokenizer: Tokenizer,
     pub optimizer: Adam,
@@ -179,7 +218,7 @@ pub struct Trainer {
     cfg_debug_sample_every: usize, // AIDEEN_DEBUG_SAMPLE
     cfg_solve_control_every: usize, // AIDEEN_SOLVE_CONTROL_EVERY
     pub cfg_loss_readback_every: usize, // AIDEEN_LOSS_READBACK_EVERY
-    cfg_tps_sync_every: usize,     // AIDEEN_TPS_SYNC_EVERY
+    cfg_gpu_step_fence_every: usize, // AIDEEN_GPU_STEP_FENCE_EVERY
     cfg_grad_accum: u32,           // AIDEEN_GRAD_ACCUM
     cfg_hist_min_iters: u32,       // AIDEEN_HIST_MIN_ITERS
     cfg_val_every: usize,          // AIDEEN_VAL_EVERY
@@ -194,6 +233,10 @@ pub struct Trainer {
     cfg_force_renorm: bool,        // AIDEEN_DEQ_FORCE_RENORM
     cfg_lm_force_cpu_dldh: bool,   // AIDEEN_LM_FORCE_CPU_DLDH
     cfg_lm_dldh_parity: bool,      // AIDEEN_LM_DLDH_PARITY
+    cfg_lm_exact_cpu: bool,        // AIDEEN_LM_EXACT_CPU
+    cfg_lm_exact_cpu_every: u32,   // AIDEEN_LM_EXACT_CPU_EVERY
+    cfg_exact_timing: bool,        // AIDEEN_EXACT_TIMING
+    cfg_exact_gpu_w_update: bool,  // AIDEEN_LM_EXACT_GPU_W_UPDATE
     cfg_log_emb_stats: bool,       // AIDEEN_LOG_EMB_STATS
     cfg_lr_plateau_enable: bool,   // AIDEEN_LR_PLATEAU_ENABLE
     cfg_lr_plateau_patience: usize, // AIDEEN_LR_PLATEAU_PATIENCE
@@ -219,6 +262,17 @@ impl Trainer {
             return gpu.forward_seq_cap.max(1) as usize;
         }
         self.config.ctx_len.max(1)
+    }
+
+    pub fn has_exact_gpu_checkpoint_weights(&self) -> bool {
+        #[cfg(feature = "wgpu")]
+        {
+            return self.exact_gpu_checkpoint_weights.is_some();
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            false
+        }
     }
 
     #[cfg(feature = "wgpu")]
@@ -681,10 +735,14 @@ impl Trainer {
 
     #[cfg(feature = "wgpu")]
     fn upload_reasoning_weights_with_slot_anchor(
-        &self,
+        &mut self,
         gpu: &GpuDeqBackend,
         slot_anchor_rm: &[f32],
     ) {
+        if self.gpu_weights_uploaded {
+            gpu.upload_slot_anchor(&gpu.queue, slot_anchor_rm);
+            return;
+        }
         let (
             w_hist_shared_rm,
             hist_slot_scale_rm,
@@ -739,15 +797,92 @@ impl Trainer {
             w_q_assoc_rm.as_slice(),
             alpha_assoc.as_slice(),
         );
+        self.gpu_weights_uploaded = true;
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn upload_exact_gpu_checkpoint_weights(&mut self, gpu: &GpuDeqBackend) -> bool {
+        let Some(weights) = self.exact_gpu_checkpoint_weights.as_ref() else {
+            return false;
+        };
+        let d_r = self.config.d_r;
+        let h_slots = self.config.h_slots;
+        const RETAIN_RANK: usize = 32;
+
+        let hist = weights.hist_params.as_slice();
+        let hist_mat_base = 0usize;
+        let slot_scale_base = hist_mat_base + d_r * d_r;
+        let hist_bias_base = slot_scale_base + h_slots * d_r;
+        let hist_gate_base = hist_bias_base + h_slots * d_r;
+        let slot_anchor_base = hist_gate_base + h_slots;
+        let w_kv_write_base = slot_anchor_base + h_slots * d_r;
+        let b_delta_base = w_kv_write_base + 2 * h_slots * d_r * RETAIN_RANK;
+        let scalar_base = b_delta_base + h_slots * d_r;
+        let w_gate_hist_base = scalar_base + 21;
+        let w_write_gate_base = w_gate_hist_base + h_slots * d_r;
+        let b_write_mem_base = w_write_gate_base + h_slots * d_r;
+        let hhist_gamma_base = b_write_mem_base + h_slots;
+        let w_retain_up_base = hhist_gamma_base + h_slots;
+        let w_retain_down_base = w_retain_up_base + h_slots * d_r * RETAIN_RANK;
+        let b_retain_base = w_retain_down_base + h_slots * RETAIN_RANK * d_r;
+        let w_q_mem_base = b_retain_base + h_slots * d_r;
+        let w_k_mem_base = w_q_mem_base + h_slots * d_r * RETAIN_RANK;
+        let b_read_mem_base = w_k_mem_base + h_slots * d_r * RETAIN_RANK;
+        let w_k_assoc_base = b_read_mem_base + h_slots;
+        let w_v_assoc_base = w_k_assoc_base + h_slots * d_r * RETAIN_RANK;
+        let w_q_assoc_base = w_v_assoc_base + h_slots * d_r * RETAIN_RANK;
+        let alpha_assoc_base = w_q_assoc_base + h_slots * d_r * RETAIN_RANK;
+        let expected_len = alpha_assoc_base + h_slots;
+        if hist.len() < expected_len {
+            return false;
+        }
+
+        gpu.upload_weights(
+            &gpu.queue,
+            &weights.w_q,
+            &weights.w_k,
+            &weights.w_v,
+            &weights.w_o,
+            &weights.w_in,
+            &weights.w_x,
+            &weights.w_out,
+            &weights.a_log,
+            &weights.norm_scale,
+            &hist[hist_mat_base..slot_scale_base],
+            &hist[slot_scale_base..hist_bias_base],
+            &hist[hist_bias_base..hist_gate_base],
+            &hist[hist_gate_base..slot_anchor_base],
+            &hist[slot_anchor_base..w_kv_write_base],
+            &hist[w_kv_write_base..b_delta_base],
+            &hist[b_delta_base..scalar_base],
+            &hist[w_gate_hist_base..w_write_gate_base],
+            &hist[w_write_gate_base..b_write_mem_base],
+            &hist[b_write_mem_base..hhist_gamma_base],
+            &hist[w_retain_up_base..w_retain_down_base],
+            &hist[w_retain_down_base..b_retain_base],
+            &hist[b_retain_base..w_q_mem_base],
+            &hist[w_q_mem_base..w_k_mem_base],
+            &hist[w_k_mem_base..b_read_mem_base],
+            &hist[b_read_mem_base..w_k_assoc_base],
+            &hist[w_k_assoc_base..w_v_assoc_base],
+            &hist[w_v_assoc_base..w_q_assoc_base],
+            &hist[w_q_assoc_base..alpha_assoc_base],
+            &hist[alpha_assoc_base..alpha_assoc_base + h_slots],
+        );
+        self.gpu_weights_uploaded = true;
+        self.gpu_cg_weights_uploaded = true;
+        true
     }
 
     #[cfg(feature = "wgpu")]
     fn gpu_solve_token_with_fixed_history(
-        &self,
+        &mut self,
         gpu: &GpuDeqBackend,
         token: u32,
         m_prev: Option<&HSlots>,
-    ) -> Result<(nalgebra::DVector<f32>, HSlots, HSlots), &'static str> {
+    ) -> Result<(HSlots, HSlots), &'static str> {
+        let profile_fixed = Self::env_flag("AIDEEN_FIXED_HISTORY_PROFILE");
+        let t0 = std::time::Instant::now();
         let query = self.tokenizer.embed(token);
         let hist_ctx = self.reasoning.fixed_hist_ctx(m_prev, &query);
         let (
@@ -779,8 +914,10 @@ impl Trainer {
         }
 
         self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_eff.as_slice());
+        let t_upload = t0.elapsed().as_secs_f64() * 1000.0;
         let s_sequence = self.tokenizer.embed_sequence(&[token]);
-        let (h_pooled, h_star_flat, _) = gpu.run_forward_deq_pooled_with_state(
+        let t1 = std::time::Instant::now();
+        gpu.run_forward_deq_no_readback(
             1,
             1,
             self.config.max_deq_iters as u32,
@@ -798,10 +935,23 @@ impl Trainer {
             self.reasoning.norm_scale.as_slice(),
             false,
         )?;
-
+        let t_forward = t1.elapsed().as_secs_f64() * 1000.0;
+        let t2 = std::time::Instant::now();
+        let h_star_flat = gpu.read_hnext();
+        let t_read = t2.elapsed().as_secs_f64() * 1000.0;
         let h_star = HSlots::from_flat(&h_star_flat, &self.config);
         let m_next = self.temporal_update_from_h(m_prev, &h_star);
-        Ok((nalgebra::DVector::from_vec(h_pooled), h_star, m_next))
+        if profile_fixed {
+            eprintln!(
+                "[FIXED-HIST-PROFILE] token={} upload_ms={:.3} forward_ms={:.3} read_hnext_ms={:.3} total_ms={:.3}",
+                token,
+                t_upload,
+                t_forward,
+                t_read,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok((h_star, m_next))
     }
 
     fn gib(bytes: f64) -> f64 {
@@ -988,6 +1138,18 @@ impl Trainer {
         out
     }
 
+    fn decode_slot_owner_metrics(fw: &[f32], h_slots: usize) -> Vec<(f32, f32, f32)> {
+        let mut out = Vec::new();
+        for slot in 0..h_slots {
+            let base = 360 + slot * 3;
+            if fw.len() <= base + 2 {
+                break;
+            }
+            out.push((fw[base], fw[base + 1], fw[base + 2]));
+        }
+        out
+    }
+
     fn decode_debug_snapshot_header(fw: &[f32]) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
         if fw.len() <= 18 {
             return None;
@@ -1057,7 +1219,11 @@ impl Trainer {
                     }
                 }
             }
-            if pairs == 0 { 0.0 } else { acc / pairs as f32 }
+            if pairs == 0 {
+                0.0
+            } else {
+                acc / pairs as f32
+            }
         };
         let mean_rms_owned = |data: &[f32], width: usize| -> f32 {
             let mut acc = 0.0f32;
@@ -1082,7 +1248,11 @@ impl Trainer {
                     count += 1;
                 }
             }
-            if count == 0 { 0.0 } else { acc / count as f32 }
+            if count == 0 {
+                0.0
+            } else {
+                acc / count as f32
+            }
         };
 
         let mut src_flat = vec![0.0f32; seq_len as usize * h * d];
@@ -1093,7 +1263,8 @@ impl Trainer {
                 let anchor_base = slot * d;
                 let out_base = (token * h + slot) * d;
                 for i in 0..d {
-                    src_flat[out_base + i] = scratch[signal_base + i] + slot_anchor[anchor_base + i];
+                    src_flat[out_base + i] =
+                        scratch[signal_base + i] + slot_anchor[anchor_base + i];
                 }
             }
         }
@@ -1113,8 +1284,9 @@ impl Trainer {
                 qgrad_flat[dst_base..dst_base + hd]
                     .copy_from_slice(&qgrad[src_base..src_base + hd]);
                 let src_slice = &src_flat[src_base..src_base + d];
-                let src_rms =
-                    (src_slice.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32).sqrt().max(1.0e-6);
+                let src_rms = (src_slice.iter().map(|x| x * x).sum::<f32>() / d.max(1) as f32)
+                    .sqrt()
+                    .max(1.0e-6);
                 let wk_slot = &wk[slot * mat_len..(slot + 1) * mat_len];
                 let k_bias_slot = &wk[k_bias_base + slot * d..k_bias_base + (slot + 1) * d];
                 for head in 0..hd {
@@ -1211,10 +1383,21 @@ impl Trainer {
         }
         let score_pair = pair_l2_owned(&score_flat, h);
         let score_rms = mean_rms_owned(&score_flat, h);
-        let score_margin = if score_count == 0 { 0.0 } else { score_margin_acc / score_count as f32 };
-        let score_self = if score_count == 0 { 0.0 } else { self_prob_acc / score_count as f32 };
-        let score_entropy =
-            if score_count == 0 { 0.0 } else { score_entropy_acc / score_count as f32 };
+        let score_margin = if score_count == 0 {
+            0.0
+        } else {
+            score_margin_acc / score_count as f32
+        };
+        let score_self = if score_count == 0 {
+            0.0
+        } else {
+            self_prob_acc / score_count as f32
+        };
+        let score_entropy = if score_count == 0 {
+            0.0
+        } else {
+            score_entropy_acc / score_count as f32
+        };
         let incoming_den = (seq_len as usize * h).max(1) as f32;
         let incoming_mean = incoming_acc
             .iter()
@@ -1268,7 +1451,11 @@ impl Trainer {
                     pairs += 1;
                 }
             }
-            if pairs == 0 { 0.0 } else { acc / pairs as f32 }
+            if pairs == 0 {
+                0.0
+            } else {
+                acc / pairs as f32
+            }
         };
         let pick_qkv = |m: &[f32]| -> Vec<f32> {
             let mut out = Vec::with_capacity(d * head_dim);
@@ -1303,7 +1490,11 @@ impl Trainer {
                     pairs += 1;
                 }
             }
-            if pairs == 0 { 0.0 } else { acc / pairs as f32 }
+            if pairs == 0 {
+                0.0
+            } else {
+                acc / pairs as f32
+            }
         };
         let q_bias_base = h * mat_len;
         let k_bias_base = h * mat_len;
@@ -1348,7 +1539,22 @@ impl Trainer {
     fn decode_fpm_read_metrics(
         fw: &[f32],
         h_slots: usize,
-    ) -> Vec<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
+    ) -> Vec<(
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+    )> {
         let mut out = Vec::new();
         for slot in 0..h_slots {
             let base = 520 + slot * 14;
@@ -1613,6 +1819,8 @@ impl Trainer {
             gpu_emb_weights_uploaded: false,
             #[cfg(feature = "wgpu")]
             lm_head_cpu_stale: false,
+            #[cfg(feature = "wgpu")]
+            exact_gpu_checkpoint_weights: None,
             lm_head: LmHead::new(config.clone()),
             tokenizer,
             optimizer: Adam::new(lr),
@@ -1680,7 +1888,7 @@ impl Trainer {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0),
-            cfg_tps_sync_every: std::env::var("AIDEEN_TPS_SYNC_EVERY")
+            cfg_gpu_step_fence_every: std::env::var("AIDEEN_GPU_STEP_FENCE_EVERY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1),
@@ -1718,6 +1926,14 @@ impl Trainer {
             cfg_force_renorm: Self::env_flag("AIDEEN_DEQ_FORCE_RENORM"),
             cfg_lm_force_cpu_dldh: Self::env_flag("AIDEEN_LM_FORCE_CPU_DLDH"),
             cfg_lm_dldh_parity: Self::env_flag("AIDEEN_LM_DLDH_PARITY"),
+            cfg_lm_exact_cpu: Self::env_flag("AIDEEN_LM_EXACT_CPU"),
+            cfg_lm_exact_cpu_every: std::env::var("AIDEEN_LM_EXACT_CPU_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
+            cfg_exact_timing: Self::env_flag("AIDEEN_EXACT_TIMING"),
+            cfg_exact_gpu_w_update: Self::env_flag("AIDEEN_LM_EXACT_GPU_W_UPDATE"),
             cfg_log_emb_stats: Self::env_flag("AIDEEN_LOG_EMB_STATS"),
             cfg_lr_plateau_enable: !Self::env_flag("AIDEEN_LR_PLATEAU_DISABLE"),
             cfg_lr_plateau_patience: std::env::var("AIDEEN_LR_PLATEAU_PATIENCE")
@@ -1744,7 +1960,7 @@ impl Trainer {
             cfg_assoc_alpha_lr_mult: Self::env_f32("AIDEEN_ASSOC_ALPHA_LR_MULT").unwrap_or(1.0),
             cfg_assoc_addr_lr_mult: Self::env_f32("AIDEEN_ASSOC_ADDR_LR_MULT")
                 .or_else(|| Self::env_f32("AIDEEN_ASSOC_LR_MULT"))
-                .unwrap_or(0.0),
+                .unwrap_or(1.0),
         };
         trainer.apply_experimental_profile_from_env();
         if let Some(alpha_init) = Self::env_f32("AIDEEN_ASSOC_ALPHA_INIT") {
@@ -1757,8 +1973,7 @@ impl Trainer {
                 "\x1b[33m[AIDEEN] WARNING: AIDEEN_BATCH_SIZE={} may cause thermal overload on \
                  integrated GPUs (Apple Silicon, iGPU). Use AIDEEN_BATCH_SIZE=1 \
                  AIDEEN_GRAD_ACCUM={} instead.\x1b[0m",
-                trainer.cfg_fwd_batch_size,
-                trainer.cfg_fwd_batch_size,
+                trainer.cfg_fwd_batch_size, trainer.cfg_fwd_batch_size,
             );
         }
 
@@ -1817,6 +2032,24 @@ impl Trainer {
                 w_head.get("head.b").unwrap(),
                 w_head.get("head.g").unwrap(),
             );
+            if let (Some(m_w), Some(v_w), Some(m_b), Some(v_b), Some(m_g), Some(v_g)) = (
+                self.optimizer.get_mat("lm_w_m"),
+                self.optimizer.get_mat_v("lm_w_v"),
+                self.optimizer.get_vec("lm_b_m"),
+                self.optimizer.get_vec_v("lm_b_v"),
+                self.optimizer.get_vec("lm_g_m"),
+                self.optimizer.get_vec_v("lm_g_v"),
+            ) {
+                lm.write_moments(
+                    &gpu.queue,
+                    m_w.as_slice(),
+                    v_w.as_slice(),
+                    m_b.as_slice(),
+                    v_b.as_slice(),
+                    m_g.as_slice(),
+                    v_g.as_slice(),
+                );
+            }
             self.gpu_lm_weights_uploaded = true;
             self.gpu_lm = Some(lm);
         }
@@ -2135,6 +2368,271 @@ impl Trainer {
     }
 
     #[cfg(feature = "wgpu")]
+    fn exact_cpu_lm_update_from_hpooled(
+        &mut self,
+        gpu: &GpuDeqBackend,
+        targets: &[u32],
+        lm_lr: f32,
+    ) -> Option<(f32, bool, Vec<f32>)> {
+        if !self.cfg_lm_exact_cpu || self.eval_mode || self.frozen_lm || lm_lr <= 0.0 {
+            return None;
+        }
+        let exact_every = self.cfg_lm_exact_cpu_every.max(1) as usize;
+        if exact_every > 1 && self.optimizer.step_count() % exact_every != 0 {
+            return None;
+        }
+        if targets.is_empty() {
+            return Some((0.0, false, Vec::new()));
+        }
+
+        let gpu_lm_owner = self.cfg_exact_gpu_w_update
+            && self
+                .gpu_lm
+                .as_ref()
+                .map(|lm| lm.exact_forward_gpu_enabled())
+                .unwrap_or(false);
+        let exact_t0 = std::time::Instant::now();
+        let exact_logits_gpu = if gpu_lm_owner {
+            None
+        } else {
+            self.gpu_lm
+                .as_ref()
+                .filter(|lm| lm.exact_forward_gpu_enabled())
+                .and_then(|lm| {
+                    lm.read_exact_logits_from_h(
+                        &gpu.device,
+                        &gpu.queue,
+                        &gpu.bridge.hpooled_buf,
+                        targets.len() as u32,
+                    )
+                    .ok()
+                })
+        };
+        if !gpu_lm_owner {
+            // Exact CPU accumulation must see the same pre-update W for every token
+            // in the sequence when CPU still owns the accumulators.
+            self.sync_lm_head_from_gpu_if_needed();
+        } else if let Some(gpu_lm) = self.gpu_lm.as_ref() {
+            gpu_lm.exact_zero_accumulators(&gpu.device, &gpu.queue, targets.len() as u32);
+        }
+        let need_h_seq = !gpu_lm_owner || exact_logits_gpu.is_none();
+        let h_seq = if need_h_seq {
+            gpu.read_hpooled_seq(targets.len() as u32)
+        } else {
+            Vec::new()
+        };
+        let exact_forward_ms = exact_t0.elapsed().as_secs_f32() * 1000.0;
+        let d_r = self.config.d_r;
+        let vocab = self.lm_head.b.len();
+        let active_targets = targets.iter().filter(|&&t| (t as usize) < vocab).count().max(1);
+        let seq_scale = 1.0f32 / active_targets as f32;
+
+        let mut dw = nalgebra::DMatrix::zeros(vocab, d_r);
+        let mut db = nalgebra::DVector::zeros(vocab);
+        let mut dg = nalgebra::DVector::zeros(d_r);
+        let mut dl_dh_seq = vec![0.0f32; targets.len() * d_r];
+        let mut loss_sum = 0.0f32;
+        let mut loss_count = 0usize;
+        let mut dl_buf = vec![0.0f32; vocab];
+        let mut dl_scaled_buf = vec![0.0f32; vocab];
+        let mut h_norm_buf = vec![0.0f32; d_r];
+        let mut h_rms_buf = vec![0.0f32; d_r];
+        let mut dl_dh_rms_buf = vec![0.0f32; d_r];
+        let mut exact_loss_grad_ms = 0.0f32;
+        let mut exact_accum_ms = 0.0f32;
+        let base_opt_lr = self.optimizer.lr.max(1.0e-12);
+        let grad_scale = lm_lr / base_opt_lr;
+
+        for (idx, &target_u32) in targets.iter().enumerate() {
+            let target = target_u32 as usize;
+            if target >= vocab {
+                continue;
+            }
+            let base = idx * d_r;
+            if need_h_seq && base + d_r > h_seq.len() {
+                break;
+            }
+            let h_slice = if need_h_seq {
+                Some(&h_seq[base..base + d_r])
+            } else {
+                None
+            };
+            let lg_t0 = std::time::Instant::now();
+            if gpu_lm_owner {
+                loss_sum += self
+                    .gpu_lm
+                    .as_ref()
+                    .expect("gpu_lm required for exact gpu lm owner")
+                    .exact_compute_token_loss_grad(
+                        &gpu.device,
+                        &gpu.queue,
+                        &gpu.bridge.hpooled_buf,
+                        idx as u32,
+                        target_u32,
+                        seq_scale,
+                    )
+                    .ok()?;
+                loss_count += 1;
+            } else {
+                let logits_vec = if let Some(flat) = exact_logits_gpu.as_ref() {
+                    let logits_base = idx * vocab;
+                    flat[logits_base..logits_base + vocab].to_vec()
+                } else {
+                    self.lm_head
+                        .forward_on_flat(h_slice.expect("h_seq required for CPU exact logits"))
+                        .as_slice()
+                        .to_vec()
+                };
+                loss_sum +=
+                    loss::cross_entropy_and_grad_slice(&logits_vec, target_u32, &mut dl_buf);
+                loss_count += 1;
+            }
+            exact_loss_grad_ms += lg_t0.elapsed().as_secs_f32() * 1000.0;
+
+            let accum_t0 = std::time::Instant::now();
+            if gpu_lm_owner {
+                self.gpu_lm
+                    .as_ref()
+                    .expect("gpu_lm required for exact gpu lm owner")
+                    .exact_accumulate_token(
+                        &gpu.device,
+                        &gpu.queue,
+                        &gpu.bridge.hpooled_buf,
+                        idx as u32,
+                        &[],
+                    )
+                    .ok()?;
+            } else {
+                for v in 0..vocab {
+                    let dlv = dl_buf[v] * seq_scale;
+                    dl_scaled_buf[v] = dlv;
+                }
+                let h_slice = h_slice.expect("h_seq required for CPU accumulation");
+                let eps = 1e-5f32;
+                let mut mean_sq = 0.0f32;
+                for &v in h_slice {
+                    mean_sq += v * v;
+                }
+                let rms = (mean_sq / d_r.max(1) as f32 + eps).sqrt();
+                for d in 0..d_r {
+                    h_norm_buf[d] = h_slice[d] / rms;
+                    h_rms_buf[d] = h_norm_buf[d] * self.lm_head.g[d];
+                    dl_dh_rms_buf[d] = 0.0;
+                }
+
+                for v in 0..vocab {
+                    db[v] += dl_scaled_buf[v];
+                }
+
+                let w_slice = self.lm_head.w.as_slice();
+                let dw_slice: &mut [f32] = dw.as_mut_slice();
+                for d in 0..d_r {
+                    let col_base = d * vocab;
+                    let w_col = &w_slice[col_base..col_base + vocab];
+                    let dw_col = &mut dw_slice[col_base..col_base + vocab];
+                    let h_rms_d = h_rms_buf[d];
+                    let mut accum_d = 0.0f32;
+                    for v in 0..vocab {
+                        let dlv = dl_scaled_buf[v];
+                        dw_col[v] += dlv * h_rms_d;
+                        accum_d += w_col[v] * dlv;
+                    }
+                    dl_dh_rms_buf[d] = accum_d;
+                }
+
+                let mut sum_dx_h = 0.0f32;
+                for d in 0..d_r {
+                    dg[d] += dl_dh_rms_buf[d] * h_norm_buf[d];
+                    let dx = dl_dh_rms_buf[d] * self.lm_head.g[d] / rms;
+                    dl_dh_seq[base + d] = dx;
+                    sum_dx_h += dx * h_slice[d];
+                }
+                let corr_scale = sum_dx_h / (d_r.max(1) as f32 * rms * rms);
+                for d in 0..d_r {
+                    dl_dh_seq[base + d] -= h_slice[d] * corr_scale;
+                }
+            }
+            exact_accum_ms += accum_t0.elapsed().as_secs_f32() * 1000.0;
+        }
+
+        if loss_count == 0 {
+            return Some((0.0, gpu_lm_owner, dl_dh_seq));
+        }
+
+        let adam_t0 = std::time::Instant::now();
+        if gpu_lm_owner {
+            self.gpu_lm
+                .as_ref()
+                .expect("gpu_lm required for exact gpu w owner")
+                .exact_apply_w_from_internal_grad(
+                    &gpu.device,
+                    &gpu.queue,
+                    self.optimizer.step_count() as u32,
+                    self.optimizer.lr,
+                    self.optimizer.beta1,
+                    self.optimizer.beta2,
+                    self.optimizer.eps,
+                    grad_scale,
+                )
+                .ok()?;
+            self.gpu_lm
+                .as_ref()
+                .expect("gpu_lm required for exact gpu lm owner")
+                .exact_apply_bg_from_internal_grad(
+                    &gpu.device,
+                    &gpu.queue,
+                    self.optimizer.step_count() as u32,
+                    self.optimizer.lr,
+                    self.optimizer.beta1,
+                    self.optimizer.beta2,
+                    self.optimizer.eps,
+                    grad_scale,
+                )
+                .ok()?;
+        } else {
+            self.optimizer
+                .step_matrix_scaled_inplace("lm_w", &mut self.lm_head.w, &dw, grad_scale);
+            self.optimizer
+                .step_vector_scaled_inplace("lm_b", &mut self.lm_head.b, &db, grad_scale);
+            self.optimizer
+                .step_vector_scaled_inplace("lm_g", &mut self.lm_head.g, &dg, grad_scale);
+        }
+        let exact_adam_ms = adam_t0.elapsed().as_secs_f32() * 1000.0;
+
+        if self.cfg_exact_timing {
+            if gpu_lm_owner {
+                if let Some(gpu_lm) = self.gpu_lm.as_ref() {
+                    if let Ok((m_w, v_w, _, _, _, _)) = gpu_lm.read_moments(&gpu.device, &gpu.queue)
+                    {
+                        let sum_mw: f32 = m_w.iter().map(|x| x.abs()).sum();
+                        let sum_vw: f32 = v_w.iter().map(|x| x.abs()).sum();
+                        println!(
+                            "    [EXACT-GPU-W] gpu_mw_sum={:.6e} gpu_vw_sum={:.6e}",
+                            sum_mw, sum_vw
+                        );
+                    }
+                }
+            }
+            println!(
+                "    [EXACT-TIMING] seq={} vocab={} forward_ms={:.3} loss_grad_ms={:.3} accum_ms={:.3} adam_ms={:.3}",
+                targets.len(),
+                vocab,
+                exact_forward_ms,
+                exact_loss_grad_ms,
+                exact_accum_ms,
+                exact_adam_ms,
+            );
+        }
+
+        if gpu_lm_owner {
+            self.gpu_lm_weights_uploaded = true;
+            self.lm_head_cpu_stale = true;
+        }
+
+        Some((loss_sum / loss_count as f32, gpu_lm_owner, dl_dh_seq))
+    }
+
+    #[cfg(feature = "wgpu")]
     fn apply_training_update_from_gpu_buffers(
         &mut self,
         context: &[u32],
@@ -2189,14 +2687,102 @@ impl Trainer {
         );
         let emergency_iter_cap = self.emergency_solve_cap();
 
-        if let (Some(gpu), Some(gpu_lm), Some(gpu_emb)) =
-            (gpu_ctx, self.gpu_lm.as_mut(), self.gpu_emb.as_ref())
-        {
+        if let Some(gpu) = gpu_ctx {
             self.optimizer.tick();
             if num_tokens == 0 {
                 return 0.0;
             }
             let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+
+            let mut exact_cpu_lm_active = false;
+            if let Some((exact_loss, exact_gpu_dldh_ready, exact_dl_dh)) =
+                self.exact_cpu_lm_update_from_hpooled(gpu, &targets_u32, lm_lr)
+            {
+                exact_cpu_lm_active = true;
+                let exact_gpu_lm_owner = self.cfg_exact_gpu_w_update
+                    && self.cfg_lm_exact_cpu
+                    && self
+                        .gpu_lm
+                        .as_ref()
+                        .map(|lm| lm.exact_forward_gpu_enabled())
+                        .unwrap_or(false);
+                if !self.frozen_emb {
+                    let emb_lr = base_lr * self.training_config.emb_lr_mult;
+                    let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+                        return 0.0;
+                    };
+                    if exact_gpu_dldh_ready {
+                        let Some(gpu_lm_ref) = self.gpu_lm.as_ref() else {
+                            return 0.0;
+                        };
+                        let _ = gpu_emb.apply_embedding_update_from_buffer(
+                            &gpu.device,
+                            &gpu.queue,
+                            context,
+                            self.config.ctx_len,
+                            &gpu_lm_ref.dl_dh_buf,
+                            emb_lr,
+                            self.optimizer.beta1,
+                            self.optimizer.beta2,
+                            self.optimizer.eps,
+                            self.optimizer.step_count() as u32,
+                            self.training_config.ternary,
+                        );
+                    } else {
+                        let _ = gpu_emb.apply_embedding_update(
+                            &gpu.device,
+                            &gpu.queue,
+                            context,
+                            self.config.ctx_len,
+                            &exact_dl_dh,
+                            emb_lr,
+                            self.optimizer.beta1,
+                            self.optimizer.beta2,
+                            self.optimizer.eps,
+                            self.optimizer.step_count() as u32,
+                            self.training_config.ternary,
+                        );
+                    }
+                    self.gpu_emb_weights_uploaded = true;
+                }
+                if let Some(gpu_lm) = self.gpu_lm.as_mut() {
+                    if !exact_gpu_lm_owner {
+                        let w_head = self.lm_head.export_weights();
+                        gpu_lm.upload_weights_only(
+                            &gpu.queue,
+                            w_head.get("head.w").unwrap(),
+                            w_head.get("head.b").unwrap(),
+                            w_head.get("head.g").unwrap(),
+                        );
+                        gpu.queue.write_buffer(
+                            &gpu_lm.dl_dh_buf,
+                            0,
+                            bytemuck::cast_slice(&exact_dl_dh),
+                        );
+                    }
+                    self.gpu_lm_weights_uploaded = true;
+                    self.lm_head_cpu_stale = exact_gpu_lm_owner;
+                    let zero_len = if exact_gpu_dldh_ready {
+                        num_tokens * self.config.d_r
+                    } else {
+                        exact_dl_dh.len()
+                    };
+                    let zeros = vec![0.0f32; zero_len];
+                    gpu.queue
+                        .write_buffer(gpu_lm.assoc_grad_buf(), 0, bytemuck::cast_slice(&zeros));
+                }
+                self.last_gpu_loss = exact_loss;
+                if self.frozen_deq {
+                    return exact_loss;
+                }
+            }
+
+            let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+                return 0.0;
+            };
+            let Some(gpu_lm) = self.gpu_lm.as_mut() else {
+                return 0.0;
+            };
 
             // 1. Prepare DEQ input on GPU
             // per_seq_len = tokens per sequence (num_tokens / B for batch mode, or 1 for query mode)
@@ -2350,13 +2936,14 @@ impl Trainer {
                 None
             };
             let model_a_fpm = Self::fpm_stage_from_env() < 6;
-            let cached_fpm_status = cached_fpm_metrics
-                .map(|m| Self::classify_fpm_solve(m, max_h_dbg, contractivity, epsilon, model_a_fpm));
+            let cached_fpm_status = cached_fpm_metrics.map(|m| {
+                Self::classify_fpm_solve(m, max_h_dbg, contractivity, epsilon, model_a_fpm)
+            });
             // Evaluate invalidity at most once per freshly captured debug snapshot.
             // Reusing the same cached sample for several training steps would turn one
             // bad window into an artificial streak of "consecutive" failures.
-            let fresh_invalid_sample = self.cached_debug_gen != 0
-                && self.cached_debug_gen != self.invalid_eval_debug_gen;
+            let fresh_invalid_sample =
+                self.cached_debug_gen != 0 && self.cached_debug_gen != self.invalid_eval_debug_gen;
             // DEQ-INVALID: only when the system FAILED to converge (maxΔ >> epsilon) while
             // also being non-contractive. Non-monotone convergence (contr transiently > 1
             // but maxΔ ≈ epsilon) is a normal property of non-linear Picard iterations and
@@ -2435,35 +3022,41 @@ impl Trainer {
             // Submit LM forward+backward without blocking for loss readback.
             // For eval_mode (validation) we still read synchronously since there's no adjoint.
             // For train mode, loss is read after apply_gradient_update when GPU is already idle.
-            let read_loss_now = self.eval_mode;
-            let lm_t0 = std::time::Instant::now();
-            let current_loss_sync = gpu_lm
-                .train_step_no_readback(
-                    &gpu.device,
-                    &gpu.queue,
-                    &gpu.bridge.hpooled_buf,
-                    0,
-                    &gpu.bridge.assoc_pooled_buf,
-                    0,
-                    Some(gpu_emb.weights_buffer()),
-                    &targets_u32,
-                    lm_lr,
-                    self.optimizer.step_count() as u32,
-                    self.training_config.ternary,
-                    read_loss_now,
-                )
-                .unwrap_or(0.0);
-            if audit_cost {
-                audit_lm_ms += lm_t0.elapsed().as_secs_f64() * 1e3;
-            }
-            if self.eval_mode {
-                self.last_gpu_loss = current_loss_sync;
-            }
-            if lm_lr > 0.0 {
-                self.lm_head_cpu_stale = true;
-            }
+            let _current_loss_sync = if exact_cpu_lm_active {
+                self.last_gpu_loss
+            } else {
+                let read_loss_now = self.eval_mode;
+                let lm_t0 = std::time::Instant::now();
+                let current_loss_sync = gpu_lm
+                    .train_step_no_readback(
+                        &gpu.device,
+                        &gpu.queue,
+                        &gpu.bridge.hpooled_buf,
+                        0,
+                        &gpu.bridge.assoc_pooled_buf,
+                        0,
+                        Some(gpu_emb.weights_buffer()),
+                        &targets_u32,
+                        lm_lr,
+                        self.optimizer.step_count() as u32,
+                        self.training_config.ternary,
+                        read_loss_now,
+                    )
+                    .unwrap_or(0.0);
+                if audit_cost {
+                    audit_lm_ms += lm_t0.elapsed().as_secs_f64() * 1e3;
+                }
+                if self.eval_mode {
+                    self.last_gpu_loss = current_loss_sync;
+                }
+                if lm_lr > 0.0 {
+                    self.lm_head_cpu_stale = true;
+                }
+                current_loss_sync
+            };
             // TEMPORARY DIAGNOSTIC: localize first non-finite source entering clean Picard.
-            if Self::env_flag("AIDEEN_BACKWARD_INPUT_PROBE")
+            if !exact_cpu_lm_active
+                && Self::env_flag("AIDEEN_BACKWARD_INPUT_PROBE")
                 && self.cfg_debug_sample_every > 0
                 && self.optimizer.step_count() % self.cfg_debug_sample_every == 0
             {
@@ -2651,7 +3244,9 @@ impl Trainer {
                 self.gpu_weights_uploaded = true;
                 self.gpu_cg_weights_uploaded = true;
 
-                if self.cfg_debug_sample_every > 0 && self.optimizer.step_count() % self.cfg_debug_sample_every == 0 {
+                if self.cfg_debug_sample_every > 0
+                    && self.optimizer.step_count() % self.cfg_debug_sample_every == 0
+                {
                     let adbg = gpu.read_assoc_bwd_debug();
                     if !adbg.is_empty() {
                         let h = self.config.h_slots;
@@ -2763,27 +3358,111 @@ impl Trainer {
                 let trunc_flag = if fw.len() > 18 { fw[18] } else { 0.0 };
                 let total_elems = if fw.len() > 19 { fw[19] } else { 0.0 };
                 let eps_runtime_dbg = if fw.len() > 9 { fw[9] } else { 0.0 };
-                let signal_rms_dbg = if debug_v901 && fw.len() > 12 { fw[12] } else { 0.0 };
-                let pre_rms_dbg = if debug_v901 && fw.len() > 13 { fw[13] } else { 0.0 };
-                let fh_rms_dbg = if debug_v901 && fw.len() > 14 { fw[14] } else { 0.0 };
-                let hprev_rms_dbg = if debug_v901 && fw.len() > 15 { fw[15] } else { 0.0 };
-                let nscale_abs_dbg = if debug_v901 && fw.len() > 16 { fw[16] } else { 0.0 };
-                let pre2h_dbg = if debug_v901 && fw.len() > 17 { fw[17] } else { 0.0 };
-                let fh2h_dbg = if debug_v901 && fw.len() > 18 { fw[18] } else { 0.0 };
-                let attn_rms_dbg = if debug_v901 && fw.len() > 19 { fw[19] } else { 0.0 };
-                let attn2sig_dbg = if debug_v901 && fw.len() > 20 { fw[20] } else { 0.0 };
-                let attn_scale_dbg = if debug_v901 && fw.len() > 21 { fw[21] } else { 0.0 };
-                let iter0_err_h_dbg = if debug_v901 && fw.len() > 22 { fw[22] } else { 0.0 };
-                let iter1_err_h_dbg = if debug_v901 && fw.len() > 23 { fw[23] } else { 0.0 };
-                let iter0_attn2sig_dbg = if debug_v901 && fw.len() > 24 { fw[24] } else { 0.0 };
-                let iter1_attn2sig_dbg = if debug_v901 && fw.len() > 25 { fw[25] } else { 0.0 };
-                let iter0_attn_scale_dbg = if debug_v901 && fw.len() > 26 { fw[26] } else { 0.0 };
-                let iter1_attn_scale_dbg = if debug_v901 && fw.len() > 27 { fw[27] } else { 0.0 };
-                let iter_max_err_dbg = if debug_v901 && fw.len() > 28 { fw[28] } else { 0.0 };
-                let iter_max_attn_dbg = if debug_v901 && fw.len() > 29 { fw[29] } else { 0.0 };
-                let token_max_err_dbg = if debug_v901 && fw.len() > 30 { fw[30] } else { 0.0 };
-                let token_max_attn_dbg = if debug_v901 && fw.len() > 31 { fw[31] } else { 0.0 };
-                let fpm_rms = if !debug_v901 && fw.len() > 25 { fw[25] } else { 0.0 };
+                let signal_rms_dbg = if debug_v901 && fw.len() > 12 {
+                    fw[12]
+                } else {
+                    0.0
+                };
+                let pre_rms_dbg = if debug_v901 && fw.len() > 13 {
+                    fw[13]
+                } else {
+                    0.0
+                };
+                let fh_rms_dbg = if debug_v901 && fw.len() > 14 {
+                    fw[14]
+                } else {
+                    0.0
+                };
+                let hprev_rms_dbg = if debug_v901 && fw.len() > 15 {
+                    fw[15]
+                } else {
+                    0.0
+                };
+                let nscale_abs_dbg = if debug_v901 && fw.len() > 16 {
+                    fw[16]
+                } else {
+                    0.0
+                };
+                let pre2h_dbg = if debug_v901 && fw.len() > 17 {
+                    fw[17]
+                } else {
+                    0.0
+                };
+                let fh2h_dbg = if debug_v901 && fw.len() > 18 {
+                    fw[18]
+                } else {
+                    0.0
+                };
+                let attn_rms_dbg = if debug_v901 && fw.len() > 19 {
+                    fw[19]
+                } else {
+                    0.0
+                };
+                let attn2sig_dbg = if debug_v901 && fw.len() > 20 {
+                    fw[20]
+                } else {
+                    0.0
+                };
+                let attn_scale_dbg = if debug_v901 && fw.len() > 21 {
+                    fw[21]
+                } else {
+                    0.0
+                };
+                let iter0_err_h_dbg = if debug_v901 && fw.len() > 22 {
+                    fw[22]
+                } else {
+                    0.0
+                };
+                let iter1_err_h_dbg = if debug_v901 && fw.len() > 23 {
+                    fw[23]
+                } else {
+                    0.0
+                };
+                let iter0_attn2sig_dbg = if debug_v901 && fw.len() > 24 {
+                    fw[24]
+                } else {
+                    0.0
+                };
+                let iter1_attn2sig_dbg = if debug_v901 && fw.len() > 25 {
+                    fw[25]
+                } else {
+                    0.0
+                };
+                let iter0_attn_scale_dbg = if debug_v901 && fw.len() > 26 {
+                    fw[26]
+                } else {
+                    0.0
+                };
+                let iter1_attn_scale_dbg = if debug_v901 && fw.len() > 27 {
+                    fw[27]
+                } else {
+                    0.0
+                };
+                let iter_max_err_dbg = if debug_v901 && fw.len() > 28 {
+                    fw[28]
+                } else {
+                    0.0
+                };
+                let iter_max_attn_dbg = if debug_v901 && fw.len() > 29 {
+                    fw[29]
+                } else {
+                    0.0
+                };
+                let token_max_err_dbg = if debug_v901 && fw.len() > 30 {
+                    fw[30]
+                } else {
+                    0.0
+                };
+                let token_max_attn_dbg = if debug_v901 && fw.len() > 31 {
+                    fw[31]
+                } else {
+                    0.0
+                };
+                let fpm_rms = if !debug_v901 && fw.len() > 25 {
+                    fw[25]
+                } else {
+                    0.0
+                };
                 let hist0 = if fw.len() > 100 { fw[100] } else { 0.0 };
                 let hist1 = if fw.len() > 101 { fw[101] } else { 0.0 };
                 let hist2 = if fw.len() > 102 { fw[102] } else { 0.0 };
@@ -3296,6 +3975,9 @@ impl Trainer {
                 self.last_gpu_loss = loss;
                 return loss;
             }
+            if exact_cpu_lm_active && self.last_gpu_loss.is_finite() && self.last_gpu_loss > 0.0 {
+                return self.last_gpu_loss;
+            }
             // No fresh GPU loss was read this step. Returning the last cached value would
             // silently contaminate epoch_loss_avg with stale or zero data, so report "no sample"
             // and let the caller skip this step in the running average.
@@ -3440,7 +4122,9 @@ impl Trainer {
                 interval_tokens += batch_ctx.len();
                 total_tokens += batch_ctx.len();
                 #[cfg(feature = "wgpu")]
-                if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0 {
+                if self.cfg_gpu_step_fence_every != 0
+                    && num_chunks % self.cfg_gpu_step_fence_every == 0
+                {
                     if let Some(gpu) = self.gpu_deq.as_ref() {
                         gpu.device.poll(wgpu::Maintain::Wait);
                     }
@@ -3566,17 +4250,37 @@ impl Trainer {
             if self.gpu_deq.is_some() && use_fixed_history_ref {
                 let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
                 let current_token = *context.last().unwrap_or(&0);
-                if let Ok((h_pooled, _h_star, m_next)) = self.gpu_solve_token_with_fixed_history(
+                if let Ok((_h_star, m_next)) = self.gpu_solve_token_with_fixed_history(
                     &gpu,
                     current_token,
                     ref_m_prev.as_ref(),
                 ) {
                     ref_m_prev = Some(m_next);
-                    self.sync_lm_head_from_gpu_if_needed();
-                    let d_r = self.config.d_r;
-                    let last_h = h_pooled.as_slice().chunks(d_r).last().unwrap();
-                    let h_pooled = nalgebra::DVector::from_column_slice(last_h);
-                    let logits = &self.lm_head.w * h_pooled + &self.lm_head.b;
+                    let logits = if let Some(gpu_lm) =
+                        self.gpu_lm.as_ref().filter(|lm| lm.exact_forward_gpu_enabled())
+                    {
+                        gpu_lm
+                            .read_exact_logits_from_h(
+                                &gpu.device,
+                                &gpu.queue,
+                                &gpu.bridge.hpooled_buf,
+                                1,
+                            )
+                            .ok()
+                            .map(nalgebra::DVector::from_vec)
+                    } else {
+                        self.sync_lm_head_from_gpu_if_needed();
+                        let h_pooled = gpu.read_hpooled_seq(1);
+                        let d_r = self.config.d_r;
+                        h_pooled.as_slice().chunks(d_r).last().map(|last_h| {
+                            let h_pooled = nalgebra::DVector::from_column_slice(last_h);
+                            &self.lm_head.w * h_pooled + &self.lm_head.b
+                        })
+                    };
+                    let Some(logits) = logits else {
+                        self.gpu_deq = Some(gpu);
+                        continue;
+                    };
                     let next_token = LmHead::sample(
                         &logits,
                         temperature,
@@ -3630,6 +4334,11 @@ impl Trainer {
                     }
                 };
                 let needs_upload = !self.gpu_weights_uploaded;
+                let uploaded_exact = if needs_upload {
+                    self.upload_exact_gpu_checkpoint_weights(&gpu)
+                } else {
+                    false
+                };
 
                 if let Ok((h_pooled, _)) = gpu.run_forward_deq_pooled(
                     1,
@@ -3647,7 +4356,7 @@ impl Trainer {
                     self.reasoning.w_out.as_slice(),
                     &self.reasoning.a_log_gpu_flat(),
                     self.reasoning.norm_scale.as_slice(),
-                    needs_upload,
+                    needs_upload && !uploaded_exact,
                 ) {
                     self.gpu_weights_uploaded = true;
                     self.sync_lm_head_from_gpu_if_needed();
@@ -3704,11 +4413,12 @@ impl Trainer {
         if use_fixed_history_ref {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
-            if let Some(gpu) = self.gpu_deq.as_ref() {
+            if let Some(gpu) = self.gpu_deq.take() {
                 let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
-                self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
+                self.upload_reasoning_weights_with_slot_anchor(&gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
+                self.gpu_deq = Some(gpu);
             }
         }
         self.tokenizer.decode(&tokens[prompt_len..])
@@ -3755,17 +4465,37 @@ impl Trainer {
             if self.gpu_deq.is_some() && use_fixed_history_ref {
                 let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
                 let current_token = *context.last().unwrap_or(&0);
-                if let Ok((h_pooled, _h_star, m_next)) = self.gpu_solve_token_with_fixed_history(
+                if let Ok((_h_star, m_next)) = self.gpu_solve_token_with_fixed_history(
                     &gpu,
                     current_token,
                     ref_m_prev.as_ref(),
                 ) {
                     ref_m_prev = Some(m_next);
-                    self.sync_lm_head_from_gpu_if_needed();
-                    let d_r = self.config.d_r;
-                    let last_h = h_pooled.as_slice().chunks(d_r).last().unwrap();
-                    let h_pooled = nalgebra::DVector::from_column_slice(last_h);
-                    let logits = &self.lm_head.w * h_pooled + &self.lm_head.b;
+                    let logits = if let Some(gpu_lm) =
+                        self.gpu_lm.as_ref().filter(|lm| lm.exact_forward_gpu_enabled())
+                    {
+                        gpu_lm
+                            .read_exact_logits_from_h(
+                                &gpu.device,
+                                &gpu.queue,
+                                &gpu.bridge.hpooled_buf,
+                                1,
+                            )
+                            .ok()
+                            .map(nalgebra::DVector::from_vec)
+                    } else {
+                        self.sync_lm_head_from_gpu_if_needed();
+                        let h_pooled = gpu.read_hpooled_seq(1);
+                        let d_r = self.config.d_r;
+                        h_pooled.as_slice().chunks(d_r).last().map(|last_h| {
+                            let h_pooled = nalgebra::DVector::from_column_slice(last_h);
+                            &self.lm_head.w * h_pooled + &self.lm_head.b
+                        })
+                    };
+                    let Some(logits) = logits else {
+                        self.gpu_deq = Some(gpu);
+                        continue;
+                    };
                     let next_token = LmHead::sample(
                         &logits,
                         temperature,
@@ -3825,6 +4555,11 @@ impl Trainer {
                     }
                 };
                 let needs_upload = !self.gpu_weights_uploaded;
+                let uploaded_exact = if needs_upload {
+                    self.upload_exact_gpu_checkpoint_weights(&gpu)
+                } else {
+                    false
+                };
 
                 if let Ok((h_pooled, _)) = gpu.run_forward_deq_pooled(
                     1,
@@ -3842,7 +4577,7 @@ impl Trainer {
                     self.reasoning.w_out.as_slice(),
                     &self.reasoning.a_log_gpu_flat(),
                     self.reasoning.norm_scale.as_slice(),
-                    needs_upload,
+                    needs_upload && !uploaded_exact,
                 ) {
                     self.gpu_weights_uploaded = true;
                     self.sync_lm_head_from_gpu_if_needed();
@@ -3913,11 +4648,12 @@ impl Trainer {
         if use_fixed_history_ref {
             self.m_prev = ref_m_prev;
             #[cfg(feature = "wgpu")]
-            if let Some(gpu) = self.gpu_deq.as_ref() {
+            if let Some(gpu) = self.gpu_deq.take() {
                 let (_, _, _, _, slot_anchor_rm, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) =
                     self.reasoning.history_params_gpu_layout();
-                self.upload_reasoning_weights_with_slot_anchor(gpu, slot_anchor_rm.as_slice());
+                self.upload_reasoning_weights_with_slot_anchor(&gpu, slot_anchor_rm.as_slice());
                 self.gpu_weights_uploaded = true;
+                self.gpu_deq = Some(gpu);
             }
         }
 
@@ -3982,6 +4718,517 @@ impl Trainer {
         } else {
             total_loss / count as f32
         }
+    }
+
+    /// Full-vocab teacher-forced diagnostic through the same GPU inference path used by generation.
+    #[cfg(feature = "wgpu")]
+    pub fn eval_full_vocab_gpu(
+        &mut self,
+        tokens: &[u32],
+        max_positions: usize,
+    ) -> FullVocabEvalMetrics {
+        let max_positions = max_positions.min(tokens.len().saturating_sub(1));
+        if max_positions == 0 {
+            return FullVocabEvalMetrics::default();
+        }
+        if !self.reasoning.has_backend() {
+            let _ = self.configure_inference_backend(true);
+        }
+        self.sync_lm_head_from_gpu_if_needed();
+
+        let mut count = 0usize;
+        let mut ce_sum = 0.0f64;
+        let mut top1_hits = 0usize;
+        let mut top5_hits = 0usize;
+        let mut rank_sum = 0.0f64;
+        let mut target_logit_sum = 0.0f64;
+        let mut top_logit_sum = 0.0f64;
+
+        let mut score_logits = |target: usize, logits: &[f32]| {
+            if target >= logits.len() {
+                return;
+            }
+            let target_logit = logits[target];
+            let mut max_logit = f32::NEG_INFINITY;
+            for &v in logits {
+                max_logit = max_logit.max(v);
+            }
+            let mut denom = 0.0f64;
+            let mut rank = 1usize;
+            let mut top5_threshold = [f32::NEG_INFINITY; 5];
+            for &v in logits {
+                denom += ((v - max_logit) as f64).exp();
+                if v > target_logit {
+                    rank += 1;
+                }
+                if v > top5_threshold[4] {
+                    top5_threshold[4] = v;
+                    top5_threshold
+                        .sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
+            let ce = (denom.ln() + (max_logit - target_logit) as f64) as f32;
+            ce_sum += ce as f64;
+            rank_sum += rank as f64;
+            target_logit_sum += target_logit as f64;
+            top_logit_sum += max_logit as f64;
+            count += 1;
+            if rank == 1 {
+                top1_hits += 1;
+            }
+            if rank <= 5 {
+                top5_hits += 1;
+            }
+        };
+
+        if Self::fixed_history_reference_mode() {
+            let mut m_prev: Option<HSlots> = None;
+            for i in 0..max_positions {
+                let token = tokens[i];
+                let target = tokens[i + 1] as usize;
+                if target >= self.lm_head.b.len() {
+                    continue;
+                }
+
+                let logits_vec = {
+                    #[cfg(feature = "wgpu")]
+                    if self.gpu_deq.is_some() {
+                        let gpu = self.gpu_deq.take().expect("gpu_deq checked as Some");
+                        let solved =
+                            self.gpu_solve_token_with_fixed_history(&gpu, token, m_prev.as_ref());
+                        self.gpu_deq = Some(gpu);
+                        if let Ok((_h_star, m_next)) = solved {
+                            m_prev = Some(m_next);
+                            let exact_gpu_logits = if let (Some(gpu), Some(gpu_lm)) =
+                                (self.gpu_deq.as_ref(), self.gpu_lm.as_ref())
+                            {
+                                if gpu_lm.exact_forward_gpu_enabled() {
+                                    gpu_lm
+                                        .read_exact_logits_from_h(
+                                            &gpu.device,
+                                            &gpu.queue,
+                                            &gpu.bridge.hpooled_buf,
+                                            1,
+                                        )
+                                        .ok()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(logits) = exact_gpu_logits {
+                                Some(logits)
+                            } else {
+                                let h_pooled_cpu =
+                                    self.gpu_deq.as_ref().map(|gpu| gpu.read_hpooled_seq(1));
+                                self.sync_lm_head_from_gpu_if_needed();
+                                let d_r = self.config.d_r;
+                                h_pooled_cpu.and_then(|h_pooled| {
+                                    h_pooled.as_slice().chunks(d_r).last().map(|last_h| {
+                                        let h_pooled =
+                                            nalgebra::DVector::from_column_slice(last_h);
+                                        (&self.lm_head.w * h_pooled + &self.lm_head.b)
+                                            .as_slice()
+                                            .to_vec()
+                                    })
+                                })
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        let query = self.tokenizer.embed(token);
+                        let h_star = self.solve_query_with_fixed_history(
+                            &query,
+                            m_prev.as_ref(),
+                            self.config.max_deq_iters,
+                        );
+                        m_prev = Some(self.temporal_update_from_h(m_prev.as_ref(), &h_star));
+                        Some(self.lm_head.forward(&h_star).as_slice().to_vec())
+                    }
+                };
+
+                if let Some(logits) = logits_vec {
+                    score_logits(target, &logits);
+                }
+            }
+
+            if count == 0 {
+                return FullVocabEvalMetrics::default();
+            }
+            return FullVocabEvalMetrics {
+                count,
+                ce: (ce_sum / count as f64) as f32,
+                top1_acc: top1_hits as f32 / count as f32,
+                top5_acc: top5_hits as f32 / count as f32,
+                mean_rank: (rank_sum / count as f64) as f32,
+                mean_target_logit: (target_logit_sum / count as f64) as f32,
+                mean_top_logit: (top_logit_sum / count as f64) as f32,
+            };
+        }
+
+        for i in 0..max_positions {
+            let context_end = i + 1;
+            let ctx_start = context_end.saturating_sub(self.config.ctx_len);
+            let context = &tokens[ctx_start..context_end];
+            let target = tokens[context_end] as usize;
+            if target >= self.lm_head.b.len() {
+                continue;
+            }
+
+            let logits = {
+                let Some(gpu) = self.gpu_deq.take() else {
+                    break;
+                };
+                if self.gpu_emb.is_none() {
+                    let safe_ctx = self.config.ctx_len.max(1024);
+                    self.gpu_emb = Some(GpuEmbeddingTrainer::new(
+                        &gpu.device,
+                        self.tokenizer.vocab_size(),
+                        safe_ctx,
+                        self.config.clone(),
+                    ));
+                }
+                let Some(gpu_emb) = self.gpu_emb.as_ref() else {
+                    self.gpu_deq = Some(gpu);
+                    break;
+                };
+                let emb_needs_upload = !self.gpu_emb_weights_uploaded;
+                let emb_upload = if emb_needs_upload {
+                    Some(self.tokenizer.embeddings_row_major())
+                } else {
+                    None
+                };
+                let prepared = gpu_emb.prepare_sequence_and_query(
+                    &gpu.device,
+                    &gpu.queue,
+                    context,
+                    self.config.ctx_len,
+                    emb_upload.as_deref().unwrap_or(&[]),
+                    emb_needs_upload,
+                );
+                if emb_needs_upload && prepared.is_ok() {
+                    self.gpu_emb_weights_uploaded = true;
+                }
+                let Ok((s_sequence, _)) = prepared else {
+                    self.gpu_emb_weights_uploaded = false;
+                    self.gpu_deq = Some(gpu);
+                    continue;
+                };
+
+                let needs_upload = !self.gpu_weights_uploaded;
+                let uploaded_exact = if needs_upload {
+                    self.upload_exact_gpu_checkpoint_weights(&gpu)
+                } else {
+                    false
+                };
+                let forward = gpu.run_forward_deq_pooled(
+                    1,
+                    context.len() as u32,
+                    self.config.max_deq_iters as u32,
+                    self.config.deq_epsilon,
+                    self.reasoning.damping,
+                    &s_sequence,
+                    &self.reasoning.w_q_gpu_flat(),
+                    &self.reasoning.w_k_gpu_flat(),
+                    &self.reasoning.w_v_gpu_flat(),
+                    &self.reasoning.w_o_gpu_flat(),
+                    &self.reasoning.w_in_gpu_flat(),
+                    self.reasoning.w_x.as_slice(),
+                    self.reasoning.w_out.as_slice(),
+                    &self.reasoning.a_log_gpu_flat(),
+                    self.reasoning.norm_scale.as_slice(),
+                    needs_upload && !uploaded_exact,
+                );
+                let exact_gpu_logits = self
+                    .gpu_lm
+                    .as_ref()
+                    .filter(|gpu_lm| gpu_lm.exact_forward_gpu_enabled())
+                    .and_then(|gpu_lm| {
+                        gpu_lm
+                            .read_exact_logits_from_h(
+                                &gpu.device,
+                                &gpu.queue,
+                                &gpu.bridge.hpooled_buf,
+                                1,
+                            )
+                            .ok()
+                    });
+                self.gpu_deq = Some(gpu);
+                let Ok((h_pooled, _)) = forward else {
+                    continue;
+                };
+                self.gpu_weights_uploaded = true;
+                if let Some(logits) = exact_gpu_logits {
+                    nalgebra::DVector::from_column_slice(&logits[..self.lm_head.b.len()])
+                } else {
+                    self.sync_lm_head_from_gpu_if_needed();
+                    let d_r = self.config.d_r;
+                    let Some(last_h) = h_pooled.chunks(d_r).last() else {
+                        continue;
+                    };
+                    let h_pooled = nalgebra::DVector::from_column_slice(last_h);
+                    &self.lm_head.w * h_pooled + &self.lm_head.b
+                }
+            };
+
+            score_logits(target, logits.as_slice());
+        }
+
+        if count == 0 {
+            return FullVocabEvalMetrics::default();
+        }
+        FullVocabEvalMetrics {
+            count,
+            ce: (ce_sum / count as f64) as f32,
+            top1_acc: top1_hits as f32 / count as f32,
+            top5_acc: top5_hits as f32 / count as f32,
+            mean_rank: (rank_sum / count as f64) as f32,
+            mean_target_logit: (target_logit_sum / count as f64) as f32,
+            mean_top_logit: (top_logit_sum / count as f64) as f32,
+        }
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn eval_full_vocab_gpu(
+        &mut self,
+        _tokens: &[u32],
+        _max_positions: usize,
+    ) -> FullVocabEvalMetrics {
+        FullVocabEvalMetrics::default()
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn eval_full_vocab_train_path_gpu(
+        &mut self,
+        tokens: &[u32],
+        max_positions: usize,
+    ) -> FullVocabEvalMetrics {
+        if tokens.len() < 2 {
+            return FullVocabEvalMetrics::default();
+        }
+
+        let prev_eval_mode = self.eval_mode;
+        self.eval_mode = true;
+        self.reset_state();
+        self.sync_lm_head_from_gpu_if_needed();
+
+        let ctx_len = self.config.ctx_len.max(1);
+        let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
+        let max_inputs = (batch_size * ctx_len).max(1);
+        let epsilon = self.config.deq_epsilon;
+        let mut offset = 0usize;
+        let mut remaining = max_positions.min(tokens.len().saturating_sub(1));
+
+        let mut count = 0usize;
+        let mut ce_sum = 0.0f64;
+        let mut top1_hits = 0usize;
+        let mut top5_hits = 0usize;
+        let mut rank_sum = 0.0f64;
+        let mut target_logit_sum = 0.0f64;
+        let mut top_logit_sum = 0.0f64;
+
+        while offset + 1 < tokens.len() && remaining > 0 {
+            let end = (offset + max_inputs + 1).min(tokens.len());
+            let inputs = &tokens[offset..end - 1];
+            let targets = &tokens[offset + 1..end];
+            if inputs.is_empty() || inputs.len() != targets.len() {
+                offset += max_inputs;
+                continue;
+            }
+
+            let seq_take = remaining.min(targets.len());
+            let _ = self.train_sequence(inputs, targets, false, epsilon);
+
+            let Some(gpu) = self.gpu_deq.as_ref() else {
+                break;
+            };
+            let h_seq = gpu.read_hpooled_seq(targets.len() as u32);
+            let d_r = self.config.d_r;
+
+            for (idx, &target_u32) in targets.iter().take(seq_take).enumerate() {
+                let target = target_u32 as usize;
+                if target >= self.lm_head.b.len() {
+                    continue;
+                }
+                let base = idx * d_r;
+                if base + d_r > h_seq.len() {
+                    break;
+                }
+                let logits = self.lm_head.forward_on_flat(&h_seq[base..base + d_r]);
+
+                let target_logit = logits[target];
+                let mut max_logit = f32::NEG_INFINITY;
+                for &v in logits.iter() {
+                    max_logit = max_logit.max(v);
+                }
+                let mut denom = 0.0f64;
+                let mut rank = 1usize;
+                for &v in logits.iter() {
+                    denom += ((v - max_logit) as f64).exp();
+                    if v > target_logit {
+                        rank += 1;
+                    }
+                }
+                let ce = (denom.ln() + (max_logit - target_logit) as f64) as f32;
+                ce_sum += ce as f64;
+                rank_sum += rank as f64;
+                target_logit_sum += target_logit as f64;
+                top_logit_sum += max_logit as f64;
+                count += 1;
+                if rank == 1 {
+                    top1_hits += 1;
+                }
+                if rank <= 5 {
+                    top5_hits += 1;
+                }
+            }
+
+            remaining -= seq_take;
+            offset += max_inputs;
+        }
+
+        self.eval_mode = prev_eval_mode;
+        self.reset_state();
+
+        if count == 0 {
+            return FullVocabEvalMetrics::default();
+        }
+        FullVocabEvalMetrics {
+            count,
+            ce: (ce_sum / count as f64) as f32,
+            top1_acc: top1_hits as f32 / count as f32,
+            top5_acc: top5_hits as f32 / count as f32,
+            mean_rank: (rank_sum / count as f64) as f32,
+            mean_target_logit: (target_logit_sum / count as f64) as f32,
+            mean_top_logit: (top_logit_sum / count as f64) as f32,
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn probe_exact_forward_parity_gpu(
+        &mut self,
+        tokens: &[u32],
+        max_positions: usize,
+    ) -> Option<ExactForwardProbeMetrics> {
+        if tokens.len() < 2 {
+            return None;
+        }
+        let prev_eval_mode = self.eval_mode;
+        self.eval_mode = true;
+        self.reset_state();
+        self.sync_lm_head_from_gpu_if_needed();
+
+        let ctx_len = self.config.ctx_len.max(1);
+        let batch_size = self.cfg_fwd_batch_size.max(1) as usize;
+        let max_inputs = (batch_size * ctx_len).max(1);
+        let epsilon = self.config.deq_epsilon;
+        let mut offset = 0usize;
+        let mut remaining = max_positions.min(tokens.len().saturating_sub(1));
+
+        let mut positions = 0usize;
+        let vocab = self.lm_head.b.len();
+        let mut cpu_ms = 0.0f32;
+        let mut gpu_ms = 0.0f32;
+        let mut abs_sum = 0.0f64;
+        let mut diff_count = 0usize;
+        let mut max_abs_diff = 0.0f32;
+        let mut max_rel_diff = 0.0f32;
+
+        while offset + 1 < tokens.len() && remaining > 0 {
+            let end = (offset + max_inputs + 1).min(tokens.len());
+            let inputs = &tokens[offset..end - 1];
+            let targets = &tokens[offset + 1..end];
+            if inputs.is_empty() || inputs.len() != targets.len() {
+                offset += max_inputs;
+                continue;
+            }
+            let seq_take = remaining.min(targets.len());
+            let _ = self.train_sequence(inputs, targets, false, epsilon);
+
+            let Some(gpu) = self.gpu_deq.as_ref() else {
+                break;
+            };
+            let Some(gpu_lm) = self.gpu_lm.as_ref() else {
+                break;
+            };
+            let h_seq = gpu.read_hpooled_seq(targets.len() as u32);
+            let d_r = self.config.d_r;
+
+            let cpu_t0 = std::time::Instant::now();
+            let mut cpu_logits = vec![0.0f32; seq_take * vocab];
+            for idx in 0..seq_take {
+                let base = idx * d_r;
+                if base + d_r > h_seq.len() {
+                    break;
+                }
+                let logits = self.lm_head.forward_on_flat(&h_seq[base..base + d_r]);
+                let dst = idx * vocab;
+                cpu_logits[dst..dst + vocab].copy_from_slice(logits.as_slice());
+            }
+            cpu_ms += cpu_t0.elapsed().as_secs_f32() * 1000.0;
+
+            let gpu_t0 = std::time::Instant::now();
+            let gpu_logits = gpu_lm
+                .read_exact_logits_from_h(
+                    &gpu.device,
+                    &gpu.queue,
+                    &gpu.bridge.hpooled_buf,
+                    seq_take as u32,
+                )
+                .ok()?;
+            gpu_ms += gpu_t0.elapsed().as_secs_f32() * 1000.0;
+
+            let compare_len = cpu_logits.len().min(gpu_logits.len());
+            for i in 0..compare_len {
+                let a = cpu_logits[i];
+                let b = gpu_logits[i];
+                let abs = (a - b).abs();
+                let rel = abs / a.abs().max(b.abs()).max(1.0e-8);
+                abs_sum += abs as f64;
+                diff_count += 1;
+                max_abs_diff = max_abs_diff.max(abs);
+                max_rel_diff = max_rel_diff.max(rel);
+            }
+            positions += seq_take;
+            remaining -= seq_take;
+            offset += max_inputs;
+        }
+
+        self.eval_mode = prev_eval_mode;
+        self.reset_state();
+
+        if positions == 0 || diff_count == 0 {
+            return None;
+        }
+        Some(ExactForwardProbeMetrics {
+            positions,
+            vocab,
+            cpu_ms,
+            gpu_ms,
+            max_abs_diff,
+            mean_abs_diff: (abs_sum / diff_count as f64) as f32,
+            max_rel_diff,
+        })
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn probe_exact_forward_parity_gpu(
+        &mut self,
+        _tokens: &[u32],
+        _max_positions: usize,
+    ) -> Option<ExactForwardProbeMetrics> {
+        None
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn eval_full_vocab_train_path_gpu(
+        &mut self,
+        _tokens: &[u32],
+        _max_positions: usize,
+    ) -> FullVocabEvalMetrics {
+        FullVocabEvalMetrics::default()
     }
 
     /// GPU forward-only validation over token windows, without weight updates.
@@ -4230,8 +5477,8 @@ impl Trainer {
                                     batch_train_buf.clear();
                                     batch_tgt_buf.clear();
                                     #[cfg(feature = "wgpu")]
-                                    if self.cfg_tps_sync_every != 0
-                                        && num_chunks % self.cfg_tps_sync_every == 0
+                                    if self.cfg_gpu_step_fence_every != 0
+                                        && num_chunks % self.cfg_gpu_step_fence_every == 0
                                     {
                                         if let Some(gpu) = self.gpu_deq.as_ref() {
                                             gpu.device.poll(wgpu::Maintain::Wait);
@@ -4280,8 +5527,8 @@ impl Trainer {
                                 batch_train_buf.clear();
                                 batch_tgt_buf.clear();
                                 #[cfg(feature = "wgpu")]
-                                if self.cfg_tps_sync_every != 0
-                                    && num_chunks % self.cfg_tps_sync_every == 0
+                                if self.cfg_gpu_step_fence_every != 0
+                                    && num_chunks % self.cfg_gpu_step_fence_every == 0
                                 {
                                     if let Some(gpu) = self.gpu_deq.as_ref() {
                                         gpu.device.poll(wgpu::Maintain::Wait);
@@ -4324,7 +5571,8 @@ impl Trainer {
                         batch_train_buf.clear();
                         batch_tgt_buf.clear();
                         #[cfg(feature = "wgpu")]
-                        if self.cfg_tps_sync_every != 0 && num_chunks % self.cfg_tps_sync_every == 0
+                        if self.cfg_gpu_step_fence_every != 0
+                            && num_chunks % self.cfg_gpu_step_fence_every == 0
                         {
                             if let Some(gpu) = self.gpu_deq.as_ref() {
                                 gpu.device.poll(wgpu::Maintain::Wait);
@@ -4477,7 +5725,10 @@ impl Trainer {
                             vl == "1" || vl == "true" || vl == "yes"
                         })
                         .unwrap_or(false);
-                    if debug_fpm && !self.cached_debug_buf.is_empty() && !Self::valid_debug_snapshot(&self.cached_debug_buf) {
+                    if debug_fpm
+                        && !self.cached_debug_buf.is_empty()
+                        && !Self::valid_debug_snapshot(&self.cached_debug_buf)
+                    {
                         if let Some((sig, eps, tokens, slots, aux0, aux1, aux2)) =
                             Self::decode_debug_snapshot_header(&self.cached_debug_buf)
                         {
@@ -4505,6 +5756,10 @@ impl Trainer {
                             self.config.h_slots,
                         );
                         let slot_a_delta = Self::decode_slot_max_a_delta_metrics(
+                            &self.cached_debug_buf,
+                            self.config.h_slots,
+                        );
+                        let slot_owner = Self::decode_slot_owner_metrics(
                             &self.cached_debug_buf,
                             self.config.h_slots,
                         );
@@ -4546,6 +5801,29 @@ impl Trainer {
                             println!(
                                 "    [FPM-SLOTS] self_assign=[{}] entropy=[{}] move=[{}] a_delta_max=[{}]",
                                 assign, entropy, movement, a_delta
+                            );
+                        }
+                        if slot_owner.iter().any(|(curr, prev, gate)| {
+                            curr.abs() > 1e-6 || prev.abs() > 1e-6 || gate.abs() > 1e-6
+                        }) {
+                            let curr = slot_owner
+                                .iter()
+                                .map(|(curr, _, _)| format!("{curr:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let prev = slot_owner
+                                .iter()
+                                .map(|(_, prev, _)| format!("{prev:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let gate = slot_owner
+                                .iter()
+                                .map(|(_, _, gate)| format!("{gate:.3}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            println!(
+                                "    [SLOT-OWNER] curr=[{}] prev=[{}] prev_gate=[{}]",
+                                curr, prev, gate
                             );
                         }
                         if !slot_diag.is_empty() {
@@ -4613,72 +5891,100 @@ impl Trainer {
                                 .join(",");
                             let read_rms = slot_read
                                 .iter()
-                                .map(|(rms, _, _, _, _, _, _, _, _, _, _, _, _, _)| format!("{rms:.3e}"))
+                                .map(|(rms, _, _, _, _, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{rms:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let read_to_sig = slot_read
                                 .iter()
-                                .map(|(_, ratio, _, _, _, _, _, _, _, _, _, _, _, _)| format!("{ratio:.3e}"))
+                                .map(|(_, ratio, _, _, _, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{ratio:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let retain_max = slot_read
                                 .iter()
-                                .map(|(_, _, mx, _, _, _, _, _, _, _, _, _, _, _)| format!("{mx:.3}"))
+                                .map(|(_, _, mx, _, _, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{mx:.3}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let retain_avg = slot_read
                                 .iter()
-                                .map(|(_, _, _, avg, _, _, _, _, _, _, _, _, _, _)| format!("{avg:.3}"))
+                                .map(|(_, _, _, avg, _, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{avg:.3}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let prop_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, pr, _, _, _, _, _, _, _, _, _)| format!("{pr:.3e}"))
+                                .map(|(_, _, _, _, pr, _, _, _, _, _, _, _, _, _)| {
+                                    format!("{pr:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let cand_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, cr, _, _, _, _, _, _, _, _)| format!("{cr:.3e}"))
+                                .map(|(_, _, _, _, _, cr, _, _, _, _, _, _, _, _)| {
+                                    format!("{cr:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let q_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, q, _, _, _, _, _, _, _)| format!("{q:.3e}"))
+                                .map(|(_, _, _, _, _, _, q, _, _, _, _, _, _, _)| {
+                                    format!("{q:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let k_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, k, _, _, _, _, _, _)| format!("{k:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, k, _, _, _, _, _, _)| {
+                                    format!("{k:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let logit_gap = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, _, gap, _, _, _, _, _)| format!("{gap:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, _, gap, _, _, _, _, _)| {
+                                    format!("{gap:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let confidence = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, _, _, conf, _, _, _, _)| format!("{conf:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, _, _, conf, _, _, _, _)| {
+                                    format!("{conf:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let src_m_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, _, _, _, m, _, _, _)| format!("{m:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, _, _, _, m, _, _, _)| {
+                                    format!("{m:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let keyed_m_rms = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, _, _, _, _, km, _, _)| format!("{km:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, _, _, _, _, km, _, _)| {
+                                    format!("{km:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let peak_w = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, _, _, _, _, _, peak, _)| format!("{peak:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, _, _, _, _, _, peak, _)| {
+                                    format!("{peak:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let raw_gap = slot_read
                                 .iter()
-                                .map(|(_, _, _, _, _, _, _, _, _, _, _, _, _, rg)| format!("{rg:.3e}"))
+                                .map(|(_, _, _, _, _, _, _, _, _, _, _, _, _, rg)| {
+                                    format!("{rg:.3e}")
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             let write_h_unit = slot_write_branches
@@ -4775,14 +6081,16 @@ impl Trainer {
                                     self.config.d_r
                                 )
                             );
-                            if let Some(summary) =
-                                Self::format_assoc_budget_debug(&self.cached_debug_buf, self.config.h_slots)
-                            {
+                            if let Some(summary) = Self::format_assoc_budget_debug(
+                                &self.cached_debug_buf,
+                                self.config.h_slots,
+                            ) {
                                 println!("    [ASSOC-BUDGET] {summary}");
                             }
-                            if let Some(summary) =
-                                Self::format_assoc_read_debug(&self.cached_debug_buf, self.config.h_slots)
-                            {
+                            if let Some(summary) = Self::format_assoc_read_debug(
+                                &self.cached_debug_buf,
+                                self.config.h_slots,
+                            ) {
                                 println!("    [ASSOC-READ] {summary}");
                             }
                             if let Some(summary) = Self::format_assoc_bridge_debug(
@@ -4794,7 +6102,9 @@ impl Trainer {
                         }
                     }
                     // Slot-coord diagnostics (slot attention, active in DEQ_NO_MAMBA mode)
-                    if Self::slot_coord_mode_active() && Self::valid_debug_snapshot(&self.cached_debug_buf) {
+                    if Self::slot_coord_mode_active()
+                        && Self::valid_debug_snapshot(&self.cached_debug_buf)
+                    {
                         let slot_obs = Self::decode_slot_observability_metrics(
                             &self.cached_debug_buf,
                             self.config.h_slots,
@@ -4812,7 +6122,10 @@ impl Trainer {
                         } else {
                             None
                         };
-                        if slot_obs.iter().any(|(sw, ent, _)| sw.abs() > 1e-6 || ent.abs() > 1e-6) {
+                        if slot_obs
+                            .iter()
+                            .any(|(sw, ent, _)| sw.abs() > 1e-6 || ent.abs() > 1e-6)
+                        {
                             let assign = slot_obs
                                 .iter()
                                 .map(|(sw, _, _)| format!("{sw:.3}"))
@@ -5034,7 +6347,34 @@ impl Trainer {
 
         // LM Head moments
         if let Some(gpu_lm) = self.gpu_lm.as_ref() {
-            if let Ok((m_w, v_w, m_b, v_b, m_g, v_g)) = gpu_lm.read_moments(&gpu.device, &gpu.queue)
+            if self.cfg_lm_exact_cpu && self.cfg_exact_gpu_w_update && !self.frozen_lm {
+                if let Ok((m_w, v_w, m_b, v_b, m_g, v_g)) =
+                    gpu_lm.read_moments(&gpu.device, &gpu.queue)
+                {
+                    let sum_mw: f32 = m_w.iter().map(|x| x.abs()).sum();
+                    let sum_vw: f32 = v_w.iter().map(|x| x.abs()).sum();
+                    if sum_mw == 0.0 && sum_vw == 0.0 && self.optimizer.step_count() > 10 {
+                        panic!("\x1b[31m[CRITICAL ERROR]\x1b[0m Mixed-owner VRAM checksum failed (LM W moments = 0). Abortando para proteger checkpoint.");
+                    }
+                    println!(
+                        "    LM Head Moments Checksum: exact GPU-owner mode (w_m={:.4}, w_v={:.6e})",
+                        sum_mw, sum_vw
+                    );
+                    let d_r = self.config.d_r;
+                    let vocab = self.config.vocab_size;
+                    self.optimizer
+                        .set_mat("lm_w_m", DMatrix::from_vec(d_r, vocab, m_w));
+                    self.optimizer
+                        .set_mat_v("lm_w_v", DMatrix::from_vec(d_r, vocab, v_w));
+                    self.optimizer.set_vec("lm_b_m", DVector::from_vec(m_b));
+                    self.optimizer.set_vec_v("lm_b_v", DVector::from_vec(v_b));
+                    self.optimizer.set_vec("lm_g_m", DVector::from_vec(m_g));
+                    self.optimizer.set_vec_v("lm_g_v", DVector::from_vec(v_g));
+                }
+            } else if self.cfg_lm_exact_cpu && !self.frozen_lm {
+                println!("    LM Head Moments Checksum: CPU-owner (exact LM mode)");
+            } else if let Ok((m_w, v_w, m_b, v_b, m_g, v_g)) =
+                gpu_lm.read_moments(&gpu.device, &gpu.queue)
             {
                 let sum_mw: f32 = m_w.iter().map(|x| x.abs()).sum();
                 let sum_vw: f32 = v_w.iter().map(|x| x.abs()).sum();
@@ -5058,11 +6398,11 @@ impl Trainer {
                 self.optimizer
                     .set_mat("lm_w_m", DMatrix::from_vec(d_r, vocab, m_w));
                 self.optimizer
-                    .set_mat("lm_w_v", DMatrix::from_vec(d_r, vocab, v_w));
+                    .set_mat_v("lm_w_v", DMatrix::from_vec(d_r, vocab, v_w));
                 self.optimizer.set_vec("lm_b_m", DVector::from_vec(m_b));
-                self.optimizer.set_vec("lm_b_v", DVector::from_vec(v_b));
+                self.optimizer.set_vec_v("lm_b_v", DVector::from_vec(v_b));
                 self.optimizer.set_vec("lm_g_m", DVector::from_vec(m_g));
-                self.optimizer.set_vec("lm_g_v", DVector::from_vec(v_g));
+                self.optimizer.set_vec_v("lm_g_v", DVector::from_vec(v_g));
             }
         }
 
@@ -5080,7 +6420,7 @@ impl Trainer {
                 self.optimizer
                     .set_mat("emb_m", DMatrix::from_vec(d_r, vocab, m_emb));
                 self.optimizer
-                    .set_mat("emb_v", DMatrix::from_vec(d_r, vocab, v_emb));
+                    .set_mat_v("emb_v", DMatrix::from_vec(d_r, vocab, v_emb));
             }
         }
     }
@@ -5096,11 +6436,11 @@ impl Trainer {
         if let Some(gpu_lm) = self.gpu_lm.as_ref() {
             if let (Some(m_w), Some(v_w), Some(m_b), Some(v_b), Some(m_g), Some(v_g)) = (
                 self.optimizer.get_mat("lm_w_m"),
-                self.optimizer.get_mat("lm_w_v"),
+                self.optimizer.get_mat_v("lm_w_v"),
                 self.optimizer.get_vec("lm_b_m"),
-                self.optimizer.get_vec("lm_b_v"),
+                self.optimizer.get_vec_v("lm_b_v"),
                 self.optimizer.get_vec("lm_g_m"),
-                self.optimizer.get_vec("lm_g_v"),
+                self.optimizer.get_vec_v("lm_g_v"),
             ) {
                 gpu_lm.write_moments(
                     &gpu.queue,
@@ -5117,7 +6457,7 @@ impl Trainer {
         if let Some(gpu_emb) = self.gpu_emb.as_ref() {
             if let (Some(m_emb), Some(v_emb)) = (
                 self.optimizer.get_mat("emb_m"),
-                self.optimizer.get_mat("emb_v"),
+                self.optimizer.get_mat_v("emb_v"),
             ) {
                 gpu_emb.write_moments(&gpu.queue, m_emb.as_slice(), v_emb.as_slice());
             }
@@ -5143,6 +6483,32 @@ impl Trainer {
             model.set_weight(&k, v);
         }
 
+        #[cfg(feature = "wgpu")]
+        if let Some(gpu) = self.gpu_deq.as_ref() {
+            if self.gpu_weights_uploaded {
+                if let Ok((w_q, w_k, w_v, w_o, w_in, w_x, w_out, a_log, norm_scale)) =
+                    gpu.read_weights()
+                {
+                    model.set_weight("reasoning.gpu_exact.w_q", w_q);
+                    model.set_weight("reasoning.gpu_exact.w_k", w_k);
+                    model.set_weight("reasoning.gpu_exact.w_v", w_v);
+                    model.set_weight("reasoning.gpu_exact.w_o", w_o);
+                    model.set_weight("reasoning.gpu_exact.w_in", w_in);
+                    model.set_weight("reasoning.gpu_exact.w_x", w_x);
+                    model.set_weight("reasoning.gpu_exact.w_out", w_out);
+                    model.set_weight("reasoning.gpu_exact.a_log", a_log);
+                    model.set_weight("reasoning.gpu_exact.norm_scale", norm_scale);
+                    model.set_weight(
+                        "reasoning.gpu_exact.hist_params",
+                        gpu.read_hist_params_full(),
+                    );
+                    model
+                        .metadata
+                        .insert("gpu_exact_checkpoint".to_string(), "true".to_string());
+                }
+            }
+        }
+
         // Empacar embeddings del Tokenizer
         model.set_weight(
             "tokenizer.embeddings",
@@ -5159,6 +6525,18 @@ impl Trainer {
             "vocab_size".to_string(),
             self.tokenizer.vocab_size().to_string(),
         );
+        if self.tokenizer.hf_tokenizer.is_none() {
+            let char_vocab = self
+                .tokenizer
+                .vocab
+                .iter()
+                .map(|&c| (c as u32).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            model
+                .metadata
+                .insert("tokenizer.char_vocab".to_string(), char_vocab);
+        }
 
         // Persistir estado del Stability Oracle (v13.2)
         model.metadata.insert(
@@ -5234,19 +6612,37 @@ impl Trainer {
             })?;
 
         let mut tokenizer = Tokenizer::new_empty(vocab_size, model.config.clone());
+        let has_char_vocab =
+            if let Some(char_vocab_raw) = model.metadata.get("tokenizer.char_vocab") {
+                let parsed_vocab: Vec<char> = char_vocab_raw
+                    .split(',')
+                    .filter_map(|part| part.trim().parse::<u32>().ok())
+                    .filter_map(char::from_u32)
+                    .collect();
+                if parsed_vocab.len() == vocab_size {
+                    tokenizer.vocab = parsed_vocab;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
         // Restaurar el HF tokenizer (BPE) si está disponible en rutas estándar.
         // Sin esto, encode() usa el fallback char-level vacío y devuelve [].
-        let tok_paths = [
-            "aideen-backbone/tokenizer.json",
-            "tokenizer.json",
-            "../aideen-backbone/tokenizer.json",
-        ];
-        for tok_path in &tok_paths {
-            if std::path::Path::new(tok_path).exists() {
-                if let Ok(hf) = tokenizers::Tokenizer::from_file(tok_path) {
-                    tokenizer.hf_tokenizer = Some(hf);
-                    break;
+        if !has_char_vocab {
+            let tok_paths = [
+                "aideen-backbone/tokenizer.json",
+                "tokenizer.json",
+                "../aideen-backbone/tokenizer.json",
+            ];
+            for tok_path in &tok_paths {
+                if std::path::Path::new(tok_path).exists() {
+                    if let Ok(hf) = tokenizers::Tokenizer::from_file(tok_path) {
+                        tokenizer.hf_tokenizer = Some(hf);
+                        break;
+                    }
                 }
             }
         }
@@ -5277,6 +6673,48 @@ impl Trainer {
             .lm_head
             .import_weights(&model.weights)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        #[cfg(feature = "wgpu")]
+        {
+            let get_exact = |name: &str| model.get_weight(name).cloned();
+            trainer.exact_gpu_checkpoint_weights = match (
+                get_exact("reasoning.gpu_exact.w_q"),
+                get_exact("reasoning.gpu_exact.w_k"),
+                get_exact("reasoning.gpu_exact.w_v"),
+                get_exact("reasoning.gpu_exact.w_o"),
+                get_exact("reasoning.gpu_exact.w_in"),
+                get_exact("reasoning.gpu_exact.w_x"),
+                get_exact("reasoning.gpu_exact.w_out"),
+                get_exact("reasoning.gpu_exact.a_log"),
+                get_exact("reasoning.gpu_exact.norm_scale"),
+                get_exact("reasoning.gpu_exact.hist_params"),
+            ) {
+                (
+                    Some(w_q),
+                    Some(w_k),
+                    Some(w_v),
+                    Some(w_o),
+                    Some(w_in),
+                    Some(w_x),
+                    Some(w_out),
+                    Some(a_log),
+                    Some(norm_scale),
+                    Some(hist_params),
+                ) => Some(ExactGpuCheckpointWeights {
+                    w_q,
+                    w_k,
+                    w_v,
+                    w_o,
+                    w_in,
+                    w_x,
+                    w_out,
+                    a_log,
+                    norm_scale,
+                    hist_params,
+                }),
+                _ => None,
+            };
+        }
 
         // Restaurar estado del Stability Oracle (v13.2)
         if let Some(v) = model
@@ -5370,20 +6808,10 @@ impl Trainer {
 
     #[cfg(feature = "wgpu")]
     pub fn sync_inference_weights(&mut self) {
-        if Self::slot_coord_mode_active() {
-            // Temporary GPU-only guard for slot-coord mode:
-            // the active training state contains per-slot Q/K/V/O/W_in matrices on GPU, while the
-            // CPU-side reasoning object can only represent shared prototypes plus a few slot-wise
-            // terms. Averaging GPU slot matrices back into CPU loses specialization and risks
-            // re-uploading flattened weights later in the same process or after a checkpoint round-trip.
-            //
-            // Removal criteria: replace this guard once checkpoint/export paths can serialize and
-            // restore exact per-slot slot-coord weights instead of lossy shared averages.
-            return;
-        }
+        let skip_lossy_deq_cpu_sync = Self::slot_coord_mode_active();
         if let Some(gpu) = self.gpu_deq.as_ref() {
             // Sincronizar DEQ Core solo si los pesos fueron subidos/actualizados en GPU.
-            if self.gpu_weights_uploaded {
+            if self.gpu_weights_uploaded && !skip_lossy_deq_cpu_sync {
                 if let Ok((wq, wk, wv, wo, win, wx, wout, alog, nscale)) = gpu.read_weights() {
                     let to_mat = |vec: Vec<f32>| {
                         let d_r = self.config.d_r;

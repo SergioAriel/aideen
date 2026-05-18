@@ -74,6 +74,10 @@ fn main() {
     let mut rep_penalty = DEFAULT_REP_PENALTY;
     let mut stream = false;
     let mut stats = false;
+    let mut eval_file: Option<String> = None;
+    let mut eval_max_positions = 64usize;
+    let mut eval_train_path = false;
+    let mut probe_exact_forward = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -129,6 +133,20 @@ fn main() {
             }
             "--stream" => stream = true,
             "--stats" => stats = true,
+            "--eval-file" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    eval_file = Some(v.clone());
+                }
+            }
+            "--eval-max-positions" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    eval_max_positions = v.parse().unwrap_or(eval_max_positions);
+                }
+            }
+            "--eval-train-path" => eval_train_path = true,
+            "--probe-exact-forward" => probe_exact_forward = true,
             _ => {}
         }
         i += 1;
@@ -199,6 +217,14 @@ fn main() {
         let (slot_anchor_min, slot_anchor_max) = min_max(&slot_anchor);
         println!("--- STATS ---");
         println!(
+            "  gpu_exact   : {}",
+            if trainer.has_exact_gpu_checkpoint_weights() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
             "  embeddings  : rms={:.5} mean={:.5} n={}",
             rms(emb),
             mean(emb),
@@ -251,6 +277,53 @@ fn main() {
             slot_anchor_min,
             slot_anchor_max
         );
+    }
+
+    if let Some(path) = eval_file.as_ref() {
+        let eval_text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("No se pudo leer --eval-file {}: {}", path, e));
+        let eval_tokens = trainer.tokenizer.encode(&eval_text);
+        let metrics = trainer.eval_full_vocab_gpu(&eval_tokens, eval_max_positions);
+        println!("--- FULL-VOCAB EVAL ---");
+        println!("  eval file   : {}", path);
+        println!("  eval tokens : {}", eval_tokens.len());
+        println!("  positions   : {}", metrics.count);
+        println!("  ce          : {:.4}", metrics.ce);
+        println!("  top1        : {:.4}", metrics.top1_acc);
+        println!("  top5        : {:.4}", metrics.top5_acc);
+        println!("  mean_rank   : {:.1}", metrics.mean_rank);
+        println!("  target_logit: {:.4}", metrics.mean_target_logit);
+        println!("  top_logit   : {:.4}", metrics.mean_top_logit);
+        if eval_train_path {
+            let train_metrics =
+                trainer.eval_full_vocab_train_path_gpu(&eval_tokens, eval_max_positions);
+            println!("--- FULL-VOCAB EVAL (TRAIN PATH) ---");
+            println!("  positions   : {}", train_metrics.count);
+            println!("  ce          : {:.4}", train_metrics.ce);
+            println!("  top1        : {:.4}", train_metrics.top1_acc);
+            println!("  top5        : {:.4}", train_metrics.top5_acc);
+            println!("  mean_rank   : {:.1}", train_metrics.mean_rank);
+            println!("  target_logit: {:.4}", train_metrics.mean_target_logit);
+            println!("  top_logit   : {:.4}", train_metrics.mean_top_logit);
+        }
+        if probe_exact_forward {
+            println!("--- EXACT FORWARD PARITY ---");
+            match trainer.probe_exact_forward_parity_gpu(&eval_tokens, eval_max_positions) {
+                Some(m) => {
+                    println!("  positions    : {}", m.positions);
+                    println!("  vocab        : {}", m.vocab);
+                    println!("  cpu_ms       : {:.3}", m.cpu_ms);
+                    println!("  gpu_ms       : {:.3}", m.gpu_ms);
+                    println!("  max_abs_diff : {:.6e}", m.max_abs_diff);
+                    println!("  mean_abs_diff: {:.6e}", m.mean_abs_diff);
+                    println!("  max_rel_diff : {:.6e}", m.max_rel_diff);
+                }
+                None => println!("  unavailable"),
+            }
+        }
+        if max_tokens == 0 {
+            return;
+        }
     }
 
     let prompt_tokens = trainer.tokenizer.encode(&prompt);

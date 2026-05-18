@@ -54,6 +54,7 @@ struct SpectralParams {
 
 pub struct RustDeqBridge {
     pub h_slots: u32,
+    pub slot_owner_prepass_pipeline: wgpu::ComputePipeline,
     pub slot_coord_unified_pipeline: wgpu::ComputePipeline,
     pub hist_v2_signal_cache_pipeline: wgpu::ComputePipeline,
     pub hist_v2_project_pipeline: wgpu::ComputePipeline,
@@ -93,6 +94,7 @@ pub struct RustDeqBridge {
     pub h_hist_buf: wgpu::Buffer,
     pub hist_ctx_enabled: bool,
     pub fpm_enabled: bool,
+    pub slot_owner_prepass_enabled: bool,
 
     pub bind_group: wgpu::BindGroup,
     pub pool_bind_group: wgpu::BindGroup,
@@ -345,6 +347,28 @@ impl RustDeqBridge {
                 vl == "1" || vl == "true" || vl == "yes"
             })
             .unwrap_or(false);
+        let slot_owner_prepass_enabled = std::env::var("AIDEEN_SLOT_OWNER_PREPASS")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let slot_owner_min_gate = std::env::var("AIDEEN_SLOT_OWNER_MIN_GATE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.10)
+            .clamp(0.0, 1.0);
+        let slot_owner_beta = std::env::var("AIDEEN_SLOT_OWNER_BETA")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(16.0)
+            .clamp(0.1, 32.0);
+        let slot_owner_hash_mix = std::env::var("AIDEEN_SLOT_OWNER_HASH_MIX")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(8.0)
+            .clamp(0.0, 8.0);
 
         let mut entries = Vec::new();
         entries.push(wgpu::BindGroupLayoutEntry {
@@ -409,121 +433,122 @@ impl RustDeqBridge {
             entries: &entries,
         });
 
-        let solve_pool_bg1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Solve Pool BG1 Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let solve_pool_bg1_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Solve Pool BG1 Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("DEQ Core Pipeline Layout"),
@@ -608,6 +633,12 @@ impl RustDeqBridge {
             label: Some("AIDEEN DEQ SlotCoord Unified Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/deq_slot_attn_unified_clean.wgsl").into(),
+            ),
+        });
+        let owner_prepass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AIDEEN Slot Owner Prepass Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/slot_owner_prepass.wgsl").into(),
             ),
         });
         let fpm_requested = std::env::var("AIDEEN_FPM")
@@ -745,7 +776,11 @@ impl RustDeqBridge {
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE".to_string(),
-            if assoc_suppress_value_source { 1.0 } else { 0.0 },
+            if assoc_suppress_value_source {
+                1.0
+            } else {
+                0.0
+            },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_SALIENCE_REPLACE".to_string(),
@@ -764,6 +799,11 @@ impl RustDeqBridge {
             if assoc_persistent { 1.0 } else { 0.0 },
         );
         slot_coord_constants.insert(
+            "ENABLE_SLOT_OWNER_PREPASS".to_string(),
+            if slot_owner_prepass_enabled { 1.0 } else { 0.0 },
+        );
+        slot_coord_constants.insert("SLOT_OWNER_MIN_GATE".to_string(), slot_owner_min_gate);
+        slot_coord_constants.insert(
             "ENABLE_ASSOC_READ".to_string(),
             if assoc_read_enabled { 1.0 } else { 0.0 },
         );
@@ -773,7 +813,11 @@ impl RustDeqBridge {
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
-            if assoc_oracle_write_positions { 1.0 } else { 0.0 },
+            if assoc_oracle_write_positions {
+                1.0
+            } else {
+                0.0
+            },
         );
         slot_coord_constants.insert(
             "ENABLE_ASSOC_ORACLE_FORCE_WRITE".to_string(),
@@ -783,6 +827,25 @@ impl RustDeqBridge {
             "ASSOC_ORACLE_PREFIX_PAIRS".to_string(),
             assoc_oracle_prefix_pairs as f64,
         );
+        let mut owner_prepass_constants = std::collections::HashMap::new();
+        owner_prepass_constants.insert(
+            "ENABLE_SLOT_OWNER_PREPASS".to_string(),
+            if slot_owner_prepass_enabled { 1.0 } else { 0.0 },
+        );
+        owner_prepass_constants.insert("SLOT_OWNER_BETA".to_string(), slot_owner_beta);
+        owner_prepass_constants.insert("SLOT_OWNER_HASH_MIX".to_string(), slot_owner_hash_mix);
+        let slot_owner_prepass_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Slot Owner Prepass Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &owner_prepass_shader,
+                entry_point: Some("slot_owner_prepass_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &owner_prepass_constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            });
         let slot_coord_unified_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("DEQ SlotCoord Unified Pipeline"),
@@ -1012,7 +1075,7 @@ impl RustDeqBridge {
             + 3u32 * h_slots * d_model * ASSOC_RANK          // assoc projections/reserved layout
             + h_slots                                        // alpha_assoc
             + h_slots * d_model                              // W_event_assoc
-            + h_slots;                                       // b_event_assoc
+            + h_slots; // b_event_assoc
         let d64 = d_model as u64;
         let h64 = h_slots as u64;
         let all_weights_size = aw_total_bytes(d64, h64, hist_params_len as u64);
@@ -1528,7 +1591,8 @@ impl RustDeqBridge {
                     binding: 9,
                     resource: s_v_buf.as_entire_binding(),
                 },
-             ], });
+            ],
+        });
 
         let solve_pool_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Solve Pool BG1 (Forward)"),
@@ -1583,6 +1647,7 @@ impl RustDeqBridge {
 
         Self {
             h_slots,
+            slot_owner_prepass_pipeline,
             slot_coord_unified_pipeline,
             hist_v2_signal_cache_pipeline,
             hist_v2_project_pipeline,
@@ -1620,6 +1685,7 @@ impl RustDeqBridge {
             h_hist_buf,
             hist_ctx_enabled,
             fpm_enabled,
+            slot_owner_prepass_enabled,
             bind_group,
             pool_bind_group,
         }
@@ -2093,6 +2159,18 @@ impl RustDeqBridge {
             }
         }
         {
+            if self.slot_owner_prepass_enabled {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Slot Owner Prepass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.slot_owner_prepass_pipeline);
+                cpass.set_bind_group(0, &self.bind_group, &[]);
+                cpass.set_bind_group(1, &self.solve_pool_bg1, &[]);
+                cpass.dispatch_workgroups(shape.batch_size.max(1), shape.token_count.max(1), 1);
+            }
+        }
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("DEQ Forward Unified SlotCoord Pass"),
                 timestamp_writes: None,
@@ -2153,6 +2231,145 @@ impl RustDeqBridge {
         queue: &wgpu::Queue,
         shape: &DeqComputeShape,
     ) {
+        let profile_forward = std::env::var("AIDEEN_DEQ_FORWARD_PROFILE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        if profile_forward {
+            let shape_bytes = Self::shape_bytes(shape);
+            queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
+            let run_pass = |label: &str,
+                            pipeline: &wgpu::ComputePipeline,
+                            x: u32,
+                            y: u32,
+                            z: u32,
+                            bind_group0: &wgpu::BindGroup,
+                            bind_group1: &wgpu::BindGroup| {
+                let t0 = std::time::Instant::now();
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some(label),
+                    });
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(pipeline);
+                    cpass.set_bind_group(0, bind_group0, &[]);
+                    cpass.set_bind_group(1, bind_group1, &[]);
+                    cpass.dispatch_workgroups(x, y, z);
+                }
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::Maintain::Wait);
+                eprintln!("[DEQ-FWD-PROFILE] {label}: {} ms", t0.elapsed().as_millis());
+            };
+            let fpm_stage = shape.fpm_stage;
+            let fpm_read_enabled = self.fpm_enabled && fpm_stage >= 2;
+            let fpm_persist_enabled = self.fpm_enabled && fpm_stage >= 4;
+            let fpm_slot_stride = if fpm_read_enabled {
+                Some((shape.h_slots as u64) * (shape.d_model as u64) * 4u64)
+            } else {
+                None
+            };
+            if self.hist_ctx_enabled {
+                run_pass(
+                    "Hist V2 Signal Cache Pass",
+                    &self.hist_v2_signal_cache_pipeline,
+                    shape.batch_size.max(1),
+                    shape.token_count.max(1),
+                    1,
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+                run_pass(
+                    "Hist V2 Project Pass",
+                    &self.hist_v2_project_pipeline,
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    shape.token_count.max(1),
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+            }
+            if self.slot_owner_prepass_enabled {
+                run_pass(
+                    "Slot Owner Prepass",
+                    &self.slot_owner_prepass_pipeline,
+                    shape.batch_size.max(1),
+                    shape.token_count.max(1),
+                    1,
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+            }
+            run_pass(
+                "DEQ Forward Unified SlotCoord Pass",
+                &self.slot_coord_unified_pipeline,
+                shape.batch_size.max(1),
+                shape.h_slots.max(1),
+                1,
+                &self.bind_group,
+                &self.solve_pool_bg1,
+            );
+            if self.hist_ctx_enabled {
+                run_pass(
+                    "Hist V2 Temporal Pass",
+                    &self.hist_v2_temporal_pipeline,
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    1,
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+            }
+            {
+                let t0 = std::time::Instant::now();
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("DEQ Forward Pool Pass"),
+                    });
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("DEQ Forward Pool Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.pool_pipeline);
+                    cpass.set_bind_group(0, &self.pool_bind_group, &[]);
+                    cpass.dispatch_workgroups(
+                        shape.d_model.div_ceil(256).max(1),
+                        shape.batch_size.max(1),
+                        shape.token_count.max(1),
+                    );
+                }
+                if fpm_persist_enabled {
+                    let slot_stride = fpm_slot_stride.expect("persist requires read slot stride");
+                    let last_token = (shape.token_start + shape.token_count - 1) as u64;
+                    for b in 0..shape.batch_size as u64 {
+                        let src_off = (b * shape.seq_len as u64 + last_token) * slot_stride;
+                        let dst_off = b * slot_stride;
+                        encoder.copy_buffer_to_buffer(
+                            &self.hist_ctx_buf,
+                            src_off,
+                            &self.mstate_buf,
+                            dst_off,
+                            slot_stride,
+                        );
+                    }
+                }
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::Maintain::Wait);
+                eprintln!(
+                    "[DEQ-FWD-PROFILE] DEQ Forward Pool Pass{}: {} ms",
+                    if fpm_persist_enabled { " + MState copy" } else { "" },
+                    t0.elapsed().as_millis()
+                );
+            }
+            return;
+        }
         // Single submit for the entire chunk — fpm_m_cache carry between tokens
         // is handled inside the shader (intra-slot, workgroup memory).
         let encoder = self.encode_forward_gpu_only(device, queue, shape);
@@ -2266,6 +2483,146 @@ impl RustDeqBridge {
         norm_scale: &[f32],
         update_weights: bool,
     ) -> Result<(), &'static str> {
+        let profile_forward = std::env::var("AIDEEN_DEQ_FORWARD_PROFILE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        if profile_forward && !update_weights {
+            let shape_bytes = Self::shape_bytes(shape);
+            queue.write_buffer(&self.uniform_buf, 0, &shape_bytes);
+            queue.write_buffer(&self.s_buf, 0, bytemuck::cast_slice(s_in));
+            let run_pass = |label: &str,
+                            pipeline: &wgpu::ComputePipeline,
+                            x: u32,
+                            y: u32,
+                            z: u32,
+                            bind_group0: &wgpu::BindGroup,
+                            bind_group1: &wgpu::BindGroup| {
+                let t0 = std::time::Instant::now();
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some(label),
+                    });
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(pipeline);
+                    cpass.set_bind_group(0, bind_group0, &[]);
+                    cpass.set_bind_group(1, bind_group1, &[]);
+                    cpass.dispatch_workgroups(x, y, z);
+                }
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::Maintain::Wait);
+                eprintln!("[DEQ-FWD-PROFILE] {label}: {} ms", t0.elapsed().as_millis());
+            };
+            let fpm_stage = shape.fpm_stage;
+            let fpm_read_enabled = self.fpm_enabled && fpm_stage >= 2;
+            let fpm_persist_enabled = self.fpm_enabled && fpm_stage >= 4;
+            let fpm_slot_stride = if fpm_read_enabled {
+                Some((shape.h_slots as u64) * (shape.d_model as u64) * 4u64)
+            } else {
+                None
+            };
+            if self.hist_ctx_enabled {
+                run_pass(
+                    "Hist V2 Signal Cache Pass",
+                    &self.hist_v2_signal_cache_pipeline,
+                    shape.batch_size.max(1),
+                    shape.token_count.max(1),
+                    1,
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+                run_pass(
+                    "Hist V2 Project Pass",
+                    &self.hist_v2_project_pipeline,
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    shape.token_count.max(1),
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+            }
+            if self.slot_owner_prepass_enabled {
+                run_pass(
+                    "Slot Owner Prepass",
+                    &self.slot_owner_prepass_pipeline,
+                    shape.batch_size.max(1),
+                    shape.token_count.max(1),
+                    1,
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+            }
+            run_pass(
+                "DEQ Forward Unified SlotCoord Pass",
+                &self.slot_coord_unified_pipeline,
+                shape.batch_size.max(1),
+                shape.h_slots.max(1),
+                1,
+                &self.bind_group,
+                &self.solve_pool_bg1,
+            );
+            if self.hist_ctx_enabled {
+                run_pass(
+                    "Hist V2 Temporal Pass",
+                    &self.hist_v2_temporal_pipeline,
+                    shape.batch_size.max(1),
+                    shape.h_slots.max(1),
+                    1,
+                    &self.bind_group,
+                    &self.solve_pool_bg1,
+                );
+            }
+            {
+                let t0 = std::time::Instant::now();
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("DEQ Forward Pool Pass"),
+                    });
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("DEQ Forward Pool Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.pool_pipeline);
+                    cpass.set_bind_group(0, &self.pool_bind_group, &[]);
+                    cpass.dispatch_workgroups(
+                        shape.d_model.div_ceil(256).max(1),
+                        shape.batch_size.max(1),
+                        shape.token_count.max(1),
+                    );
+                }
+                if fpm_persist_enabled {
+                    let slot_stride = fpm_slot_stride.expect("persist requires read slot stride");
+                    let last_token = (shape.token_start + shape.token_count - 1) as u64;
+                    for b in 0..shape.batch_size as u64 {
+                        let src_off = (b * shape.seq_len as u64 + last_token) * slot_stride;
+                        let dst_off = b * slot_stride;
+                        encoder.copy_buffer_to_buffer(
+                            &self.hist_ctx_buf,
+                            src_off,
+                            &self.mstate_buf,
+                            dst_off,
+                            slot_stride,
+                        );
+                    }
+                }
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::Maintain::Wait);
+                eprintln!(
+                    "[DEQ-FWD-PROFILE] DEQ Forward Pool Pass{}: {} ms",
+                    if fpm_persist_enabled { " + MState copy" } else { "" },
+                    t0.elapsed().as_millis()
+                );
+            }
+            return Ok(());
+        }
         let encoder = self.encode_forward(
             device,
             queue,

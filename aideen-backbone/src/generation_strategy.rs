@@ -5,8 +5,8 @@ use aideen_core::{
 use nalgebra::DVector;
 use std::time::Instant;
 
-use crate::lm_head::LmHead;
 use crate::fixed_point_memory_decoder::FixedPointMemoryDecoder;
+use crate::lm_head::LmHead;
 
 // ── Tipos auxiliares ──────────────────────────────────────────────────────────
 

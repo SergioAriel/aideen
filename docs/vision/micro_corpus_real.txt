@@ -1,0 +1,11 @@
+AIDEEN: Advanced Intelligence Distributed Expert Engineering Network.
+
+AIDEEN is a next-generation neural architecture based on Deep Equilibrium Models (DEQ) and Fixed-Point Memory (FPM). Unlike traditional transformers that use sequential layers, AIDEEN find a global equilibrium state through iterative refinement.
+
+The associative memory system in AIDEEN uses a Librarian to route information to specific banks. Each bank stores a key-value binding that can be retrieved later using a query. This allows the model to maintain long-term context without the quadratic cost of full self-attention.
+
+The structural stabilization of AIDEEN memory involves two key mechanisms:
+1. Confidence-Aware Reading: The retrieval strength is modulated by the max softmax probability across banks.
+2. Surprise-Based Writing: The model only updates its memory when the retrieved information contradicts the current state.
+
+By combining these structural invariants, AIDEEN achieves superior training stability and faster convergence on complex linguistic tasks. The Librarian learns to specialize each slot, ensuring that diverse concepts are mapped to unique memory locations.

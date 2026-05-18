@@ -1,9 +1,9 @@
+use crate::deq_mode::DeqRuntimeConfig;
 use aideen_block::deq_bridge::{
     aw_alog_byte_off, aw_hist_byte_off, aw_nscale_byte_off, aw_total_bytes, aw_win_byte_off,
     aw_wk_byte_off, aw_wo_byte_off, aw_wout_byte_off, aw_wv_byte_off, aw_wx_byte_off,
     DeqComputeShape, RustDeqBridge,
 };
-use crate::deq_mode::DeqRuntimeConfig;
 use aideen_core::state::ArchitectureConfig;
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
@@ -264,7 +264,7 @@ impl GpuDeqBackend {
         hist_slot_bias: &[f32],
         hist_gate_logit: &[f32],
         slot_anchor: &[f32],
-        w_kv_write: &[f32],   // W_k_write (h*d×r) then W_v_write (h*r×d) packed together
+        w_kv_write: &[f32], // W_k_write (h*d×r) then W_v_write (h*r×d) packed together
         b_delta: &[f32],
         w_gate_hist: &[f32],
         w_write_gate: &[f32],
@@ -318,11 +318,7 @@ impl GpuDeqBackend {
         out.push(self.cfg_contr_floor);
         out.push(if self.cfg_hist_zero { 0.0 } else { 1.0 });
         out.push(if self.cfg_hist_minner_zero { 1.0 } else { 0.0 });
-        out.push(if self.cfg_hist_force_nofpm {
-            1.0
-        } else {
-            0.0
-        });
+        out.push(if self.cfg_hist_force_nofpm { 1.0 } else { 0.0 });
         out.push(if self.cfg_hist_prelude_skip { 1.0 } else { 0.0 });
         out.push(if self.cfg_hist_loop_force_nofpm {
             1.0
@@ -384,8 +380,9 @@ impl GpuDeqBackend {
             .clamp(-8.0, 4.0);
         for slot in 0..h {
             for dim in 0..d {
-                let hash = ((slot as u32 + 1) * 1_103_515_245u32)
-                    ^ ((dim as u32 + 17) * 2_654_435_761u32);
+                let hash = (slot as u32 + 1)
+                    .wrapping_mul(1_103_515_245u32)
+                    ^ (dim as u32 + 17).wrapping_mul(2_654_435_761u32);
                 let unit = (hash as f32 / u32::MAX as f32) * 2.0 - 1.0;
                 out.push(assoc_event_w_init * unit);
             }
@@ -422,7 +419,7 @@ impl GpuDeqBackend {
             + 3 * h * d * ASSOC_RANK    // reserved decoupled W_k_assoc + W_v_assoc + W_q_assoc
             + h                         // alpha_assoc
             + h * d                     // W_event_assoc
-            + h                         // b_event_assoc
+            + h // b_event_assoc
     }
 
     pub fn set_hist_warmup_factor(&self, factor: f32) {
@@ -645,13 +642,10 @@ impl GpuDeqBackend {
                     include_str!("shaders/staged_adjoint_picard_clean.wgsl").into(),
                 ),
             });
-        let slot_rhs_expand_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Slot RHS Expand Shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("shaders/slot_rhs_expand.wgsl").into(),
-                ),
-            });
+        let slot_rhs_expand_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Slot RHS Expand Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/slot_rhs_expand.wgsl").into()),
+        });
         let segment_memory_promote_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Segment Memory Promote Shader"),
@@ -1514,7 +1508,11 @@ impl GpuDeqBackend {
         );
         shader_constants.insert(
             "ENABLE_ASSOC_SUPPRESS_VALUE_SOURCE".to_string(),
-            if assoc_suppress_value_source { 1.0 } else { 0.0 },
+            if assoc_suppress_value_source {
+                1.0
+            } else {
+                0.0
+            },
         );
         shader_constants.insert(
             "ENABLE_ASSOC_SALIENCE_REPLACE".to_string(),
@@ -1522,7 +1520,11 @@ impl GpuDeqBackend {
         );
         shader_constants.insert(
             "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
-            if assoc_oracle_write_positions { 1.0 } else { 0.0 },
+            if assoc_oracle_write_positions {
+                1.0
+            } else {
+                0.0
+            },
         );
         shader_constants.insert(
             "ENABLE_ASSOC_ORACLE_FORCE_WRITE".to_string(),
@@ -1703,10 +1705,8 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         fpm_retain_bwd_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
         fpm_retain_bwd_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
-        fpm_retain_bwd_constants.insert(
-            "FPM_DIRECT_WRITE_SCALE".to_string(),
-            fpm_direct_write_scale,
-        );
+        fpm_retain_bwd_constants
+            .insert("FPM_DIRECT_WRITE_SCALE".to_string(), fpm_direct_write_scale);
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_LIBRARIAN_BWD".to_string(),
             if assoc_librarian_bwd { 1.0 } else { 0.0 },
@@ -1765,7 +1765,11 @@ impl GpuDeqBackend {
         );
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_ORACLE_WRITE_POSITIONS".to_string(),
-            if assoc_oracle_write_positions { 1.0 } else { 0.0 },
+            if assoc_oracle_write_positions {
+                1.0
+            } else {
+                0.0
+            },
         );
         fpm_retain_bwd_constants.insert(
             "ENABLE_ASSOC_ORACLE_FORCE_WRITE".to_string(),
@@ -1902,11 +1906,13 @@ impl GpuDeqBackend {
         let slot_rhs_expand_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Slot RHS Expand Pipeline"),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Slot RHS Expand PL"),
-                    bind_group_layouts: &[&slot_rhs_expand_bgl],
-                    push_constant_ranges: &[],
-                })),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Slot RHS Expand PL"),
+                        bind_group_layouts: &[&slot_rhs_expand_bgl],
+                        push_constant_ranges: &[],
+                    }),
+                ),
                 module: &slot_rhs_expand_shader,
                 entry_point: Some("slot_rhs_expand_main"),
                 compilation_options: Default::default(),
@@ -1915,11 +1921,13 @@ impl GpuDeqBackend {
         let segment_memory_promote_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Segment Memory Promote Pipeline"),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Segment Memory Promote PL"),
-                    bind_group_layouts: &[&segment_memory_promote_bgl],
-                    push_constant_ranges: &[],
-                })),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Segment Memory Promote PL"),
+                        bind_group_layouts: &[&segment_memory_promote_bgl],
+                        push_constant_ranges: &[],
+                    }),
+                ),
                 module: &segment_memory_promote_shader,
                 entry_point: Some("segment_memory_promote_main"),
                 compilation_options: pipeline_options.clone(),
@@ -1928,11 +1936,13 @@ impl GpuDeqBackend {
         let assoc_persistent_promote_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Assoc Persistent Promote Pipeline"),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Assoc Persistent Promote PL"),
-                    bind_group_layouts: &[&assoc_persistent_promote_bgl],
-                    push_constant_ranges: &[],
-                })),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Assoc Persistent Promote PL"),
+                        bind_group_layouts: &[&assoc_persistent_promote_bgl],
+                        push_constant_ranges: &[],
+                    }),
+                ),
                 module: &assoc_persistent_promote_shader,
                 entry_point: Some("assoc_persistent_promote_main"),
                 compilation_options: pipeline_options.clone(),
@@ -1941,14 +1951,19 @@ impl GpuDeqBackend {
         let assoc_history_carry_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Assoc History Carry Pipeline"),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Assoc History Carry PL"),
-                    bind_group_layouts: &[&assoc_history_carry_bgl],
-                    push_constant_ranges: &[],
-                })),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Assoc History Carry PL"),
+                        bind_group_layouts: &[&assoc_history_carry_bgl],
+                        push_constant_ranges: &[],
+                    }),
+                ),
                 module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("Assoc History Carry Shader"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("../../aideen-block/src/shaders/assoc_state_carry.wgsl").into()),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../../aideen-block/src/shaders/assoc_state_carry.wgsl")
+                            .into(),
+                    ),
                 }),
                 entry_point: Some("assoc_state_carry_main"),
                 compilation_options: Default::default(),
@@ -1963,11 +1978,13 @@ impl GpuDeqBackend {
         let assoc_persistent_load_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Assoc Persistent Load Pipeline"),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Assoc Persistent Load PL"),
-                    bind_group_layouts: &[&assoc_persistent_promote_bgl],
-                    push_constant_ranges: &[],
-                })),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Assoc Persistent Load PL"),
+                        bind_group_layouts: &[&assoc_persistent_promote_bgl],
+                        push_constant_ranges: &[],
+                    }),
+                ),
                 module: &assoc_persistent_promote_shader,
                 entry_point: Some("assoc_persistent_load_main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
@@ -2230,16 +2247,16 @@ impl GpuDeqBackend {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let segment_memory_promote_params_buf =
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Segment Memory Promote Params"),
-                size: std::mem::size_of::<SegmentMemoryPromoteParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        let attn_entries =
-            (forward_batch_cap as usize * forward_seq_cap.max(1) as usize * config.h_slots * config.d_r)
-                as u64;
+        let segment_memory_promote_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Segment Memory Promote Params"),
+            size: std::mem::size_of::<SegmentMemoryPromoteParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let attn_entries = (forward_batch_cap as usize
+            * forward_seq_cap.max(1) as usize
+            * config.h_slots
+            * config.d_r) as u64;
         let fused_mix_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Mix Buffer"),
             size: attn_entries * 4,
@@ -2280,12 +2297,10 @@ impl GpuDeqBackend {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let gscore_entries =
-            (forward_batch_cap as usize
-                * forward_seq_cap.max(1) as usize
-                * config.h_slots
-                * config.h_slots)
-                as u64;
+        let gscore_entries = (forward_batch_cap as usize
+            * forward_seq_cap.max(1) as usize
+            * config.h_slots
+            * config.h_slots) as u64;
         let fused_gscore_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fused Attn Gscore Buffer"),
             size: gscore_entries * 4,
@@ -2341,8 +2356,9 @@ impl GpuDeqBackend {
         let w_mat_bytes = (config.d_r * config.d_r * std::mem::size_of::<f32>()) as u64;
         let fpm_wout_partial_buf = {
             let fpm_block = 64u64;
-            let reduce_entries =
-                (forward_batch_cap as u64) * (forward_seq_cap.max(1) as u64) * (config.h_slots as u64);
+            let reduce_entries = (forward_batch_cap as u64)
+                * (forward_seq_cap.max(1) as u64)
+                * (config.h_slots as u64);
             let fpm_blocks = (reduce_entries + fpm_block - 1) / fpm_block;
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("FPM Wout Partial Buffer"),
@@ -2355,8 +2371,9 @@ impl GpuDeqBackend {
         };
         let fpm_wx_partial_buf = {
             let fpm_block = 64u64;
-            let reduce_entries =
-                (forward_batch_cap as u64) * (forward_seq_cap.max(1) as u64) * (config.h_slots as u64);
+            let reduce_entries = (forward_batch_cap as u64)
+                * (forward_seq_cap.max(1) as u64)
+                * (config.h_slots as u64);
             let fpm_blocks = (reduce_entries + fpm_block - 1) / fpm_block;
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("FPM Wx Partial Buffer"),
@@ -2422,10 +2439,7 @@ impl GpuDeqBackend {
         });
         let assoc_value_grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Assoc Value Grad State"),
-            size: (config.h_slots as u64)
-                * (assoc_banks as u64)
-                * (config.d_r as u64)
-                * 4u64,
+            size: (config.h_slots as u64) * (assoc_banks as u64) * (config.d_r as u64) * 4u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -3130,7 +3144,8 @@ impl GpuDeqBackend {
             let buf_bytes = self.bridge.assoc_buf.size() as usize;
             let n_floats = buf_bytes / 4;
             let data = vec![0.0f32; n_floats];
-            self.queue.write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
+            self.queue
+                .write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
             self.queue.write_buffer(
                 &self.bridge.assoc_persistent_buf,
                 0,
@@ -3391,8 +3406,6 @@ impl GpuDeqBackend {
             .write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
     }
 
-
-
     /// Reinicia solo la memoria local/intra-segmento.
     ///
     /// Mantiene intacto el carry lento de FPM (`mstate_buf` y `h_hist_buf`) para que
@@ -3424,7 +3437,8 @@ impl GpuDeqBackend {
         let buf_bytes = self.bridge.assoc_buf.size() as usize;
         let n_floats = buf_bytes / 4;
         let data = vec![0.0f32; n_floats];
-        self.queue.write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
+        self.queue
+            .write_buffer(&self.bridge.assoc_buf, 0, bytemuck::cast_slice(&data));
     }
 
     // --- HELPER UNIFICADO ---
@@ -3520,7 +3534,7 @@ impl GpuDeqBackend {
         hist_slot_bias: &[f32],
         hist_gate_logit: &[f32],
         slot_anchor: &[f32],
-        w_kv_write: &[f32],   // W_k_write (h*d×r) then W_v_write (h*r×d) packed together
+        w_kv_write: &[f32], // W_k_write (h*d×r) then W_v_write (h*r×d) packed together
         b_delta: &[f32],
         w_gate_hist: &[f32],
         w_write_gate: &[f32],
@@ -3641,6 +3655,22 @@ impl GpuDeqBackend {
                 );
             }
         }
+    }
+
+    pub fn upload_slot_anchor(&self, queue: &wgpu::Queue, slot_anchor: &[f32]) {
+        let d = self.config.d_r;
+        let h = self.config.h_slots;
+        if slot_anchor.len() != h * d {
+            return;
+        }
+        let hist_float_off = d * d + 2 * h * d + h;
+        let hist_byte_off =
+            aw_hist_byte_off(d as u64, h as u64) + (hist_float_off * std::mem::size_of::<f32>()) as u64;
+        queue.write_buffer(
+            &self.bridge.all_weights_buf,
+            hist_byte_off,
+            bytemuck::cast_slice(slot_anchor),
+        );
     }
 
     // --- MÉTODOS DE EJECUCIÓN ---
@@ -3832,11 +3862,23 @@ impl GpuDeqBackend {
         norm: &[f32],
         update_weights: bool,
     ) -> Result<(), &'static str> {
+        let profile_fixed = std::env::var("AIDEEN_FIXED_HISTORY_PROFILE")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false);
+        let t0 = std::time::Instant::now();
         self.promote_assoc_persistent_load();
+        let t_promote = t0.elapsed().as_secs_f64() * 1000.0;
 
+        let t1 = std::time::Instant::now();
         let shape =
             self.build_compute_shape(batch_size, seq_len, max_iters, epsilon, damping, false);
-        self.bridge.run_forward_no_readback(
+        let t_shape = t1.elapsed().as_secs_f64() * 1000.0;
+        let t2 = std::time::Instant::now();
+        let out = self.bridge.run_forward_no_readback(
             &self.device,
             &self.queue,
             &shape,
@@ -3851,7 +3893,17 @@ impl GpuDeqBackend {
             a_log,
             norm,
             update_weights,
-        )
+        );
+        if profile_fixed {
+            eprintln!(
+                "[FIXED-HIST-WRAP] promote_ms={:.3} shape_ms={:.3} bridge_ms={:.3} total_ms={:.3}",
+                t_promote,
+                t_shape,
+                t2.elapsed().as_secs_f64() * 1000.0,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        out
     }
 
     pub fn run_forward_from_seq_buf(
@@ -4032,10 +4084,8 @@ impl GpuDeqBackend {
         // path here would train against stale/OOB activations. Route
         // unified modes through the clean adjoint until its dedicated backward is
         // rewritten against the live forward contract.
-        let use_legacy_adjoint = std::env::var("AIDEEN_USE_LEGACY_ADJOINT")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let use_legacy_adjoint =
+            std::env::var("AIDEEN_USE_LEGACY_ADJOINT").ok().as_deref() == Some("1");
         if !use_legacy_adjoint {
             return self.run_clean_adjoint_picard_no_readback(
                 seq_len,
@@ -4970,9 +5020,7 @@ impl GpuDeqBackend {
         // hist_gated is the default mode. Disable explicitly with AIDEEN_DEQ_HIST_GATED=0.
         let runtime_cfg = DeqRuntimeConfig::from_env();
         let deq_only = runtime_cfg.is_deq_only();
-        let hist_gated = self.cfg_hist_gated
-            && !deq_only
-            && !self.bridge.fpm_enabled;
+        let hist_gated = self.cfg_hist_gated && !deq_only && !self.bridge.fpm_enabled;
         let hist_internal_probe = self.cfg_hist_internal_probe;
         let train_hist_wx = self.cfg_hist_train_wx;
         let stage4_wo_win_pipeline = &self.fused_update_stage4_wo_win_pipeline;
@@ -5076,11 +5124,7 @@ impl GpuDeqBackend {
                     d.div_ceil(16),
                     n.div_ceil(16)
                 );
-                add_pass!(
-                    stage4_wo_win_pipeline,
-                    d.div_ceil(16),
-                    d.div_ceil(16)
-                );
+                add_pass!(stage4_wo_win_pipeline, d.div_ceil(16), d.div_ceil(16));
                 add_pass_3d!(
                     &self.fused_update_stage4_wq_pipeline,
                     d.div_ceil(16),

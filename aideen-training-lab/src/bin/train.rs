@@ -86,6 +86,14 @@ fn encode_training_corpus(tok: &Tokenizer, corpus: &str) -> (Vec<u32>, u32) {
     (tokens, BPE_EOS_TOKEN)
 }
 
+fn tokenizer_cache_suffix(tok: &Tokenizer) -> &'static str {
+    if tok.hf_tokenizer.is_some() {
+        "bpe"
+    } else {
+        "char"
+    }
+}
+
 fn main() {
     // ── Parse args ──────────────────────────────────────────────────────────
     let args: Vec<String> = env::args().collect();
@@ -158,6 +166,16 @@ fn main() {
     );
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| {
+            let vl = v.trim().to_ascii_lowercase();
+            vl == "1" || vl == "true" || vl == "yes"
+        })
+        .unwrap_or(false)
+}
+
 /// Entrena sobre un .txt grande usando streaming (sin límite de RAM).
 /// Tokeniza el texto, lo escribe a un .bin temporal y llama train_on_file.
 fn run_large_file(
@@ -200,7 +218,12 @@ fn run_large_file(
 
     // ── Construir tokenizer ────────────────────────────────────────────────
     let config_default = ArchitectureConfig::default();
-    let tok_path = find_tokenizer_path();
+    let force_char_tokenizer = env_flag("AIDEEN_FORCE_CHAR_TOKENIZER");
+    let tok_path = if force_char_tokenizer {
+        None
+    } else {
+        find_tokenizer_path()
+    };
     let mut tok = if let Some(ref path) = tok_path {
         println!("  Tokenizer: BPE ({path}) ✅");
         Tokenizer::from_file(path, config_default.clone()).expect("Failed to load tokenizer.json")
@@ -208,7 +231,11 @@ fn run_large_file(
         let corpus = corpus
             .as_ref()
             .expect("Tokenizer char-level requiere corpus en memoria.");
-        println!("  Tokenizer: Char-level — escaneando vocab...");
+        if force_char_tokenizer {
+            println!("  Tokenizer: Char-level (forced) — escaneando vocab...");
+        } else {
+            println!("  Tokenizer: Char-level — escaneando vocab...");
+        }
         Tokenizer::from_text(corpus, config_default.clone())
     };
 
@@ -219,7 +246,21 @@ fn run_large_file(
         // Training throughput is strongly launch-bound at 256. 512 stays stable on M1 Pro
         // and gives the GPU more useful work per dispatch; callers can still override it.
         .unwrap_or(512);
+    tok.config.num_samples = std::env::var("AIDEEN_NUM_SAMPLES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(tok.config.num_samples)
+        .max(1);
     tok.config.train_deq = true;
+    println!(
+        "  LM samples: {}{}",
+        tok.config.num_samples,
+        if tok.config.num_samples >= tok.config.vocab_size {
+            " (full vocab)"
+        } else {
+            ""
+        }
+    );
 
     let vocab_size = tok.vocab_size();
     let heldout_tokens = val_file.as_ref().map(|path| {
@@ -233,16 +274,13 @@ fn run_large_file(
         {
             tokens.truncate(max_tokens);
         }
-        println!(
-            "  Held-out: {} tokens desde {}",
-            tokens.len(),
-            path
-        );
+        println!("  Held-out: {} tokens desde {}", tokens.len(), path);
         tokens
     });
 
     // ── Tokenizar y escribir .bin (o reutilizar cache) ─────────────────────
-    let bin_path = format!("{txt_path}.tokens.bin");
+    let cache_suffix = tokenizer_cache_suffix(&tok);
+    let bin_path = format!("{txt_path}.{cache_suffix}.tokens.bin");
     let txt_meta = fs::metadata(&txt_path).ok();
     let bin_meta = fs::metadata(&bin_path).ok();
     let use_cache = bin_meta
@@ -252,7 +290,7 @@ fn run_large_file(
         .map(|(b, t)| b >= t)
         .unwrap_or(false);
 
-    if use_cache && tok_path.is_some() {
+    if use_cache {
         let bin_bytes = bin_meta.unwrap().len() as usize;
         let tokens_len = bin_bytes / 4;
         println!(

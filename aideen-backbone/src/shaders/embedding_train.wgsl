@@ -127,10 +127,12 @@ fn embedding_adamw_update(
     var grad = 0.0;
     let start = unique_offsets[u];
     let end = unique_offsets[u + 1u];
+    let occ_count = max(1u, end - start);
     for (var j = start; j < end; j = j + 1u) {
         let p = unique_positions[j];
         grad = grad + dl_dh[p * params.d_model + d];
     }
+    grad = grad / f32(occ_count);
 
     let m_new = beta1 * m_emb[idx] + (1.0 - beta1) * grad;
     let v_new = beta2 * v_emb[idx] + (1.0 - beta2) * grad * grad;

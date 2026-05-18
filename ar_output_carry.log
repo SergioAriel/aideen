@@ -1,0 +1,897 @@
+   Compiling aideen-block v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-block)
+   Compiling aideen-backbone v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-backbone)
+warning: unused import: `Mutex`
+ --> aideen-backbone/src/gpu_deq.rs:9:22
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `hist_selective`
+    --> aideen-backbone/src/gpu_deq.rs:4720:13
+     |
+4720 |         let hist_selective = self.cfg_hist_selective;
+     |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hist_selective`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: fields `assoc_slot_stride_floats`, `cfg_hist_train_carrier`, `cfg_hist_train_alog`, and `cfg_hist_train_delta` are never read
+   --> aideen-backbone/src/gpu_deq.rs:91:5
+    |
+80  | pub struct GpuDeqBackend {
+    |            ------------- fields in this struct
+...
+91  |     assoc_slot_stride_floats: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+207 |     cfg_hist_train_carrier: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+...
+210 |     cfg_hist_train_alog: bool,
+    |     ^^^^^^^^^^^^^^^^^^^
+211 |     cfg_hist_train_delta: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+   Compiling aideen-training v0.1.0 (/Users/sergiosolis/Programacion/aideen/aideen-training-lab)
+warning: `aideen-backbone` (lib) generated 3 warnings (run `cargo fix --lib -p aideen-backbone` to apply 1 suggestion)
+warning: unused variable: `required_seq_cap`
+   --> aideen-training-lab/src/bin/assoc_recall.rs:812:9
+    |
+812 |     let required_seq_cap = gaps
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_required_seq_cap`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `aideen-training` (bin "assoc_recall") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 10.29s
+     Running `target/release/assoc_recall`
+╔══════════════════════════════════════════════════════════════════════╗
+║              AIDEEN  Associative Recall Benchmark                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+  vocab=50  keys=16  vals=16
+  ctx_len=128  mode=FPM+SlotAttn
+  n_train=400  n_eval=100  gaps=[0, 64, 128, 256]  pairs_per_seq=4
+  random_baseline = log(vocab=50) = 3.9120
+
+  d_r=512  h_slots=4
+  Initializing GPU (Metal shader compilation may take a few minutes)…
+[GpuDeqBackend] Adapter: Apple M1 Pro
+[GpuDeqBackend] SUBGROUP supported: fast paths may be enabled.
+
+thread 'main' panicked at /Users/sergiosolis/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-23.0.1/src/backend/wgpu_core.rs:1147:18:
+wgpu error: Validation Error
+
+Caused by:
+  In Device::create_compute_pipeline, label = 'DEQ SlotCoord Unified Pipeline'
+    Internal error: Metal: program_source:578:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:627:13: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+            LOOP_IS_REACHABLE while(true) {
+            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:692:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:724:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:774:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:804:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:823:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:848:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:868:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:890:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:906:13: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+            LOOP_IS_REACHABLE while(true) {
+            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:938:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:960:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:987:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1019:9: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+        LOOP_IS_REACHABLE while(true) {
+        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1034:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1064:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1086:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1169:22: error: no 'threadgroup' resource location available for 'hhist_gamma_wg'
+, threadgroup float& hhist_gamma_wg
+                     ^
+program_source:1656:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1705:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1746:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1768:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1806:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1882:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1931:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1968:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:1991:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2043:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2082:13: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+            LOOP_IS_REACHABLE while(true) {
+            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2115:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2157:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2205:25: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                        LOOP_IS_REACHABLE while(true) {
+                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2235:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2263:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2291:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2316:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2337:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2396:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2430:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2460:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2486:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2508:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2548:25: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                        LOOP_IS_REACHABLE while(true) {
+                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2595:25: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                        LOOP_IS_REACHABLE while(true) {
+                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2628:25: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                        LOOP_IS_REACHABLE while(true) {
+                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2684:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2710:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2741:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2770:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2794:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2812:45: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                            LOOP_IS_REACHABLE while(true) {
+                                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2858:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2884:41: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                        LOOP_IS_REACHABLE while(true) {
+                                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2927:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2957:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:2991:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3015:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3037:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3061:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3086:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3135:37: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                    LOOP_IS_REACHABLE while(true) {
+                                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3182:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3208:45: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                            LOOP_IS_REACHABLE while(true) {
+                                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3252:41: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                        LOOP_IS_REACHABLE while(true) {
+                                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3276:41: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                        LOOP_IS_REACHABLE while(true) {
+                                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3298:41: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                        LOOP_IS_REACHABLE while(true) {
+                                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3318:41: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                        LOOP_IS_REACHABLE while(true) {
+                                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3342:41: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                        LOOP_IS_REACHABLE while(true) {
+                                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3371:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3400:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3435:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3573:33: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                                LOOP_IS_REACHABLE while(true) {
+                                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3614:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3646:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3693:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3721:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3752:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3781:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3810:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3844:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3877:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3905:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3937:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:3964:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4157:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4283:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4314:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4342:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4379:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4412:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4447:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4476:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4506:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4543:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4576:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4637:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4674:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4702:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4730:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4758:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4786:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4833:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4862:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4890:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4919:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4950:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:4266:23: warning: unused variable 'c0_' [-Wunused-variable]
+                float c0_ = 0.5 * (h_val0_ + _e4385);
+                      ^
+program_source:4268:23: warning: unused variable 'c1_' [-Wunused-variable]
+                float c1_ = 0.5 * (h_val1_ + _e4392);
+                      ^
+program_source:4272:23: warning: unused variable 'alpha_m_1' [-Wunused-variable]
+                float alpha_m_1 = metal::clamp(_e4404, 0.01, 0.1);
+                      ^
+program_source:4470:23: warning: unused variable 'proposal_norm' [-Wunused-variable]
+                float proposal_norm = metal::sqrt(metal::max(_e4666, 0.000001));
+                      ^
+program_source:5031:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5072:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5129:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5161:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5199:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5232:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5255:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5283:25: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                        LOOP_IS_REACHABLE while(true) {
+                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5325:17: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                LOOP_IS_REACHABLE while(true) {
+                ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5359:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5382:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5432:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5454:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5475:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5495:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5519:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5580:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5606:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5624:29: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                            LOOP_IS_REACHABLE while(true) {
+                            ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5660:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5689:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5716:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5737:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5761:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5784:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5826:25: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                        LOOP_IS_REACHABLE while(true) {
+                        ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5909:21: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+                    LOOP_IS_REACHABLE while(true) {
+                    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:5980:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+program_source:6004:5: warning: 'if' initialization statements are a C++17 extension [-Wc++17-extensions]
+    LOOP_IS_REACHABLE while(true) {
+    ^
+program_source:576:31: note: expanded from macro 'LOOP_IS_REACHABLE'
+#define LOOP_IS_REACHABLE if (volatile bool unpredictable_jump_over_loop = true; unpredictable_jump_over_loop)
+                              ^
+
+
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -145,7 +145,11 @@ fn make_ar_sequence(
     seq.push(vocab.tok_key_base + query_key);
     seq.push(vocab.tok_query);
     seq.push(vocab.tok_val_base + query_val); // answer token (last)
-    ArSequence { seq, query_key, query_val }
+    ArSequence {
+        seq,
+        query_key,
+        query_val,
+    }
 }
 
 // ── Train/eval full sequence when GPU capacity fits; chunk only as fallback ───
@@ -233,22 +237,27 @@ fn train_ar_sequence(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f3
     let total_len = inputs.len();
     let full_cap = effective_full_cap(trainer, ctx_len);
     let mut last_loss = f32::NAN;
-    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, _final_chunk| {
-        if !first && assoc_local_segment_mode() {
-            trainer.reset_local_segment_state();
-        }
-        let mut chunk_targets = if segment_dense_train_mode() {
-            targets[start..end].to_vec()
-        } else {
-            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start]
-        };
-        if !segment_dense_train_mode() && end == total_len {
-            if let Some(last) = chunk_targets.last_mut() {
-                *last = targets[end - 1];
+    run_sequence_chunks(
+        total_len,
+        ctx_len,
+        full_cap,
+        |first, start, end, _final_chunk| {
+            if !first && assoc_local_segment_mode() {
+                trainer.reset_local_segment_state();
             }
-        }
-        last_loss = trainer.train_sequence(&inputs[start..end], &chunk_targets, first, eps);
-    });
+            let mut chunk_targets = if segment_dense_train_mode() {
+                targets[start..end].to_vec()
+            } else {
+                vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start]
+            };
+            if !segment_dense_train_mode() && end == total_len {
+                if let Some(last) = chunk_targets.last_mut() {
+                    *last = targets[end - 1];
+                }
+            }
+            last_loss = trainer.train_sequence(&inputs[start..end], &chunk_targets, first, eps);
+        },
+    );
 
     last_loss
 }
@@ -269,33 +278,38 @@ fn train_ar_sequence_with_assoc_trace(
     let full_cap = effective_full_cap(trainer, ctx_len);
     let mut last_loss = f32::NAN;
     let mut trace = Vec::new();
-    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
-        if !first && assoc_local_segment_mode() {
-            trainer.reset_local_segment_state();
-        }
-        let mut chunk_targets = if segment_dense_train_mode() {
-            targets[start..end].to_vec()
-        } else {
-            vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start]
-        };
-        if !segment_dense_train_mode() && final_chunk {
-            if let Some(last) = chunk_targets.last_mut() {
-                *last = targets[end - 1];
+    run_sequence_chunks(
+        total_len,
+        ctx_len,
+        full_cap,
+        |first, start, end, final_chunk| {
+            if !first && assoc_local_segment_mode() {
+                trainer.reset_local_segment_state();
             }
-        }
-        last_loss = trainer.train_sequence(&inputs[start..end], &chunk_targets, first, eps);
-        if let Some(gpu) = trainer.gpu_deq.as_ref() {
-            let fw = gpu.read_debug_buffer();
-            trace.push(format_assoc_chunk_summary(
-                trainer,
-                &fw,
-                trace.len(),
-                start,
-                end,
-                final_chunk,
-            ));
-        }
-    });
+            let mut chunk_targets = if segment_dense_train_mode() {
+                targets[start..end].to_vec()
+            } else {
+                vec![aideen_backbone::gpu_lm_head::GpuLmHeadTrainer::IGNORE_TARGET; end - start]
+            };
+            if !segment_dense_train_mode() && final_chunk {
+                if let Some(last) = chunk_targets.last_mut() {
+                    *last = targets[end - 1];
+                }
+            }
+            last_loss = trainer.train_sequence(&inputs[start..end], &chunk_targets, first, eps);
+            if let Some(gpu) = trainer.gpu_deq.as_ref() {
+                let fw = gpu.read_debug_buffer();
+                trace.push(format_assoc_chunk_summary(
+                    trainer,
+                    &fw,
+                    trace.len(),
+                    start,
+                    end,
+                    final_chunk,
+                ));
+            }
+        },
+    );
 
     (last_loss, trace)
 }
@@ -309,15 +323,21 @@ fn eval_answer_loss(trainer: &mut Trainer, seq: &[u32], ctx_len: usize, eps: f32
     let total_len = inputs.len();
     let full_cap = effective_full_cap(trainer, ctx_len);
     let mut answer_loss = f32::NAN;
-    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
-        if !first && assoc_local_segment_mode() {
-            trainer.reset_local_segment_state();
-        }
-        let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
-        if final_chunk {
-            answer_loss = trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
-        }
-    });
+    run_sequence_chunks(
+        total_len,
+        ctx_len,
+        full_cap,
+        |first, start, end, final_chunk| {
+            if !first && assoc_local_segment_mode() {
+                trainer.reset_local_segment_state();
+            }
+            let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
+            if final_chunk {
+                answer_loss =
+                    trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
+            }
+        },
+    );
 
     answer_loss
 }
@@ -338,26 +358,32 @@ fn eval_answer_loss_with_assoc_trace(
     let full_cap = effective_full_cap(trainer, ctx_len);
     let mut answer_loss = f32::NAN;
     let mut trace = Vec::new();
-    run_sequence_chunks(total_len, ctx_len, full_cap, |first, start, end, final_chunk| {
-        if !first && assoc_local_segment_mode() {
-            trainer.reset_local_segment_state();
-        }
-        let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
-        if final_chunk {
-            answer_loss = trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
-        }
-        if let Some(gpu) = trainer.gpu_deq.as_ref() {
-            let fw = gpu.read_debug_buffer();
-            trace.push(format_assoc_chunk_summary(
-                trainer,
-                &fw,
-                trace.len(),
-                start,
-                end,
-                final_chunk,
-            ));
-        }
-    });
+    run_sequence_chunks(
+        total_len,
+        ctx_len,
+        full_cap,
+        |first, start, end, final_chunk| {
+            if !first && assoc_local_segment_mode() {
+                trainer.reset_local_segment_state();
+            }
+            let _ = trainer.train_sequence(&inputs[start..end], &targets[start..end], first, eps);
+            if final_chunk {
+                answer_loss =
+                    trainer.eval_cached_hpooled_token_loss(end - start - 1, targets[end - 1]);
+            }
+            if let Some(gpu) = trainer.gpu_deq.as_ref() {
+                let fw = gpu.read_debug_buffer();
+                trace.push(format_assoc_chunk_summary(
+                    trainer,
+                    &fw,
+                    trace.len(),
+                    start,
+                    end,
+                    final_chunk,
+                ));
+            }
+        },
+    );
 
     (answer_loss, trace)
 }
@@ -482,7 +508,11 @@ fn format_lm_top_debug(
         }
     }
     let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let denom = logits.iter().map(|x| (*x - mx).exp()).sum::<f32>().max(1e-20);
+    let denom = logits
+        .iter()
+        .map(|x| (*x - mx).exp())
+        .sum::<f32>()
+        .max(1e-20);
     let target_idx = target as usize;
     let target_prob = if target_idx < logits.len() {
         (logits[target_idx] - mx).exp() / denom
@@ -496,7 +526,10 @@ fn format_lm_top_debug(
     for slot in 0..h_slots {
         let slot_base = token_base + slot * d;
         let slot_logits = compute_logits(&h_slots_flat[slot_base..slot_base + d], None);
-        let slot_mx = slot_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let slot_mx = slot_logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
         let slot_denom = slot_logits
             .iter()
             .map(|x| (*x - slot_mx).exp())
@@ -531,11 +564,7 @@ fn format_lm_top_debug(
     let mut chosen_read_target_logit = f32::NEG_INFINITY;
     for slot in 0..h_slots {
         let query_pick_base = 940 + slot * 2;
-        let slot_read_bank = debug
-            .get(query_pick_base)
-            .copied()
-            .unwrap_or(0.0)
-            .max(0.0) as usize;
+        let slot_read_bank = debug.get(query_pick_base).copied().unwrap_or(0.0).max(0.0) as usize;
         let slot_read_prob = debug
             .get(query_pick_base + 1)
             .copied()
@@ -550,7 +579,10 @@ fn format_lm_top_debug(
             }
             let bank_value = &assoc_state[value_base..value_base + d];
             let bank_logits = compute_logits(bank_value, None);
-            let bank_mx = bank_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let bank_mx = bank_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
             let bank_denom = bank_logits
                 .iter()
                 .map(|x| (*x - bank_mx).exp())
@@ -581,8 +613,7 @@ fn format_lm_top_debug(
                 chosen_read_bank = bank;
                 chosen_read_prob = slot_read_prob;
                 chosen_read_target_prob = bank_target_prob;
-                chosen_read_target_logit =
-                    bank_logits.get(target_idx).copied().unwrap_or(f32::NAN);
+                chosen_read_target_logit = bank_logits.get(target_idx).copied().unwrap_or(f32::NAN);
             }
             if bank_target_prob > best_bank_target_prob {
                 best_bank_slot = slot;
@@ -602,7 +633,10 @@ fn format_lm_top_debug(
                     fused[j] += bank_value[j];
                 }
                 let fused_logits = compute_logits(&fused, Some(&assoc_h[..d]));
-                let fused_mx = fused_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let fused_mx = fused_logits
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let fused_denom = fused_logits
                     .iter()
                     .map(|x| (*x - fused_mx).exp())
@@ -759,12 +793,7 @@ fn format_assoc_chunk_summary(
 }
 
 #[cfg(feature = "wgpu")]
-fn format_assoc_forward_debug(
-    trainer: &Trainer,
-    fw: &[f32],
-    label: &str,
-    loss: f32,
-) -> String {
+fn format_assoc_forward_debug(trainer: &Trainer, fw: &[f32], label: &str, loss: f32) -> String {
     let h = trainer.config.h_slots;
     let mut parts = Vec::with_capacity(h);
     let mut query_parts = Vec::with_capacity(h);
@@ -892,7 +921,10 @@ fn main() {
         })
         .unwrap_or(false);
     if oracle_write_pos_enabled && std::env::var("AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS").is_err() {
-        std::env::set_var("AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS", pairs_per_seq.to_string());
+        std::env::set_var(
+            "AIDEEN_ASSOC_ORACLE_PREFIX_PAIRS",
+            pairs_per_seq.to_string(),
+        );
     }
     // AIDEEN_SEQ_CAP override removed to enforce strict local learning chunking.
     // The sequence will now be properly split into ctx_len chunks by run_sequence_chunks.
@@ -1004,10 +1036,9 @@ fn main() {
             .unwrap_or("1")
             != "0";
     }
-    if let Ok(v) = std::env::var("AIDEEN_DAMPING").and_then(|s| {
-        s.parse::<f32>()
-            .map_err(|_| std::env::VarError::NotPresent)
-    }) {
+    if let Ok(v) = std::env::var("AIDEEN_DAMPING")
+        .and_then(|s| s.parse::<f32>().map_err(|_| std::env::VarError::NotPresent))
+    {
         trainer.adaptive_damping = v;
         trainer.reasoning.damping = v;
     }
@@ -1089,10 +1120,16 @@ fn main() {
         let (loss, train_trace) = if assoc_audit {
             train_ar_sequence_with_assoc_trace(&mut trainer, &ar.seq, ctx_len, eps)
         } else {
-            (train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps), Vec::new())
+            (
+                train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps),
+                Vec::new(),
+            )
         };
         #[cfg(not(feature = "wgpu"))]
-        let (loss, train_trace) = (train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps), Vec::new());
+        let (loss, train_trace) = (
+            train_ar_sequence(&mut trainer, &ar.seq, ctx_len, eps),
+            Vec::new(),
+        );
         if loss.is_finite() {
             train_loss_sum += loss;
             train_valid += 1;
@@ -1274,10 +1311,15 @@ fn main() {
             let b_event_assoc_base = w_event_assoc_base + h * d;
             let wk_assoc_gpu_rms = rms(hist.get(w_k_assoc_base..w_v_assoc_base).unwrap_or(&[]));
             let wv_assoc_gpu_rms = rms(hist.get(w_v_assoc_base..w_q_assoc_base).unwrap_or(&[]));
-            let wq_assoc_gpu_rms =
-                rms(hist.get(w_q_assoc_base..w_q_assoc_base + h * d * rank).unwrap_or(&[]));
-            let event_w = hist.get(w_event_assoc_base..b_event_assoc_base).unwrap_or(&[]);
-            let event_b = hist.get(b_event_assoc_base..b_event_assoc_base + h).unwrap_or(&[]);
+            let wq_assoc_gpu_rms = rms(hist
+                .get(w_q_assoc_base..w_q_assoc_base + h * d * rank)
+                .unwrap_or(&[]));
+            let event_w = hist
+                .get(w_event_assoc_base..b_event_assoc_base)
+                .unwrap_or(&[]);
+            let event_b = hist
+                .get(b_event_assoc_base..b_event_assoc_base + h)
+                .unwrap_or(&[]);
             let event_w_max = event_w.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
             let event_b_mean = event_b.iter().copied().sum::<f32>() / event_b.len().max(1) as f32;
             let event_b_min = event_b.iter().copied().fold(f32::INFINITY, f32::min);
@@ -1453,7 +1495,8 @@ fn main() {
             let mut case_trace: Option<Vec<String>> = None;
             #[cfg(feature = "wgpu")]
             let aloss = if assoc_audit {
-                let (loss, trace) = eval_answer_loss_with_assoc_trace(&mut trainer, &seq, ctx_len, eps);
+                let (loss, trace) =
+                    eval_answer_loss_with_assoc_trace(&mut trainer, &seq, ctx_len, eps);
                 case_trace = Some(trace);
                 if let Some(gpu) = trainer.gpu_deq.as_ref() {
                     let fw = gpu.read_debug_buffer();
@@ -1472,7 +1515,10 @@ fn main() {
                                 ),
                                 loss,
                             ),
-                            case_trace.as_ref().map(|t| t.join(" || ")).unwrap_or_default()
+                            case_trace
+                                .as_ref()
+                                .map(|t| t.join(" || "))
+                                .unwrap_or_default()
                         ));
                     }
                 }
@@ -1489,18 +1535,17 @@ fn main() {
             // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove once per-key/per-value failure distribution is closed.
             if assoc_audit {
                 #[cfg(feature = "wgpu")]
-                let lm_top =
-                    format_lm_top_debug(
-                        &trainer,
-                        final_cached_token_index(
-                            seq.len() - 1,
-                            ctx_len,
-                            effective_full_cap(&trainer, ctx_len),
-                        ),
-                        ar_vocab.tok_key_base + ar.query_key,
-                        ar_vocab.tok_query,
-                        ar_vocab.tok_val_base + ar.query_val,
-                    );
+                let lm_top = format_lm_top_debug(
+                    &trainer,
+                    final_cached_token_index(
+                        seq.len() - 1,
+                        ctx_len,
+                        effective_full_cap(&trainer, ctx_len),
+                    ),
+                    ar_vocab.tok_key_base + ar.query_key,
+                    ar_vocab.tok_query,
+                    ar_vocab.tok_val_base + ar.query_val,
+                );
                 #[cfg(not(feature = "wgpu"))]
                 let lm_top = "lm_top=NA".to_string();
                 #[cfg(feature = "wgpu")]
@@ -1516,7 +1561,10 @@ fn main() {
                     aloss,
                     lm_top,
                     solve_dbg,
-                    case_trace.as_ref().map(|t| t.join(" || ")).unwrap_or_default()
+                    case_trace
+                        .as_ref()
+                        .map(|t| t.join(" || "))
+                        .unwrap_or_default()
                 );
             }
         }

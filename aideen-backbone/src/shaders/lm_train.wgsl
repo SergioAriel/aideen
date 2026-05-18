@@ -29,6 +29,7 @@ struct TrainParams {
     active_targets: u32,
     tie_lambda_bits: u32,
     assoc_logit_lambda_bits: u32,
+    full_vocab_estimate: u32,
 };
 
 @group(0) @binding(0)  var<uniform>            params:          TrainParams;
@@ -110,6 +111,12 @@ fn lm_probs_main(
 
     // --- 2. Apply RMSNorm + g_lm scale, cache to s_h_rms ---
     let rms = s_rms;
+    let full_vocab_estimate = params.full_vocab_estimate != 0u && params.num_samples < params.vocab_size;
+    let neg_scale = select(
+        1.0,
+        f32(max(1u, params.vocab_size - 1u)) / f32(max(1u, params.num_samples - 1u)),
+        full_vocab_estimate
+    );
     for (var i = tid; i < d_model; i += WG_SIZE) {
         let normed        = (h_pooled[base_h + i] / rms) * g_lm[i];
         s_h_rms[s_h_rms_idx(t, i)] = normed;
@@ -175,9 +182,10 @@ fn lm_probs_main(
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
         let v = sampled_indices[k];
         let e = exp(probs[probs_idx(t, k)] - mx);
-        probs[probs_idx(t, k)] = e;
+        let sample_weight = select(neg_scale, 1.0, v == target_v);
+        probs[probs_idx(t, k)] = e * sample_weight;
         if (v == target_v) { local_target_exp = local_target_exp + e; }
-        local_sum = local_sum + e;
+        local_sum = local_sum + e * sample_weight;
     }
     s_scratch[tid] = local_sum;
     s_h_tile[tid] = local_target_exp;

@@ -432,8 +432,7 @@ impl FixedPointMemoryReasoning {
                     for dim in 0..d_r {
                         let phi0 = 0.047 * dim as f32;
                         let phi1 = 0.089 * dim as f32;
-                        slot_code[(slot, dim)] =
-                            0.08_f32 * (theta + phi0).sin()
+                        slot_code[(slot, dim)] = 0.08_f32 * (theta + phi0).sin()
                             + 0.08_f32 * (theta + phi1).cos()
                             + rng.gen_range(-0.005_f32..0.005_f32);
                     }
@@ -447,8 +446,7 @@ impl FixedPointMemoryReasoning {
                     for dim in 0..d_r {
                         let phi0 = 0.047 * dim as f32;
                         let phi1 = 0.089 * dim as f32;
-                        slot_code[(slot, dim)] =
-                            0.08_f32 * (theta + phi0).sin()
+                        slot_code[(slot, dim)] = 0.08_f32 * (theta + phi0).sin()
                             + 0.08_f32 * (theta + phi1).cos()
                             + rng.gen_range(-0.005_f32..0.005_f32);
                     }
@@ -971,7 +969,8 @@ impl FixedPointMemoryReasoning {
                 if data.len() != expected {
                     return Err(format!(
                         "reasoning.w_k_write size mismatch: expected {}, got {}",
-                        expected, data.len()
+                        expected,
+                        data.len()
                     ));
                 }
                 self.w_k_write =
@@ -985,7 +984,8 @@ impl FixedPointMemoryReasoning {
                 if data.len() != expected {
                     return Err(format!(
                         "reasoning.w_v_write size mismatch: expected {}, got {}",
-                        expected, data.len()
+                        expected,
+                        data.len()
                     ));
                 }
                 self.w_v_write =

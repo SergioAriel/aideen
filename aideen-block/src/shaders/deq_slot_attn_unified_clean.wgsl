@@ -66,6 +66,8 @@ override ENABLE_ASSOC_READ: bool = true;
 override ENABLE_ASSOC_POST_HSTAR: bool = false;
 override ENABLE_SEGMENT_MEMORY_TOKEN: bool = false;
 override ENABLE_ASSOC_PERSISTENT: bool = false;
+override ENABLE_SLOT_OWNER_PREPASS: bool = false;
+override SLOT_OWNER_MIN_GATE: f32 = 0.10;
 const SLOT_COORD_USE_BIAS: bool = true;
 const SLOT_COORD_LOGIT_GAIN: f32 = 2.0;
 const WG_SIZE: u32 = 256u;
@@ -168,6 +170,9 @@ struct DiagScalars {
     max_contractivity: f32,
     max_h_seen: f32,
     hhist_gamma_wg: f32,
+    sum_owner_current_seen: f32,
+    sum_owner_prev_seen: f32,
+    sum_owner_prev_gate_seen: f32,
 }
 var<workgroup> wg_diags: DiagScalars;
 var<workgroup> total_iters_seen: u32;
@@ -232,6 +237,22 @@ fn b_event_assoc_base(d: u32, h: u32) -> u32 { return w_event_assoc_base(d, h) +
 
 fn scratch_stride(d: u32, h: u32) -> u32 {
     return d * (h * 8u) + h * h + h;
+}
+
+fn slot_owner_current_base(batch_scratch_t: u32, d: u32, h: u32) -> u32 {
+    let signal_span = d * h;
+    return batch_scratch_t + signal_span * 2u;
+}
+
+fn slot_owner_prev_base(batch_scratch_t: u32, d: u32, h: u32) -> u32 {
+    return slot_owner_current_base(batch_scratch_t, d, h) + h;
+}
+
+fn slot_owner_gate(prob: f32, h_slots: u32) -> f32 {
+    let p = finite_or(prob, 1.0 / max(1.0, f32(h_slots)));
+    let owner_gain = clamp(p * max(1.0, f32(h_slots)), 0.0, 1.0);
+    let min_gate = clamp(SLOT_OWNER_MIN_GATE, 0.0, 1.0);
+    return min_gate + (1.0 - min_gate) * owner_gain;
 }
 
 @group(0) @binding(11) var<storage, read_write> H_hist: array<f32>;
@@ -553,6 +574,9 @@ fn deq_slot_coord_unified_main(
         wg_diags.last_delta = 0.0;
         wg_diags.max_contractivity = 0.0;
         wg_diags.max_h_seen = 1.0;
+        wg_diags.sum_owner_current_seen = 0.0;
+        wg_diags.sum_owner_prev_seen = 0.0;
+        wg_diags.sum_owner_prev_gate_seen = 0.0;
         total_iters_seen = 0u;
         failed_hits_seen = 0u;
         converged_flag_wg = 0u;
@@ -688,6 +712,45 @@ fn deq_slot_coord_unified_main(
         let signal_base = batch_scratch_t + slot_offset;
         let attn_base = batch_scratch_t + signal_span + slot_offset;
         let alpha_base = batch_scratch_t + signal_span * 2u;
+        let owner_current_base = slot_owner_current_base(batch_scratch_t, d_model, h_slots);
+        let owner_prev_base = slot_owner_prev_base(batch_scratch_t, d_model, h_slots);
+        let slot_owner_current_raw = select(
+            1.0 / max(1.0, f32(h_slots)),
+            Scratch[owner_current_base + slot_idx],
+            ENABLE_SLOT_OWNER_PREPASS,
+        );
+        let slot_owner_prev_raw = select(
+            1.0 / max(1.0, f32(h_slots)),
+            Scratch[owner_prev_base + slot_idx],
+            ENABLE_SLOT_OWNER_PREPASS,
+        );
+        let slot_owner_current_prob = slot_owner_current_raw;
+        let slot_owner_prev_prob = slot_owner_prev_raw;
+        let slot_owner_current_role_prob = select(
+            slot_owner_current_raw,
+            0.0,
+            ENABLE_SLOT_OWNER_PREPASS && slot_idx >= (h_slots / 2u),
+        );
+        let slot_owner_prev_role_prob = select(
+            slot_owner_prev_raw,
+            0.0,
+            ENABLE_SLOT_OWNER_PREPASS && slot_idx < (h_slots / 2u),
+        );
+        let slot_owner_current_gate = select(
+            1.0,
+            slot_owner_gate(slot_owner_current_role_prob, max(1u, h_slots / 2u)),
+            ENABLE_SLOT_OWNER_PREPASS,
+        );
+        let slot_owner_prev_gate = select(
+            1.0,
+            slot_owner_gate(slot_owner_prev_role_prob, max(1u, h_slots - (h_slots / 2u))),
+            ENABLE_SLOT_OWNER_PREPASS,
+        );
+        let slot_owner_prev_diag_gate = select(
+            1.0,
+            slot_owner_gate(slot_owner_prev_prob, h_slots),
+            ENABLE_SLOT_OWNER_PREPASS,
+        );
         let s_in_base = (batch_idx * shape.seq_len + global_t) * d_model;
         let use_prev_token_mem = t > 0u;
         var prev_hist_base_t = 0u;
@@ -748,6 +811,15 @@ fn deq_slot_coord_unified_main(
         if (debug_on && slot_idx == 0u && tid == 0u && t == 0u) {
             DebugLog[8] = 121.0;
         }
+        if (tid == 0u) {
+            wg_diags.sum_owner_current_seen =
+                wg_diags.sum_owner_current_seen + slot_owner_current_prob;
+            wg_diags.sum_owner_prev_seen =
+                wg_diags.sum_owner_prev_seen + slot_owner_prev_prob;
+            wg_diags.sum_owner_prev_gate_seen =
+                wg_diags.sum_owner_prev_gate_seen + slot_owner_prev_diag_gate;
+        }
+        workgroupBarrier();
 
         // Historical state sources are loaded as stop-grad constants before Picard.
         // ENABLE_H_HIST and ENABLE_FPM remain mutually exclusive because both use
@@ -1092,7 +1164,7 @@ fn deq_slot_coord_unified_main(
                 // Model A: memory is a token-fixed context. Its strength should depend on
                 // how selective the token's content lookup is, not on the current Picard
                 // error of H. The gate is frozen from the first read of the token.
-                let read_gate = shared_vals[0];
+                let read_gate = shared_vals[0] * slot_owner_current_gate;
                 let mem_unit0 = tanh(mem_raw0);
                 let mem_unit1 = tanh(mem_raw1);
                 let mem_unit_sq = mem_unit0 * mem_unit0 + mem_unit1 * mem_unit1;
@@ -1183,7 +1255,9 @@ fn deq_slot_coord_unified_main(
                         }
                         assoc_scratch[1024u + ASSOC_BANKS] = q_norm;
                         var slot_read_allowed = 1.0;
-                        if (ENABLE_ASSOC_SLOT_OWNER && ENABLE_ASSOC_HASH_LANE) {
+                        if (ENABLE_SLOT_OWNER_PREPASS) {
+                            slot_read_allowed = slot_owner_prev_gate;
+                        } else if (ENABLE_ASSOC_SLOT_OWNER && ENABLE_ASSOC_HASH_LANE) {
                             let assoc_slot_start_read = h_slots / 2u;
                             let assoc_slot_count_read = max(1u, h_slots - assoc_slot_start_read);
                             let owner_slot = assoc_hash_lane_from_assoc_scratch(
@@ -1476,8 +1550,8 @@ fn deq_slot_coord_unified_main(
                         }
                     }
                     workgroupBarrier();
-                    let assoc_rms = sqrt(assoc_scratch[0] / max(1.0, f32(d_model)));
-                    let assoc_scale = 1.0 / max(assoc_rms, 0.1); // Soft normalization floor
+                    let assoc_norm = sqrt(max(assoc_scratch[0], 1.0e-6));
+                    let assoc_scale = signal_norm * read_residual_scale / max(assoc_norm, 1.0e-6);
                     assoc_inj0 = alpha_assoc * assoc_ctx0 * assoc_scale;
                     assoc_inj1 = alpha_assoc * assoc_ctx1 * assoc_scale;
                     let assoc_export0 = assoc_ctx0;
@@ -1587,7 +1661,7 @@ fn deq_slot_coord_unified_main(
                 let nscale = AllWeights[nscale_base + d];
                 let attn_val = Scratch[attn_base + d] * slot_attn_scale;
                 let f_h = nscale * (H_next[h_base_t + slot_offset + d] / rms);
-                let blend = select(shape.damping, alpha_h, fpm_policy_enabled && d_model == WG_SIZE * 2u);
+                let blend = select(shape.damping, alpha_h, fpm_inject_enabled && d_model == WG_SIZE * 2u);
                 let val = blend * f_h + (1.0 - blend) * h_prev;
                 let delta_h = val - h_prev;
                 local_delta_h_num = local_delta_h_num + delta_h * delta_h;
@@ -1736,7 +1810,12 @@ fn deq_slot_coord_unified_main(
                 if ((enable_slot_coord && !ENABLE_FPM || model_a_memory_bootstrap) && iter > 0u) {
                     recurrent_iter = iter - 1u;
                 }
-                if (recurrent_iter > 0u && d_prev > 1e-12 && d_prev > shape.epsilon * 10.0) {
+                let contractivity_floor = max(homeo_band, shape.epsilon * 10.0);
+                if (
+                    recurrent_iter > 0u
+                    && d_prev > contractivity_floor
+                    && d_curr > contractivity_floor
+                ) {
                     wg_diags.max_contractivity = max(wg_diags.max_contractivity, d_curr / d_prev);
                 }
                 wg_diags.last_delta = d_curr;
@@ -1818,9 +1897,14 @@ fn deq_slot_coord_unified_main(
                 let w = slot_coord_weights[ms];
                 entropy = entropy - w * log(max(w, 1e-12));
             }
-            wg_diags.sum_self_assign_seen = wg_diags.sum_self_assign_seen + slot_coord_weights[slot_idx];
+            let self_assign = select(
+                slot_coord_weights[slot_idx],
+                slot_owner_current_prob,
+                ENABLE_SLOT_OWNER_PREPASS,
+            );
+            wg_diags.sum_self_assign_seen = wg_diags.sum_self_assign_seen + self_assign;
             wg_diags.sum_assign_entropy_seen = wg_diags.sum_assign_entropy_seen + entropy;
-            if (slot_coord_weights[slot_idx] < FPM_DEAD_THRESHOLD) {
+            if (self_assign < FPM_DEAD_THRESHOLD) {
                 wg_diags.dead_slot_seen = wg_diags.dead_slot_seen + 1.0;
             }
             if (wg_diags.max_z_seen > FPM_SAT_THRESHOLD) {
@@ -1984,7 +2068,7 @@ fn deq_slot_coord_unified_main(
             // and the carried memory, not just the magnitude of the candidate.
             let diff_norm = sqrt(max(shared_vals[0], 1e-6));
             let novelty = diff_norm / (diff_norm + prev_norm + 1e-6);
-            let z = clamp(raw_z, 0.0, 1.0);
+            let z = clamp(raw_z * slot_owner_current_gate, 0.0, 1.0);
             // Retain gate (low-rank r=32): retain = σ(W_down · (W_up · c) + b_retain)
             // Replaces uniform fatigue decay with input-dependent selective forgetting.
             let hist_base_r = aw_hist_base(d_model, h_slots);
@@ -2014,8 +2098,9 @@ fn deq_slot_coord_unified_main(
             // Retain is now a true preservation gate:
             // when novelty is low, preserve memory regardless of local write preference;
             // when novelty is high, the learned retain gate decides which dimensions stay fixed.
-            let retain0 = 1.0 - novelty * (1.0 - retain_raw0);
-            let retain1 = 1.0 - novelty * (1.0 - retain_raw1);
+            let owner_novelty = novelty * slot_owner_current_gate;
+            let retain0 = 1.0 - owner_novelty * (1.0 - retain_raw0);
+            let retain1 = 1.0 - owner_novelty * (1.0 - retain_raw1);
             let write_budget0 = (1.0 - retain0) * z;
             let write_budget1 = (1.0 - retain1) * z;
             let write0 = z * (residual_scale * proposal0);
@@ -2525,7 +2610,9 @@ fn deq_slot_coord_unified_main(
                 let assoc_slot_start = h_slots / 2u;
                 let assoc_slot_count = max(1u, h_slots - assoc_slot_start);
                 var p_slot_i = 1.0;
-                if (ENABLE_ASSOC_SLOT_OWNER) {
+                if (ENABLE_SLOT_OWNER_PREPASS) {
+                    p_slot_i = slot_owner_prev_gate;
+                } else if (ENABLE_ASSOC_SLOT_OWNER) {
                     if (ENABLE_ASSOC_HASH_LANE) {
                         let owner_slot = assoc_hash_lane_from_q_self(assoc_slot_start, assoc_slot_count);
                         let replica_slot = assoc_slot_start
@@ -2878,6 +2965,10 @@ fn deq_slot_coord_unified_main(
         DebugLog[slot_obs_base + 1u] = wg_diags.sum_assign_entropy_seen / token_den;
         DebugLog[slot_obs_base + 2u] = wg_diags.sum_slot_move_seen / token_den;
         DebugLog[384u + slot_idx] = wg_diags.max_a_delta_seen;
+        let owner_diag_base = 360u + slot_idx * 3u;
+        DebugLog[owner_diag_base + 0u] = wg_diags.sum_owner_current_seen / token_den;
+        DebugLog[owner_diag_base + 1u] = wg_diags.sum_owner_prev_seen / token_den;
+        DebugLog[owner_diag_base + 2u] = wg_diags.sum_owner_prev_gate_seen / token_den;
         let slot_diag_base = 400u + slot_idx * 12u;
         DebugLog[slot_diag_base + 0u] = wg_diags.max_err_h_seen;
         DebugLog[slot_diag_base + 1u] = wg_diags.max_err_m_seen;

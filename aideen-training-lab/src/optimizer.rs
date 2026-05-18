@@ -2,6 +2,7 @@
 
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
+use std::thread;
 
 /// Adam optimizer con first/second moment tracking.
 pub struct Adam {
@@ -48,11 +49,23 @@ impl Adam {
     pub fn get_mat(&self, key: &str) -> Option<&DMatrix<f32>> {
         self.m_mat.get(key)
     }
+    pub fn set_mat_v(&mut self, key: &str, val: DMatrix<f32>) {
+        self.v_mat.insert(key.to_string(), val);
+    }
+    pub fn get_mat_v(&self, key: &str) -> Option<&DMatrix<f32>> {
+        self.v_mat.get(key)
+    }
     pub fn set_vec(&mut self, key: &str, val: DVector<f32>) {
         self.m_vec.insert(key.to_string(), val);
     }
     pub fn get_vec(&self, key: &str) -> Option<&DVector<f32>> {
         self.m_vec.get(key)
+    }
+    pub fn set_vec_v(&mut self, key: &str, val: DVector<f32>) {
+        self.v_vec.insert(key.to_string(), val);
+    }
+    pub fn get_vec_v(&self, key: &str) -> Option<&DVector<f32>> {
+        self.v_vec.get(key)
     }
 
     /// Actualiza una DMatrix in-place con Adam.
@@ -87,6 +100,88 @@ impl Adam {
         }
     }
 
+    /// Variante in-place sobre slices contiguos, útil cuando el gradiente ya fue
+    /// acumulado exactamente y queremos evitar temporales de álgebra matricial.
+    pub fn step_matrix_scaled_inplace(
+        &mut self,
+        name: &str,
+        w: &mut DMatrix<f32>,
+        grad: &DMatrix<f32>,
+        grad_scale: f32,
+    ) {
+        let key = name.to_string();
+        let (nrows, ncols) = (w.nrows(), w.ncols());
+        let m = self
+            .m_mat
+            .entry(key.clone())
+            .or_insert_with(|| DMatrix::zeros(nrows, ncols));
+        let v = self
+            .v_mat
+            .entry(key)
+            .or_insert_with(|| DMatrix::zeros(nrows, ncols));
+
+        let t = self.t.max(1) as f32;
+        let bc1 = 1.0 - self.beta1.powf(t);
+        let bc2 = 1.0 - self.beta2.powf(t);
+        let w_slice = w.as_mut_slice();
+        let g_slice = grad.as_slice();
+        let m_slice = m.as_mut_slice();
+        let v_slice = v.as_mut_slice();
+        let len = w_slice.len();
+        let threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let use_parallel = std::env::var("AIDEEN_EXACT_ADAM_PAR")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false)
+            && threads > 1
+            && len >= 1_000_000;
+        if use_parallel {
+            let chunk = len.div_ceil(threads);
+            thread::scope(|scope| {
+                for (((w_chunk, m_chunk), v_chunk), g_chunk) in w_slice
+                    .chunks_mut(chunk)
+                    .zip(m_slice.chunks_mut(chunk))
+                    .zip(v_slice.chunks_mut(chunk))
+                    .zip(g_slice.chunks(chunk))
+                {
+                    let beta1 = self.beta1;
+                    let beta2 = self.beta2;
+                    let lr = self.lr;
+                    let eps = self.eps;
+                    scope.spawn(move || {
+                        for i in 0..w_chunk.len() {
+                            let g = g_chunk[i] * grad_scale;
+                            let m_new = beta1 * m_chunk[i] + (1.0 - beta1) * g;
+                            let v_new = beta2 * v_chunk[i] + (1.0 - beta2) * g * g;
+                            m_chunk[i] = m_new;
+                            v_chunk[i] = v_new;
+                            let m_hat = m_new / bc1;
+                            let v_hat = v_new / bc2;
+                            w_chunk[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+                        }
+                    });
+                }
+            });
+        } else {
+            for i in 0..len {
+                let g = g_slice[i] * grad_scale;
+                let m_new = self.beta1 * m_slice[i] + (1.0 - self.beta1) * g;
+                let v_new = self.beta2 * v_slice[i] + (1.0 - self.beta2) * g * g;
+                m_slice[i] = m_new;
+                v_slice[i] = v_new;
+                let m_hat = m_new / bc1;
+                let v_hat = v_new / bc2;
+                w_slice[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+            }
+        }
+    }
+
     /// Actualiza un DVector in-place con Adam.
     pub fn step_vector(&mut self, name: &str, w: &mut DVector<f32>, grad: &DVector<f32>) {
         let key = name.to_string();
@@ -109,6 +204,41 @@ impl Adam {
             let m_hat = m_i / bc1;
             let v_hat = v_i / bc2;
             *w_i -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+        }
+    }
+
+    pub fn step_vector_scaled_inplace(
+        &mut self,
+        name: &str,
+        w: &mut DVector<f32>,
+        grad: &DVector<f32>,
+        grad_scale: f32,
+    ) {
+        let key = name.to_string();
+        let len = w.len();
+        let m = self
+            .m_vec
+            .entry(key.clone())
+            .or_insert_with(|| DVector::zeros(len));
+        let v = self.v_vec.entry(key).or_insert_with(|| DVector::zeros(len));
+
+        let t = self.t.max(1) as f32;
+        let bc1 = 1.0 - self.beta1.powf(t);
+        let bc2 = 1.0 - self.beta2.powf(t);
+        let w_slice = w.as_mut_slice();
+        let g_slice = grad.as_slice();
+        let m_slice = m.as_mut_slice();
+        let v_slice = v.as_mut_slice();
+
+        for i in 0..w_slice.len() {
+            let g = g_slice[i] * grad_scale;
+            let m_new = self.beta1 * m_slice[i] + (1.0 - self.beta1) * g;
+            let v_new = self.beta2 * v_slice[i] + (1.0 - self.beta2) * g * g;
+            m_slice[i] = m_new;
+            v_slice[i] = v_new;
+            let m_hat = m_new / bc1;
+            let v_hat = v_new / bc2;
+            w_slice[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
         }
     }
 }
