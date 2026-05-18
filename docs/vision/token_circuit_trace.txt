@@ -1,0 +1,744 @@
+AIDEEN TOKEN CIRCUIT TRACE
+==========================
+
+Purpose
+-------
+This document is the authoritative living trace of the token lifecycle through AIDEEN.
+It must be updated whenever the model path, memory path, training path, GPU layout, or debugging understanding changes.
+
+Rule for completeness
+---------------------
+For every variable/function/buffer/env flag mentioned here, all transitive definitions, writes, reads, layout assumptions, and CPU/GPU crossings must be searched and understood before declaring the path stable.
+
+Current stabilization corridor
+------------------------------
+Benchmark: aideen-training-lab/src/bin/assoc_recall.rs
+Main command shape:
+AIDEEN_ASSOC_PERSISTENT=1 AIDEEN_DAMPING=0.4 AR_PAIRS_PER_SEQ=2 AR_AUDIT=1 AR_N_TRAIN=12 AR_N_EVAL=1 AIDEEN_DEBUG_SAMPLE=4 AIDEEN_ASSOC_EVENT_GATE=1 AIDEEN_ASSOC_BANKS=4 AIDEEN_ASSOC_LIBRARIAN_BWD=1 AIDEEN_ASSOC_LOGIT_LAMBDA=1.0 cargo run -p aideen-training --features wgpu --bin assoc_recall --release
+Log directory: logs/assoc_recall/
+
+0. Sequence construction
+------------------------
+File/function: aideen-training-lab/src/bin/assoc_recall.rs::make_ar_sequence
+Role:
+- Creates associative recall sequences.
+- Format for pairs=1: KEY_i VAL_i FILLER*gap KEY_i QUERY VAL_i.
+- Format for pairs>1: (KEY_j VAL_j)*N FILLER*gap KEY_q QUERY VAL_q.
+- The final VAL token is the answer target.
+
+Important tokens:
+- KEY tokens: TOK_KEY_BASE + key.
+- VAL tokens: TOK_VAL_BASE + val.
+- FILLER tokens: TOK_FILLER_BASE + random filler.
+- QUERY token: TOK_QUERY.
+
+Invariant:
+- The desired durable binding is previous KEY token -> current VAL token for the initial pair section.
+- Filler transitions should not overwrite or diffusely contaminate finite associative banks.
+
+Open trace tasks:
+- Document exact token constants and ranges after inspecting definitions.
+
+Slot Owner Prepass (experimental, opt-in)
+-----------------------------------------
+Files:
+- `aideen-block/src/shaders/slot_owner_prepass.wgsl`
+- `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`
+- `aideen-block/src/deq_bridge.rs`
+
+Flag:
+- `AIDEEN_SLOT_OWNER_PREPASS=1`
+
+Role:
+- Adds a separate GPU pass before the DEQ slot dispatch.
+- Dispatch shape is `(batch, token, 1)`, so each token has one owner source-of-truth before per-slot workgroups run.
+- Pass ordering in the command encoder is the global synchronization boundary; this avoids the invalid pattern of trying to coordinate slots through `var<workgroup>` inside one slot workgroup.
+
+Scratch staging:
+- Existing token scratch stride remains `signal_span * 3 + h_slots * h_slots`.
+- `owner_current_base = batch_scratch_t + signal_span * 2`.
+- `owner_prev_base = owner_current_base + h_slots`.
+- This reuses the first two rows of the alpha matrix as temporary staging. The DEQ shader reads owner before `compute_slot_coord` overwrites alpha, so buffer size and backward stride remain unchanged.
+
+Semantics:
+- `owner_current[s]`: softmax over all slot anchors against current raw token source `S_in[t]`.
+- `owner_prev[s]`: softmax over all slot anchors against previous source. For `t > 0`, source is `S_in[t-1]`; for chunk start, source falls back to carried `PrevHStarBuf`.
+- DEQ/FPM consumes `owner_current` as residual gate for FPM read, write, and retain.
+- Assoc consumes `owner_prev` as residual gate for read/write allocation.
+
+Invariant:
+- With `AIDEEN_SLOT_OWNER_PREPASS` omitted, all owner gates are neutral and default behavior is unchanged.
+- With the flag enabled, all local slot decisions consume the same precomputed token-level owner distribution instead of recomputing independent owner estimates inside each slot.
+- Trace whether any marker semantics are available to GPU shaders or only to benchmark code.
+
+Assoc Backward Circuit (current traced path)
+--------------------------------------------
+Files:
+- `aideen-backbone/src/shaders/lm_train.wgsl`
+- `aideen-backbone/src/gpu_lm_head.rs`
+- `aideen-backbone/src/shaders/staged_adjoint_picard_clean.wgsl`
+- `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`
+- `aideen-training-lab/src/trainer.rs`
+
+Path:
+- `deq_forward_pool.wgsl` pools `AssocReadBuf` into `Assoc_pooled`.
+- `gpu_lm_head.rs::train_step_no_readback` copies `Assoc_pooled` into LM scratch `dl_dh_temp_buf` before LM passes.
+- `lm_train.wgsl` uses `Assoc_pooled` in logits only when `AIDEEN_ASSOC_LOGIT_LAMBDA > 0`.
+- The same shader writes Assoc RHS into `s_h_rms`, exposed by `GpuLmHead::assoc_grad_buf()`.
+- `trainer.rs` passes that buffer as `rhs_slot_buf` into `run_staged_adjoint_picard_no_readback`.
+- `staged_adjoint_picard_clean.wgsl` adds `rhs_slot_buf[token, slot, dim]` to the per-slot adjoint RHS.
+- `fused_fpm_retain_bwd.wgsl` consumes `v_state`, `AssocHist`, and `AssocBuf` to accumulate Assoc read/write gradients, then applies updates to `W_q_assoc`, `W_k_assoc`, `W_v_assoc`, `W_event_assoc`, `b_event_assoc`, and `alpha_assoc`.
+
+Invariants:
+- If `AIDEEN_ASSOC_LOGIT_LAMBDA=0`, Assoc RHS must be zero because Assoc is not part of LM logits.
+- If `AIDEEN_ASSOC_BANKS=1`, bank-address gradients for `W_q_assoc/W_k_assoc` are structurally unobservable: there is no bank-selection decision to differentiate.
+- `AIDEEN_ASSOC_ADDR_LR_MULT` must be nonzero for valid address gradients to change `W_q_assoc/W_k_assoc`; default is `1.0` after the May 12 fix.
+
+1. Chunking and local segment execution
+---------------------------------------
+Files/functions:
+- aideen-training-lab/src/bin/assoc_recall.rs::run_sequence_chunks
+- train_ar_sequence
+- train_ar_sequence_with_assoc_trace
+- eval_answer_loss
+- eval_answer_loss_with_assoc_trace
+- aideen-training-lab/src/trainer.rs::train_sequence
+
+Role:
+- Splits full sequence into chunks if needed.
+- Uses first/reset flags to control whether sequence-local GPU state resets.
+- Training can use sparse final target or dense targets depending on AR_SEGMENT_DENSE_TRAIN.
+
+Important target behavior:
+- IGNORE_TARGET means LM loss/backward ignores that token.
+- Sparse mode trains only final answer target in a sequence/chunk.
+- Dense mode trains each next-token target, used only as an ablation so far.
+
+Observed failure relevance:
+- Sparse final loss gives weak/late signal to the event writer.
+- Dense-local did not solve long recall and worsened gap256 in the current probe.
+
+Open trace tasks:
+- Trace reset_local_segment_state and exactly which buffers it clears.
+- Trace effective_full_cap and assoc_local_segment_mode interactions.
+
+2. Trainer entrypoint
+---------------------
+File/function: aideen-training-lab/src/trainer.rs::train_sequence
+Role:
+- Uploads token sequence to GPU.
+- Runs DEQ/GPU forward.
+- Runs LM head forward/backward.
+- Runs staged adjoint/Picard backward.
+- Runs FPM/Assoc backward/update path.
+- Applies/accumulates optimizer updates.
+- Emits diagnostics.
+
+Key state owners:
+- Trainer owns high-level training loop and CPU-side objects.
+- GpuDeqBackend owns GPU DEQ/FPM/Assoc buffers and AllWeights/AllGradients.
+- GpuLmHeadTrainer owns LM head GPU buffers and reuses s_h_rms_buf as assoc RHS buffer in the current Metal limit workaround.
+
+Critical invariant:
+- GPU path is the effective training path. CPU sync must not silently average or overwrite per-slot GPU semantics except where explicitly documented as checkpoint/fallback behavior.
+
+Open trace tasks:
+- Trace every call inside train_sequence from forward through update with exact buffer inputs/outputs.
+- Document which CPU syncs are active in this corridor and whether they alter training state.
+
+3. Token embedding and S_in
+---------------------------
+Files/functions:
+- aideen-training-lab/src/trainer.rs sequence upload path.
+- aideen-backbone/src/gpu_deq.rs forward sequence buffer APIs.
+- aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl binding S_in.
+
+Role:
+- Converts token ids into vector input S_in for the GPU forward shader.
+- S_in is read by forward as the literal token signal and by backward to reconstruct Assoc query/key/value/event features.
+
+Important invariant:
+- Assoc binding currently uses literal normalized token identity from S_in, not DEQ scratch h*.
+- Previous token source is stored in PrevHStarBuf after each token.
+
+Known issue fixed previously:
+- PrevHStarBuf must store the literal assoc token source, not a scratch/clean signal that can be zero or contaminated in segmented long runs.
+
+Open trace tasks:
+- Identify exact embedding upload function and buffer layout.
+- Verify S_in layout is batch-major token-major d_model contiguous in both Rust and WGSL.
+
+4. Forward DEQ dispatch
+-----------------------
+Files/functions:
+- aideen-backbone/src/gpu_deq.rs::run_forward_from_seq_buf
+- run_forward_segmented_from_seq_buf
+- RustDeqBridge forward methods
+- aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl::deq_slot_coord_unified_main
+
+Role:
+- Runs the token loop and per-token fixed-point/slot update.
+- Maintains H_curr/H_next, Scratch, HistCtx, MState, AssocBuf, AssocHist, AssocReadBuf, PrevHStarBuf.
+
+Compile constants and flags:
+- ASSOC_BANKS
+- ASSOC_RANK
+- ASSOC_READ_BETA
+- ENABLE_ASSOC_TRANSITION_GATE
+- ENABLE_ASSOC_SLOT_ANCHOR
+- ENABLE_ASSOC_REUSE_MATCH
+- ENABLE_ASSOC_SLOT_STRIPE
+- ENABLE_ASSOC_SLOT_OWNER
+- ENABLE_ASSOC_TIE_QK
+- ENABLE_ASSOC_CONF_READ
+- ENABLE_ASSOC_READ
+- ENABLE_ASSOC_EVENT_GATE
+
+Critical invariant found 2026-04-28:
+- Forward and backward must receive the same Assoc compile constants.
+- A bug existed where AIDEEN_ASSOC_EVENT_GATE was passed to backward but not forward, so event parameters trained without affecting forward writes.
+
+5. Forward associative read
+---------------------------
+File/shader: aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+Buffers:
+- AssocBuf: durable bank memory, per slot and bank.
+- AssocReadBuf: selected/read context diagnostics or read state.
+- AllWeights: W_q_assoc, alpha_assoc, slot anchors, etc.
+
+Conceptual equation:
+- Query is built from previous associative source source_{t-1}.
+- Banks contain key/value/usage.
+- Read selects bank(s) by similarity between query and bank key.
+- Read context contributes to token representation/logit path depending active flags.
+
+Important diagnostics:
+- qmax, qctx, usage, spread, bank_cos, chosen_read_prob, target logit/prob.
+
+Observed failure:
+- Read often chooses occupied banks with nontrivial probability, but bank value/logit remains near random because bank contents are diffuse.
+
+Open trace tasks:
+- Trace exact read contribution into H/Scratch and LM output.
+- Determine whether LM head receives Assoc value directly, via h*, via late fuse, or diagnostic-only route for each flag.
+
+6. Forward associative write
+----------------------------
+File/shader: aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+Buffers:
+- PrevHStarBuf: previous token literal source.
+- AssocBuf: bank key/value/usage.
+- AssocHist: pre-write bank snapshot plus metadata for backward.
+- AllWeights: W_k_assoc, W_v_assoc, W_event_assoc, b_event_assoc, slot anchors.
+
+Current conceptual equation:
+- event_gate = sigmoid(W_event * feature(source_{t-1}, source_t) + b_event) when ENABLE_ASSOC_EVENT_GATE.
+- bind_gate = event_gate * has_prev_hstar.
+- slot allocator gives p_slot_i.
+- bank allocator gives p_bank.
+- allow_write = event_gate * p_slot_i * p_bank.
+- effective_bind_gate = bind_gate * allow_write * transition_gate.
+- effective_write_mass = effective_bind_gate^2 unless linear write flag is active.
+- bank_key <- (1 - mass) bank_key + mass * key(source_{t-1}).
+- bank_value <- (1 - mass) bank_value + mass * value(source_t).
+- usage updates with write mass.
+
+Known failure:
+- Long gaps still produce writes across filler tokens; finite banks become an EMA/mix of many tokens.
+- w_n remains proportional to sequence length in diagnostics.
+
+Known structural fix pending validation:
+- Forward now receives ENABLE_ASSOC_EVENT_GATE and related constants, matching backward.
+
+Open trace tasks:
+- Validate that event_b changes now reduce forward w_allow/w_gate.
+- If not, trace event feature, parameter offsets, and AllWeights indexing.
+
+7. Fixed Point Memory path
+--------------------------
+Files/shaders:
+- aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+- aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl
+- aideen-backbone/src/shaders/segment_memory_promote.wgsl
+
+Role:
+- FPM is the slower contextual/plastic memory carrier.
+- It should use richer context and may be informed by Assoc, but should not replace literal Assoc persistence.
+
+Current design intent:
+- Assoc: explicit/literal key-value persistence.
+- FPM: contextual/general consolidation and recurrent memory.
+- FPM may use Assoc content to decide what to persist or enrich context.
+
+Open trace tasks:
+- Fully map MState, fpm_m_cache, segment promote/load, and Assoc persistent carry.
+- Identify which FPM write backward paths are default, frozen, or experimental.
+
+8. LM head forward/backward
+---------------------------
+Files/shaders:
+- aideen-backbone/src/gpu_lm_head.rs
+- aideen-backbone/src/shaders/lm_train.wgsl
+
+Role:
+- Computes logits and loss from h/h_pooled.
+- Computes dL/dh.
+- Writes assoc RHS gradient through the current assoc_grad buffer path.
+
+Important current implementation note:
+- GpuLmHeadTrainer::assoc_grad_buf currently maps to s_h_rms_buf as a Metal storage-buffer-limit workaround.
+- The buffer is zeroed for IGNORE_TARGET and overwritten with dlassoc on active tokens.
+
+Known issue fixed previously:
+- Reusing s_h_rms without proper overwrite/zero semantics contaminated assoc RHS.
+
+Open trace tasks:
+- Document exact LM direct assoc logit path controlled by AIDEEN_ASSOC_LOGIT_LAMBDA.
+- Verify whether target logits from bank_value are coupled strongly enough to train/read.
+
+9. Staged adjoint / Picard backward
+-----------------------------------
+Files/shaders:
+- aideen-backbone/src/shaders/staged_adjoint_picard_clean.wgsl
+- aideen-backbone/src/gpu_deq.rs::run_staged_adjoint_picard_no_readback
+
+Role:
+- Solves/approximates DEQ backward adjoint.
+- Expands LM gradients into slot/h paths.
+- Supplies v_state/adjoints used by subsequent FPM/Assoc backward.
+
+Known issue fixed previously:
+- Slot-major v_next layout read mismatch was corrected.
+
+Open trace tasks:
+- Trace exact layout of adj_v_out and h_star per token/slot/dim.
+- Verify RHS clearing before every solve.
+
+10. FPM/Assoc backward and updates
+----------------------------------
+File/shader: aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl
+Role:
+- Sweeps tokens backward.
+- Reconstructs forward Assoc read/write decisions using AssocHist and S_in.
+- Backprops through bank read/write, event gate, slot/bank librarian, Wq/Wk/Wv assoc, alpha, and selected FPM paths.
+- Accumulates into AllGradients and/or applies updates.
+
+Important invariant:
+- Backward reconstruction must match forward equations and compile constants exactly.
+- AssocHist stores selected bank, allow_write, transition_gate, overwrite flag, and pre-write bank state.
+
+Current diagnostics:
+- val_rms
+- bevent_update_max
+- event_grad_signed
+- score_grad_max
+- wq_step_max / wk_step_max
+- wq_update_max / wk_update_max
+- key_grad_sum
+- gprev_sum
+- write_mass
+
+Known issues fixed previously:
+- Wk diagnostic was incomplete; Wk was not actually dead.
+- Divergent barrier/reduce path causing NaNs was fixed.
+- Double LR scaling in Wq_assoc local gradient was removed.
+- Assoc backward restricted to Assoc slots only.
+
+Open trace tasks:
+- Restore or relocate val_bad diagnostic because debug index 2 is temporarily reused for bevent_update_max.
+- Confirm all event/librarian gradients are not double-counted.
+
+11. HistParams / AllWeights layout
+----------------------------------
+Files:
+- aideen-backbone/src/gpu_deq.rs
+- aideen-training-lab/src/bin/assoc_recall.rs audit offsets
+- aideen-training-lab/src/trainer.rs GPU->CPU sync offsets
+- aideen-backbone/src/shaders/segment_memory_promote.wgsl
+- WGSL layout functions in deq_slot_attn_unified_clean.wgsl and fused_fpm_retain_bwd.wgsl
+
+Critical invariant:
+- Rust packing offsets must match WGSL layout functions exactly.
+
+Known issue fixed 2026-04-28:
+- CPU/debug treated b_delta as d, but GPU layout uses h*d.
+- This shifted all following sections including event params, causing misleading stats and possible parameter mismatch.
+- pack_history_params now expands shared CPU b_delta d-vector to h*d for GPU layout.
+- GPU->CPU sync averages h*d b_delta back into the CPU shared vector.
+
+Open trace tasks:
+- Produce a full offset table for HistParams/AllWeights.
+- Add a layout parity test or static assertion if feasible.
+
+12. Persistence across segments
+-------------------------------
+Files:
+- aideen-backbone/src/gpu_deq.rs
+- aideen-block/src/shaders/assoc_state_carry.wgsl
+- segment memory promote/load shaders
+
+Role:
+- Maintains durable Assoc/FPM state across chunks/segments of a prompt/document.
+
+Current concern:
+- The model philosophy wants memory across segments without fully decoupling token dynamics.
+- Assoc should preserve explicit bindings; FPM should consolidate contextual state.
+
+Open trace tasks:
+- Document exact carry/load/promote timing between chunks.
+- Verify whether per-segment state reset affects only local state or persistent memory too.
+
+13. Logs and diagnostics
+------------------------
+Required log directory:
+- logs/assoc_recall/
+
+Current important logs:
+- exp_layout_fixed_reverted_gate_probe.log
+- exp_layout_fixed_event_lr4_probe.log
+- exp_event_l1_005_probe.log
+- exp_dense_local_event_l1_probe.log
+
+Rule:
+- Keep logs unless intentionally superseded.
+- Reuse log filenames only when the run structure is the same.
+- New structural experiment gets a new descriptive filename.
+
+
+AssocHist segmented coordinate invariant
+----------------------------------------
+Forward file: aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+Backward file: aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl
+Buffer owner: RustDeqBridge.assoc_hist_buf, allocated as [batch][max_seq_len][h_slots][assoc_hist_slot_stride].
+Forward token coordinates: local segment loop variable `t`, full-sequence token `global_t = shape.token_start + t`, full-sequence length `shape.seq_len`.
+Backward token coordinates: `t` over `params.seq_len`, absolute index `t_abs = b * params.seq_len + t`.
+Required invariant: every AssocHist write for a forward token must use the full-sequence coordinate `(batch_idx * shape.seq_len + global_t)`, because backward reads `(b * params.seq_len + t)`.
+Failure mode found: local segment indexing can overwrite early history positions and leave later positions stale when internal segmented forward is active.
+
+
+Stabilized Assoc multi-binding path update
+------------------------------------------
+- Assoc address path now treats `W_k_assoc`/`W_q_assoc` as an optional learned residual over the direct normalized token/source address. `AIDEEN_ASSOC_ADDR_LR_MULT` defaults to 0.0, preserving the literal key/query manifold during current explicit-memory training.
+- When `ENABLE_ASSOC_SLOT_OWNER=false`, Assoc slots are replicated lanes, not competitors. Each active Assoc slot writes full local binding mass. If slot ownership is enabled later, `p_slot_i` returns to normalized owner probability.
+- Bank allocation now uses empty-first placement for novel bindings: if a free bank exists and no existing key match is strong enough, the new binding is committed to the free bank instead of being dropped by occupied-bank protection.
+- Assoc retrieval is winner-take-all by default. Soft bank mixtures are experimental because they blend multiple literal values and contaminate exact key->value recall. FPM remains the graded/contextual memory path.
+- Validated default AR corridor: pairs_per_seq=8, banks=8, gaps 0/64/128/256 solved with losses around 0.0002-0.0004.
+
+Assoc scalable capacity note - adaptive hash replication
+-------------------------------------------------------
+Current experimental capacity path:
+- `AIDEEN_ASSOC_HASH_LANE=1` makes Assoc lane ownership deterministic rather than fully competitive.
+- `AIDEEN_ASSOC_HASH_REPLICA=1` can add a deterministic adjacent lane as a second probe, but only when `ASSOC_BANKS >= 16` in the shader path.
+- For `ASSOC_BANKS < 16`, replica is disabled even if the env flag is set, preserving the single-owner small-bank circuit.
+
+Circuit invariant:
+- Write and read must share the same owner/probe lane set for a binding.
+- Replication is a collision-reduction mechanism, not a replacement for salience or durable slot policy.
+- Literal Assoc recall remains separate from FPM contextual consolidation: Assoc stores explicit key->value evidence; FPM may summarize/contextualize but should not be required to recover literal pairs that Assoc failed to preserve.
+
+Validated observations:
+- p16/b8 is protected by the adaptive guard and remains in the working small-bank corridor.
+- p24/b16 can work with replica, proving that the previous p24 failure was largely capacity/collision/routing related.
+- p24/b16 variance shows the next unresolved circuit segment is write salience/replacement under lane pressure.
+
+Capacity edge observation
+-------------------------
+- h8/b16 with adaptive two-lane Assoc replication solved p32 (`eval_loss=0.0941`, random=4.4067).
+- This means the current token path can preserve many literal bindings when lane/bank geometry is sufficient.
+- The unresolved problem is now narrower: behavior when requested bindings exceed effective lane/bank capacity, or when salience should decide which bindings persist across longer documents/segments.
+
+LM sampled-softmax probability invariant
+----------------------------------------
+Files:
+- aideen-backbone/src/shaders/lm_train.wgsl
+- aideen-backbone/src/gpu_lm_head.rs
+- aideen-training-lab/src/trainer.rs
+
+Role:
+- Converts pooled hidden state (`hpooled` plus optional Assoc contribution) into sampled logits/probabilities, loss, and `dl_dh` for the DEQ/FPM/Assoc backward path.
+
+Current circuit invariant:
+- For each token row, sampled probabilities must satisfy `0 <= probs[t,k] <= 1` and `sum_k probs[t,k] ~= 1` before `lm_backprop_h_t_main` computes `dl_dh`.
+- `probs` storage is the single source of truth for logits/probabilities in the current correctness corridor.
+- The serial tid0 max/sum normalization is intentionally performance-sensitive but equation-correct; any future parallel version must reproduce the same row-sum/probability invariant before promotion.
+
+Failure mode found:
+- The previous workgroup reduction/cache path produced invalid probabilities (`row sum ~1e13`, many entries >1), while LM weights and pooled inputs were normal. This created huge `dl_dh`, which then poisoned Picard adjoints and Assoc/FPM backward.
+
+Validated observation:
+- Serial normalization restored `row0_sum ~= 1`, removed probabilities >1, and reduced `dl_dh`, `assoc_rhs`, and `adj_v_out` to small finite scales. Four-chunk validation kept active Assoc `val_rms` around `1e-3` without NaNs.
+
+Open trace tasks:
+- Re-parallelize only after adding an invariant check/probe that proves probability rows remain normalized for `num_samples=2048`.
+- Trace why Assoc budget telemetry for s6/s7 can disagree with final `[ASSOC-STATE]` occupancy.
+
+Assoc Read Confidence Path Update
+---------------------------------
+Files:
+- aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl
+- aideen-training-lab/src/trainer.rs
+- aideen-backbone/src/fixed_point_memory_reasoning.rs
+- aideen-backbone/src/gpu_lm_head.rs
+
+Current invariant:
+- Hard-read bank selection may choose one bank, but read confidence must come from query/key address match, not from the post-hard-read probability. Under `AIDEEN_ASSOC_CONF_READ=1`, the read multiplier is now based on pre-hard-read best address cosine clamped to `[0,1]`.
+- `alpha_assoc` is stored in logit space because GPU forward/backward apply `sigmoid(alpha_assoc)`. Default initialization stores `logit(0.3)`, giving effective read mix 0.3.
+- Direct Assoc-to-LM logit coupling is disabled by default (`AIDEEN_ASSOC_LOGIT_LAMBDA=0`) until promotion/read utility is validated. The env override remains for experiments.
+
+Failure modes found:
+- Previous `alpha_assoc=0.3` produced effective read mix `sigmoid(0.3)=0.574`, stronger than the documented 0.3.
+- Previous `ENABLE_ASSOC_CONF_READ` was inert under hard-read because `read_max_prob=1` for the selected bank even when the address match was weak.
+- Positive Assoc LM-logit coupling degraded the short real-text corridor while memory promotion remains immature.
+
+Open trace tasks:
+- Add durable promotion/salience policy so hard/confident reads select predictive bindings, not merely first-admitted literal transitions.
+- Retest positive Assoc LM-logit coupling only after selected bindings become useful under confidence-gated reads.
+
+Assoc write admission - experimental salience replacement
+---------------------------------------------------------
+Path: `deq_slot_attn_unified_clean.wgsl` write phase, after slot/bank selection and before `AssocHist` metadata is emitted.
+Source values: `best_cos_safe` measures key similarity to existing banks; `best_prev_value_cos` measures whether the candidate value duplicates previous hidden source; `occupied_count` and `min_usage/min_usage_bank` summarize current bank occupancy metadata.
+Invariant: when the experimental salience path is disabled, `usage` remains committed write mass and no replacement occurs. When enabled, metadata is interpreted as salience and replacement uses `overwrite_bank=1`; forward key/value update clears prior bank contribution, matching backward's overwrite handling.
+Failure mode addressed: bounded banks preserved first-arrival bindings even when later bindings had stronger evidence, so long-context memory could become full but not useful.
+
+Assoc read backward parity
+--------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, read-backward section after recovering per-bank address scores.
+Forward invariant: when `ENABLE_ASSOC_HARD_READ=true`, bank weights are one-hot; when `ENABLE_ASSOC_CONF_READ=1`, value injection is scaled by `slot_read_allowed * clamp(best_address_score / ASSOC_READ_BETA, 0, 1)`.
+Backward invariant: the fused backward path now receives `ENABLE_ASSOC_HARD_READ` and mirrors the hard one-hot selection. Confidence uses the same address-score scalar. This avoids training an inactive softmax read allocator when forward is hard-read.
+
+Assoc write backward parity
+---------------------------
+Path: `fused_fpm_retain_bwd.wgsl`, durable associative memory backward.
+Forward invariant: `effective_write_mass = effective_bind_gate` when `ENABLE_ASSOC_LINEAR_WRITE=true`, otherwise `effective_bind_gate^2`; writes below `ASSOC_WRITE_MIN_MASS` become zero; replacement overwrite sets prior keep gate to zero.
+Backward invariant: fused backward now uses the same write mass, the matching derivative `d mass / d effective_bind_gate`, and zero keep gradient when `overwrite_bank=1`.
+
+LM sampled-negative determinism invariant
+-----------------------------------------
+Files:
+- aideen-backbone/src/gpu_lm_head.rs
+- aideen-backbone/src/shaders/lm_train.wgsl
+
+Role:
+- `GpuLmHeadTrainer::build_sampled_indices` constructs the sampled-softmax vocabulary slice consumed by `lm_probs_main`, `lm_backprop_h_t_main`, and `lm_update_main`.
+
+Invariant:
+- For stabilization runs, sampled indices must be reproducible for a fixed LM sample seed, `step_t`, targets, vocabulary size, and sample capacity.
+- The target tokens are always inserted first, sorted/deduped, and negatives fill the remaining capacity without duplication.
+- Any stochasticity in the sampled set changes the LM loss and `dl_dh`, so it is part of the training equation, not just a diagnostic detail.
+
+Validated status:
+- `GpuLmHeadTrainer` now uses `AIDEEN_LM_SAMPLE_SEED`, falling back to `AIDEEN_TRAIN_SEED`, to generate deterministic sampled-softmax negatives from a counter/hash function keyed by `step_t`.
+- The sampled set is no longer drawn from `thread_rng`; this removes an uncontrolled stochastic input from the LM loss and `dl_dh` path.
+- Remaining caveat: 16-chunk repeated runs are stable but not bit-identical, so another non-bitwise path remains outside sampled-negative construction.
+
+Assoc bank-capacity trace correction
+------------------------------------
+- Forward Assoc bank count is controlled by `AIDEEN_ASSOC_BANKS` in `RustDeqBridge` and `GpuDeqBackend`, then passed as WGSL override `ASSOC_BANKS` into `deq_slot_attn_unified_clean.wgsl`.
+- Forward bank placement/read local arrays must be at least `ASSOC_BANKS`; current experimental supported cap is 32 banks.
+- Backward Assoc in `fused_fpm_retain_bwd.wgsl` historically copied one full slot state into `assoc_b_state[4096]` and accumulated `assoc_gb[4096]`. Required floats are `ASSOC_BANKS * (ASSOC_RANK + d_model + 1)`. For `d_model=512`, even 16 banks need 8720 floats, so large-bank backward cannot safely use this workgroup cache.
+- Current invariant: scalable bank-count experiments may validate forward memory/layout up to 32 banks, but Assoc backward is skipped when the slot state exceeds 4096 floats. Full scalable training requires storage-backed or tiled Assoc adjoints.
+
+Large-bank Assoc key-write backward
+-----------------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, branch `assoc_slot_stride > ASSOC_BWD_STATE_CAP`.
+Forward source of truth: `deq_slot_attn_unified_clean.wgsl` stores per-token pre-write banks in `AssocHist` plus metadata `[chosen_bank, allow_write, transition_gate, overwrite_bank]` after the full-sequence coordinate fix.
+Backward invariant now covered: large-bank read score gradients write a compact key-only adjoint `assoc_gb[bank * ASSOC_RANK + r]`. For the bank selected by forward metadata, the adjoint is propagated through the active key-write equation into `W_k_assoc` using the same write mass and overwrite keep semantics as forward. This avoids copying `[key|value|usage]` for every bank into the 4096-float workgroup cache.
+Still out of scope: full value adjoint, event/librarian/replacement-policy gradients, and exact `PrevHStarBuf` key-source parity. The current large-bank key backward mirrors the existing backward source convention (`S_in[t-1]`) to avoid adding a new buffer dependency mid-corridor.
+
+FPM vs Assoc slot telemetry split
+---------------------------------
+Path: `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`.
+Invariant: slots `slot_idx < h_slots/2` run the base FPM plastic write block; slots `slot_idx >= h_slots/2` are Assoc slots and skip that base block via `!is_assoc_slot`. Assoc slots can still consolidate a slow contextual trace into FPM state inside the Assoc write block (`ASSOC_TO_FPM_SCALE * effective_write_mass`), but current `[FPM-PATH] write/retain` telemetry is sourced from the base FPM write diagnostics, so zeros on slots 4..7 do not by themselves prove that Assoc-to-FPM consolidation is inactive.
+Failure-risk: real-text logs can look like half the slots are dead if interpreted only through FPM write counters. Need explicit Assoc-to-FPM bridge telemetry before deciding whether contextual consolidation from Assoc slots is weak or merely unobserved.
+
+Assoc-to-FPM bridge observability
+---------------------------------
+Path: `deq_slot_attn_unified_clean.wgsl` Assoc write block, after exact key/value bank write.
+Observed equation: `consolidate = ASSOC_TO_FPM_SCALE * clamp(assoc_write_gate_token, 0, ASSOC_WRITE_CAP) * effective_write_mass`; `fpm_m_cache` then moves toward normalized `H_curr` trace by that consolidate amount.
+Telemetry: `[ASSOC-BRIDGE]` now reports total-average and active-average bridge mass/consolidation/delta per Assoc slot. This is necessary because base `[FPM-PATH] write(...)` counters intentionally exclude Assoc slots and therefore cannot diagnose whether the Assoc contextual bridge is active.
+Current real-text observation: bridge is wired and finite, but sparse/low-energy on average. Active writes can reach the configured max consolidate, while total average is dominated by zero/near-zero write mass.
+
+Assoc-to-FPM scale control
+--------------------------
+`ASSOC_TO_FPM_SCALE` is now a shader override supplied by `AIDEEN_ASSOC_TO_FPM_SCALE` with default `0.02`. It directly multiplies the Assoc contextual consolidation equation and is therefore an explicit experimental control surface, not a hidden default behavior change.
+
+Direct Assoc-to-LM path check
+-----------------------------
+- Real train path: `Trainer` calls `GpuLmHeadTrainer::train_step_no_readback(...)` with `h_src = gpu.bridge.hpooled_buf` and `assoc_src = gpu.bridge.assoc_pooled_buf`.
+- `gpu_lm_head.rs` copies `assoc_src` into LM `dl_dh_temp_buf` before the forward LM probability pass.
+- In `lm_train.wgsl`, direct Assoc logits are disabled by default because `AIDEEN_ASSOC_LOGIT_LAMBDA` defaults to `0.0`.
+- If enabled, the sampled logit equation becomes `logit(v,t) = b[v] + W_lm[v] dot RMSNorm(h_t) + lambda * Emb[v] dot AssocRead_t`.
+- Backward then writes the Assoc RHS into `s_h_rms`/`assoc_grad_buf`: `dL/dAssocRead_t = sum_k (p_k - y_k) * lambda * Emb[k]`.
+- Trainer passes both `dl_dh_buf` and `assoc_grad_buf()` to `run_staged_adjoint_picard_no_readback`, so the direct Assoc LM path is gradient-coupled when lambda is nonzero.
+- Current serious-training baseline keeps this lambda at `0.0` because the first short real-text validation did not beat the no-bridge baseline.
+
+Current promoted end-to-end training circuit
+--------------------------------------------
+Promoted serious-prep path:
+`token ids -> GPU embeddings -> DEQ slot solve -> FPM slots + Assoc slots -> hpooled/assoc_pooled -> GPU sampled LM head -> loss -> LM backward -> staged DEQ adjoint -> GPU weight/state updates`.
+
+What is active:
+- Embedding training is active unless `--freeze-emb` is explicitly passed; promoted runs do not freeze it.
+- DEQ/FPM/Assoc forward is active on GPU/Metal.
+- LM head forward/backward is active through `GpuLmHeadTrainer::train_step_no_readback`.
+- DEQ adjoint receives `dl_dh_buf` and, when direct Assoc LM lambda is nonzero, `assoc_grad_buf`; in the promoted baseline lambda is zero, so the direct Assoc LM RHS is intentionally inactive.
+- Assoc slots use explicit memory banks in the forward path with 32-bank support in the promoted corridor.
+
+What is intentionally inactive in the promoted baseline:
+- Direct Assoc-to-LM logit contribution: `AIDEEN_ASSOC_LOGIT_LAMBDA=0.0`.
+- Assoc-to-FPM bridge contribution: `AIDEEN_ASSOC_TO_FPM_SCALE=0.0`.
+- Held-out validation updates: skipped by design because `eval_mode=true` sets LM lr to zero and returns before optimizer/adjoint updates.
+
+Known partial areas:
+- Large-bank Assoc backward has scalable key-write coverage, but full value adjoint and replacement/librarian/event gradients remain pending.
+- Base FPM write telemetry intentionally reports zeros on Assoc slots because those slots do not use the base FPM write block; Assoc-specific bridge telemetry is the correct observer for contextual consolidation.
+
+Large-bank Assoc selected value adjoint
+---------------------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl`, `assoc_slot_stride > ASSOC_BWD_STATE_CAP` branch.
+Forward equation: selected bank value is updated as `bank_value <- value_keep_gate * bank_value + value_write_mass * normalized_current_value`.
+Backward addition: because full `ASSOC_BANKS * d_model` value adjoints do not fit in workgroup storage at 32 banks, the large-bank branch computes only the forward-selected bank's value adjoint from the read equation: `dL/dbank_value_selected = alpha_assoc * assoc_read_conf * p_selected * g_ctx`. This selected adjoint contributes to the write-mass/event-gate gradient through `(normalized_current_value - previous_bank_value)`.
+Invariant: no full-bank value cache is introduced; storage stays compact and proportional to `d_model + ASSOC_RANK`, not `ASSOC_BANKS * d_model`.
+Diagnostic: `[ASSOC-BWD-STEP] value_adj_sum` reports nonzero selected value adjoint mass on Assoc slots in debug runs.
+
+Large-bank Assoc value adjoint gating
+-------------------------------------
+`AIDEEN_ASSOC_VALUE_WRITE_BWD=1` enables the experimental selected-bank value-write adjoint. It is off by default after a 200-chunk run produced NaN diagnostics and loss ~22.94. The code path remains as an opt-in diagnostic/experimental branch; the promoted serious-prep circuit keeps it disabled.
+
+Temporal large-bank Assoc value adjoint
+---------------------------------------
+Path: `aideen-backbone/src/shaders/fused_fpm_retain_bwd.wgsl` large-bank branch plus `aideen-backbone/src/gpu_deq.rs` binding 15.
+Buffer: `AssocValueGrad`, layout `(slot * ASSOC_BANKS + bank) * d_model + dim`, cleared per batch/slot before the reverse token scan when `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`.
+Forward timeline invariant: `read_t` observes the pre-write bank state; `write_t` produces the state consumed by future reads. Therefore, the write backward must consume only adjoints already accumulated from future tokens.
+Backward timeline now used: at reverse token t, selected value write consumes `AssocValueGrad[selected_bank]` as `dL/dM_post_t`, propagates it through `value_keep_gate` into `dL/dM_pre_t`, then the current read equation adds `alpha_assoc * assoc_read_conf * p_bank * v_state * assoc_scale` into every bank's pre-write value adjoint. This avoids the rejected same-token shortcut where `read_t` directly trained `write_t`.
+Default status: path remains disabled unless `AIDEEN_ASSOC_VALUE_WRITE_BWD=1`; promoted baseline behavior is unchanged.
+
+Experimental embedding source adjoint from clean Picard
+-------------------------------------------------------
+Path: `staged_adjoint_picard_clean.wgsl::picard_source_grad_reduce_main`, `GpuDeqBackend::reduce_clean_adjoint_to_source_grad_no_readback`, trainer embedding update.
+Default status: disabled unless `AIDEEN_EMB_USE_DEQ_ADJOINT=1`.
+Circuit correction: LM head writes token-major `dl_dh`; clean Picard expands/solves it into slot-major `v_state`. The new reducer mirrors the clean Picard RMSNorm derivative for the direct slot-branch/source term and reduces slot-major adjoints back into token-major `dL/dS_in`, which is the layout expected by `embedding_train.wgsl`.
+Invariant: embeddings must not consume raw slot-summed `v_state`; source gradients must pass through the same normalization Jacobian used by the clean Picard equation.
+
+2026-05-12 - FPM/Assoc H-solve stabilization trace
+---------------------------------------------------
+Files:
+- `aideen-block/src/shaders/deq_slot_attn_unified_clean.wgsl`
+- `aideen-training-lab/src/trainer.rs`
+
+Circuit updates:
+- Model A FPM path now uses `FPM_ALPHA_H` for the H Picard blend whenever `fpm_inject_enabled` is active. This aligns the actual update `H <- alpha_h*f(H) + (1-alpha_h)*H` with the FPM health/homeostatic contract.
+- Assoc read has two separate outputs:
+  - raw `assoc_ctx` exported to `AssocReadBuf` for LM-head coupling/backward signal;
+  - residual-budgeted `assoc_inj` injected into the H solve, scaled by `signal_norm * read_residual_scale / assoc_norm`.
+- Contractivity diagnostic/control now ignores ratios where either residual is already inside the accepted homeostatic band. `exit_err_h`, failed-hit counters, and numeric invalid checks remain responsible for detecting real solve failure.
+Failure modes closed in this trace:
+- More iterations alone did not solve `EMERG`.
+- Assoc read was not wrong structurally, but its H injection bypassed the FPM residual budget.
+- Seed 7 `EMERG` after Assoc scaling was a false contractivity measurement over accepted residual jitter, not a true solve failure.
+
+GPU step boundary lifecycle fence
+---------------------------------
+Path: `aideen-training-lab/src/trainer.rs` training loops after each completed chunk.
+Invariant: a training chunk reuses persistent GPU buffers across the next chunk: embeddings/source `s_buf`, DEQ `hcurr/hnext`, pooled outputs, LM buffers, adjoint buffers, optimizer state, FPM/Assoc state, and debug buffers. The next CPU-side chunk enqueue must not depend on a human-facing TPS/readback flag to guarantee that the previous chunk's GPU work has completed.
+Current control: `AIDEEN_GPU_STEP_FENCE_EVERY` defaults to `1` and owns the step-boundary `device.poll(Maintain::Wait)`. `AIDEEN_TPS_SYNC_EVERY` is no longer the lifecycle owner.
+Failure mode seen: with the old control, setting `AIDEEN_TPS_SYNC_EVERY=0` could make seed 11 fail by sampled step 20 with NaNs in hpool/FPM/owner diagnostics, while debug/readback every step or TPS sync every step passed. This identified a GPU execution-order/lifetime hazard, not a pure DEQ/Assoc math failure.
+
+## 2026-05-12 - FPM/Assoc slot telemetry ownership note
+
+In the current 8-slot corridor, base FPM plastic write telemetry is role-owned by slots 0..3. The shader enters the base FPM write/update block only when the slot is not a segment-memory slot and not an Assoc slot. Therefore `[FPM-PATH] retain_max/retain_avg` and `[FPM-WRITE] h_unit/write/m_inner/wout/cand` are expected to be zero for slots 4..7.
+
+This is not a slot liveness test for Assoc. Slots 4..7 are Assoc-owned and must be inspected through Assoc diagnostics: `[ASSOC-BWD-STEP]` fields such as `val_rms`, `value_adj_sum`, `score_grad_max`, `wq_step_max`, `wq_update_max`, `wk_step_max`, `gprev_sum`, `write_mass`, plus Assoc read/bridge logs when enabled.
+
+Current invariant: FPM telemetry zeros on slots 4..7 are normal only for FPM write-owned fields. If Assoc diagnostics for slots 4..7 also remain zero across real backward steps, that is a separate failure mode.
+
+2026-05-13 - Sparse debug cadence note
+--------------------------------------
+The current corridor has now been observed to complete under both `AIDEEN_DEBUG_SAMPLE=5` and `AIDEEN_DEBUG_SAMPLE=20` for seed 13 with the same owner/Assoc/FPM setup and default GPU step fence. This reduces confidence that sparse debug cadence itself is a live structural failure source in the present code.
+
+Operational reading:
+- if an incomplete sparse-debug observation appears again, treat it first as a session/logging/lifecycle observation issue and reproduce it before building model-level theories;
+- the current token path and DEQ/FPM/Assoc math are not blocked by debug cadence based on the latest seed13 and seed42 sparse reruns.
+
+2026-05-13 - Checkpoint to inference parity
+-------------------------------------------
+Training source-of-truth for the current slot-coordinate corridor is the GPU weight buffer, not the CPU `FixedPointMemoryReasoning` projection. The CPU object cannot exactly represent learned per-slot `W_q/W_k/W_v/W_o/W_in` matrices, so checkpointing only CPU reasoning weights can make later generation evaluate a different model.
+
+Current invariant for new checkpoints:
+- `save_full` stores exact GPU tensors under `reasoning.gpu_exact.*` when GPU weights have been uploaded/updated;
+- `load_full` preserves those tensors inside `Trainer`;
+- `generate` and `generate_stream` upload them before the first GPU forward when available;
+- `infer --stats` reports `gpu_exact: yes` when this path is active.
+
+Failure mode now closed:
+- text generation from a new checkpoint no longer depends on lossy CPU reconstruction of slot-coordinate tensors.
+
+Remaining interpretation rule:
+- incoherent text after a very short run is evidence about insufficient text training or objective/data limits only after `gpu_exact: yes` confirms checkpoint parity.
+
+2026-05-13 - LM/embedding checkpoint sync and full-vocab diagnostic
+-------------------------------------------------------------------
+Checkpoint boundary:
+- In slot-coordinate mode, DEQ CPU projection is intentionally skipped because CPU reasoning cannot represent per-slot GPU matrices without lossy averaging.
+- That skip must not bypass LM-head or embedding sync. LM-head GPU buffers and embedding GPU buffers are the trained owners for text generation checkpoints, so they must be read back before serializing `head.*` and `tokenizer.embeddings`.
+
+Generation-time text diagnostic:
+- `infer --eval-file PATH --eval-max-positions N` runs the same GPU inference H* path as generation, then evaluates the target token against the complete LM vocabulary.
+- Metrics: full-vocab CE, top1/top5 accuracy, mean target rank, target logit, top logit.
+- This is the required metric for text generation; sampled training loss alone is not sufficient.
+
+LM sampled-softmax estimator:
+- Default training still uses target + sampled negatives as before.
+- With `AIDEEN_LM_FULL_VOCAB_ESTIMATE=1`, sampled negative probabilities are weighted by `(vocab_size - 1) / (num_samples - 1)`, target probability remains unweighted.
+- This changes the LM loss denominator from sampled-subset scale to a full-vocab estimate while preserving the same sampled rows and GPU memory footprint.
+
+2026-05-13 - Exact full-vocab train-path metric
+-----------------------------------------------
+- `infer --eval-train-path` measures exact full-vocab CE/rank from the fused training path.
+- Mechanism:
+  - run `train_sequence(..., eval_mode=true)` on token windows;
+  - read `hpooled_buf` sequence from GPU;
+  - apply the full CPU LM head against all vocab rows;
+  - compute CE/top1/top5/rank.
+- This isolates whether the fused train path already contains usable next-token signal before any autoregressive/path-construction differences.
+
+Observed conclusion so far:
+- On the DEQ-frozen micro probes, both the autoregressive full-vocab metric and the fused-train-path full-vocab metric remain near random even when the training loss estimate improves.
+- Therefore the current blocker is not primarily a late split between training and generation paths; it is earlier, at the LM objective coverage/calibration or signal strength level.
+
+2026-05-13 - Char-level exact tokenizer parity
+----------------------------------------------
+- Char-level checkpoints must serialize the ordered character vocabulary itself, not only `vocab_size` and embeddings.
+- `load_full()` now prefers serialized `tokenizer.char_vocab` over ambient BPE files.
+- Without this, `infer` would silently attach the standard BPE tokenizer to a char-level checkpoint and invalidate every eval/generation result.
+
+2026-05-13 - Sample count sweep result
+-------------------------------------
+- BPE + `num_samples=2048` did not improve exact full-vocab metrics and reintroduced embedding-state instability.
+- Char-level + exact full-vocab softmax (`num_samples >= vocab_size`) stayed finite and showed small but real exact-ranking gains.
+- Reading: exact objective pressure can move the model on a small vocabulary, but the current BPE corridor still loses that gain to scale/coverage and stability constraints.
+
+2026-05-13 - LM-only BPE vs exact char-level follow-up
+------------------------------------------------------
+- `BPE + num_samples=2048 + DEQ frozen + embeddings frozen`:
+  - training loss can improve materially without NaNs;
+  - exact full-vocab eval still stays near random.
+- `char-level + exact full softmax + DEQ frozen`:
+  - training loss improves;
+  - exact full-vocab eval improves in both autoregressive and fused train-path metrics.
+
+Circuit reading:
+- The LM head and the rest of the token circuit are capable of carrying exact next-token signal.
+- The current BPE bottleneck is not "no signal exists anywhere"; it is that the real-vocab objective and/or token interface fail to turn training progress into usable exact ranking at 50k vocab scale.
+
+
+2026-05-14 - Exact LM GPU corridor note
+---------------------------------------
+Exact-owner path (`AIDEEN_LM_EXACT_CPU=1` + `AIDEEN_LM_EXACT_GPU_FORWARD=1` + `AIDEEN_LM_EXACT_GPU_W_UPDATE=1`):
+- `h*` stays on GPU in `gpu.bridge.hpooled_buf`.
+- Per token, GPU computes full-vocab logits, exact softmax/loss gradient, and writes `dl_scaled` into LM exact scratch.
+- GPU accumulates `dW/db/dg` across the sequence and writes exact `dl_dh` into `gpu_lm.dl_dh_buf`.
+- GPU applies exact Adam to `W/b/g` from those accumulated grad buffers at sequence end.
+- Embedding update consumes `gpu_lm.dl_dh_buf` directly without CPU readback.
+- CPU in this corridor only orchestrates token loop / scalar loss aggregation and optional diagnostics.
