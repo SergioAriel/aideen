@@ -4,10 +4,10 @@ use aideen_core::{
 };
 use nalgebra::{DMatrix, DVector};
 
-/// MambaDecoder — lightweight autoregressive decoder conditioned on H*.
-pub struct MambaDecoder {
+/// FixedPointMemoryDecoder — lightweight autoregressive decoder conditioned on H*.
+pub struct FixedPointMemoryDecoder {
     pub config: ArchitectureConfig,
-    /// d_model of the decoder (may differ from config.d_r of the DEQ)
+    /// Decoder d_model (may differ from the DEQ's config.d_r)
     pub d_model: usize,
     pub n_layers: usize,
     pub embedding: DMatrix<f32>,
@@ -20,7 +20,7 @@ pub struct MambaDecoder {
     pub eos_token: u32,
 }
 
-impl MambaDecoder {
+impl FixedPointMemoryDecoder {
     /// Builds a decoder with small random weights.
     pub fn new(n_layers: usize, config: ArchitectureConfig) -> Self {
         let d_model = config.d_r;
@@ -32,12 +32,12 @@ impl MambaDecoder {
         });
 
         let lm_head = DMatrix::from_fn(vocab_size, d_model, |i, j| {
-            ((i * d_model + j + 1) as f32 * std::f32::consts::E % 1.0 - 0.5) * scale
+            ((i * d_model + j + 1) as f32 * 2.71828 % 1.0 - 0.5) * scale
         });
 
         let make_mat = |rows: usize, cols: usize, seed: usize| -> DMatrix<f32> {
             DMatrix::from_fn(rows, cols, |i, j| {
-                ((i * cols + j + seed) as f32 * std::f32::consts::SQRT_2 % 1.0 - 0.5) * scale
+                ((i * cols + j + seed) as f32 * 1.41421 % 1.0 - 0.5) * scale
             })
         };
 
@@ -73,7 +73,7 @@ impl MambaDecoder {
         }
     }
 
-    // ── H* Pooling ─────────────────────────────────────────────────────────
+    // ── Pooling of H* ─────────────────────────────────────────────────────────
 
     fn pool_h_star(&self, h_star: &HSlots) -> DVector<f32> {
         let slots = h_star.slots;
@@ -84,7 +84,7 @@ impl MambaDecoder {
             / slots as f32
     }
 
-    // ── FiLM conditioning for a single layer ──────────────────────────────────────
+    // ── FiLM conditioning for one layer ──────────────────────────────────────
 
     fn film_params(&self, layer: usize, h_pooled: &DVector<f32>) -> (DVector<f32>, DVector<f32>) {
         let film = &self.film_projs[layer] * h_pooled;
@@ -93,9 +93,9 @@ impl MambaDecoder {
         (scale, bias)
     }
 
-    // ── Mamba step ───────────────────────────────────────────────────────────
+    // ── Fixed-Point Memory step ───────────────────────────────────────────────────────────
 
-    fn mamba_layer_step(
+    fn fpm_layer_step(
         &self,
         layer: usize,
         h: &DVector<f32>,
@@ -142,7 +142,7 @@ impl MambaDecoder {
                 let embed = self.embedding.row(tok as usize).transpose();
                 hidden += embed * 0.1;
                 for l in 0..self.n_layers {
-                    hidden = self.mamba_layer_step(l, &hidden, &film[l].0, &film[l].1);
+                    hidden = self.fpm_layer_step(l, &hidden, &film[l].0, &film[l].1);
                 }
             }
         }
@@ -167,7 +167,7 @@ impl MambaDecoder {
                 let embed = self.embedding.row(next_token as usize).transpose();
                 hidden += embed * 0.1;
                 for l in 0..self.n_layers {
-                    hidden = self.mamba_layer_step(l, &hidden, &film[l].0, &film[l].1);
+                    hidden = self.fpm_layer_step(l, &hidden, &film[l].0, &film[l].1);
                 }
             }
         }
@@ -199,7 +199,7 @@ impl ClassHead {
         let d_r = config.d_r;
         let scale = (d_r as f32).sqrt().recip() * 0.1;
         let w = DMatrix::from_fn(num_classes, d_r, |i, j| {
-            ((i * d_r + j) as f32 * std::f32::consts::SQRT_2 % 1.0 - 0.5) * scale
+            ((i * d_r + j) as f32 * 1.41421 % 1.0 - 0.5) * scale
         });
         Self { config, w }
     }
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn generate_produces_tokens() {
         let config = ArchitectureConfig::default();
-        let decoder = MambaDecoder::new(4, config.clone());
+        let decoder = FixedPointMemoryDecoder::new(4, config.clone());
         let h_star = make_h_star(&config, 1.0);
         let tokens = decoder.generate(&h_star, &[], 10);
         assert!(!tokens.is_empty());

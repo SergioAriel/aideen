@@ -73,7 +73,7 @@ impl Reasoning for FfnReasoning {
     ) -> HSlots {
         let mut next = HSlots::zeros(&self.config);
 
-        // ── 1. Paso FFN por slot (independiente) ────────────────────────────
+        // ── 1. FFN step per slot (independent) ──────────────────────────────
         let h_slots = self.config.h_slots;
         let d_r = self.config.d_r;
 
@@ -82,7 +82,7 @@ impl Reasoning for FfnReasoning {
             let h_r = h_slot.rows(0, d_r).into_owned();
 
             let updated_r = if let Some(be) = exec.as_mut() {
-                // Rama GPU (misma lógica que antes, trasladada por slot)
+                // GPU branch (same logic as before, applied per slot)
                 if self.w1_id.borrow().is_none() {
                     *self.w1_id.borrow_mut() = be.load_tensor(self.w1.as_slice()).ok();
                 }
@@ -124,14 +124,14 @@ impl Reasoning for FfnReasoning {
                     cpu_ffn(&self.w1, &self.b1, &self.w2, &self.b2, &h_r)
                 }
             } else {
-                // Rama CPU
+                // CPU branch
                 cpu_ffn(&self.w1, &self.b1, &self.w2, &self.b2, &h_r)
             };
 
             next.set_slot(k, &updated_r);
         }
 
-        // ── 2. Slot-mixing: residual de la media ────────────────────────────
+        // ── 2. Slot-mixing: residual of the mean ────────────────────────────
         let mean_slot: DVector<f32> = {
             let sum = (0..h_slots).fold(DVector::zeros(d_r), |acc, k| acc + next.slot(k));
             sum / (h_slots as f32)
@@ -202,10 +202,10 @@ impl FfnReasoning {
         critic_public_key: &[u8; 32],
         guard: &mut ReplayGuard,
     ) -> Result<(), String> {
-        // 1) Firma
+        // 1) Signature
         update.verify_signature(critic_public_key)?;
 
-        // 2) Anti-replay por version monotónica (Mas rápido de chequear)
+        // 2) Anti-replay via monotonic version (faster to check)
         let last_v = guard
             .last_version
             .get(&update.target_id)
@@ -215,13 +215,13 @@ impl FfnReasoning {
             return Err("replay detected: version not increasing".into());
         }
 
-        // 3) base_model_hash debe matchear el modelo actual
+        // 3) base_model_hash must match the current model
         let my_hash = self.current_model_hash();
         if update.base_model_hash != my_hash {
             return Err("base_model_hash mismatch (client model != update base)".into());
         }
 
-        // 4) Encadenado opcional (previene forks/rollbacks ocultos)
+        // 4) Optional chaining (prevents hidden forks/rollbacks)
         let expected_prev = guard
             .last_update_hash
             .get(&update.target_id)
@@ -236,7 +236,7 @@ impl FfnReasoning {
         let deltas: Vec<aideen_core::protocol::QuantizedDelta> =
             decode_payload_zstd(&update.payload)?;
 
-        // 6) Aplicar deltas
+        // 6) Apply deltas
         for d in deltas {
             match d.param {
                 ParamId::W1 => {
@@ -282,11 +282,11 @@ impl FfnReasoning {
             }
         }
 
-        // 7) Invalidar descriptores GPU para que se recarguen
+        // 7) Invalidate GPU descriptors so they get reloaded
         *self.w1_id.borrow_mut() = None;
         *self.w2_id.borrow_mut() = None;
 
-        // 8) Commit estado al Replay Guard
+        // 8) Commit state to the Replay Guard
         guard
             .last_version
             .insert(update.target_id.clone(), update.version);

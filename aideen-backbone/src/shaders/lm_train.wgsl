@@ -4,13 +4,15 @@
 // Architecture: Sampled Softmax + RMSNorm + AdamW
 //
 // Pipelines (dispatch sizes set by gpu_lm_head.rs):
-//   1. lm_probs_main         (seq_len, 1, 1)   – forward: RMSNorm, softmax, loss
+//   1. lm_probs_main         (min(seq_len,65535), ceil(seq_len/65535), 1)
+//                                         – forward: RMSNorm, softmax, loss
 //   2. lm_update_main        (d/16, k/16, 1)   – fused: accumulate dW + AdamW (no-fused path)
 //   3. lm_dw_accum_main      (d/16, k/16, 1)   – accumulate dW only (fused path)
 //   4. lm_apply_adamw_main   (d/16, k/16, 1)   – apply AdamW to accumulated dW (fused path)
-//   5. lm_backprop_h_t_main  (seq_len, 1, 1)   – backprop dL/dh to DEQ
+//   5. lm_backprop_h_t_main  (min(seq_len,65535), ceil(seq_len/65535), 1)
+//                                         – backprop dL/dh to DEQ
 //
-// Bindings: 0-15 (16 total, matching bgl_probs in gpu_lm_head.rs)
+// Bindings: 0-16 (17 total, matching bgl_probs in gpu_lm_head.rs)
 // =============================================================================
 
 struct TrainParams {
@@ -24,8 +26,10 @@ struct TrainParams {
     eps_bits:     u32,
     ternary_flag: u32,
     num_samples:  u32,
-    _pad1:        u32,
-    _pad2:        u32,
+    active_targets: u32,
+    tie_lambda_bits: u32,
+    assoc_logit_lambda_bits: u32,
+    full_vocab_estimate: u32,
 };
 
 @group(0) @binding(0)  var<uniform>            params:          TrainParams;
@@ -44,15 +48,19 @@ struct TrainParams {
 @group(0) @binding(13) var<storage, read_write> dl_dh_temp:      array<f32>;
 @group(0) @binding(14) var<storage, read>       sampled_indices: array<u32>;
 @group(0) @binding(15) var<storage, read_write> s_h_rms:         array<f32>;
+@group(0) @binding(16) var<storage, read>       emb_ref:         array<f32>;
 // Binding 15 (s_h_rms) is also used as dl_dh_rms_red scratch via offset:
 // s_h_rms[seq_len * d_model + t] = rms_dot[t]  (if buffer is large enough)
 // In practice the Rust allocates s_h_rms_buf = seq_len * d_model floats,
 // so the reduction lives entirely in workgroup memory.
 
 const WG_SIZE: u32 = 256u;
+const TOKEN_GRID_X: u32 = 65535u;
+const IGNORE_TARGET: u32 = 0xffffffffu;
 
 fn probs_idx(t: u32, k: u32)    -> u32 { return t * params.num_samples + k; }
 fn s_h_rms_idx(t: u32, d: u32) -> u32 { return t * params.d_model + d; }
+fn token_workgroup_index(wgid: vec3<u32>) -> u32 { return wgid.y * TOKEN_GRID_X + wgid.x; }
 
 // =============================================================================
 // Workgroup shared memory
@@ -61,12 +69,10 @@ var<workgroup> s_scratch:    array<f32, WG_SIZE>;
 var<workgroup> s_rms:        f32;
 var<workgroup> s_target_exp: f32;
 var<workgroup> s_h_tile:     array<f32, WG_SIZE>;
-var<workgroup> s_indices_cache: array<u32, 512>;
-var<workgroup> s_logits: array<f32, 512>;
 
 // =============================================================================
 // Pipeline 1: lm_probs_main
-// Dispatch: (seq_len, 1, 1) — one workgroup per token
+// Dispatch: (min(seq_len,65535), ceil(seq_len/65535), 1) — one workgroup per token
 // Computes: RMSNorm(h_t), sampled logits, softmax, cross-entropy loss
 // Writes:   probs[t,*], rms_buf[t], s_h_rms[t,*], loss_out (atomic)
 // =============================================================================
@@ -75,13 +81,14 @@ fn lm_probs_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>
 ) {
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
 
     let d_model  = params.d_model;
     let base_h   = t * d_model;
     let target_v = target_indices[t];
+    let assoc_lambda = bitcast<f32>(params.assoc_logit_lambda_bits);
 
     // --- 1. RMSNorm: compute RMS of h_t ---
     var local_sq = 0.0;
@@ -104,6 +111,12 @@ fn lm_probs_main(
 
     // --- 2. Apply RMSNorm + g_lm scale, cache to s_h_rms ---
     let rms = s_rms;
+    let full_vocab_estimate = params.full_vocab_estimate != 0u && params.num_samples < params.vocab_size;
+    let neg_scale = select(
+        1.0,
+        f32(max(1u, params.vocab_size - 1u)) / f32(max(1u, params.num_samples - 1u)),
+        full_vocab_estimate
+    );
     for (var i = tid; i < d_model; i += WG_SIZE) {
         let normed        = (h_pooled[base_h + i] / rms) * g_lm[i];
         s_h_rms[s_h_rms_idx(t, i)] = normed;
@@ -111,16 +124,11 @@ fn lm_probs_main(
     workgroupBarrier();
 
     // --- 3. Sampled logits ---
-    // Cache sampled_indices into workgroup memory (avoid repeated storage reads).
-    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        s_indices_cache[k] = sampled_indices[k];
-    }
-    workgroupBarrier();
     if (tid == 0u) { s_target_exp = 0.0; }
-    // Initialize logits with bias.
+    // `probs` is the single source of truth: logits first, probabilities after softmax.
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = s_indices_cache[k];
-        s_logits[k] = b_lm[v];
+        let v = sampled_indices[k];
+        probs[probs_idx(t, k)] = b_lm[v];
     }
     workgroupBarrier();
     // GEMM-style blocking: load H once per tile, reuse for all sampled rows.
@@ -134,47 +142,67 @@ fn lm_probs_main(
         workgroupBarrier();
         let tile_limit = min(WG_SIZE, d_model - tile);
         for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-            let v        = s_indices_cache[k];
+            let v        = sampled_indices[k];
             let row_base = v * d_model + tile;
             var acc = 0.0;
             for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
                 acc += w_lm[row_base + tj] * s_h_tile[tj];
             }
-            s_logits[k] = s_logits[k] + acc;
+            if (assoc_lambda > 0.0) {
+                let assoc_row_base = v * d_model + tile;
+                for (var tj = 0u; tj < tile_limit; tj = tj + 1u) {
+                    acc += assoc_lambda * emb_ref[assoc_row_base + tj] * dl_dh_temp[base_h + tile + tj];
+                }
+            }
+            let pidx = probs_idx(t, k);
+            probs[pidx] = probs[pidx] + acc;
         }
         workgroupBarrier();
     }
-    var local_max = -3.4e38;
+    // --- 4. Softmax ---
+    // Keep `probs` as the only logits/probabilities storage, but parallelize the
+    // row max and denominator reductions. This preserves the serial invariant:
+    // every row must normalize over the full sampled set exactly once.
+    var local_mx = -3.4e38;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let logit = s_logits[k];
-        probs[probs_idx(t, k)] = logit;
-        local_max = max(local_max, logit);
+        local_mx = max(local_mx, probs[probs_idx(t, k)]);
     }
-
-    // --- 4. Softmax (numerically stable) ---
-    s_scratch[tid] = local_max;
+    s_scratch[tid] = local_mx;
     workgroupBarrier();
     for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { s_scratch[tid] = max(s_scratch[tid], s_scratch[tid + stride]); }
+        if (tid < stride) {
+            s_scratch[tid] = max(s_scratch[tid], s_scratch[tid + stride]);
+        }
         workgroupBarrier();
     }
     let mx = s_scratch[0];
 
     var local_sum = 0.0;
+    var local_target_exp = 0.0;
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        let v = s_indices_cache[k];
+        let v = sampled_indices[k];
         let e = exp(probs[probs_idx(t, k)] - mx);
-        probs[probs_idx(t, k)] = e;
-        if (v == target_v) { s_target_exp = e; }
-        local_sum += e;
+        let sample_weight = select(neg_scale, 1.0, v == target_v);
+        probs[probs_idx(t, k)] = e * sample_weight;
+        if (v == target_v) { local_target_exp = local_target_exp + e; }
+        local_sum = local_sum + e * sample_weight;
     }
     s_scratch[tid] = local_sum;
+    s_h_tile[tid] = local_target_exp;
     workgroupBarrier();
     for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { s_scratch[tid] += s_scratch[tid + stride]; }
+        if (tid < stride) {
+            s_scratch[tid] = s_scratch[tid] + s_scratch[tid + stride];
+            s_h_tile[tid] = s_h_tile[tid] + s_h_tile[tid + stride];
+        }
         workgroupBarrier();
     }
-    let sm = max(s_scratch[0], 1e-10);
+    if (tid == 0u) {
+        s_scratch[0] = max(s_scratch[0], 1e-10);
+        s_target_exp = s_h_tile[0];
+    }
+    workgroupBarrier();
+    let sm = s_scratch[0];
 
     // Normalize to probabilities
     for (var k = tid; k < params.num_samples; k += WG_SIZE) {
@@ -182,9 +210,9 @@ fn lm_probs_main(
     }
 
     // --- 5. Loss contribution ---
-    if (tid == 0u) {
+    if (tid == 0u && target_v != IGNORE_TARGET) {
         let target_prob = s_target_exp / sm;
-        let l_val = -log(max(target_prob, 1e-10)) / f32(params.seq_len);
+        let l_val = -log(max(target_prob, 1e-10)) / f32(max(1u, params.active_targets));
         atomicAdd(&loss_out[0], i32(l_val * 10000.0));
     }
 }
@@ -203,12 +231,15 @@ fn compute_dW_and_optionally_apply(
 
     let v     = sampled_indices[k];
     let w_idx = v * params.d_model + d;
-    let seq_f = f32(params.seq_len);
+    let seq_f = f32(max(1u, params.active_targets));
     let g_val = g_lm[d];
 
     // Accumulate dW[v,d] over the sequence
     var dW = 0.0;
     for (var t = 0u; t < params.seq_len; t++) {
+        if (target_indices[t] == IGNORE_TARGET) {
+            continue;
+        }
         let p       = probs[probs_idx(t, k)];
         let one_hot = select(0.0, 1.0, v == target_indices[t]);
         let h_rms   = s_h_rms[s_h_rms_idx(t, d)];
@@ -221,6 +252,7 @@ fn compute_dW_and_optionally_apply(
         let beta1 = bitcast<f32>(params.beta1_bits);
         let beta2 = bitcast<f32>(params.beta2_bits);
         let eps   = bitcast<f32>(params.eps_bits);
+        let tie_lambda = bitcast<f32>(params.tie_lambda_bits);
         let t_f   = max(1.0, f32(params.step_t));
         let bc1   = 1.0 - pow(beta1, t_f);
         let bc2   = 1.0 - pow(beta2, t_f);
@@ -230,11 +262,17 @@ fn compute_dW_and_optionally_apply(
         let v_new   = beta2 * mv.y + (1.0 - beta2) * dW * dW;
         moments_w[w_idx] = vec2<f32>(m_new, v_new);
         w_lm[w_idx] -= lr * (m_new / bc1) / (sqrt(v_new / bc2) + eps);
+        if (tie_lambda > 0.0) {
+            w_lm[w_idx] -= lr * tie_lambda * (w_lm[w_idx] - emb_ref[w_idx]);
+        }
 
         // Bias update: only thread d==0 per vocab entry
         if (d == 0u) {
             var db = 0.0;
             for (var t = 0u; t < params.seq_len; t++) {
+                if (target_indices[t] == IGNORE_TARGET) {
+                    continue;
+                }
                 let p       = probs[probs_idx(t, k)];
                 let one_hot = select(0.0, 1.0, v == target_indices[t]);
                 db += (p - one_hot);
@@ -280,50 +318,51 @@ fn lm_apply_adamw_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // =============================================================================
 // Pipeline 5: lm_backprop_h_t_main
-// Dispatch: (seq_len, 1, 1) — one workgroup per token
+// Dispatch: (min(seq_len,65535), ceil(seq_len/65535), 1) — one workgroup per token
 // Computes: dL/dh_t = sum_k(p_k - 1_hot_k) * W_k via RMSNorm backward
 // Writes:   dl_dh[t * d_model ... (t+1)*d_model]  (one row per token)
 // Note:     Rust copies dl_dh[0..d_model] to staging, so writes must be
 //           per-token into dl_dh_temp, then reduced to dl_dh.
 // =============================================================================
-var<workgroup> s_probs_cache: array<f32, 512>;
-
 @compute @workgroup_size(256, 1, 1)
 fn lm_backprop_h_t_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>
 ) {
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
 
     let d_model  = params.d_model;
     let base     = t * d_model;
     let target_v = target_indices[t];
-
-    // Cache probs for this token into workgroup memory
-    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        s_probs_cache[k] = probs[probs_idx(t, k)];
+    if (target_v == IGNORE_TARGET) {
+        for (var d = tid; d < d_model; d += WG_SIZE) {
+            dl_dh_temp[base + d] = 0.0;
+            dl_dh[base + d] = 0.0;
+            s_h_rms[s_h_rms_idx(t, d)] = 0.0;
+        }
+        return;
     }
-    workgroupBarrier();
-
-    // Cache sampled indices (avoid repeated storage reads in the inner loop).
-    for (var k = tid; k < params.num_samples; k += WG_SIZE) {
-        s_indices_cache[k] = sampled_indices[k];
-    }
-    workgroupBarrier();
+    let seq_scale = 1.0 / max(1.0, f32(params.active_targets));
 
     // --- dL/dy_d = sum_k (p_k - 1_{v==target}) * W_k[d] ---
     var local_rms_dot = 0.0;
     for (var d = tid; d < d_model; d += WG_SIZE) {
         var dldy = 0.0;
+        var dlassoc = 0.0;
         for (var k = 0u; k < params.num_samples; k++) {
-            let v       = s_indices_cache[k];
-            let p       = s_probs_cache[k];
+            let v       = sampled_indices[k];
+            let p       = probs[probs_idx(t, k)];
             let one_hot = select(0.0, 1.0, v == target_v);
-            dldy += (p - one_hot) * w_lm[v * d_model + d];
+            let coeff = p - one_hot;
+            dldy += coeff * w_lm[v * d_model + d];
+            dlassoc += coeff * bitcast<f32>(params.assoc_logit_lambda_bits) * emb_ref[v * d_model + d];
         }
+        dldy = dldy * seq_scale;
+        dlassoc = dlassoc * seq_scale;
         dl_dh_temp[base + d] = dldy;
+        s_h_rms[s_h_rms_idx(t, d)] = dlassoc;
         // Accumulate dot product for RMSNorm backward: sum_d dldy * g[d] * h[d]
         local_rms_dot += dldy * g_lm[d] * h_pooled[base + d];
     }
@@ -376,7 +415,7 @@ fn lm_backprop_rms_reduce_main(
     @builtin(local_invocation_id) lid:  vec3<u32>,
     @builtin(workgroup_id)        wgid: vec3<u32>
 ) {
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
     let d_model = params.d_model;
@@ -415,7 +454,7 @@ fn lm_backprop_reduce_main(
 ) {
     // Final accumulation of dl_dh across all tokens — no-op in current Rust path.
     // Kept for pipeline compatibility.
-    let t   = wgid.x;
+    let t   = token_workgroup_index(wgid);
     let tid = lid.x;
     if (t >= params.seq_len) { return; }
 }

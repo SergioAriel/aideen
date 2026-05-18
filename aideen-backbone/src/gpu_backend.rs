@@ -1,22 +1,22 @@
 //! gpu_backend — WgpuBlockBackend and CpuBlockBackend
 //!
 //! - `CpuBlockBackend`: pure nalgebra implementation (always compiled).
-//!   Works without GPU, useful for tests and fallback.
+//!   Works without a GPU, useful for tests and as a fallback.
 //!
 //! - `WgpuBlockBackend`: wgpu+WGSL implementation (feature "wgpu").
-//!   Uses the `mamba.wgsl` shader from `aideen-block` to run the SSM
-//!   on GPU (Metal/Vulkan/WebGPU). Synchronization via pollster::block_on.
+//!   Uses the `fixed_point_memory.wgsl` shader from `aideen-block` to run the SSM
+//!   on the GPU (Metal/Vulkan/WebGPU). Synchronization via pollster::block_on.
 
 use aideen_core::block_backend::BlockBackend;
 
 // ── CPU Fallback ──────────────────────────────────────────────────────────────
 
-/// Pure CPU backend. Implements the same ZOH as MambaSlotReasoning
-/// but as a swappable backend. Useful for tests and deployment without GPU.
+/// Pure CPU backend. Implements the same ZOH as FixedPointMemoryReasoning
+/// but as a swappable backend. Useful for tests and GPU-less deployment.
 pub struct CpuBlockBackend;
 
 impl BlockBackend for CpuBlockBackend {
-    fn mamba_batch_step(
+    fn fpm_batch_step(
         &mut self,
         x: &[f32],
         dt: &[f32],
@@ -36,7 +36,7 @@ impl BlockBackend for CpuBlockBackend {
         }
 
         // ZOH discretization: A_bar = exp(dt * A), B_bar = (A_bar - 1) / A * B
-        // h_new = A_bar * h_prev + B_bar * x    (h_prev = 0 para un solo paso)
+        // h_new = A_bar * h_prev + B_bar * x    (h_prev = 0 for a single step)
         // y = C * h_new
         let y: Vec<f32> = (0..d)
             .map(|i| {
@@ -44,9 +44,9 @@ impl BlockBackend for CpuBlockBackend {
                 let b_bar = if a[i].abs() > 1e-8 {
                     (a_bar - 1.0) / a[i] * b[i]
                 } else {
-                    dt[i] * b[i] // límite cuando A → 0
+                    dt[i] * b[i] // limit when A → 0
                 };
-                let h_new = b_bar * x[i]; // h_prev=0 para paso único
+                let h_new = b_bar * x[i]; // h_prev=0 for a single step
                 c[i] * h_new
             })
             .collect();
@@ -57,21 +57,21 @@ impl BlockBackend for CpuBlockBackend {
 
 // ── GPU Backend (feature = "wgpu") ────────────────────────────────────────────
 
-/// wgpu backend: executes the `mamba_parallel_scan` kernel from aideen-block
-/// on GPU via blocking synchronization with `pollster`.
+/// wgpu backend: runs aideen-block's `fpm_parallel_scan` kernel
+/// on the GPU via blocking synchronization with `pollster`.
 ///
 /// ## Usage
 /// ```ignore
 /// let gpu = WgpuBlockBackend::new_blocking();
 /// if let Some(mut backend) = gpu {
-///     let y = backend.mamba_batch_step(&x, &dt, &a, &b, &c)?;
+///     let y = backend.fpm_batch_step(&x, &dt, &a, &b, &c)?;
 /// }
 /// ```
 #[cfg(feature = "wgpu")]
 pub struct WgpuBlockBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    bridge: aideen_block::mamba::RustMambaBridge,
+    bridge: aideen_block::fixed_point_memory::FixedPointMemoryBridge,
 }
 
 #[cfg(feature = "wgpu")]
@@ -83,9 +83,9 @@ impl WgpuBlockBackend {
     }
 
     async fn new_async() -> Option<Self> {
-        use aideen_block::{mamba::RustMambaBridge, ComputeState};
+        use aideen_block::{fixed_point_memory::FixedPointMemoryBridge, ComputeState};
         let state = ComputeState::new().await?;
-        let bridge = RustMambaBridge::new(&state.device);
+        let bridge = FixedPointMemoryBridge::new(&state.device);
         Some(Self {
             device: state.device,
             queue: state.queue,
@@ -96,7 +96,7 @@ impl WgpuBlockBackend {
 
 #[cfg(feature = "wgpu")]
 impl BlockBackend for WgpuBlockBackend {
-    fn mamba_batch_step(
+    fn fpm_batch_step(
         &mut self,
         x: &[f32],
         dt: &[f32],
@@ -147,7 +147,7 @@ impl BlockBackend for WgpuBlockBackend {
                 })
         };
 
-        // Output buffer: read_write + MAP_READ so we can read the result
+        // Output buffer: read_write + MAP_READ so the result can be read back
         let out_size = (d as usize * std::mem::size_of::<f32>()) as u64;
         let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -162,7 +162,7 @@ impl BlockBackend for WgpuBlockBackend {
             mapped_at_creation: false,
         });
 
-        // Crear buffers de entrada
+        // Create input buffers
         let shape_buf = make_uniform(bytemuck::bytes_of(&shape));
         let x_buf = make_storage_ro(x);
         let dt_buf = make_storage_ro(dt);
@@ -170,7 +170,7 @@ impl BlockBackend for WgpuBlockBackend {
         let b_buf = make_storage_ro(b);
         let c_buf = make_storage_ro(c);
 
-        // Bind group acorde al layout de RustMambaBridge
+        // Bind group matching the FixedPointMemoryBridge layout
         // (shape, X_in, dt, A, B, C, Y_out)
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,

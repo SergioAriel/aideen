@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Tensor {
     pub shape: Vec<usize>,
     pub data: Vec<f32>,
-    // Nota: en el futuro, Vec<f32> puede reemplazarse por bytes (Vec<u8>)
-    // y tipos genéricos (f16, bf16) para cuantización.
+    // Note: in the future, Vec<f32> may be replaced by bytes (Vec<u8>)
+    // and generic types (f16, bf16) for quantization.
 }
 
 impl Tensor {
