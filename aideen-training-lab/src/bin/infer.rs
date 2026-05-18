@@ -1,0 +1,367 @@
+//! Non-interactive inference runner for AIDEEN checkpoints.
+//!
+//! Usage:
+//!   cargo run --release --features wgpu -p aideen-training --bin infer -- \
+//!     --model model_large --prompt "Temporal memory enables"
+
+use aideen_training::trainer::Trainer;
+use std::{
+    env, fs,
+    io::{self, Read},
+    path::Path,
+    time::Instant,
+};
+
+const DEFAULT_MODEL: &str = "model_large";
+const DEFAULT_MAX_TOKENS: usize = 120;
+const DEFAULT_TEMPERATURE: f32 = 0.7;
+const DEFAULT_TOP_P: f32 = 0.9;
+const DEFAULT_TOP_K: usize = 40;
+const DEFAULT_REP_PENALTY: f32 = 1.1;
+const DEFAULT_PROMPT: &str = "Temporal memory enables";
+
+fn rms(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let mean_sq = xs.iter().map(|x| x * x).sum::<f32>() / xs.len() as f32;
+    mean_sq.sqrt()
+}
+
+fn mean(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f32>() / xs.len() as f32
+}
+
+fn min_max(xs: &[f32]) -> (f32, f32) {
+    if xs.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for &x in xs {
+        mn = mn.min(x);
+        mx = mx.max(x);
+    }
+    (mn, mx)
+}
+
+fn read_prompt_from_stdin() -> io::Result<String> {
+    let mut buf = String::new();
+    io::stdin().read_to_string(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+fn resolve_model_path(model: &str) -> (String, bool) {
+    if model.ends_with(".aidn") {
+        return (model.to_string(), true);
+    }
+    (model.to_string(), false)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut model = DEFAULT_MODEL.to_string();
+    let mut prompt: Option<String> = None;
+    let mut prompt_file: Option<String> = None;
+    let mut read_stdin = false;
+    let mut max_tokens = DEFAULT_MAX_TOKENS;
+    let mut temperature = DEFAULT_TEMPERATURE;
+    let mut top_p = DEFAULT_TOP_P;
+    let mut top_k = DEFAULT_TOP_K;
+    let mut rep_penalty = DEFAULT_REP_PENALTY;
+    let mut stream = false;
+    let mut stats = false;
+    let mut eval_file: Option<String> = None;
+    let mut eval_max_positions = 64usize;
+    let mut eval_train_path = false;
+    let mut probe_exact_forward = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" | "-m" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    model = v.clone();
+                }
+            }
+            "--prompt" | "-p" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    prompt = Some(v.clone());
+                }
+            }
+            "--prompt-file" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    prompt_file = Some(v.clone());
+                }
+            }
+            "--stdin" => read_stdin = true,
+            "--max-tokens" | "-n" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    max_tokens = v.parse().unwrap_or(DEFAULT_MAX_TOKENS);
+                }
+            }
+            "--temperature" | "-t" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    temperature = v.parse().unwrap_or(DEFAULT_TEMPERATURE);
+                }
+            }
+            "--top-p" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    top_p = v.parse().unwrap_or(DEFAULT_TOP_P);
+                }
+            }
+            "--top-k" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    top_k = v.parse().unwrap_or(DEFAULT_TOP_K);
+                }
+            }
+            "--rep-penalty" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    rep_penalty = v.parse().unwrap_or(DEFAULT_REP_PENALTY);
+                }
+            }
+            "--stream" => stream = true,
+            "--stats" => stats = true,
+            "--eval-file" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    eval_file = Some(v.clone());
+                }
+            }
+            "--eval-max-positions" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    eval_max_positions = v.parse().unwrap_or(eval_max_positions);
+                }
+            }
+            "--eval-train-path" => eval_train_path = true,
+            "--probe-exact-forward" => probe_exact_forward = true,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let prompt = if let Some(path) = prompt_file {
+        fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Could not read --prompt-file {}: {}", path, e))
+            .trim()
+            .to_string()
+    } else if read_stdin {
+        read_prompt_from_stdin().expect("Could not read prompt from stdin")
+    } else {
+        prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string())
+    };
+
+    let (model_path, is_full_path) = resolve_model_path(&model);
+
+    println!("AIDEEN inference");
+    println!("  model       : {}", model_path);
+    println!("  prompt chars: {}", prompt.len());
+    println!(
+        "  sampling    : max_tokens={} temp={} top_p={} top_k={} rep={}",
+        max_tokens, temperature, top_p, top_k, rep_penalty
+    );
+
+    let load_start = Instant::now();
+    let mut trainer = if is_full_path {
+        Trainer::load_full(&model_path)
+            .unwrap_or_else(|e| panic!("Could not load model {}: {}", model_path, e))
+    } else if Path::new(&format!("{model_path}.aidn")).exists() {
+        Trainer::load_checkpoint(&model_path)
+            .unwrap_or_else(|e| panic!("Could not load checkpoint {}: {}", model_path, e))
+    } else {
+        Trainer::load_full(&model_path)
+            .unwrap_or_else(|e| panic!("Could not load model {}: {}", model_path, e))
+    };
+    let load_elapsed = load_start.elapsed().as_secs_f32();
+
+    if stats {
+        let emb = trainer.tokenizer.embeddings.as_slice();
+        let lm_w = trainer.lm_head.w.as_slice();
+        let lm_b = trainer.lm_head.b.as_slice();
+        let lm_g = trainer.lm_head.g.as_slice();
+        let (
+            w_hist_shared,
+            hist_slot_scale,
+            hist_slot_bias,
+            hist_gate_logit,
+            slot_anchor,
+            _w_kv_write,
+            _b_delta,
+            _w_gate_hist,
+            _w_write_gate,
+            _b_write_mem,
+            _w_retain_up,
+            _w_retain_down,
+            _b_retain,
+            _w_q_mem,
+            _w_k_mem,
+            _b_read_mem,
+            _w_k_assoc,
+            _w_v_assoc,
+            _w_q_assoc,
+            _alpha_assoc,
+        ) = trainer.reasoning.history_params_gpu_layout();
+        let (gate_min, gate_max) = min_max(&hist_gate_logit);
+        let (slot_anchor_min, slot_anchor_max) = min_max(&slot_anchor);
+        println!("--- STATS ---");
+        println!(
+            "  gpu_exact   : {}",
+            if trainer.has_exact_gpu_checkpoint_weights() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  embeddings  : rms={:.5} mean={:.5} n={}",
+            rms(emb),
+            mean(emb),
+            emb.len()
+        );
+        println!(
+            "  lm_w        : rms={:.5} mean={:.5} n={}",
+            rms(lm_w),
+            mean(lm_w),
+            lm_w.len()
+        );
+        println!(
+            "  lm_b        : rms={:.5} mean={:.5} n={}",
+            rms(lm_b),
+            mean(lm_b),
+            lm_b.len()
+        );
+        println!(
+            "  lm_g        : rms={:.5} mean={:.5} min={:.5} max={:.5}",
+            rms(lm_g),
+            mean(lm_g),
+            min_max(lm_g).0,
+            min_max(lm_g).1
+        );
+        println!(
+            "  hist_shared : rms={:.5} mean={:.5}",
+            rms(&w_hist_shared),
+            mean(&w_hist_shared)
+        );
+        println!(
+            "  hist_scale  : rms={:.5} mean={:.5}",
+            rms(&hist_slot_scale),
+            mean(&hist_slot_scale)
+        );
+        println!(
+            "  hist_bias   : rms={:.5} mean={:.5}",
+            rms(&hist_slot_bias),
+            mean(&hist_slot_bias)
+        );
+        println!(
+            "  hist_gate   : mean={:.5} min={:.5} max={:.5}",
+            mean(&hist_gate_logit),
+            gate_min,
+            gate_max
+        );
+        println!(
+            "  slot_anchor : rms={:.5} mean={:.5} min={:.5} max={:.5}",
+            rms(&slot_anchor),
+            mean(&slot_anchor),
+            slot_anchor_min,
+            slot_anchor_max
+        );
+    }
+
+    if let Some(path) = eval_file.as_ref() {
+        let eval_text = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("Could not read --eval-file {}: {}", path, e));
+        let eval_tokens = trainer.tokenizer.encode(&eval_text);
+        let metrics = trainer.eval_full_vocab_gpu(&eval_tokens, eval_max_positions);
+        println!("--- FULL-VOCAB EVAL ---");
+        println!("  eval file   : {}", path);
+        println!("  eval tokens : {}", eval_tokens.len());
+        println!("  positions   : {}", metrics.count);
+        println!("  ce          : {:.4}", metrics.ce);
+        println!("  top1        : {:.4}", metrics.top1_acc);
+        println!("  top5        : {:.4}", metrics.top5_acc);
+        println!("  mean_rank   : {:.1}", metrics.mean_rank);
+        println!("  target_logit: {:.4}", metrics.mean_target_logit);
+        println!("  top_logit   : {:.4}", metrics.mean_top_logit);
+        if eval_train_path {
+            let train_metrics =
+                trainer.eval_full_vocab_train_path_gpu(&eval_tokens, eval_max_positions);
+            println!("--- FULL-VOCAB EVAL (TRAIN PATH) ---");
+            println!("  positions   : {}", train_metrics.count);
+            println!("  ce          : {:.4}", train_metrics.ce);
+            println!("  top1        : {:.4}", train_metrics.top1_acc);
+            println!("  top5        : {:.4}", train_metrics.top5_acc);
+            println!("  mean_rank   : {:.1}", train_metrics.mean_rank);
+            println!("  target_logit: {:.4}", train_metrics.mean_target_logit);
+            println!("  top_logit   : {:.4}", train_metrics.mean_top_logit);
+        }
+        if probe_exact_forward {
+            println!("--- EXACT FORWARD PARITY ---");
+            match trainer.probe_exact_forward_parity_gpu(&eval_tokens, eval_max_positions) {
+                Some(m) => {
+                    println!("  positions    : {}", m.positions);
+                    println!("  vocab        : {}", m.vocab);
+                    println!("  cpu_ms       : {:.3}", m.cpu_ms);
+                    println!("  gpu_ms       : {:.3}", m.gpu_ms);
+                    println!("  max_abs_diff : {:.6e}", m.max_abs_diff);
+                    println!("  mean_abs_diff: {:.6e}", m.mean_abs_diff);
+                    println!("  max_rel_diff : {:.6e}", m.max_rel_diff);
+                }
+                None => println!("  unavailable"),
+            }
+        }
+        if max_tokens == 0 {
+            return;
+        }
+    }
+
+    let prompt_tokens = trainer.tokenizer.encode(&prompt);
+    println!("  prompt tokens: {}", prompt_tokens.len());
+    println!("  load time    : {:.2}s", load_elapsed);
+    println!();
+    println!("--- PROMPT ---");
+    println!("{}", prompt);
+    println!("--- OUTPUT ---");
+
+    let gen_start = Instant::now();
+    let output = if stream {
+        trainer.generate_stream(
+            &prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            rep_penalty,
+            |chunk| print!("{}", chunk),
+        )
+    } else {
+        let out = trainer.generate(&prompt, max_tokens, temperature, top_p, top_k, rep_penalty);
+        println!("{}", out);
+        out
+    };
+    let gen_elapsed = gen_start.elapsed().as_secs_f32();
+    if stream {
+        println!();
+    }
+
+    let output_tokens = trainer.tokenizer.encode(&output);
+    println!("--- METRICS ---");
+    println!("  output chars : {}", output.len());
+    println!("  output tokens: {}", output_tokens.len());
+    println!("  gen time     : {:.2}s", gen_elapsed);
+    println!(
+        "  tok/s        : {:.1}",
+        output_tokens.len() as f32 / gen_elapsed.max(1e-9)
+    );
+}

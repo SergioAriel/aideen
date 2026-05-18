@@ -1,15 +1,16 @@
-//! Optimizador Adam para pesos nalgebra DMatrix/DVector.
+//! Adam optimizer for nalgebra DMatrix/DVector weights.
 
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
+use std::thread;
 
-/// Adam optimizer con first/second moment tracking.
+/// Adam optimizer with first/second moment tracking.
 pub struct Adam {
     pub lr: f32,
     pub beta1: f32,
     pub beta2: f32,
     pub eps: f32,
-    // Moments by parameter name
+    // Moments keyed by parameter name
     m_mat: HashMap<String, DMatrix<f32>>,
     v_mat: HashMap<String, DMatrix<f32>>,
     m_vec: HashMap<String, DVector<f32>>,
@@ -41,18 +42,30 @@ impl Adam {
         self.t
     }
 
-    // ── Accessors for synchronising GPU ↔ CPU moments ─────────────────────
+    // ── Accessors to sync GPU ↔ CPU moments ───────────────────────────────
     pub fn set_mat(&mut self, key: &str, val: DMatrix<f32>) {
         self.m_mat.insert(key.to_string(), val);
     }
     pub fn get_mat(&self, key: &str) -> Option<&DMatrix<f32>> {
         self.m_mat.get(key)
     }
+    pub fn set_mat_v(&mut self, key: &str, val: DMatrix<f32>) {
+        self.v_mat.insert(key.to_string(), val);
+    }
+    pub fn get_mat_v(&self, key: &str) -> Option<&DMatrix<f32>> {
+        self.v_mat.get(key)
+    }
     pub fn set_vec(&mut self, key: &str, val: DVector<f32>) {
         self.m_vec.insert(key.to_string(), val);
     }
     pub fn get_vec(&self, key: &str) -> Option<&DVector<f32>> {
         self.m_vec.get(key)
+    }
+    pub fn set_vec_v(&mut self, key: &str, val: DVector<f32>) {
+        self.v_vec.insert(key.to_string(), val);
+    }
+    pub fn get_vec_v(&self, key: &str) -> Option<&DVector<f32>> {
+        self.v_vec.get(key)
     }
 
     /// Updates a DMatrix in-place with Adam.
@@ -87,6 +100,88 @@ impl Adam {
         }
     }
 
+    /// In-place variant over contiguous slices, useful when the gradient has already
+    /// been accumulated exactly and we want to avoid matrix-algebra temporaries.
+    pub fn step_matrix_scaled_inplace(
+        &mut self,
+        name: &str,
+        w: &mut DMatrix<f32>,
+        grad: &DMatrix<f32>,
+        grad_scale: f32,
+    ) {
+        let key = name.to_string();
+        let (nrows, ncols) = (w.nrows(), w.ncols());
+        let m = self
+            .m_mat
+            .entry(key.clone())
+            .or_insert_with(|| DMatrix::zeros(nrows, ncols));
+        let v = self
+            .v_mat
+            .entry(key)
+            .or_insert_with(|| DMatrix::zeros(nrows, ncols));
+
+        let t = self.t.max(1) as f32;
+        let bc1 = 1.0 - self.beta1.powf(t);
+        let bc2 = 1.0 - self.beta2.powf(t);
+        let w_slice = w.as_mut_slice();
+        let g_slice = grad.as_slice();
+        let m_slice = m.as_mut_slice();
+        let v_slice = v.as_mut_slice();
+        let len = w_slice.len();
+        let threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let use_parallel = std::env::var("AIDEEN_EXACT_ADAM_PAR")
+            .ok()
+            .map(|v| {
+                let vl = v.trim().to_ascii_lowercase();
+                vl == "1" || vl == "true" || vl == "yes"
+            })
+            .unwrap_or(false)
+            && threads > 1
+            && len >= 1_000_000;
+        if use_parallel {
+            let chunk = len.div_ceil(threads);
+            thread::scope(|scope| {
+                for (((w_chunk, m_chunk), v_chunk), g_chunk) in w_slice
+                    .chunks_mut(chunk)
+                    .zip(m_slice.chunks_mut(chunk))
+                    .zip(v_slice.chunks_mut(chunk))
+                    .zip(g_slice.chunks(chunk))
+                {
+                    let beta1 = self.beta1;
+                    let beta2 = self.beta2;
+                    let lr = self.lr;
+                    let eps = self.eps;
+                    scope.spawn(move || {
+                        for i in 0..w_chunk.len() {
+                            let g = g_chunk[i] * grad_scale;
+                            let m_new = beta1 * m_chunk[i] + (1.0 - beta1) * g;
+                            let v_new = beta2 * v_chunk[i] + (1.0 - beta2) * g * g;
+                            m_chunk[i] = m_new;
+                            v_chunk[i] = v_new;
+                            let m_hat = m_new / bc1;
+                            let v_hat = v_new / bc2;
+                            w_chunk[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+                        }
+                    });
+                }
+            });
+        } else {
+            for i in 0..len {
+                let g = g_slice[i] * grad_scale;
+                let m_new = self.beta1 * m_slice[i] + (1.0 - self.beta1) * g;
+                let v_new = self.beta2 * v_slice[i] + (1.0 - self.beta2) * g * g;
+                m_slice[i] = m_new;
+                v_slice[i] = v_new;
+                let m_hat = m_new / bc1;
+                let v_hat = v_new / bc2;
+                w_slice[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+            }
+        }
+    }
+
     /// Updates a DVector in-place with Adam.
     pub fn step_vector(&mut self, name: &str, w: &mut DVector<f32>, grad: &DVector<f32>) {
         let key = name.to_string();
@@ -111,19 +206,54 @@ impl Adam {
             *w_i -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
         }
     }
+
+    pub fn step_vector_scaled_inplace(
+        &mut self,
+        name: &str,
+        w: &mut DVector<f32>,
+        grad: &DVector<f32>,
+        grad_scale: f32,
+    ) {
+        let key = name.to_string();
+        let len = w.len();
+        let m = self
+            .m_vec
+            .entry(key.clone())
+            .or_insert_with(|| DVector::zeros(len));
+        let v = self.v_vec.entry(key).or_insert_with(|| DVector::zeros(len));
+
+        let t = self.t.max(1) as f32;
+        let bc1 = 1.0 - self.beta1.powf(t);
+        let bc2 = 1.0 - self.beta2.powf(t);
+        let w_slice = w.as_mut_slice();
+        let g_slice = grad.as_slice();
+        let m_slice = m.as_mut_slice();
+        let v_slice = v.as_mut_slice();
+
+        for i in 0..w_slice.len() {
+            let g = g_slice[i] * grad_scale;
+            let m_new = self.beta1 * m_slice[i] + (1.0 - self.beta1) * g;
+            let v_new = self.beta2 * v_slice[i] + (1.0 - self.beta2) * g * g;
+            m_slice[i] = m_new;
+            v_slice[i] = v_new;
+            let m_hat = m_new / bc1;
+            let v_hat = v_new / bc2;
+            w_slice[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+        }
+    }
 }
 
 impl Adam {
     // ─────────────────────────────────────────────────────────────────────
-    // Checkpointing — binary serialization without extra dependencies
+    // Checkpointing — binary serialization with no extra dependencies
     //
-    // File format (.opt):
+    // .opt file format:
     //   [0..8]   magic "AIDENOPT"
     //   [8..16]  step count (u64 LE)
     //   then N entries:
     //     [u32 LE] key length in bytes
-    //     [u8 * key_len] key UTF-8
-    //     [u8]  type: 0 = vec (DVector/DMatrix flattened), 1 = mat
+    //     [u8 * key_len] UTF-8 key
+    //     [u8]  type: 0 = vec (flattened DVector/DMatrix), 1 = mat
     //     [u32 LE] number of f32 elements
     //     [f32 * n LE] data
     // ─────────────────────────────────────────────────────────────────────
@@ -138,7 +268,7 @@ impl Adam {
         f.write_all(&(self.t as u64).to_le_bytes())
             .map_err(|e| e.to_string())?;
 
-        // Helper closure para escribir un tensor plano.
+        // Helper closure to write a flat tensor.
         let write_entry =
             |f: &mut std::fs::File, prefix: &str, key: &str, data: &[f32]| -> Result<(), String> {
                 let full_key = format!("{prefix}.{key}");
@@ -178,7 +308,7 @@ impl Adam {
             .map_err(|e| e.to_string())?;
 
         if data.len() < 16 || &data[0..8] != b"AIDENOPT" {
-            return Err("Archivo .opt inválido o corrupto".to_string());
+            return Err("Invalid or corrupt .opt file".to_string());
         }
 
         self.t = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
@@ -216,7 +346,7 @@ impl Adam {
                 let mat = if side * side == floats.len() {
                     DMatrix::from_column_slice(side, side, &floats)
                 } else {
-                    // Matriz no cuadrada (p.ej. d_r × vocab): almacenar como n×1
+                    // Non-square matrix (e.g. d_r × vocab): store as n×1
                     DMatrix::from_column_slice(floats.len(), 1, &floats)
                 };
                 self.m_mat.insert(rest.to_string(), mat);
@@ -241,18 +371,18 @@ mod tests {
 
     #[test]
     fn adam_reduces_simple_quadratic() {
-        // Minimizar f(w) = ||w - target||² con Adam
+        // Minimize f(w) = ||w - target||² with Adam
         let target = DVector::from_vec(vec![1.0, 2.0, 3.0]);
         let mut w = DVector::zeros(3);
         let mut opt = Adam::new(0.1);
 
         for _ in 0..100 {
             opt.tick();
-            let grad = &w - &target; // df/dw = 2(w - target), ignoramos el 2
+            let grad = &w - &target; // df/dw = 2(w - target), we ignore the 2
             opt.step_vector("w", &mut w, &grad);
         }
 
         let dist = (&w - &target).norm();
-        assert!(dist < 0.1, "Adam debería converger, dist={dist}");
+        assert!(dist < 0.1, "Adam should converge, dist={dist}");
     }
 }

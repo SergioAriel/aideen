@@ -1,8 +1,8 @@
-//! Interactive chat binary for AIDEEN.
+//! Interactive chat binary with AIDEEN.
 //!
-//! Loads a checkpoint and allows text-mode conversation.
+//! Loads a checkpoint and allows conversing in text mode.
 //!
-//! Uso:
+//! Usage:
 //!   cargo run --release --features wgpu -p aideen-training --bin chat
 //!   cargo run --release --features wgpu -p aideen-training --bin chat -- --model model_large
 //!   cargo run --release --features wgpu -p aideen-training --bin chat -- --model model_large --max-tokens 80
@@ -19,7 +19,7 @@ const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.9;
 const DEFAULT_TOP_K: usize = 40;
 const DEFAULT_REP_PENALTY: f32 = 1.1;
-const CTX_WINDOW: usize = 512; // maximum characters in conversation history
+const CTX_WINDOW: usize = 512; // maximum characters of the conversation history
 
 fn main() {
     // ── Parse args ──────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ fn main() {
     // ── Banner ───────────────────────────────────────────────────────────────
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  AIDEEN — Interactive Chat                                   ║");
+    println!("║  AIDEEN — Interactive chat                                  ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Model  : {model_base}");
@@ -86,10 +86,10 @@ fn main() {
     println!();
     println!("  Type your message and press Enter. Type 'exit' or Ctrl+D to quit.");
     println!("  Type '/reset' to clear the conversation context.");
-    println!("  Type '/info' to see the active context.");
+    println!("  Type '/info' to view the active context.");
     println!();
 
-    // ── Cargar checkpoint ────────────────────────────────────────────────────
+    // ── Load checkpoint ──────────────────────────────────────────────────────
     print!("  Loading checkpoint '{model_base}'... ");
     io::stdout().flush().ok();
 
@@ -108,8 +108,8 @@ fn main() {
 
     println!();
 
-    // ── Conversation loop ────────────────────────────────────────────────
-    // We maintain an accumulated text context (sliding window).
+    // ── Conversation loop ────────────────────────────────────────────────────
+    // We keep an accumulated text context (sliding window).
     let mut context = String::new();
     let stdin = io::stdin();
 
@@ -145,7 +145,7 @@ fn main() {
                 if context.is_empty() {
                     println!("  (empty)");
                 } else {
-                    // Show last lines of context
+                    // Show the last lines of the context
                     let preview: String = context
                         .chars()
                         .rev()
@@ -167,7 +167,7 @@ fn main() {
         context.push_str(input);
         context.push_str("\nAIDEEN:");
 
-        // Sliding window: if context is too long, trim from the beginning
+        // Sliding window: if the context is too long, we trim from the beginning
         let prompt = if context.len() > CTX_WINDOW {
             &context[context.len() - CTX_WINDOW..]
         } else {
@@ -193,7 +193,7 @@ fn main() {
         println!();
         println!();
 
-        // Add response to context
+        // Add the response to the context
         context.push(' ');
         context.push_str(response.trim());
         context.push('\n');
