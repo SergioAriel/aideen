@@ -1,7 +1,7 @@
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
-/// Architecture and execution configuration for an AIDEEN instance.
+/// Configuration of the architecture and execution of an AIDEEN instance.
 /// Allows the engine to be dynamic and adapt to the loaded file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArchitectureConfig {
@@ -20,9 +20,9 @@ pub struct ArchitectureConfig {
     pub max_deq_iters: usize,
     /// DEQ convergence epsilon.
     pub deq_epsilon: f32,
-    /// Adjoint Picard iterations (Implicit Backpropagation).
+    /// Picard adjoint iterations (Implicit Backpropagation).
     pub adj_iters: usize,
-    /// Train the DEQ core?
+    /// Whether to train the DEQ core.
     pub train_deq: bool,
     /// DEQ gradient scale.
     pub deq_grad_scale: f32,
@@ -30,7 +30,7 @@ pub struct ArchitectureConfig {
     pub renorm_every_steps: usize,
     /// Number of samples for Sampled Softmax.
     pub num_samples: usize,
-    /// Penalty factor to prevent weight growth in DEQ.
+    /// Penalty factor to prevent weight growth in the DEQ.
     pub weight_decay: f32,
 }
 
@@ -44,13 +44,13 @@ impl Default for ArchitectureConfig {
             d_sim: 1024,
             h_slots: 8,        // 8 Slots — multi-scale temporal specialization
             vocab_size: 50257, // MUST match your tokenizer.json
-            ctx_len: 256,      // Memory window for chat
+            ctx_len: 512,      // Current stable baseline for memory/throughput on a desktop GPU
             max_deq_iters: 16, // v14 (Optimized after sweep: guarantees 100% conv with alpha=0)
             deq_epsilon: 1e-4,
-            adj_iters: 6, // contr≈0.20 → residual error 0.20^6≈6e-5, practically exact
+            adj_iters: 2, // Current stable baseline: best cost/robustness ratio for the adjoint
             train_deq: true,
-            deq_grad_scale: 0.01,
-            renorm_every_steps: 4, // Cada 4 steps: ~0.25x overhead vs inline, σ controlada en ventana corta
+            deq_grad_scale: 1.0,
+            renorm_every_steps: 4, // Every 4 steps: ~0.25x overhead vs inline, σ controlled within a short window
             num_samples: 512,
             weight_decay: 0.01,
         }
@@ -161,7 +161,7 @@ impl State {
         }
     }
 
-    // ── slices de solo lectura ───────────────────────────
+    // ── read-only slices ─────────────────────────────────
 
     pub fn m(&self) -> &[f32] {
         &self.s.as_slice()[0..self.config.d_m]
@@ -191,7 +191,7 @@ impl State {
         &self.s.as_slice()[start..end]
     }
 
-    // ── escritura controlada ────────────────────────────
+    // ── controlled writes ───────────────────────────────
 
     /// Injects delta ONLY into S_R
     pub fn inject_delta_r(&mut self, delta_r: &[f32]) {
