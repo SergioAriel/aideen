@@ -12,13 +12,13 @@ use aideen_node::update::UpdateManager;
 /// Three invariants verified without real I/O (in-process channel):
 ///
 ///   1. HANDSHAKE  — Hello → Delegation → Ack
-///   2. DISCOVERY  — tick() allow_learning=true → to_discovery_msg() → servidor recibe Discovery
+///   2. DISCOVERY  — tick() allow_learning=true → to_discovery_msg() → server receives Discovery
 ///   3. UPDATE LOOP — server sends SignedUpdate → client applies → Ack
 use ed25519_dalek::{Signer, SigningKey};
 use nalgebra::DVector;
 use rand::rngs::OsRng;
 
-// ── Helpers de llaves ─────────────────────────────────────────────────────
+// ── Key helpers ───────────────────────────────────────────────────────────
 
 fn generate_keys() -> (SigningKey, [u8; 32]) {
     let sk = SigningKey::generate(&mut OsRng);
@@ -59,7 +59,7 @@ fn create_update(
     u
 }
 
-// ── Mocks mínimos para AideenNode en test 2 ─────────────────────────────────
+// ── Minimal mocks for AideenNode in test 2 ──────────────────────────────────
 
 struct MockBackend;
 impl aideen_core::compute::ComputeBackend for MockBackend {
@@ -195,13 +195,13 @@ fn test_discovery_emitted_when_allow_learning() {
         epsilon: 1e-3,
     };
 
-    let m = node.tick().expect("tick debe producir métricas");
-    assert!(m.allow_learning, "Q debe habilitar discovery");
+    let m = node.tick().expect("tick must produce metrics");
+    assert!(m.allow_learning, "Q must enable discovery");
 
     let signal = LearningSignal {
         allow_learning: m.allow_learning,
         q_total: m.quality.q_total,
-        h_star: m.h_star.expect("h_star debe existir en atractor"),
+        h_star: m.h_star.expect("h_star must exist at the attractor"),
         s_context: DVector::zeros(config.d_r),
     };
 
@@ -225,7 +225,7 @@ fn test_discovery_emitted_when_allow_learning() {
             assert_ne!(h_star_hash, [0u8; 32]);
             assert_eq!(bundle_version, 1);
         }
-        other => panic!("esperaba NetMsg::Discovery, recibido: {:?}", other),
+        other => panic!("expected NetMsg::Discovery, received: {:?}", other),
     }
 }
 

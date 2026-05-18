@@ -26,7 +26,7 @@ fn sample_event(unix_ts: u64) -> AgentEvent {
 
 // ── Test 1 ────────────────────────────────────────────────────────────────
 
-/// set_pref → get_pref round-trip (incluye persistencia a disco).
+/// set_pref → get_pref round-trip (includes persistence to disk).
 #[test]
 fn test_fs_prefs_roundtrip() {
     let base = tmp_dir().to_string_lossy().to_string();
@@ -62,7 +62,7 @@ fn test_fs_event_append_and_recent() {
         panic!("expected TickAttractor");
     }
     if let AgentEvent::TickAttractor { unix_ts, .. } = &recent[2] {
-        assert_eq!(*unix_ts, 2, "el tercer evento debe tener ts=2");
+        assert_eq!(*unix_ts, 2, "the third event must have ts=2");
     } else {
         panic!("expected TickAttractor");
     }
@@ -70,7 +70,7 @@ fn test_fs_event_append_and_recent() {
 
 // ── Test 3 ────────────────────────────────────────────────────────────────
 
-/// open → append → drop → open → recent_events devuelve el mismo evento.
+/// open → append → drop → open → recent_events returns the same event.
 #[test]
 fn test_fs_store_survives_restart() {
     let base = tmp_dir().to_string_lossy().to_string();
@@ -79,22 +79,18 @@ fn test_fs_store_survives_restart() {
         let mut store = FsAgentStore::open(&base, "agent_3").unwrap();
         store.set_pref("key", "value_orig".into()).unwrap();
         store.append_event(sample_event(42)).unwrap();
-        // drop al salir del bloque
+        // drop when leaving the block
     }
 
-    // Reabrir — simula restart del proceso
+    // Reopen — simulates a process restart
     let store2 = FsAgentStore::open(&base, "agent_3").unwrap();
     assert_eq!(store2.get_pref("key").as_deref(), Some("value_orig"));
 
     let events = store2.recent_events(5);
-    assert_eq!(
-        events.len(),
-        1,
-        "debe haber exactamente 1 evento persistido"
-    );
+    assert_eq!(events.len(), 1, "there must be exactly 1 persisted event");
     if let AgentEvent::TickAttractor { unix_ts, .. } = &events[0] {
         assert_eq!(*unix_ts, 42);
     } else {
-        panic!("se esperaba TickAttractor con ts=42");
+        panic!("expected TickAttractor with ts=42");
     }
 }

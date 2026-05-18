@@ -12,13 +12,13 @@ fn test_trust_store_tofu_first_time() {
     let id: NodeId = [1u8; 32];
     let fp = [0xAAu8; 32];
 
-    // Primera vez → TofuStored
+    // First time → TofuStored
     let r = store
         .verify_or_tofu(id, fp, None)
         .expect("first tofu must succeed");
     assert!(matches!(r, TrustDecision::TofuStored));
 
-    // Segunda vez, mismo fp → Trusted
+    // Second time, same fp → Trusted
     let r2 = store
         .verify_or_tofu(id, fp, None)
         .expect("same fp must succeed");
@@ -36,7 +36,7 @@ fn test_trust_store_tofu_mismatch() {
         .verify_or_tofu(id, fp1, None)
         .expect("first tofu must succeed");
 
-    // Segundo intento con fp distinto → Err (TOFU mismatch)
+    // Second attempt with a different fp → Err (TOFU mismatch)
     let r = store.verify_or_tofu(id, fp2, None);
     assert!(r.is_err(), "fp change must be rejected");
 }
@@ -47,7 +47,7 @@ fn test_trust_store_pinned_ok() {
     let id: NodeId = [3u8; 32];
     let fp = [0x33u8; 32];
 
-    // Pinning explícito que coincide con el observado → TofuStored
+    // Explicit pinning that matches the observed one → TofuStored
     let r = store
         .verify_or_tofu(id, fp, Some(fp))
         .expect("matching pin must succeed");
@@ -61,7 +61,7 @@ fn test_trust_store_pinned_mismatch() {
     let fp_observed = [0x44u8; 32];
     let fp_pinned = [0x55u8; 32];
 
-    // Pinning que NO coincide con el observado → Err inmediato
+    // Pinning that does NOT match the observed one → immediate Err
     let r = store.verify_or_tofu(id, fp_observed, Some(fp_pinned));
     assert!(r.is_err(), "pin mismatch must be rejected");
 }
@@ -72,20 +72,20 @@ fn test_trust_store_pinned_mismatch() {
 fn test_circuit_breaker_opens_and_recovers() {
     let mut s = FailureState::default();
 
-    // Sin fallos: puede intentar
+    // No failures: can try
     assert!(s.can_try(), "initially must be able to try");
 
-    // Primer fallo: breaker se abre (backoff=1s)
+    // First failure: breaker opens (backoff=1s)
     let node_id = [0u8; 32];
     s.record_failure(&node_id);
     assert_eq!(s.fail_count, 1);
     assert!(!s.can_try(), "after 1 failure breaker must be open");
 
-    // Manipular open_until al pasado → simular expiración del TTL
+    // Set open_until to the past → simulate TTL expiration
     s.open_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
     assert!(s.can_try(), "after TTL expired must be able to try again");
 
-    // record_success → resetea
+    // record_success → resets
     s.record_success();
     assert_eq!(s.fail_count, 0);
     assert!(s.open_until.is_none());
@@ -145,7 +145,7 @@ fn test_quic_channel_factory_dial_loopback() {
                 recv.read_exact(&mut buf).await.unwrap();
                 let msg = NetMsg::decode(&buf).unwrap();
 
-                // Responder con Pong en stream uni de salida
+                // Respond with Pong on the outgoing uni stream
                 let pong = match msg {
                     NetMsg::Ping => NetMsg::Pong,
                     _ => NetMsg::Pong,
@@ -157,7 +157,7 @@ fn test_quic_channel_factory_dial_loopback() {
                     .unwrap();
                 send.write_all(&payload).await.unwrap();
                 send.finish().unwrap();
-                // Dar tiempo para que el cliente lea
+                // Give the client time to read
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         });
@@ -165,11 +165,11 @@ fn test_quic_channel_factory_dial_loopback() {
 
     let server_addr = addr_rx.recv().unwrap();
 
-    // ── Dial con QuicChannelFactory ────────────────────────────────────────────
+    // ── Dial with QuicChannelFactory ───────────────────────────────────────────
     let factory = QuicChannelFactory;
     let peer = aideen_node::peers::types::PeerEntry {
         node_id: [0u8; 32],
-        endpoint: server_addr.to_string(), // "host:port" sin prefijo
+        endpoint: server_addr.to_string(), // "host:port" without prefix
         domains: vec![],
         bundle_version: 1,
         tls_fingerprint: None,
@@ -177,13 +177,13 @@ fn test_quic_channel_factory_dial_loopback() {
 
     let dr = factory.dial(&peer).expect("dial must succeed");
 
-    // Verificar fingerprint
+    // Verify fingerprint
     assert_eq!(
         dr.fingerprint, expected_fp,
         "DialResult.fingerprint must equal sha256(cert_der)"
     );
 
-    // Enviar Ping, recibir Pong
+    // Send Ping, receive Pong
     let mut ch = dr.channel;
     ch.send(NetMsg::Ping).expect("send Ping must succeed");
     let resp = ch.recv().expect("recv Pong must succeed");

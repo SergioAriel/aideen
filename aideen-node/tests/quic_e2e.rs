@@ -10,16 +10,16 @@ use aideen_node::update::UpdateManager;
 /// E2E: AIDEEN canonical network pipeline over real QUIC (quinn).
 ///
 /// Same three invariants as net_pipeline_e2e, but the channel is
-/// QuicChannel::pair_local() con framing u32 LE + bincode.
+/// QuicChannel::pair_local() with u32 LE framing + bincode.
 ///
 ///   1. HANDSHAKE  — Hello → Delegation → Ack
-///   2. DISCOVERY  — tick() allow_learning=true → Discovery enviado
+///   2. DISCOVERY  — tick() allow_learning=true → Discovery sent
 ///   3. UPDATE LOOP — SignedUpdate → on_message → Ack
 use ed25519_dalek::{Signer, SigningKey};
 use nalgebra::DVector;
 use rand::rngs::OsRng;
 
-// ── Helpers de llaves ─────────────────────────────────────────────────────
+// ── Key helpers ───────────────────────────────────────────────────────────
 
 fn generate_keys() -> (SigningKey, [u8; 32]) {
     let sk = SigningKey::generate(&mut OsRng);
@@ -60,7 +60,7 @@ fn create_update(
     u
 }
 
-// ── Mocks mínimos ─────────────────────────────────────────────────────────
+// ── Minimal mocks ─────────────────────────────────────────────────────────
 
 struct MockBackend;
 impl aideen_core::compute::ComputeBackend for MockBackend {
@@ -134,7 +134,7 @@ impl aideen_core::memory::Memory for NullMemory {
     }
 }
 
-// ── Test 1: Handshake sobre QUIC ─────────────────────────────────────────
+// ── Test 1: Handshake over QUIC ──────────────────────────────────────────
 
 #[test]
 fn test_quic_handshake_hello_delegation_ack() {
@@ -144,7 +144,7 @@ fn test_quic_handshake_hello_delegation_ack() {
     let (_, critic_pk) = generate_keys();
     let delegation = create_delegation(&root_sk, critic_pk, 1);
 
-    // cliente → Hello
+    // client → Hello
     client
         .send(NetMsg::Hello {
             node_id: [1u8; 32],
@@ -154,12 +154,12 @@ fn test_quic_handshake_hello_delegation_ack() {
         })
         .unwrap();
 
-    // servidor recibe Hello, envía Delegation
+    // server receives Hello, sends Delegation
     let msg = server.recv().unwrap();
-    assert!(matches!(msg, NetMsg::Hello { .. }), "esperaba Hello");
+    assert!(matches!(msg, NetMsg::Hello { .. }), "expected Hello");
     server.send(NetMsg::Delegation(delegation)).unwrap();
 
-    // cliente recibe Delegation → on_message → Ack
+    // client receives Delegation → on_message → Ack
     let msg = client.recv().unwrap();
     let mut manager = UpdateManager::new(root_pk);
     let config = ArchitectureConfig::default();
@@ -175,17 +175,17 @@ fn test_quic_handshake_hello_delegation_ack() {
                 ok: true
             }
         ),
-        "Ack esperado kind=Delegation version=1 ok=true, recibido: {:?}",
+        "expected Ack kind=Delegation version=1 ok=true, received: {:?}",
         ack
     );
     client.send(ack).unwrap();
 
-    // servidor confirma Ack
+    // server confirms Ack
     let ack_rcv = server.recv().unwrap();
     assert!(matches!(ack_rcv, NetMsg::Ack { ok: true, .. }));
 }
 
-// ── Test 2: Discovery sobre QUIC ─────────────────────────────────────────
+// ── Test 2: Discovery over QUIC ──────────────────────────────────────────
 
 #[test]
 fn test_quic_discovery_emitted_when_allow_learning() {
@@ -203,13 +203,13 @@ fn test_quic_discovery_emitted_when_allow_learning() {
         epsilon: 1e-3,
     };
 
-    let m = node.tick().expect("tick debe producir métricas");
-    assert!(m.allow_learning, "Q debe habilitar discovery");
+    let m = node.tick().expect("tick must produce metrics");
+    assert!(m.allow_learning, "Q must enable discovery");
 
     let signal = LearningSignal {
         allow_learning: m.allow_learning,
         q_total: m.quality.q_total,
-        h_star: m.h_star.expect("h_star debe existir en atractor"),
+        h_star: m.h_star.expect("h_star must exist at the attractor"),
         s_context: DVector::zeros(config.d_r),
     };
 
@@ -229,15 +229,15 @@ fn test_quic_discovery_emitted_when_allow_learning() {
         } => {
             assert_eq!(node_id, [42u8; 32]);
             assert_eq!(target_id, "expert_0");
-            assert!(q_total >= 0.6, "q_total debe ser >= Q_MIN_LEARN");
-            assert_ne!(h_star_hash, [0u8; 32], "h_star_hash no debe ser cero");
+            assert!(q_total >= 0.6, "q_total must be >= Q_MIN_LEARN");
+            assert_ne!(h_star_hash, [0u8; 32], "h_star_hash must not be zero");
             assert_eq!(bundle_version, 1);
         }
-        other => panic!("esperaba NetMsg::Discovery, recibido: {:?}", other),
+        other => panic!("expected NetMsg::Discovery, received: {:?}", other),
     }
 }
 
-// ── Test 3: Update loop sobre QUIC ────────────────────────────────────────
+// ── Test 3: Update loop over QUIC ─────────────────────────────────────────
 
 #[test]
 fn test_quic_update_loop_server_sends_client_applies_ack() {
@@ -268,7 +268,7 @@ fn test_quic_update_loop_server_sends_client_applies_ack() {
                 ok: true
             }
         ),
-        "Ack esperado kind=Update version=1, recibido: {:?}",
+        "expected Ack kind=Update version=1, received: {:?}",
         response
     );
     client.send(response).unwrap();
@@ -283,6 +283,6 @@ fn test_quic_update_loop_server_sends_client_applies_ack() {
                 version: 1
             }
         ),
-        "servidor esperaba Ack kind=Update ok=true version=1"
+        "server expected Ack kind=Update ok=true version=1"
     );
 }

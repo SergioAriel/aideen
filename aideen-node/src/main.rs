@@ -11,7 +11,7 @@ use aideen_node::system::node::{AideenNode, TickMetrics};
 use nalgebra::DVector;
 use rand::Rng;
 
-// ─── Implementaciones Temporales (Dummies) ───────────────────────
+// ─── Temporary Implementations (Dummies) ─────────────────────────
 
 struct DummyEthics;
 impl Ethics for DummyEthics {
@@ -55,7 +55,7 @@ impl Control for StressControl {
     }
 }
 
-// Reasoning inestable para Test D
+// Unstable reasoning for Test D
 struct UnstableReasoning {
     config: ArchitectureConfig,
     mode: u8, // 0: oscillation, 1: divergence
@@ -86,10 +86,10 @@ impl aideen_core::reasoning::Reasoning for UnstableReasoning {
         for k in 0..h_slots {
             let mut slot = h.slot(k);
             if self.mode == 0 {
-                // Oscilación: voltea y amplía lentamente
+                // Oscillation: flips and slowly amplifies
                 slot.iter_mut().for_each(|v| *v *= -1.1);
             } else {
-                // Divergencia lineal
+                // Linear divergence
                 slot.iter_mut().for_each(|v| *v += 10.0);
             }
             next.set_slot(k, &slot);
@@ -100,49 +100,49 @@ impl aideen_core::reasoning::Reasoning for UnstableReasoning {
 
 #[tokio::main]
 async fn main() {
-    println!("🟥 NIVEL 2 — STRESS DINÁMICO AIDEEN");
+    println!("🟥 LEVEL 2 — AIDEEN DYNAMIC STRESS");
     println!("──────────────────────────────────────────────────");
 
-    // A. Sensibilidad a Alpha
+    // A. Sensitivity to Alpha
     test_alpha_sweep().await;
 
-    // B. Sensibilidad a Beta
+    // B. Sensitivity to Beta
     test_beta_sweep().await;
 
-    // C. Perturbación Adversaria en S_sim
+    // C. Adversarial Perturbation in S_sim
     test_adversarial_sim().await;
 
-    // D. No convergencia forzada
+    // D. Forced non-convergence
     test_unstable_reasoning().await;
 }
 
 async fn test_alpha_sweep() {
-    println!("\n[TEST A: BARRIDO DE ALPHA]");
+    println!("\n[TEST A: ALPHA SWEEP]");
     let alphas = [0.01, 0.05, 0.1, 0.3, 0.7, 1.0];
 
     for alpha in alphas {
         let mut node = build_base_node(alpha, 1.0, 5).await;
-        println!(">>> Ejecutando alpha = {}", alpha);
+        println!(">>> Running alpha = {}", alpha);
         run_sim_quiet(&mut node);
     }
 }
 
 async fn test_beta_sweep() {
-    println!("\n[TEST B: BARRIDO DE BETA (CONTROL)]");
+    println!("\n[TEST B: BETA SWEEP (CONTROL)]");
     let betas = [0.1, 0.5, 1.0, 2.0, 5.0];
 
     for beta in betas {
         let mut node = build_base_node(0.1, beta, 5).await;
-        println!(">>> Ejecutando beta = {}", beta);
+        println!(">>> Running beta = {}", beta);
         run_sim_quiet(&mut node);
     }
 }
 
 async fn test_adversarial_sim() {
-    println!("\n[TEST C: PERTURBACIÓN ADVERSARIA EN S_SIM]");
+    println!("\n[TEST C: ADVERSARIAL PERTURBATION IN S_SIM]");
 
-    // 1. Ruido aleatorio grande
-    println!(">>> 1. Ruido grande en S_sim");
+    // 1. Large random noise
+    println!(">>> 1. Large noise in S_sim");
     let mut node_large = build_base_node(0.1, 1.0, 5).await;
     let config = node_large.reasoning.config().clone();
     let d_sim = config.d_sim;
@@ -152,8 +152,8 @@ async fn test_adversarial_sim() {
     node_large.state.as_mut_slice()[off_sim..off_sim + d_sim].copy_from_slice(&noise);
     run_sim_quiet(&mut node_large);
 
-    // 2. Ruido pequeño persistente (inyectado cada tick)
-    println!(">>> 2. Ruido persistente");
+    // 2. Small persistent noise (injected every tick)
+    println!(">>> 2. Persistent noise");
     let mut node_persist = build_base_node(0.1, 1.0, 5).await;
     for tick in 1..=5 {
         let noise: Vec<f32> = (0..d_sim).map(|_| rng.gen_range(-0.1..0.1)).collect();
@@ -165,13 +165,13 @@ async fn test_adversarial_sim() {
 }
 
 async fn test_unstable_reasoning() {
-    println!("\n[TEST D: NO CONVERGENCIA FORZADA]");
+    println!("\n[TEST D: FORCED NON-CONVERGENCE]");
 
     let config = ArchitectureConfig::default();
     let d_r = config.d_r;
     let total_size = config.total_size();
 
-    println!(">>> 1. Oscilación divergente");
+    println!(">>> 1. Divergent oscillation");
     let mut state_osc = DVector::zeros(total_size);
     state_osc.rows_mut(0, d_r).add_scalar_mut(1.0);
 
@@ -193,7 +193,7 @@ async fn test_unstable_reasoning() {
     };
     run_sim_quiet(&mut node_osc);
 
-    println!(">>> 2. Divergencia lineal");
+    println!(">>> 2. Linear divergence");
     let mut state_div = DVector::zeros(total_size);
     state_div.rows_mut(0, d_r).add_scalar_mut(1.0);
 
@@ -218,7 +218,7 @@ async fn test_unstable_reasoning() {
 
 // --- Helpers ---
 
-// Reasoning simulado para pruebas de stress
+// Simulated reasoning for stress tests
 struct StableMockReasoning {
     config: ArchitectureConfig,
 }
@@ -286,7 +286,7 @@ where
     M: aideen_core::memory::Memory,
     B: ComputeBackend,
 {
-    // Solo mostramos el primer y último tick relevante para no saturar
+    // We only show the first and last relevant tick to avoid clutter
     let mut last_m: Option<TickMetrics> = None;
     for tick in 1..=5 {
         if let Some(m) = node.tick() {

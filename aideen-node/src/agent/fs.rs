@@ -5,18 +5,18 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Almacenamiento persistente del agente en disco (native only).
+/// Persistent on-disk storage for the agent (native only).
 ///
 /// Layout:
 ///   <dir>/prefs.bin   — bincode(HashMap<String, String>)
-///   <dir>/events.log  — secuencia de [u32 LE len][bincode(AgentEvent)]
+///   <dir>/events.log  — sequence of [u32 LE len][bincode(AgentEvent)]
 pub struct FsAgentStore {
     dir: PathBuf,
     prefs: HashMap<String, String>,
 }
 
 impl FsAgentStore {
-    /// Abre o crea el store en `<base_dir>/<agent_id>/`.
+    /// Opens or creates the store at `<base_dir>/<agent_id>/`.
     pub fn open(base_dir: &str, agent_id: &str) -> Result<Self, String> {
         let dir = PathBuf::from(base_dir).join(agent_id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -69,7 +69,7 @@ impl AgentStore for FsAgentStore {
     }
 
     fn recent_events(&self, limit: usize) -> Vec<AgentEvent> {
-        // MVP: lee todos los frames, devuelve los últimos `limit` en orden inverso.
+        // MVP: reads all frames, returns the last `limit` in reverse order.
         let path = self.events_path();
         if !path.exists() {
             return vec![];

@@ -55,7 +55,7 @@ impl AttractorMemory {
 
 impl Memory for AttractorMemory {
     fn write(&mut self, h: DVector<f32>) {
-        assert_eq!(h.len(), self.dim, "AttractorMemory: dim mismatch en write");
+        assert_eq!(h.len(), self.dim, "AttractorMemory: dim mismatch in write");
         let normed = Self::normalize(&h);
         self.store_raw.push(h);
         self.store_normed.push(normed);
@@ -65,7 +65,7 @@ impl Memory for AttractorMemory {
         assert_eq!(
             query.len(),
             self.dim,
-            "AttractorMemory: dim mismatch en query"
+            "AttractorMemory: dim mismatch in query"
         );
         if self.store_normed.is_empty() || k == 0 {
             return vec![];
@@ -83,9 +83,9 @@ impl Memory for AttractorMemory {
 
         let take = k.min(n);
 
-        // Top-k en O(n) + O(k log k):
-        // select_nth_unstable_by(take-1) garantiza que scored[..take]
-        // contiene los k mejores (no ordenados), luego ordenamos solo esos k.
+        // Top-k in O(n) + O(k log k):
+        // select_nth_unstable_by(take-1) guarantees that scored[..take]
+        // contains the k best (unordered), then we sort only those k.
         if take > 0 && take < n {
             scored.select_nth_unstable_by(take - 1, |a, b| {
                 b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)

@@ -1,26 +1,26 @@
-//! # Aideen AI MVP — End-to-End Demo
+//! # Aideen AI MVP — Demo End-to-End
 //!
-//! Demonstrates three inference loop operation modes:
+//! Demonstrates three operating modes of the inference loop:
 //!
 //! ## Mode 1: Local-Only
-//! Local DEQ converges without querying external experts.
+//! Local DEQ converges without consulting external experts.
 //!
 //! ## Mode 2: Expert-Hop (in-process)
-//! The node queries an expert in the same process via
+//! The node consults an expert in the same process through
 //! `InProcessChannel`. The Critic updates reputation after each response.
 //!
-//! ## Mode 3: Full Pipeline (DEQ → H* → MambaDecoder → text)
+//! ## Mode 3: Full Pipeline (DEQ → H* → FixedPointMemoryDecoder → text)
 //! Runs the full pipeline:
-//!   query → encoder → DEQ (MambaSlotReasoning) → H* → MambaDecoder → tokens
+//!   query → encoder → DEQ (FixedPointMemoryReasoning) → H* → FixedPointMemoryDecoder → tokens
 //!
-//! ## Running
+//! ## Execution
 //! ```
 //! cargo run --bin demo -- [local|expert|full|both]
 //! ```
 
 use std::time::Instant;
 
-use aideen_backbone::{MambaDecoder, MambaSlotReasoning};
+use aideen_backbone::{FixedPointMemoryDecoder, FixedPointMemoryReasoning};
 use aideen_core::{
     compute::{ComputeBackend, TensorId},
     reasoning::Reasoning,
@@ -35,7 +35,7 @@ use aideen_node::{
 };
 use nalgebra::DVector;
 
-// ── Compact mocks ────────────────────────────────────────────────────────────
+// ── Compact mocks ─────────────────────────────────────────────────────────────
 
 struct DemoBackend;
 impl ComputeBackend for DemoBackend {
@@ -86,14 +86,14 @@ impl Reasoning for StableReasoning {
     }
 }
 
-// ── Minimal vocabulary for demo ───────────────────────────────────────────────
+// ── Minimal vocabulary for the demo ───────────────────────────────────────────
 
-/// Trivial tokeniser: each ASCII character → token ID.
+/// Trivial tokenizer: each ASCII character → token ID.
 fn tokenize(text: &str, vocab_size: usize) -> Vec<u32> {
     text.bytes().map(|b| b as u32 % vocab_size as u32).collect()
 }
 
-/// Trivial detokeniser: token ID → character.
+/// Trivial detokenizer: token ID → character.
 fn detokenize(tokens: &[u32]) -> String {
     tokens
         .iter()
@@ -108,11 +108,11 @@ fn detokenize(tokens: &[u32]) -> String {
         .collect()
 }
 
-// ── MODO 1: Local-only ────────────────────────────────────────────────────────
+// ── MODE 1: Local-only ────────────────────────────────────────────────────────
 
 fn run_local_mode(queries: &[&str]) {
     println!("\n╔══════════════════════════════════════════════════════╗");
-    println!("║           MODO 1: Local-Only Inference              ║");
+    println!("║           MODE 1: Local-Only Inference              ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
 
     let config = ArchitectureConfig::default();
@@ -128,7 +128,7 @@ fn run_local_mode(queries: &[&str]) {
 
     for (i, query) in queries.iter().enumerate() {
         let t0 = Instant::now();
-        // Note: run_local_mode uses StableReasoning which doesn't need tokens,
+        // Note: run_local_mode uses StableReasoning which does not need tokens,
         // but we pass the query as a string for compatibility with the inference_run signature.
         let result = inference_run(query, &mut reasoning, &mut backend, None, &cfg);
         let elapsed_ms = t0.elapsed().as_millis();
@@ -152,7 +152,7 @@ fn run_local_mode(queries: &[&str]) {
     }
 }
 
-// ── MODO 2: Expert-Hop ────────────────────────────────────────────────────────
+// ── MODE 2: Expert-Hop ────────────────────────────────────────────────────────
 
 fn spawn_expert_server() -> Box<dyn NetChannel> {
     let (client_ch, mut server_ch) = InProcessChannel::pair();
@@ -179,7 +179,7 @@ fn spawn_expert_server() -> Box<dyn NetChannel> {
 
 fn run_expert_mode(queries: &[&str]) {
     println!("\n╔══════════════════════════════════════════════════════╗");
-    println!("║         MODO 2: Expert-Hop con Critic v0            ║");
+    println!("║         MODE 2: Expert-Hop with Critic v0           ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
 
     let peer_id: NodeId = [0x42u8; 32];
@@ -259,25 +259,25 @@ fn run_expert_mode(queries: &[&str]) {
     println!("Top-1 expert by reputation: {:?}", critic.top_k(1));
 }
 
-// ── MODO 3: Full Pipeline (DEQ → H* → MambaDecoder → texto) ──────────────────
+// ── MODE 3: Full Pipeline (DEQ → H* → FixedPointMemoryDecoder → text) ──────────────────
 
 fn run_full_mode(queries: &[&str]) {
     println!("\n╔══════════════════════════════════════════════════════╗");
-    println!("║   MODO 3: Full Pipeline  DEQ → H* → MambaDecoder   ║");
+    println!("║   MODE 3: Full Pipeline  DEQ → H* → FixedPointMemoryDecoder   ║");
     println!("╚══════════════════════════════════════════════════════╝");
-    println!("Note: random weights — tokens have no semantic meaning.");
+    println!("Note: random weights — the tokens are semantically meaningless.");
     println!("      The goal is to validate that the PIPELINE WORKS.\n");
 
-    // MambaSlotReasoning as f of the DEQ (cross-slot attn + Mamba SSM)
+    // FixedPointMemoryReasoning as the DEQ's f (cross-slot attn + FPM SSM)
     let config = ArchitectureConfig::default();
-    let mut reasoning = MambaSlotReasoning::new(config.clone());
+    let mut reasoning = FixedPointMemoryReasoning::new(config.clone());
     let mut backend = DemoBackend;
 
-    // Small vocabulary for demo (ASCII printable)
+    // Small vocabulary for the demo (printable ASCII)
     let vocab_size = 128usize;
     let mut dec_config = config.clone();
     dec_config.vocab_size = vocab_size;
-    let decoder = MambaDecoder::new(4, dec_config);
+    let decoder = FixedPointMemoryDecoder::new(4, dec_config);
 
     let cfg = InferenceConfig {
         max_iters: 30,
@@ -288,7 +288,7 @@ fn run_full_mode(queries: &[&str]) {
     for (i, query) in queries.iter().enumerate() {
         let t0 = Instant::now();
 
-        // ① DEQ loop con MambaSlotReasoning → H*
+        // ① DEQ loop with FixedPointMemoryReasoning → H*
         let result = inference_run(query, &mut reasoning, &mut backend, None, &cfg);
         let deq_ms = t0.elapsed().as_millis();
 
@@ -308,7 +308,7 @@ fn run_full_mode(queries: &[&str]) {
             }
         };
 
-        // ② MambaDecoder: H* → tokens
+        // ② FixedPointMemoryDecoder: H* → tokens
         let prompt_tokens = tokenize(query, vocab_size);
         let t1 = Instant::now();
         let generated = decoder.generate(&h_star, &prompt_tokens[..prompt_tokens.len().min(8)], 20);

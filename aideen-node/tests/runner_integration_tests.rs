@@ -18,7 +18,7 @@ use aideen_node::{
     system::node::AideenNode,
 };
 
-// ── Mocks mínimos ──────────────────────────────────────────────────────────────
+// ── Minimal mocks ──────────────────────────────────────────────────────────────
 
 struct MockBackend;
 impl ComputeBackend for MockBackend {
@@ -51,12 +51,12 @@ impl Reasoning for MockReasoning {
         _s: &DVector<f32>,
         _exec: Option<&mut dyn ComputeBackend>,
     ) -> HSlots {
-        HSlots::zeros(&self.config) // zeros → delta_norm ≈ 0 → converge inmediato
+        HSlots::zeros(&self.config) // zeros → delta_norm ≈ 0 → converges immediately
     }
 }
 
 /// State-sensitive Reasoning: blends slots with the S_sim region (where
-/// `set_context()` escribe los features documentales). Converge en 1 paso.
+/// `set_context()` writes the document features). Converges in 1 step.
 struct ContextSensitiveReasoning {
     config: ArchitectureConfig,
 }
@@ -68,11 +68,11 @@ impl Reasoning for ContextSensitiveReasoning {
         HSlots::from_broadcast(&s.rows(0, self.config.d_r).into_owned(), &self.config)
     }
     fn step(&self, h: &HSlots, s: &DVector<f32>, _exec: Option<&mut dyn ComputeBackend>) -> HSlots {
-        // S_sim es donde set_context() escribe los features de contexto
+        // S_sim is where set_context() writes the context features
         let s_sim = s
             .rows(self.config.d_reasoning(), self.config.d_sim)
             .into_owned();
-        // Pad a D_R con ceros para hacer el blend
+        // Pad to D_R with zeros to do the blend
         let mut sim_padded = DVector::<f32>::zeros(self.config.d_r);
         for (i, v) in s_sim.iter().enumerate() {
             sim_padded[i] = *v;
@@ -125,7 +125,7 @@ impl Memory for MockMemory {
     }
 }
 
-// ── Constructores de runner ────────────────────────────────────────────────────
+// ── Runner constructors ────────────────────────────────────────────────────────
 
 fn build_runner(
     agent_store: Box<dyn AgentStore + Send>,
@@ -218,7 +218,7 @@ fn meta(title: &str) -> DocMeta {
 
 // ── Test 1 ─────────────────────────────────────────────────────────────────────
 
-/// tick() emite TickAttractor si el nodo alcanza un atractor de calidad.
+/// tick() emits TickAttractor if the node reaches a quality attractor.
 #[test]
 fn tick_produces_attractor_event() {
     let store = Box::new(InMemoryAgentStore::new());
@@ -226,24 +226,24 @@ fn tick_produces_attractor_event() {
     let mut runner = build_runner(store, doc_mem);
 
     let metrics = runner.tick();
-    assert!(metrics.is_some(), "tick debe devolver métricas");
+    assert!(metrics.is_some(), "tick must return metrics");
 
     let m = metrics.unwrap();
     if m.is_attractor {
         let events = runner.recent_events(5);
-        assert!(!events.is_empty(), "debe haber al menos un evento");
+        assert!(!events.is_empty(), "there must be at least one event");
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::TickAttractor { .. })),
-            "el evento debe ser TickAttractor"
+            "the event must be TickAttractor"
         );
     }
 }
 
 // ── Test 2 ─────────────────────────────────────────────────────────────────────
 
-/// add_document/search/locate + restart: los documentos persisten.
+/// add_document/search/locate + restart: the documents persist.
 #[test]
 fn add_doc_search_locate_survive_restart() {
     use aideen_node::{agent::FsAgentStore, doc_memory::FsDocMemory};
@@ -260,15 +260,15 @@ fn add_doc_search_locate_survive_restart() {
         let doc_id = runner.add_document(meta("Motor"), content.clone()).unwrap();
 
         let hits = runner.search_docs("aideen", 5);
-        assert!(!hits.is_empty(), "search debe encontrar el documento");
+        assert!(!hits.is_empty(), "search must find the document");
         assert_eq!(hits[0].doc_id, doc_id);
 
         let offs = runner.locate(doc_id, b"aideen", 5);
         assert!(
             offs.len() >= 2,
-            "locate debe encontrar las 2 ocurrencias de 'aideen'"
+            "locate must find the 2 occurrences of 'aideen'"
         );
-        assert_eq!(offs[0].0, 0, "primera ocurrencia en byte 0");
+        assert_eq!(offs[0].0, 0, "first occurrence at byte 0");
 
         doc_id
     };
@@ -347,21 +347,21 @@ fn context_affects_attractor() {
 
     let out_a = runner
         .tick_with_query("aideen", 5)
-        .expect("debe producir outcome (query A)");
+        .expect("must produce an outcome (query A)");
     println!("DEBUG TEST A: converged={}, is_attractor={}, delta_norm(via stop_reason)={:?}, q_total={:?}, epsilon={:?}", out_a.metrics.converged, out_a.metrics.is_attractor, out_a.metrics.stop_reason, out_a.metrics.quality.q_total, runner.node.epsilon);
     assert!(
         out_a.metrics.is_attractor,
-        "debe alcanzar atractor con query A"
+        "must reach an attractor with query A"
     );
     let h_star_a = out_a.metrics.h_star.unwrap();
 
     runner.node.state = DVector::zeros(2560);
     let out_b = runner
         .tick_with_query("zzznotfound", 5)
-        .expect("debe producir outcome (query B)");
+        .expect("must produce an outcome (query B)");
     assert!(
         out_b.metrics.is_attractor,
-        "debe alcanzar atractor con query B"
+        "must reach an attractor with query B"
     );
     let h_star_b = out_b.metrics.h_star.unwrap();
 
@@ -374,14 +374,14 @@ fn context_affects_attractor() {
         .sum();
     assert!(
         diff > 1e-6,
-        "diferente contexto debe producir diferente h* (diff={diff})"
+        "a different context must produce a different h* (diff={diff})"
     );
 }
 
 // ── Test 5 ─────────────────────────────────────────────────────────────────────
 
-/// Con delegated=true, tick_with_query produce NetMsg::Discovery y registra
-/// AgentEvent::DiscoveryEmitted con los campos correctos.
+/// With delegated=true, tick_with_query produces NetMsg::Discovery and records
+/// AgentEvent::DiscoveryEmitted with the correct fields.
 #[test]
 fn discovery_emitted_when_delegated() {
     use aideen_node::{agent::FsAgentStore, doc_memory::FsDocMemory};
@@ -405,16 +405,16 @@ fn discovery_emitted_when_delegated() {
 
     let TickOutcome { metrics, discovery } = runner
         .tick_with_query("aideen", 5)
-        .expect("debe producir outcome");
+        .expect("must produce an outcome");
 
-    assert!(metrics.is_attractor, "debe alcanzar atractor");
+    assert!(metrics.is_attractor, "must reach an attractor");
     assert!(
         metrics.allow_learning,
-        "allow_learning debe ser true (q >= Q_MIN_LEARN)"
+        "allow_learning must be true (q >= Q_MIN_LEARN)"
     );
     assert!(
         discovery.is_some(),
-        "Discovery debe existir cuando allow_learning && delegated"
+        "Discovery must exist when allow_learning && delegated"
     );
 
     if let Some(NetMsg::Discovery {
@@ -425,10 +425,10 @@ fn discovery_emitted_when_delegated() {
         ..
     }) = discovery
     {
-        assert_eq!(nid, node_id, "node_id debe coincidir");
-        assert_eq!(tid, target_id, "target_id debe coincidir");
-        assert_eq!(bv, bundle_version, "bundle_version debe coincidir");
-        assert!(q_total > 0.0, "q_total debe ser positivo");
+        assert_eq!(nid, node_id, "node_id must match");
+        assert_eq!(tid, target_id, "target_id must match");
+        assert_eq!(bv, bundle_version, "bundle_version must match");
+        assert!(q_total > 0.0, "q_total must be positive");
     }
 
     let events = runner.recent_events(10);
@@ -436,7 +436,7 @@ fn discovery_emitted_when_delegated() {
         events
             .iter()
             .any(|e| matches!(e, AgentEvent::DiscoveryEmitted { .. })),
-        "DiscoveryEmitted debe registrarse en agent_store"
+        "DiscoveryEmitted must be recorded in agent_store"
     );
 }
 
@@ -462,12 +462,12 @@ fn discovery_not_emitted_without_delegation() {
 
     let TickOutcome { metrics, discovery } = runner
         .tick_with_query("aideen", 5)
-        .expect("debe producir outcome");
+        .expect("must produce an outcome");
 
-    assert!(metrics.allow_learning, "allow_learning debe ser true");
+    assert!(metrics.allow_learning, "allow_learning must be true");
     assert!(
         discovery.is_none(),
-        "sin delegación no debe emitir Discovery"
+        "without delegation it must not emit Discovery"
     );
 
     let events = runner.recent_events(10);
@@ -475,6 +475,6 @@ fn discovery_not_emitted_without_delegation() {
         !events
             .iter()
             .any(|e| matches!(e, AgentEvent::DiscoveryEmitted { .. })),
-        "sin delegación no debe registrarse DiscoveryEmitted"
+        "without delegation DiscoveryEmitted must not be recorded"
     );
 }

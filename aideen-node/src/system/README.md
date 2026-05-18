@@ -1,13 +1,13 @@
-# Módulo local: `system` (Bucle del Sistema / Orquestador)
+# Local module: `system` (System Loop / Orchestrator)
 
-## 📌 Responsabilidades
-*   Manejar el bucle principal (`loop`) del nodo de inferencia.
-*   Definir el orden estricto de ejecución, basándose en los contratos puros de `aideen-core`:
+## 📌 Responsibilities
+*   Handle the main loop (`loop`) of the inference node.
+*   Define the strict execution order, based on the pure contracts of `aideen-core`:
     1.  `Reasoning::step`
     2.  `Control::decide`
     3.  `Ethics::violates`
-    4.  `Integración matemática` (S ← S + tanh(α · Δ))
+    4.  `Mathematical integration` (S ← S + tanh(α · Δ))
 
-## 🚫 Restricciones (Constitucionales)
-*   **NO** conoce detalles de implementación locales de la GPU.
-*   **NO** conoce los detalles del puerto, sockets ni del protocolo de red (delega estas tareas en `engine` y `network` respectivamente).
+## 🚫 Restrictions (Constitutional)
+*   Does **NOT** know local GPU implementation details.
+*   Does **NOT** know the details of the port, sockets or the network protocol (delegates these tasks to `engine` and `network` respectively).

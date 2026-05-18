@@ -2,17 +2,17 @@
 ///
 /// Verified invariants:
 ///   1. tick() with instant convergence → h_star = Some(h*)
-///   2. LinearReadout::identity devuelve exactamente h*
-///   3. LinearReadout::new(W, b) devuelve W·h* + b exacto
-///   4. Cuando Ethics viola → h_star = None (gating)
-///   5. allow_learning refleja Q >= Q_MIN_LEARN
+///   2. LinearReadout::identity returns exactly h*
+///   3. LinearReadout::new(W, b) returns exact W·h* + b
+///   4. When Ethics violates → h_star = None (gating)
+///   5. allow_learning reflects Q >= Q_MIN_LEARN
 use aideen_backbone::readout::LinearReadout;
 use aideen_core::readout::Readout;
 use aideen_core::state::{ArchitectureConfig, HSlots};
 use aideen_node::system::node::AideenNode;
 use nalgebra::{DMatrix, DVector};
 
-// ── Constantes del test ────────────────────────────────────────────────────
+// ── Test constants ─────────────────────────────────────────────────────────
 
 /// Fixed value to which MockReasoning converges
 const H_VAL: f32 = 0.3;
@@ -109,11 +109,11 @@ impl aideen_core::memory::Memory for NullMemory {
 // ── Helper ─────────────────────────────────────────────────────────────────
 
 fn assert_dvec_approx(a: &DVector<f32>, b: &DVector<f32>, tol: f32) {
-    assert_eq!(a.len(), b.len(), "dimensión distinta");
+    assert_eq!(a.len(), b.len(), "different dimension");
     for (i, (ai, bi)) in a.iter().zip(b.iter()).enumerate() {
         assert!(
             (ai - bi).abs() < tol,
-            "índice {}: {} vs {} (tol={})",
+            "index {}: {} vs {} (tol={})",
             i,
             ai,
             bi,
@@ -124,7 +124,7 @@ fn assert_dvec_approx(a: &DVector<f32>, b: &DVector<f32>, tol: f32) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-/// Readout identidad: output debe ser exactamente h*.
+/// Identity readout: output must be exactly h*.
 #[test]
 fn test_readout_identity_on_attractor() {
     let config = ArchitectureConfig::default();
@@ -139,11 +139,14 @@ fn test_readout_identity_on_attractor() {
         epsilon: 1e-3,
     };
 
-    let m = node.tick().expect("tick debe producir métricas");
-    assert!(m.is_attractor, "debe ser atractor");
+    let m = node.tick().expect("tick must produce metrics");
+    assert!(m.is_attractor, "must be an attractor");
     assert!(m.allow_learning, "Q=0.7 >= Q_MIN_LEARN=0.6");
 
-    let h_star_slots = m.h_star.as_ref().expect("h_star debe existir en atractor");
+    let h_star_slots = m
+        .h_star
+        .as_ref()
+        .expect("h_star must exist at the attractor");
     let h_star = h_star_slots.slot(0);
     assert_eq!(h_star.len(), config.d_r);
 
@@ -168,11 +171,11 @@ fn test_readout_projection_on_attractor() {
         epsilon: 1e-3,
     };
 
-    let m = node.tick().expect("tick debe producir métricas");
-    let h_star_slots = m.h_star.as_ref().expect("h_star debe existir");
+    let m = node.tick().expect("tick must produce metrics");
+    let h_star_slots = m.h_star.as_ref().expect("h_star must exist");
     let h_star = h_star_slots.slot(0);
 
-    // W: [2 × D_R] selecciona h[0] y h[1]; b = [100, 200]
+    // W: [2 × D_R] selects h[0] and h[1]; b = [100, 200]
     let out_dim = 2;
     let mut w = DMatrix::<f32>::zeros(out_dim, config.d_r);
     w[(0, 0)] = 1.0;
@@ -210,10 +213,7 @@ fn test_h_star_absent_on_ethics_violation() {
         epsilon: 1e-3,
     };
 
-    let m = node.tick().expect("tick debe producir métricas");
-    assert!(!m.is_attractor, "ética violada → no es atractor");
-    assert!(
-        m.h_star.is_none(),
-        "h_star debe ser None cuando ética falla"
-    );
+    let m = node.tick().expect("tick must produce metrics");
+    assert!(!m.is_attractor, "ethics violated → not an attractor");
+    assert!(m.h_star.is_none(), "h_star must be None when ethics fails");
 }

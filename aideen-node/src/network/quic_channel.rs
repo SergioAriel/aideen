@@ -39,7 +39,7 @@ impl NetChannel for QuicChannel {
 
 // ── Framing helpers ───────────────────────────────────────────────────────
 
-/// Escribe NetMsg con framing: u32 LE (longitud) + payload bincode.
+/// Writes NetMsg with framing: u32 LE (length) + bincode payload.
 async fn write_framed(send: &mut quinn::SendStream, msg: &NetMsg) -> Result<(), String> {
     let payload = msg.encode()?;
     let len = (payload.len() as u32).to_le_bytes();
@@ -47,7 +47,7 @@ async fn write_framed(send: &mut quinn::SendStream, msg: &NetMsg) -> Result<(), 
     send.write_all(&payload).await.map_err(|e| e.to_string())
 }
 
-/// Lee NetMsg con framing: u32 LE (longitud) + payload bincode.
+/// Reads NetMsg with framing: u32 LE (length) + bincode payload.
 async fn read_framed(recv: &mut quinn::RecvStream) -> Result<NetMsg, String> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
@@ -115,7 +115,7 @@ impl QuicChannel {
             .unwrap();
             let server_addr = server_ep.local_addr().unwrap();
 
-            // ── Client config — trusts solo este cert ────────────────────
+            // ── Client config — trusts only this cert ────────────────────
             let mut root_store = rustls::RootCertStore::empty();
             root_store.add(cert_der_cli).unwrap();
             let rustls_cli = rustls::ClientConfig::builder()
@@ -127,7 +127,7 @@ impl QuicChannel {
             let client_ep =
                 quinn::Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
 
-            // ── Conectar concurrentemente ────────────────────────────────
+            // ── Connect concurrently ─────────────────────────────────────
             let (client_conn, server_conn) = tokio::join!(
                 async {
                     client_ep
@@ -148,22 +148,22 @@ impl QuicChannel {
             // without blocking the other on accept.
             let _ = ready_tx.send(());
 
-            // ── I/O loops: 2 uni streams independientes ──────────────────
+            // ── I/O loops: 2 independent uni streams ──────────────────────
             //
             //   C→S: client opens uni stream → server accepts
             //   S→C: server opens uni stream → client accepts
             //
-            // Cada write loop abre su stream lazily cuando llega el 1er msg.
-            // Cada read loop acepta el stream del peer cuando éste escribe.
+            // Each write loop opens its stream lazily when the 1st msg arrives.
+            // Each read loop accepts the peer's stream when the peer writes.
             let _client_ep = client_ep;
             let _server_ep = server_ep;
 
-            // Clonar conexiones: cada una se usa en 2 closures (writer + reader)
+            // Clone connections: each one is used in 2 closures (writer + reader)
             let client_conn_r = client_conn.clone();
             let server_conn_r = server_conn.clone();
 
             tokio::join!(
-                // Cliente writer: abre stream uni C→S, escribe mensajes
+                // Client writer: opens uni stream C→S, writes messages
                 async move {
                     let mut send = client_conn.open_uni().await.unwrap();
                     let mut rx = c_net_rx;
@@ -173,7 +173,7 @@ impl QuicChannel {
                         }
                     }
                 },
-                // Cliente reader: acepta stream uni S→C cuando servidor escribe
+                // Client reader: accepts uni stream S→C when server writes
                 async move {
                     let mut recv = client_conn_r.accept_uni().await.unwrap();
                     loop {
@@ -187,7 +187,7 @@ impl QuicChannel {
                         }
                     }
                 },
-                // Servidor writer: abre stream uni S→C, escribe mensajes
+                // Server writer: opens uni stream S→C, writes messages
                 async move {
                     let mut send = server_conn.open_uni().await.unwrap();
                     let mut rx = s_net_rx;
@@ -197,7 +197,7 @@ impl QuicChannel {
                         }
                     }
                 },
-                // Servidor reader: acepta stream uni C→S cuando cliente escribe
+                // Server reader: accepts uni stream C→S when client writes
                 async move {
                     let mut recv = server_conn_r.accept_uni().await.unwrap();
                     loop {
@@ -281,10 +281,10 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCapture {
 // ── QuicChannel::dial() ───────────────────────────────────────────────────────
 
 impl QuicChannel {
-    /// Conecta a un endpoint real ("host:port" o "quic://host:port"), captura fingerprint.
+    /// Connects to a real endpoint ("host:port" or "quic://host:port"), captures fingerprint.
     /// Blocks until the QUIC handshake completes.
     pub fn dial(endpoint: &str) -> Result<(Self, [u8; 32]), String> {
-        // Ajuste #1: soportar "quic://host:port" y "host:port"
+        // Adjustment #1: support "quic://host:port" and "host:port"
         let endpoint = endpoint.strip_prefix("quic://").unwrap_or(endpoint);
 
         let fp_cell: Arc<OnceLock<[u8; 32]>> = Arc::new(OnceLock::new());
@@ -310,7 +310,7 @@ impl QuicChannel {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
 
         quic_rt().spawn(async move {
-            // Ajuste #4: .await directo dentro del spawn — mismo patrón que pair_local()
+            // Adjustment #4: direct .await inside the spawn — same pattern as pair_local()
             let client_ep =
                 match quinn::Endpoint::client("0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap())
                 {
@@ -339,7 +339,7 @@ impl QuicChannel {
 
             let _ = ready_tx.send(Ok(()));
 
-            // I/O loops: uni stream saliente (open_uni) + uni stream entrante (accept_uni)
+            // I/O loops: outbound uni stream (open_uni) + inbound uni stream (accept_uni)
             let conn_r = conn.clone();
             tokio::join!(
                 async move {

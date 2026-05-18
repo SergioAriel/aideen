@@ -23,7 +23,7 @@ fn test_config() -> ArchitectureConfig {
 fn test_query_empty_before_inserts() {
     let mem = AttractorMemory::new(2);
     let result = mem.query(&vec2(1.0, 0.0), 5);
-    assert!(result.is_empty(), "índice vacío debe devolver vec![]");
+    assert!(result.is_empty(), "empty index must return vec![]");
 }
 
 // ── Test 2 ────────────────────────────────────────────────────────────────
@@ -65,17 +65,17 @@ fn test_insert_k_clamps_to_n() {
     mem.write(vec2(1.0, 1.0));
 
     let results = mem.query(&vec2(1.0, 0.0), 10);
-    assert_eq!(results.len(), 3, "k=10 con 3 elementos debe devolver 3");
+    assert_eq!(results.len(), 3, "k=10 with 3 elements must return 3");
 }
 
 // ── Test 4 ────────────────────────────────────────────────────────────────
 
 /// Wrong dimension in write → panic with clear message.
 #[test]
-#[should_panic(expected = "dim mismatch en write")]
+#[should_panic(expected = "dim mismatch in write")]
 fn test_dim_mismatch_panics_on_write() {
     let mut mem = AttractorMemory::new(4);
-    mem.write(DVector::zeros(2)); // dim=2, mem espera dim=4
+    mem.write(DVector::zeros(2)); // dim=2, mem expects dim=4
 }
 
 // ── Test 5 ────────────────────────────────────────────────────────────────
@@ -90,10 +90,10 @@ fn test_warm_start_falls_back_with_null_memory() {
     let query = zeros(d_res);
 
     let results = mem.query(&query, 1);
-    assert!(results.is_empty(), "NullMemory.query debe devolver vec![]");
+    assert!(results.is_empty(), "NullMemory.query must return vec![]");
 
-    // Simular warm-start del DEQ: si empty, usa init() (simulado como zeros)
+    // Simulate the DEQ warm-start: if empty, use init() (simulated as zeros)
     let h_init = zeros(d_res);
     let h = results.into_iter().next().unwrap_or(h_init.clone());
-    assert_eq!(h, h_init, "warm-start con NullMemory debe producir h_init");
+    assert_eq!(h, h_init, "warm-start with NullMemory must produce h_init");
 }
