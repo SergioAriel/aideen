@@ -417,9 +417,10 @@ impl FixedPointMemoryReasoning {
                 .map(|_| DMatrix::from_fn(d_r, 32, |_, _| rng.gen_range(-0.01_f32..0.01_f32)))
                 .collect(),
             w_q_assoc,
-            // GPU forward/backward applies sigmoid(alpha_assoc). Store logit(0.3)
-            // so the effective initial read mix is the documented 0.3, not 0.574.
-            alpha_assoc: DVector::from_element(h_slots, (0.3_f32 / 0.7_f32).ln()),
+            // GPU forward/backward applies sigmoid(alpha_assoc). Start the assoc
+            // read branch at 0.7 now that the payload carries relational content,
+            // so the read path is active enough to move the solved state by default.
+            alpha_assoc: DVector::from_element(h_slots, (0.7_f32 / 0.3_f32).ln()),
             norm_scale: DVector::from_element(d_r, 1.0_f32),
             // Q/K per-slot bias: break permutation symmetry with a *shared slot code*,
             // not two independent random tables. If q_bias and k_bias are unrelated,

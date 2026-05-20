@@ -1438,6 +1438,11 @@ impl GpuDeqBackend {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        let assoc_rel_value_mix = std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
         let assoc_write_budget = std::env::var("AIDEEN_ASSOC_WRITE_BUDGET")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -1448,6 +1453,7 @@ impl GpuDeqBackend {
         shader_constants.insert("ASSOC_RANK".to_string(), 32.0);
         shader_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         shader_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        shader_constants.insert("ASSOC_REL_VALUE_MIX".to_string(), assoc_rel_value_mix);
         shader_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
         shader_constants.insert(
             "SEGMENT_MEMORY_BETA".to_string(),
@@ -1703,6 +1709,7 @@ impl GpuDeqBackend {
         fpm_retain_bwd_constants.insert("ASSOC_BANKS".to_string(), assoc_banks as f64);
         fpm_retain_bwd_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         fpm_retain_bwd_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        fpm_retain_bwd_constants.insert("ASSOC_REL_VALUE_MIX".to_string(), assoc_rel_value_mix);
         fpm_retain_bwd_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
         fpm_retain_bwd_constants
             .insert("FPM_DIRECT_WRITE_SCALE".to_string(), fpm_direct_write_scale);
@@ -5843,6 +5850,16 @@ impl GpuDeqBackend {
     pub fn read_assoc_state(&self) -> Vec<f32> {
         let n_floats = (self.bridge.assoc_buf.size() / 4) as usize;
         self.read_storage_buffer(&self.bridge.assoc_buf, n_floats, "AssocBuf Readback")
+    }
+
+    // TEMPORARY ASSOCIATIVE DIAGNOSTIC: read direct associative read context per token/slot.
+    pub fn read_assoc_read_seq(&self, seq_len: u32) -> Vec<f32> {
+        let n_floats = seq_len as usize * self.config.h_slots * self.config.d_r;
+        self.read_storage_buffer(
+            &self.bridge.assoc_read_buf,
+            n_floats,
+            "Assoc_read Sequence Readback Staging",
+        )
     }
 
     // TEMPORARY ASSOCIATIVE DIAGNOSTIC: remove after assoc backward path is localized.
