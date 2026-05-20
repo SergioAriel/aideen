@@ -1057,7 +1057,7 @@ fn main() {
     {
         trainer.reasoning.alpha_assoc.fill(alpha_assoc_override);
     } else if assoc_only {
-        trainer.reasoning.alpha_assoc.fill((0.3_f32 / 0.7_f32).ln());
+        trainer.reasoning.alpha_assoc.fill((0.7_f32 / 0.3_f32).ln());
     }
     if assoc_only {
         #[cfg(feature = "wgpu")]

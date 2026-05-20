@@ -713,6 +713,11 @@ impl RustDeqBridge {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        let assoc_rel_value_mix = std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
         let assoc_write_budget = std::env::var("AIDEEN_ASSOC_WRITE_BUDGET")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -720,6 +725,7 @@ impl RustDeqBridge {
             .clamp(0.0, 32.0);
         slot_coord_constants.insert("ASSOC_READ_BETA".to_string(), assoc_read_beta);
         slot_coord_constants.insert("ASSOC_WRITE_MIN_MASS".to_string(), assoc_write_min_mass);
+        slot_coord_constants.insert("ASSOC_REL_VALUE_MIX".to_string(), assoc_rel_value_mix);
         slot_coord_constants.insert("ASSOC_WRITE_BUDGET".to_string(), assoc_write_budget);
         slot_coord_constants.insert(
             "ENABLE_ASSOC_TRANSITION_GATE".to_string(),

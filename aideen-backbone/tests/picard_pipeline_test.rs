@@ -33,6 +33,29 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
+fn slice_token(seq: &[f32], token_idx: usize, h_slots: usize, d: usize) -> &[f32] {
+    let start = token_idx * h_slots * d;
+    let end = start + h_slots * d;
+    &seq[start..end]
+}
+
+fn slice_slot(token: &[f32], slot_idx: usize, d: usize) -> &[f32] {
+    let start = slot_idx * d;
+    let end = start + d;
+    &token[start..end]
+}
+
 fn cpu_hist_gated_forward_no_attn(
     s_in: &[f32],
     w_in: &[f32],
@@ -235,6 +258,568 @@ fn cpu_forward_map_no_fpm(
         }
     }
     out
+}
+
+fn run_two_token_sequence_with_seed(
+    config: &ArchitectureConfig,
+    token_carry: bool,
+    prev_dim: usize,
+    curr_dim: usize,
+    seed: u64,
+) -> Vec<f32> {
+    run_two_token_sequence_with_mode(config, token_carry, prev_dim, curr_dim, seed, false)
+}
+
+fn run_two_token_sequence_with_mode(
+    config: &ArchitectureConfig,
+    token_carry: bool,
+    prev_dim: usize,
+    curr_dim: usize,
+    seed: u64,
+    hist_gated: bool,
+) -> Vec<f32> {
+    if token_carry {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "1");
+    } else {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "0");
+    }
+    std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
+    if hist_gated {
+        std::env::set_var("AIDEEN_DEQ_HIST_GATED", "1");
+    } else {
+        std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    }
+
+    let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), seed);
+    let weights = reasoning.export_weights();
+    let w_q = weights.get("reasoning.w_q").expect("w_q missing");
+    let w_k = weights.get("reasoning.w_k").expect("w_k missing");
+    let w_v_flat = reasoning.w_v_gpu_flat();
+    let w_v = &w_v_flat;
+    let w_o_flat = reasoning.w_o_gpu_flat();
+    let w_o = &w_o_flat;
+    let w_in = weights.get("reasoning.w_in").expect("w_in missing");
+    let w_x = weights.get("reasoning.w_x").expect("w_x missing");
+    let w_out = weights.get("reasoning.w_out").expect("w_out missing");
+    let a_log = weights.get("reasoning.a_log").expect("a_log missing");
+    let norm = weights
+        .get("reasoning.norm_scale")
+        .expect("norm_scale missing");
+    let w_hist = weights
+        .get("reasoning.w_hist_shared")
+        .expect("w_hist_shared missing");
+    let hist_slot_scale = weights
+        .get("reasoning.hist_slot_scale")
+        .expect("hist_slot_scale missing");
+    let hist_slot_bias = weights
+        .get("reasoning.hist_slot_bias")
+        .expect("hist_slot_bias missing");
+    let hist_gate_logit = weights
+        .get("reasoning.hist_gate_logit")
+        .expect("hist_gate_logit missing");
+    let slot_anchor = weights
+        .get("reasoning.slot_anchor")
+        .expect("slot_anchor missing");
+    let d = config.d_r;
+    let h = config.h_slots;
+    let w_delta_zeros = vec![0.0f32; h * d];
+    let b_delta_zeros = vec![0.0f32; h];
+    let w_delta = weights.get("reasoning.w_delta").unwrap_or(&w_delta_zeros);
+    let b_delta = weights.get("reasoning.b_delta").unwrap_or(&b_delta_zeros);
+    let w_gate_hist_zeros = vec![0.0f32; h * d];
+    let w_forget_zeros = vec![0.0f32; h * d];
+    let b_forget_init = vec![3.0f32; h];
+    let w_retain_up_zeros = vec![0.0f32; h * d * 32];
+    let w_retain_down_zeros = vec![0.0f32; h * 32 * d];
+    let b_retain_zeros = vec![0.0f32; h * d];
+    let w_q_mem_zeros = vec![0.0f32; h * d * 32];
+    let w_k_mem_zeros = vec![0.0f32; h * d * 32];
+    let b_read_mem_zeros = vec![0.0f32; h];
+    let w_k_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_v_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_q_assoc_zeros = vec![0.0f32; h * d * 32];
+    let alpha_assoc_zeros = vec![0.0f32; h];
+
+    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
+    gpu.upload_weights(
+        &gpu.queue,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        w_hist,
+        hist_slot_scale,
+        hist_slot_bias,
+        hist_gate_logit,
+        slot_anchor,
+        w_delta,
+        b_delta,
+        &w_gate_hist_zeros,
+        &w_forget_zeros,
+        &b_forget_init,
+        &w_retain_up_zeros,
+        &w_retain_down_zeros,
+        &b_retain_zeros,
+        &w_q_mem_zeros,
+        &w_k_mem_zeros,
+        &b_read_mem_zeros,
+        &w_k_assoc_zeros,
+        &w_v_assoc_zeros,
+        &w_q_assoc_zeros,
+        &alpha_assoc_zeros,
+    );
+
+    let seq_len = 2u32;
+    let damping = 0.9f32;
+    let mut s_in = vec![0.0f32; seq_len as usize * d];
+    s_in[prev_dim] = 1.0;
+    s_in[d + curr_dim] = 1.0;
+
+    gpu.reset_state();
+    gpu.run_forward_deq_no_readback(
+        1,
+        seq_len,
+        config.max_deq_iters as u32,
+        config.deq_epsilon,
+        damping,
+        &s_in,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        false,
+    )
+    .expect("GPU forward failed");
+    gpu.read_hnext_seq(seq_len)
+}
+
+fn run_single_token_sequence_with_seed(
+    config: &ArchitectureConfig,
+    token_carry: bool,
+    curr_dim: usize,
+    seed: u64,
+) -> Vec<f32> {
+    run_single_token_sequence_with_mode(config, token_carry, curr_dim, seed, false)
+}
+
+fn run_single_token_sequence_with_mode(
+    config: &ArchitectureConfig,
+    token_carry: bool,
+    curr_dim: usize,
+    seed: u64,
+    hist_gated: bool,
+) -> Vec<f32> {
+    if token_carry {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "1");
+    } else {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "0");
+    }
+    std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
+    if hist_gated {
+        std::env::set_var("AIDEEN_DEQ_HIST_GATED", "1");
+    } else {
+        std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    }
+
+    let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), seed);
+    let weights = reasoning.export_weights();
+    let w_q = weights.get("reasoning.w_q").expect("w_q missing");
+    let w_k = weights.get("reasoning.w_k").expect("w_k missing");
+    let w_v_flat = reasoning.w_v_gpu_flat();
+    let w_v = &w_v_flat;
+    let w_o_flat = reasoning.w_o_gpu_flat();
+    let w_o = &w_o_flat;
+    let w_in = weights.get("reasoning.w_in").expect("w_in missing");
+    let w_x = weights.get("reasoning.w_x").expect("w_x missing");
+    let w_out = weights.get("reasoning.w_out").expect("w_out missing");
+    let a_log = weights.get("reasoning.a_log").expect("a_log missing");
+    let norm = weights
+        .get("reasoning.norm_scale")
+        .expect("norm_scale missing");
+    let w_hist = weights
+        .get("reasoning.w_hist_shared")
+        .expect("w_hist_shared missing");
+    let hist_slot_scale = weights
+        .get("reasoning.hist_slot_scale")
+        .expect("hist_slot_scale missing");
+    let hist_slot_bias = weights
+        .get("reasoning.hist_slot_bias")
+        .expect("hist_slot_bias missing");
+    let hist_gate_logit = weights
+        .get("reasoning.hist_gate_logit")
+        .expect("hist_gate_logit missing");
+    let slot_anchor = weights
+        .get("reasoning.slot_anchor")
+        .expect("slot_anchor missing");
+    let d = config.d_r;
+    let h = config.h_slots;
+    let w_delta_zeros = vec![0.0f32; h * d];
+    let b_delta_zeros = vec![0.0f32; h];
+    let w_delta = weights.get("reasoning.w_delta").unwrap_or(&w_delta_zeros);
+    let b_delta = weights.get("reasoning.b_delta").unwrap_or(&b_delta_zeros);
+    let w_gate_hist_zeros = vec![0.0f32; h * d];
+    let w_forget_zeros = vec![0.0f32; h * d];
+    let b_forget_init = vec![3.0f32; h];
+    let w_retain_up_zeros = vec![0.0f32; h * d * 32];
+    let w_retain_down_zeros = vec![0.0f32; h * 32 * d];
+    let b_retain_zeros = vec![0.0f32; h * d];
+    let w_q_mem_zeros = vec![0.0f32; h * d * 32];
+    let w_k_mem_zeros = vec![0.0f32; h * d * 32];
+    let b_read_mem_zeros = vec![0.0f32; h];
+    let w_k_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_v_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_q_assoc_zeros = vec![0.0f32; h * d * 32];
+    let alpha_assoc_zeros = vec![0.0f32; h];
+
+    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
+    gpu.upload_weights(
+        &gpu.queue,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        w_hist,
+        hist_slot_scale,
+        hist_slot_bias,
+        hist_gate_logit,
+        slot_anchor,
+        w_delta,
+        b_delta,
+        &w_gate_hist_zeros,
+        &w_forget_zeros,
+        &b_forget_init,
+        &w_retain_up_zeros,
+        &w_retain_down_zeros,
+        &b_retain_zeros,
+        &w_q_mem_zeros,
+        &w_k_mem_zeros,
+        &b_read_mem_zeros,
+        &w_k_assoc_zeros,
+        &w_v_assoc_zeros,
+        &w_q_assoc_zeros,
+        &alpha_assoc_zeros,
+    );
+
+    let seq_len = 1u32;
+    let damping = 0.9f32;
+    let mut s_in = vec![0.0f32; d];
+    s_in[curr_dim] = 1.0;
+
+    gpu.reset_state();
+    gpu.run_forward_deq_no_readback(
+        1,
+        seq_len,
+        config.max_deq_iters as u32,
+        config.deq_epsilon,
+        damping,
+        &s_in,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        false,
+    )
+    .expect("GPU forward failed");
+    gpu.read_hnext_seq(seq_len)
+}
+
+fn run_two_token_sequence_with_assoc_enabled(
+    config: &ArchitectureConfig,
+    token_carry: bool,
+    prev_dim: usize,
+    curr_dim: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    if token_carry {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "1");
+    } else {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "0");
+    }
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    std::env::set_var("AIDEEN_FPM_STAGE", "4");
+    std::env::set_var("AIDEEN_ASSOC_BANKS", "1");
+    std::env::set_var("AIDEEN_ASSOC_READ", "1");
+    let assoc_rel_value_mix =
+        std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX").unwrap_or_else(|_| "1".to_string());
+    std::env::set_var("AIDEEN_ASSOC_REL_VALUE_MIX", assoc_rel_value_mix);
+
+    let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), seed);
+    let weights = reasoning.export_weights();
+    let w_q = weights.get("reasoning.w_q").expect("w_q missing");
+    let w_k = weights.get("reasoning.w_k").expect("w_k missing");
+    let w_v_flat = reasoning.w_v_gpu_flat();
+    let w_v = &w_v_flat;
+    let w_o_flat = reasoning.w_o_gpu_flat();
+    let w_o = &w_o_flat;
+    let w_in = weights.get("reasoning.w_in").expect("w_in missing");
+    let w_x = weights.get("reasoning.w_x").expect("w_x missing");
+    let w_out = weights.get("reasoning.w_out").expect("w_out missing");
+    let a_log = weights.get("reasoning.a_log").expect("a_log missing");
+    let norm = weights
+        .get("reasoning.norm_scale")
+        .expect("norm_scale missing");
+    let w_hist = weights
+        .get("reasoning.w_hist_shared")
+        .expect("w_hist_shared missing");
+    let hist_slot_scale = weights
+        .get("reasoning.hist_slot_scale")
+        .expect("hist_slot_scale missing");
+    let hist_slot_bias = weights
+        .get("reasoning.hist_slot_bias")
+        .expect("hist_slot_bias missing");
+    let hist_gate_logit = weights
+        .get("reasoning.hist_gate_logit")
+        .expect("hist_gate_logit missing");
+    let slot_anchor = weights
+        .get("reasoning.slot_anchor")
+        .expect("slot_anchor missing");
+    let d = config.d_r;
+    let h = config.h_slots;
+    let w_delta_zeros = vec![0.0f32; h * d];
+    let b_delta_zeros = vec![0.0f32; h];
+    let w_delta = weights.get("reasoning.w_delta").unwrap_or(&w_delta_zeros);
+    let b_delta = weights.get("reasoning.b_delta").unwrap_or(&b_delta_zeros);
+    let w_gate_hist_zeros = vec![0.0f32; h * d];
+    let w_forget_zeros = vec![0.0f32; h * d];
+    let b_forget_init = vec![3.0f32; h];
+    let w_retain_up_zeros = vec![0.0f32; h * d * 32];
+    let w_retain_down_zeros = vec![0.0f32; h * 32 * d];
+    let b_retain_zeros = vec![0.0f32; h * d];
+    let w_q_mem_zeros = vec![0.0f32; h * d * 32];
+    let w_k_mem_zeros = vec![0.0f32; h * d * 32];
+    let b_read_mem_zeros = vec![0.0f32; h];
+    let w_k_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_v_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_q_assoc_zeros = vec![0.0f32; h * d * 32];
+    let alpha_assoc_zeros = vec![0.0f32; h];
+
+    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
+    gpu.upload_weights(
+        &gpu.queue,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        w_hist,
+        hist_slot_scale,
+        hist_slot_bias,
+        hist_gate_logit,
+        slot_anchor,
+        w_delta,
+        b_delta,
+        &w_gate_hist_zeros,
+        &w_forget_zeros,
+        &b_forget_init,
+        &w_retain_up_zeros,
+        &w_retain_down_zeros,
+        &b_retain_zeros,
+        &w_q_mem_zeros,
+        &w_k_mem_zeros,
+        &b_read_mem_zeros,
+        &w_k_assoc_zeros,
+        &w_v_assoc_zeros,
+        &w_q_assoc_zeros,
+        &alpha_assoc_zeros,
+    );
+
+    let seq_len = 2u32;
+    let damping = 0.9f32;
+    let mut s_in = vec![0.0f32; seq_len as usize * d];
+    s_in[prev_dim] = 1.0;
+    s_in[d + curr_dim] = 1.0;
+
+    gpu.reset_state();
+    gpu.run_forward_deq_no_readback(
+        1,
+        seq_len,
+        config.max_deq_iters as u32,
+        config.deq_epsilon,
+        damping,
+        &s_in,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        false,
+    )
+    .expect("GPU forward failed");
+    let hnext = gpu.read_hnext_seq(seq_len);
+    let assoc = gpu.read_assoc_state();
+    let assoc_read = gpu.read_assoc_read_seq(seq_len);
+    let assoc_pooled = gpu.read_assoc_pooled_seq(seq_len);
+    (hnext, assoc, assoc_read, assoc_pooled)
+}
+
+fn run_four_token_sequence_with_assoc_enabled(
+    config: &ArchitectureConfig,
+    token_carry: bool,
+    key_dim: usize,
+    mid_dim: usize,
+    final_dim: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    if token_carry {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "1");
+    } else {
+        std::env::set_var("AIDEEN_DEQ_TOKEN_CARRY", "0");
+    }
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    std::env::set_var("AIDEEN_FPM_STAGE", "4");
+    std::env::set_var("AIDEEN_ASSOC_BANKS", "1");
+    std::env::set_var("AIDEEN_ASSOC_READ", "1");
+    let assoc_rel_value_mix =
+        std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX").unwrap_or_else(|_| "1".to_string());
+    std::env::set_var("AIDEEN_ASSOC_REL_VALUE_MIX", assoc_rel_value_mix);
+
+    let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), seed);
+    let weights = reasoning.export_weights();
+    let w_q = weights.get("reasoning.w_q").expect("w_q missing");
+    let w_k = weights.get("reasoning.w_k").expect("w_k missing");
+    let w_v_flat = reasoning.w_v_gpu_flat();
+    let w_v = &w_v_flat;
+    let w_o_flat = reasoning.w_o_gpu_flat();
+    let w_o = &w_o_flat;
+    let w_in = weights.get("reasoning.w_in").expect("w_in missing");
+    let w_x = weights.get("reasoning.w_x").expect("w_x missing");
+    let w_out = weights.get("reasoning.w_out").expect("w_out missing");
+    let a_log = weights.get("reasoning.a_log").expect("a_log missing");
+    let norm = weights
+        .get("reasoning.norm_scale")
+        .expect("norm_scale missing");
+    let w_hist = weights
+        .get("reasoning.w_hist_shared")
+        .expect("w_hist_shared missing");
+    let hist_slot_scale = weights
+        .get("reasoning.hist_slot_scale")
+        .expect("hist_slot_scale missing");
+    let hist_slot_bias = weights
+        .get("reasoning.hist_slot_bias")
+        .expect("hist_slot_bias missing");
+    let hist_gate_logit = weights
+        .get("reasoning.hist_gate_logit")
+        .expect("hist_gate_logit missing");
+    let slot_anchor = weights
+        .get("reasoning.slot_anchor")
+        .expect("slot_anchor missing");
+    let d = config.d_r;
+    let h = config.h_slots;
+    let w_delta_zeros = vec![0.0f32; h * d];
+    let b_delta_zeros = vec![0.0f32; h];
+    let w_delta = weights.get("reasoning.w_delta").unwrap_or(&w_delta_zeros);
+    let b_delta = weights.get("reasoning.b_delta").unwrap_or(&b_delta_zeros);
+    let w_gate_hist_zeros = vec![0.0f32; h * d];
+    let w_forget_zeros = vec![0.0f32; h * d];
+    let b_forget_init = vec![3.0f32; h];
+    let w_retain_up_zeros = vec![0.0f32; h * d * 32];
+    let w_retain_down_zeros = vec![0.0f32; h * 32 * d];
+    let b_retain_zeros = vec![0.0f32; h * d];
+    let w_q_mem_zeros = vec![0.0f32; h * d * 32];
+    let w_k_mem_zeros = vec![0.0f32; h * d * 32];
+    let b_read_mem_zeros = vec![0.0f32; h];
+    let w_k_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_v_assoc_zeros = vec![0.0f32; h * d * 32];
+    let w_q_assoc_zeros = vec![0.0f32; h * d * 32];
+    let alpha_assoc_zeros = vec![0.0f32; h];
+
+    let gpu = GpuDeqBackend::new_blocking(config.clone()).expect("GpuDeqBackend init failed");
+    gpu.upload_weights(
+        &gpu.queue,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        w_hist,
+        hist_slot_scale,
+        hist_slot_bias,
+        hist_gate_logit,
+        slot_anchor,
+        w_delta,
+        b_delta,
+        &w_gate_hist_zeros,
+        &w_forget_zeros,
+        &b_forget_init,
+        &w_retain_up_zeros,
+        &w_retain_down_zeros,
+        &b_retain_zeros,
+        &w_q_mem_zeros,
+        &w_k_mem_zeros,
+        &b_read_mem_zeros,
+        &w_k_assoc_zeros,
+        &w_v_assoc_zeros,
+        &w_q_assoc_zeros,
+        &alpha_assoc_zeros,
+    );
+
+    let seq_len = 4u32;
+    let damping = 0.9f32;
+    let mut s_in = vec![0.0f32; seq_len as usize * d];
+    s_in[key_dim] = 1.0;
+    s_in[d + mid_dim] = 1.0;
+    s_in[2 * d + key_dim] = 1.0;
+    s_in[3 * d + final_dim] = 1.0;
+
+    gpu.reset_state();
+    gpu.run_forward_deq_no_readback(
+        1,
+        seq_len,
+        config.max_deq_iters as u32,
+        config.deq_epsilon,
+        damping,
+        &s_in,
+        w_q,
+        w_k,
+        w_v,
+        w_o,
+        w_in,
+        w_x,
+        w_out,
+        a_log,
+        norm,
+        false,
+    )
+    .expect("GPU forward failed");
+    let hnext = gpu.read_hnext_seq(seq_len);
+    let assoc = gpu.read_assoc_state();
+    let assoc_read = gpu.read_assoc_read_seq(seq_len);
+    let assoc_pooled = gpu.read_assoc_pooled_seq(seq_len);
+    (hnext, assoc, assoc_read, assoc_pooled)
 }
 
 fn numeric_jt_v_no_fpm(
@@ -449,7 +1034,7 @@ fn test_hist_gated_forward_uses_prev_fpm_carrier() {
 fn test_hist_gated_starts_near_no_fpm_with_real_initialized_weights() {
     let _guard = env_test_lock();
     let mut config = ArchitectureConfig::default();
-    config.d_r = 16;
+    config.d_r = 32;
     config.h_slots = 2;
     config.ctx_len = 3;
     config.max_deq_iters = 2;
@@ -604,6 +1189,674 @@ fn test_hist_gated_starts_near_no_fpm_with_real_initialized_weights() {
 }
 
 #[test]
+#[ignore = "Diagnostic geometry probe for token-carry attractor drag."]
+fn test_token_carry_attractor_drag_geometry_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let curr = 2usize;
+    let seed = 42u64;
+
+    let carry_on_a = run_two_token_sequence_with_seed(&config, true, prev_a, curr, seed);
+    let carry_on_b = run_two_token_sequence_with_seed(&config, true, prev_b, curr, seed);
+    let carry_off_a = run_two_token_sequence_with_seed(&config, false, prev_a, curr, seed);
+    let carry_off_b = run_two_token_sequence_with_seed(&config, false, prev_b, curr, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let prev_on_a = slice_token(&carry_on_a, 0, h, d);
+    let curr_on_a = slice_token(&carry_on_a, 1, h, d);
+    let prev_on_b = slice_token(&carry_on_b, 0, h, d);
+    let curr_on_b = slice_token(&carry_on_b, 1, h, d);
+    let prev_off_a = slice_token(&carry_off_a, 0, h, d);
+    let curr_off_a = slice_token(&carry_off_a, 1, h, d);
+    let prev_off_b = slice_token(&carry_off_b, 0, h, d);
+    let curr_off_b = slice_token(&carry_off_b, 1, h, d);
+
+    let same_current_diff_prev_cos_on = cosine(curr_on_a, curr_on_b);
+    let same_current_diff_prev_cos_off = cosine(curr_off_a, curr_off_b);
+    let same_current_diff_prev_l2_on = l2_distance(curr_on_a, curr_on_b);
+    let same_current_diff_prev_l2_off = l2_distance(curr_off_a, curr_off_b);
+
+    let curr_prev_cos_on_a = cosine(curr_on_a, prev_on_a);
+    let curr_prev_cos_on_b = cosine(curr_on_b, prev_on_b);
+    let curr_prev_cos_off_a = cosine(curr_off_a, prev_off_a);
+    let curr_prev_cos_off_b = cosine(curr_off_b, prev_off_b);
+
+    println!("[carry-drag] same-current diff-prev cosine: on={same_current_diff_prev_cos_on:.6} off={same_current_diff_prev_cos_off:.6}");
+    println!("[carry-drag] same-current diff-prev l2: on={same_current_diff_prev_l2_on:.6} off={same_current_diff_prev_l2_off:.6}");
+    println!("[carry-drag] curr-vs-prev cosine A: on={curr_prev_cos_on_a:.6} off={curr_prev_cos_off_a:.6}");
+    println!("[carry-drag] curr-vs-prev cosine B: on={curr_prev_cos_on_b:.6} off={curr_prev_cos_off_b:.6}");
+    println!(
+        "[carry-drag] norms curr_on_a={:.6} curr_on_b={:.6} curr_off_a={:.6} curr_off_b={:.6}",
+        rms(curr_on_a),
+        rms(curr_on_b),
+        rms(curr_off_a),
+        rms(curr_off_b)
+    );
+
+    for value in [
+        same_current_diff_prev_cos_on,
+        same_current_diff_prev_cos_off,
+        same_current_diff_prev_l2_on,
+        same_current_diff_prev_l2_off,
+        curr_prev_cos_on_a,
+        curr_prev_cos_on_b,
+        curr_prev_cos_off_a,
+        curr_prev_cos_off_b,
+    ] {
+        assert!(value.is_finite(), "non-finite geometry metric: {value}");
+    }
+}
+
+#[test]
+#[ignore = "Diagnostic geometry probe: same token alone vs after previous token."]
+fn test_token_context_reposition_geometry_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev = 0usize;
+    let curr = 2usize;
+    let seed = 42u64;
+
+    let single_on = run_single_token_sequence_with_seed(&config, true, curr, seed);
+    let single_off = run_single_token_sequence_with_seed(&config, false, curr, seed);
+    let two_on = run_two_token_sequence_with_seed(&config, true, prev, curr, seed);
+    let two_off = run_two_token_sequence_with_seed(&config, false, prev, curr, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let single_on_curr = slice_token(&single_on, 0, h, d);
+    let single_off_curr = slice_token(&single_off, 0, h, d);
+    let two_on_curr = slice_token(&two_on, 1, h, d);
+    let two_off_curr = slice_token(&two_off, 1, h, d);
+    let two_on_prev = slice_token(&two_on, 0, h, d);
+    let two_off_prev = slice_token(&two_off, 0, h, d);
+
+    let same_token_single_vs_two_cos_on = cosine(single_on_curr, two_on_curr);
+    let same_token_single_vs_two_cos_off = cosine(single_off_curr, two_off_curr);
+    let same_token_single_vs_two_l2_on = l2_distance(single_on_curr, two_on_curr);
+    let same_token_single_vs_two_l2_off = l2_distance(single_off_curr, two_off_curr);
+    let two_curr_vs_prev_cos_on = cosine(two_on_curr, two_on_prev);
+    let two_curr_vs_prev_cos_off = cosine(two_off_curr, two_off_prev);
+
+    println!("[carry-reposition] same-token single-vs-two cosine: on={same_token_single_vs_two_cos_on:.6} off={same_token_single_vs_two_cos_off:.6}");
+    println!("[carry-reposition] same-token single-vs-two l2: on={same_token_single_vs_two_l2_on:.6} off={same_token_single_vs_two_l2_off:.6}");
+    println!("[carry-reposition] two-token curr-vs-prev cosine: on={two_curr_vs_prev_cos_on:.6} off={two_curr_vs_prev_cos_off:.6}");
+    println!(
+        "[carry-reposition] norms single_on={:.6} two_on={:.6} single_off={:.6} two_off={:.6}",
+        rms(single_on_curr),
+        rms(two_on_curr),
+        rms(single_off_curr),
+        rms(two_off_curr)
+    );
+
+    for value in [
+        same_token_single_vs_two_cos_on,
+        same_token_single_vs_two_cos_off,
+        same_token_single_vs_two_l2_on,
+        same_token_single_vs_two_l2_off,
+        two_curr_vs_prev_cos_on,
+        two_curr_vs_prev_cos_off,
+    ] {
+        assert!(value.is_finite(), "non-finite geometry metric: {value}");
+    }
+}
+
+#[test]
+#[ignore = "Diagnostic geometry probe: per-slot contextual repositioning."]
+fn test_token_context_reposition_per_slot_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev = 0usize;
+    let curr = 2usize;
+    let seed = 42u64;
+
+    let single_on = run_single_token_sequence_with_seed(&config, true, curr, seed);
+    let two_on = run_two_token_sequence_with_seed(&config, true, prev, curr, seed);
+    let single_off = run_single_token_sequence_with_seed(&config, false, curr, seed);
+    let two_off = run_two_token_sequence_with_seed(&config, false, prev, curr, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let single_on_curr = slice_token(&single_on, 0, h, d);
+    let two_on_curr = slice_token(&two_on, 1, h, d);
+    let two_on_prev = slice_token(&two_on, 0, h, d);
+    let single_off_curr = slice_token(&single_off, 0, h, d);
+    let two_off_curr = slice_token(&two_off, 1, h, d);
+    let two_off_prev = slice_token(&two_off, 0, h, d);
+
+    for slot in 0..h {
+        let s_on = slice_slot(single_on_curr, slot, d);
+        let t_on = slice_slot(two_on_curr, slot, d);
+        let p_on = slice_slot(two_on_prev, slot, d);
+        let s_off = slice_slot(single_off_curr, slot, d);
+        let t_off = slice_slot(two_off_curr, slot, d);
+        let p_off = slice_slot(two_off_prev, slot, d);
+
+        let slot_single_vs_two_cos_on = cosine(s_on, t_on);
+        let slot_single_vs_two_cos_off = cosine(s_off, t_off);
+        let slot_curr_vs_prev_cos_on = cosine(t_on, p_on);
+        let slot_curr_vs_prev_cos_off = cosine(t_off, p_off);
+        let slot_single_vs_two_l2_on = l2_distance(s_on, t_on);
+        let slot_single_vs_two_l2_off = l2_distance(s_off, t_off);
+
+        println!(
+            "[carry-reposition-slot] slot={} single-vs-two cos on={:.6} off={:.6} | curr-vs-prev cos on={:.6} off={:.6} | single-vs-two l2 on={:.6} off={:.6}",
+            slot,
+            slot_single_vs_two_cos_on,
+            slot_single_vs_two_cos_off,
+            slot_curr_vs_prev_cos_on,
+            slot_curr_vs_prev_cos_off,
+            slot_single_vs_two_l2_on,
+            slot_single_vs_two_l2_off
+        );
+
+        for value in [
+            slot_single_vs_two_cos_on,
+            slot_single_vs_two_cos_off,
+            slot_curr_vs_prev_cos_on,
+            slot_curr_vs_prev_cos_off,
+            slot_single_vs_two_l2_on,
+            slot_single_vs_two_l2_off,
+        ] {
+            assert!(
+                value.is_finite(),
+                "slot {slot} non-finite geometry metric: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "Diagnostic geometry probe: triangle between single current and two previous-token contexts."]
+fn test_token_context_triangle_geometry_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let curr = 2usize;
+    let seed = 42u64;
+
+    let single_on = run_single_token_sequence_with_seed(&config, true, curr, seed);
+    let two_on_a = run_two_token_sequence_with_seed(&config, true, prev_a, curr, seed);
+    let two_on_b = run_two_token_sequence_with_seed(&config, true, prev_b, curr, seed);
+    let single_off = run_single_token_sequence_with_seed(&config, false, curr, seed);
+    let two_off_a = run_two_token_sequence_with_seed(&config, false, prev_a, curr, seed);
+    let two_off_b = run_two_token_sequence_with_seed(&config, false, prev_b, curr, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let single_on_curr = slice_token(&single_on, 0, h, d);
+    let two_on_a_curr = slice_token(&two_on_a, 1, h, d);
+    let two_on_b_curr = slice_token(&two_on_b, 1, h, d);
+    let single_off_curr = slice_token(&single_off, 0, h, d);
+    let two_off_a_curr = slice_token(&two_off_a, 1, h, d);
+    let two_off_b_curr = slice_token(&two_off_b, 1, h, d);
+
+    let on_single_to_a_cos = cosine(single_on_curr, two_on_a_curr);
+    let on_single_to_b_cos = cosine(single_on_curr, two_on_b_curr);
+    let on_a_to_b_cos = cosine(two_on_a_curr, two_on_b_curr);
+    let on_single_to_a_l2 = l2_distance(single_on_curr, two_on_a_curr);
+    let on_single_to_b_l2 = l2_distance(single_on_curr, two_on_b_curr);
+    let on_a_to_b_l2 = l2_distance(two_on_a_curr, two_on_b_curr);
+
+    let off_single_to_a_cos = cosine(single_off_curr, two_off_a_curr);
+    let off_single_to_b_cos = cosine(single_off_curr, two_off_b_curr);
+    let off_a_to_b_cos = cosine(two_off_a_curr, two_off_b_curr);
+    let off_single_to_a_l2 = l2_distance(single_off_curr, two_off_a_curr);
+    let off_single_to_b_l2 = l2_distance(single_off_curr, two_off_b_curr);
+    let off_a_to_b_l2 = l2_distance(two_off_a_curr, two_off_b_curr);
+
+    println!(
+        "[carry-triangle] on cos single->A={:.6} single->B={:.6} A->B={:.6}",
+        on_single_to_a_cos, on_single_to_b_cos, on_a_to_b_cos
+    );
+    println!(
+        "[carry-triangle] on l2  single->A={:.6} single->B={:.6} A->B={:.6}",
+        on_single_to_a_l2, on_single_to_b_l2, on_a_to_b_l2
+    );
+    println!(
+        "[carry-triangle] off cos single->A={:.6} single->B={:.6} A->B={:.6}",
+        off_single_to_a_cos, off_single_to_b_cos, off_a_to_b_cos
+    );
+    println!(
+        "[carry-triangle] off l2  single->A={:.6} single->B={:.6} A->B={:.6}",
+        off_single_to_a_l2, off_single_to_b_l2, off_a_to_b_l2
+    );
+
+    for value in [
+        on_single_to_a_cos,
+        on_single_to_b_cos,
+        on_a_to_b_cos,
+        on_single_to_a_l2,
+        on_single_to_b_l2,
+        on_a_to_b_l2,
+        off_single_to_a_cos,
+        off_single_to_b_cos,
+        off_a_to_b_cos,
+        off_single_to_a_l2,
+        off_single_to_b_l2,
+        off_a_to_b_l2,
+    ] {
+        assert!(value.is_finite(), "non-finite triangle metric: {value}");
+    }
+}
+
+#[test]
+#[ignore = "Diagnostic geometry probe: triangle under hist_gated memory path."]
+fn test_hist_gated_context_triangle_geometry_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let curr = 2usize;
+    let seed = 42u64;
+
+    let single_on = run_single_token_sequence_with_mode(&config, true, curr, seed, true);
+    let two_on_a = run_two_token_sequence_with_mode(&config, true, prev_a, curr, seed, true);
+    let two_on_b = run_two_token_sequence_with_mode(&config, true, prev_b, curr, seed, true);
+    let single_off = run_single_token_sequence_with_mode(&config, false, curr, seed, true);
+    let two_off_a = run_two_token_sequence_with_mode(&config, false, prev_a, curr, seed, true);
+    let two_off_b = run_two_token_sequence_with_mode(&config, false, prev_b, curr, seed, true);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let single_on_curr = slice_token(&single_on, 0, h, d);
+    let two_on_a_curr = slice_token(&two_on_a, 1, h, d);
+    let two_on_b_curr = slice_token(&two_on_b, 1, h, d);
+    let single_off_curr = slice_token(&single_off, 0, h, d);
+    let two_off_a_curr = slice_token(&two_off_a, 1, h, d);
+    let two_off_b_curr = slice_token(&two_off_b, 1, h, d);
+
+    let on_single_to_a_cos = cosine(single_on_curr, two_on_a_curr);
+    let on_single_to_b_cos = cosine(single_on_curr, two_on_b_curr);
+    let on_a_to_b_cos = cosine(two_on_a_curr, two_on_b_curr);
+    let on_single_to_a_l2 = l2_distance(single_on_curr, two_on_a_curr);
+    let on_single_to_b_l2 = l2_distance(single_on_curr, two_on_b_curr);
+    let on_a_to_b_l2 = l2_distance(two_on_a_curr, two_on_b_curr);
+
+    let off_single_to_a_cos = cosine(single_off_curr, two_off_a_curr);
+    let off_single_to_b_cos = cosine(single_off_curr, two_off_b_curr);
+    let off_a_to_b_cos = cosine(two_off_a_curr, two_off_b_curr);
+    let off_single_to_a_l2 = l2_distance(single_off_curr, two_off_a_curr);
+    let off_single_to_b_l2 = l2_distance(single_off_curr, two_off_b_curr);
+    let off_a_to_b_l2 = l2_distance(two_off_a_curr, two_off_b_curr);
+
+    println!(
+        "[hist-gated-triangle] on  cos single->A={:.6} single->B={:.6} A->B={:.6}",
+        on_single_to_a_cos, on_single_to_b_cos, on_a_to_b_cos
+    );
+    println!(
+        "[hist-gated-triangle] on  l2  single->A={:.6} single->B={:.6} A->B={:.6}",
+        on_single_to_a_l2, on_single_to_b_l2, on_a_to_b_l2
+    );
+    println!(
+        "[hist-gated-triangle] off cos single->A={:.6} single->B={:.6} A->B={:.6}",
+        off_single_to_a_cos, off_single_to_b_cos, off_a_to_b_cos
+    );
+    println!(
+        "[hist-gated-triangle] off l2  single->A={:.6} single->B={:.6} A->B={:.6}",
+        off_single_to_a_l2, off_single_to_b_l2, off_a_to_b_l2
+    );
+
+    for value in [
+        on_single_to_a_cos,
+        on_single_to_b_cos,
+        on_a_to_b_cos,
+        on_single_to_a_l2,
+        on_single_to_b_l2,
+        on_a_to_b_l2,
+        off_single_to_a_cos,
+        off_single_to_b_cos,
+        off_a_to_b_cos,
+        off_single_to_a_l2,
+        off_single_to_b_l2,
+        off_a_to_b_l2,
+    ] {
+        assert!(
+            value.is_finite(),
+            "non-finite hist-gated triangle metric: {value}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "Diagnostic probe: does Assoc differentiate previous contexts when enabled?"]
+fn test_assoc_state_differentiates_previous_context_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let curr = 2usize;
+    let seed = 42u64;
+
+    let (_h_a_on, assoc_a_on, _assoc_read_a_on, _assoc_pooled_a_on) =
+        run_two_token_sequence_with_assoc_enabled(&config, true, prev_a, curr, seed);
+    let (_h_b_on, assoc_b_on, _assoc_read_b_on, _assoc_pooled_b_on) =
+        run_two_token_sequence_with_assoc_enabled(&config, true, prev_b, curr, seed);
+    let (_h_a_off, assoc_a_off, _assoc_read_a_off, _assoc_pooled_a_off) =
+        run_two_token_sequence_with_assoc_enabled(&config, false, prev_a, curr, seed);
+    let (_h_b_off, assoc_b_off, _assoc_read_b_off, _assoc_pooled_b_off) =
+        run_two_token_sequence_with_assoc_enabled(&config, false, prev_b, curr, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    std::env::remove_var("AIDEEN_FPM_STAGE");
+    std::env::remove_var("AIDEEN_ASSOC_BANKS");
+    std::env::remove_var("AIDEEN_ASSOC_READ");
+    std::env::remove_var("AIDEEN_ASSOC_REL_VALUE_MIX");
+
+    let d = config.d_r;
+    let h = config.h_slots;
+    let assoc_banks = 1usize;
+    let assoc_rank = 32usize;
+    let assoc_bank_stride = assoc_rank + d + 1;
+    let assoc_slot_stride = assoc_banks * assoc_bank_stride;
+    let assoc_slots = h / 2;
+
+    let mut keys_a_on = Vec::new();
+    let mut keys_b_on = Vec::new();
+    let mut values_a_on = Vec::new();
+    let mut values_b_on = Vec::new();
+    let mut usages_a_on = Vec::new();
+    let mut usages_b_on = Vec::new();
+    let mut keys_a_off = Vec::new();
+    let mut keys_b_off = Vec::new();
+    let mut values_a_off = Vec::new();
+    let mut values_b_off = Vec::new();
+    let mut usages_a_off = Vec::new();
+    let mut usages_b_off = Vec::new();
+
+    for assoc_slot in 0..assoc_slots {
+        let slot = assoc_slot + h / 2;
+        let slot_base = slot * assoc_slot_stride;
+        let bank_base = slot_base;
+        let key_base = bank_base;
+        let value_base = bank_base + assoc_rank;
+        let usage_idx = value_base + d;
+
+        keys_a_on.extend_from_slice(&assoc_a_on[key_base..key_base + assoc_rank]);
+        keys_b_on.extend_from_slice(&assoc_b_on[key_base..key_base + assoc_rank]);
+        values_a_on.extend_from_slice(&assoc_a_on[value_base..value_base + d]);
+        values_b_on.extend_from_slice(&assoc_b_on[value_base..value_base + d]);
+        usages_a_on.push(assoc_a_on[usage_idx]);
+        usages_b_on.push(assoc_b_on[usage_idx]);
+
+        keys_a_off.extend_from_slice(&assoc_a_off[key_base..key_base + assoc_rank]);
+        keys_b_off.extend_from_slice(&assoc_b_off[key_base..key_base + assoc_rank]);
+        values_a_off.extend_from_slice(&assoc_a_off[value_base..value_base + d]);
+        values_b_off.extend_from_slice(&assoc_b_off[value_base..value_base + d]);
+        usages_a_off.push(assoc_a_off[usage_idx]);
+        usages_b_off.push(assoc_b_off[usage_idx]);
+    }
+
+    let key_cos_on = cosine(&keys_a_on, &keys_b_on);
+    let key_l2_on = l2_distance(&keys_a_on, &keys_b_on);
+    let value_cos_on = cosine(&values_a_on, &values_b_on);
+    let value_l2_on = l2_distance(&values_a_on, &values_b_on);
+    let usage_l2_on = l2_distance(&usages_a_on, &usages_b_on);
+
+    let key_cos_off = cosine(&keys_a_off, &keys_b_off);
+    let key_l2_off = l2_distance(&keys_a_off, &keys_b_off);
+    let value_cos_off = cosine(&values_a_off, &values_b_off);
+    let value_l2_off = l2_distance(&values_a_off, &values_b_off);
+    let usage_l2_off = l2_distance(&usages_a_off, &usages_b_off);
+
+    println!(
+        "[assoc-diff] on  key cos={:.6} l2={:.6} | value cos={:.6} l2={:.6} | usage l2={:.6}",
+        key_cos_on, key_l2_on, value_cos_on, value_l2_on, usage_l2_on
+    );
+    println!(
+        "[assoc-diff] off key cos={:.6} l2={:.6} | value cos={:.6} l2={:.6} | usage l2={:.6}",
+        key_cos_off, key_l2_off, value_cos_off, value_l2_off, usage_l2_off
+    );
+
+    for value in [
+        key_cos_on,
+        key_l2_on,
+        value_cos_on,
+        value_l2_on,
+        usage_l2_on,
+        key_cos_off,
+        key_l2_off,
+        value_cos_off,
+        value_l2_off,
+        usage_l2_off,
+    ] {
+        assert!(value.is_finite(), "non-finite assoc metric: {value}");
+    }
+}
+
+#[test]
+#[ignore = "Diagnostic probe: does pooled associative readout differentiate previous contexts?"]
+fn test_assoc_pooled_differentiates_previous_context_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let mid = 2usize;
+    let final_tok = 3usize;
+    let seed = 42u64;
+
+    let (_h_a_on, _assoc_a_on, _assoc_read_a_on, assoc_pooled_a_on) =
+        run_four_token_sequence_with_assoc_enabled(&config, true, prev_a, mid, final_tok, seed);
+    let (_h_b_on, _assoc_b_on, _assoc_read_b_on, assoc_pooled_b_on) =
+        run_four_token_sequence_with_assoc_enabled(&config, true, prev_b, mid, final_tok, seed);
+    let (_h_a_off, _assoc_a_off, _assoc_read_a_off, assoc_pooled_a_off) =
+        run_four_token_sequence_with_assoc_enabled(&config, false, prev_a, mid, final_tok, seed);
+    let (_h_b_off, _assoc_b_off, _assoc_read_b_off, assoc_pooled_b_off) =
+        run_four_token_sequence_with_assoc_enabled(&config, false, prev_b, mid, final_tok, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    std::env::remove_var("AIDEEN_FPM_STAGE");
+    std::env::remove_var("AIDEEN_ASSOC_BANKS");
+    std::env::remove_var("AIDEEN_ASSOC_READ");
+    std::env::remove_var("AIDEEN_ASSOC_REL_VALUE_MIX");
+
+    let d = config.d_r;
+    let pooled_a_on_curr = &assoc_pooled_a_on[3 * d..4 * d];
+    let pooled_b_on_curr = &assoc_pooled_b_on[3 * d..4 * d];
+    let pooled_a_off_curr = &assoc_pooled_a_off[3 * d..4 * d];
+    let pooled_b_off_curr = &assoc_pooled_b_off[3 * d..4 * d];
+
+    let cos_on = cosine(pooled_a_on_curr, pooled_b_on_curr);
+    let l2_on = l2_distance(pooled_a_on_curr, pooled_b_on_curr);
+    let cos_off = cosine(pooled_a_off_curr, pooled_b_off_curr);
+    let l2_off = l2_distance(pooled_a_off_curr, pooled_b_off_curr);
+
+    println!("[assoc-pooled-diff] on  cos={:.6} l2={:.6}", cos_on, l2_on);
+    println!(
+        "[assoc-pooled-diff] off cos={:.6} l2={:.6}",
+        cos_off, l2_off
+    );
+
+    for value in [cos_on, l2_on, cos_off, l2_off] {
+        assert!(value.is_finite(), "non-finite assoc pooled metric: {value}");
+    }
+    assert!(
+        l2_on > 1.0e-4,
+        "assoc pooled read still failed to differentiate previous context"
+    );
+    assert!(
+        l2_off > 1.0e-4,
+        "assoc pooled read still failed to differentiate previous context without carry"
+    );
+}
+
+#[test]
+#[ignore = "Diagnostic probe: does direct associative read differentiate previous contexts?"]
+fn test_assoc_read_differentiates_previous_context_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let mid = 2usize;
+    let final_tok = 3usize;
+    let seed = 42u64;
+
+    let (_h_a_on, _assoc_a_on, assoc_read_a_on, _assoc_pooled_a_on) =
+        run_four_token_sequence_with_assoc_enabled(&config, true, prev_a, mid, final_tok, seed);
+    let (_h_b_on, _assoc_b_on, assoc_read_b_on, _assoc_pooled_b_on) =
+        run_four_token_sequence_with_assoc_enabled(&config, true, prev_b, mid, final_tok, seed);
+    let (_h_a_off, _assoc_a_off, assoc_read_a_off, _assoc_pooled_a_off) =
+        run_four_token_sequence_with_assoc_enabled(&config, false, prev_a, mid, final_tok, seed);
+    let (_h_b_off, _assoc_b_off, assoc_read_b_off, _assoc_pooled_b_off) =
+        run_four_token_sequence_with_assoc_enabled(&config, false, prev_b, mid, final_tok, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    std::env::remove_var("AIDEEN_FPM_STAGE");
+    std::env::remove_var("AIDEEN_ASSOC_BANKS");
+    std::env::remove_var("AIDEEN_ASSOC_READ");
+    std::env::remove_var("AIDEEN_ASSOC_REL_VALUE_MIX");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let read_a_on_curr = slice_token(&assoc_read_a_on, 3, h, d);
+    let read_b_on_curr = slice_token(&assoc_read_b_on, 3, h, d);
+    let read_a_off_curr = slice_token(&assoc_read_a_off, 3, h, d);
+    let read_b_off_curr = slice_token(&assoc_read_b_off, 3, h, d);
+
+    let cos_on = cosine(read_a_on_curr, read_b_on_curr);
+    let l2_on = l2_distance(read_a_on_curr, read_b_on_curr);
+    let cos_off = cosine(read_a_off_curr, read_b_off_curr);
+    let l2_off = l2_distance(read_a_off_curr, read_b_off_curr);
+
+    println!("[assoc-read-diff] on  cos={:.6} l2={:.6}", cos_on, l2_on);
+    println!("[assoc-read-diff] off cos={:.6} l2={:.6}", cos_off, l2_off);
+
+    for value in [cos_on, l2_on, cos_off, l2_off] {
+        assert!(value.is_finite(), "non-finite assoc read metric: {value}");
+    }
+    assert!(
+        l2_on > 1.0e-4,
+        "assoc read still failed to differentiate previous context"
+    );
+    assert!(
+        l2_off > 1.0e-4,
+        "assoc read still failed to differentiate previous context without carry"
+    );
+}
+
+#[test]
+#[ignore = "Diagnostic probe: does assoc-enabled H_next differentiate previous contexts?"]
+fn test_assoc_enabled_hnext_differentiates_previous_context_probe() {
+    let _guard = env_test_lock();
+    let mut config = ArchitectureConfig::default();
+    config.d_r = 512;
+    config.h_slots = 8;
+    config.ctx_len = 4;
+    config.max_deq_iters = 4;
+
+    let prev_a = 0usize;
+    let prev_b = 1usize;
+    let mid = 2usize;
+    let final_tok = 3usize;
+    let seed = 42u64;
+
+    let (h_a_on, _assoc_a_on, _assoc_read_a_on, _assoc_pooled_a_on) =
+        run_four_token_sequence_with_assoc_enabled(&config, true, prev_a, mid, final_tok, seed);
+    let (h_b_on, _assoc_b_on, _assoc_read_b_on, _assoc_pooled_b_on) =
+        run_four_token_sequence_with_assoc_enabled(&config, true, prev_b, mid, final_tok, seed);
+    let (h_a_off, _assoc_a_off, _assoc_read_a_off, _assoc_pooled_a_off) =
+        run_four_token_sequence_with_assoc_enabled(&config, false, prev_a, mid, final_tok, seed);
+    let (h_b_off, _assoc_b_off, _assoc_read_b_off, _assoc_pooled_b_off) =
+        run_four_token_sequence_with_assoc_enabled(&config, false, prev_b, mid, final_tok, seed);
+
+    std::env::remove_var("AIDEEN_DEQ_TOKEN_CARRY");
+    std::env::remove_var("AIDEEN_DEQ_NO_FPM");
+    std::env::remove_var("AIDEEN_DEQ_HIST_GATED");
+    std::env::remove_var("AIDEEN_FPM_STAGE");
+    std::env::remove_var("AIDEEN_ASSOC_BANKS");
+    std::env::remove_var("AIDEEN_ASSOC_READ");
+    std::env::remove_var("AIDEEN_ASSOC_REL_VALUE_MIX");
+
+    let h = config.h_slots;
+    let d = config.d_r;
+    let curr_a_on = slice_token(&h_a_on, 3, h, d);
+    let curr_b_on = slice_token(&h_b_on, 3, h, d);
+    let curr_a_off = slice_token(&h_a_off, 3, h, d);
+    let curr_b_off = slice_token(&h_b_off, 3, h, d);
+
+    let cos_on = cosine(curr_a_on, curr_b_on);
+    let l2_on = l2_distance(curr_a_on, curr_b_on);
+    let cos_off = cosine(curr_a_off, curr_b_off);
+    let l2_off = l2_distance(curr_a_off, curr_b_off);
+
+    println!("[assoc-hnext-diff] on  cos={:.6} l2={:.6}", cos_on, l2_on);
+    println!("[assoc-hnext-diff] off cos={:.6} l2={:.6}", cos_off, l2_off);
+
+    for value in [cos_on, l2_on, cos_off, l2_off] {
+        assert!(value.is_finite(), "non-finite assoc hnext metric: {value}");
+    }
+}
+
+#[test]
 #[ignore = "Numeric reference for staged Picard no-fpm attention adjoint."]
 fn test_staged_picard_matches_numeric_reference_no_fpm_small() {
     std::env::set_var("AIDEEN_DEQ_NO_FPM", "1");
@@ -656,7 +1909,7 @@ fn test_staged_picard_matches_numeric_reference_no_fpm_small() {
     let dl = vec![0.05f32; d];
     gpu.queue
         .write_buffer(&gpu.adj_bufs.b_dl, 0, bytemuck::cast_slice(&dl));
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, None, true, 1)
         .expect("Staged Picard adjoint dispatch failed");
     let v_picard = gpu.read_adj_v_out(seq_len);
     let h_star = gpu.read_hnext();
@@ -735,7 +1988,7 @@ fn test_staged_picard_only_perf_smoke_no_fpm() {
         .write_buffer(&gpu.adj_bufs.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, true, 1)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, 8, None, None, true, 1)
         .expect("Staged Picard failed");
     let staged_ms = t0.elapsed().as_millis();
 
@@ -797,7 +2050,7 @@ fn run_staged_picard_perf_case(seq_len: u32, d: usize, h_slots: usize, iters: u3
         .write_buffer(&gpu.adj_bufs.b_dl, 0, bytemuck::cast_slice(&dl));
 
     let t0 = std::time::Instant::now();
-    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, iters, None, true, 1)
+    gpu.run_staged_adjoint_picard_no_readback(seq_len, damping, iters, None, None, true, 1)
         .expect("Staged Picard failed");
     let elapsed = t0.elapsed().as_millis();
 

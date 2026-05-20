@@ -81,6 +81,7 @@ override ASSOC_BANKS: u32 = 4u;
 const ASSOC_HIST_META: u32 = 4u;
 const ASSOC_WRITE_CAP: f32 = 0.95;
 override ASSOC_WRITE_MIN_MASS: f32 = 0.0;
+override ASSOC_REL_VALUE_MIX: f32 = 1.0;
 override ASSOC_WRITE_BUDGET: u32 = 0u;
 const ASSOC_ALLOC_THRESHOLD: f32 = 0.05;
 const ASSOC_OCCUPIED_THRESHOLD: f32 = 1.0e-4;
@@ -2428,6 +2429,8 @@ fn deq_slot_coord_unified_main(
             // not a representation already mixed by the solve.
             var assoc_value0 = 0.0;
             var assoc_value1 = 0.0;
+            var assoc_payload0 = 0.0;
+            var assoc_payload1 = 0.0;
             if (tid < ASSOC_RANK) {
                 var prev_sig_sq = 0.0;
                 for (var j = 0u; j < d_model; j = j + 1u) {
@@ -2480,6 +2483,30 @@ fn deq_slot_coord_unified_main(
             let assoc_value_rms = sqrt(shared_vals[0] * inv_d_model + 1.0e-6);
             assoc_value0 = Scratch[signal_base + d0] / max(assoc_value_rms, 1.0e-6);
             assoc_value1 = Scratch[signal_base + d1] / max(assoc_value_rms, 1.0e-6);
+            let assoc_rel_mix = clamp(ASSOC_REL_VALUE_MIX, 0.0, 1.0);
+            var prev_value_sq = 0.0;
+            for (var j = 0u; j < d_model; j = j + 1u) {
+                let prev_j = PrevHStarBuf[prev_hstar_base + j];
+                prev_value_sq = prev_value_sq + prev_j * prev_j;
+            }
+            let prev_value_rms = sqrt(prev_value_sq * inv_d_model + 1.0e-6);
+            assoc_payload0 = assoc_value0 + assoc_rel_mix
+                * (PrevHStarBuf[prev_hstar_base + d0] / max(prev_value_rms, 1.0e-6));
+            assoc_payload1 = assoc_value1 + assoc_rel_mix
+                * (PrevHStarBuf[prev_hstar_base + d1] / max(prev_value_rms, 1.0e-6));
+            Scratch[signal_base + d0] = assoc_payload0;
+            Scratch[signal_base + d1] = assoc_payload1;
+            shared_vals[tid] = assoc_payload0 * assoc_payload0 + assoc_payload1 * assoc_payload1;
+            workgroupBarrier();
+            for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride >> 1u) {
+                if (tid < stride) {
+                    shared_vals[tid] = shared_vals[tid] + shared_vals[tid + stride];
+                }
+                workgroupBarrier();
+            }
+            let assoc_payload_rms = sqrt(shared_vals[0] * inv_d_model + 1.0e-6);
+            assoc_payload0 = Scratch[signal_base + d0] / max(assoc_payload_rms, 1.0e-6);
+            assoc_payload1 = Scratch[signal_base + d1] / max(assoc_payload_rms, 1.0e-6);
             if (tid == 0u && debug_on) {
                 var key_sq = 0.0;
                 var prev_sq = 0.0;
@@ -2813,9 +2840,9 @@ fn deq_slot_coord_unified_main(
             }
             workgroupBarrier();
             AssocBuf[bank_value_base + d0] =
-                value_keep_gate * AssocBuf[bank_value_base + d0] + value_write_mass * assoc_value0;
+                value_keep_gate * AssocBuf[bank_value_base + d0] + value_write_mass * assoc_payload0;
             AssocBuf[bank_value_base + d1] =
-                value_keep_gate * AssocBuf[bank_value_base + d1] + value_write_mass * assoc_value1;
+                value_keep_gate * AssocBuf[bank_value_base + d1] + value_write_mass * assoc_payload1;
             if (fpm_write_enabled) {
                 // Phase bridge:
                 // - AssocBuf keeps the exact token-level binding (bank_value).
