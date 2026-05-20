@@ -560,8 +560,8 @@ fn run_two_token_sequence_with_assoc_enabled(
     std::env::set_var("AIDEEN_FPM_STAGE", "4");
     std::env::set_var("AIDEEN_ASSOC_BANKS", "1");
     std::env::set_var("AIDEEN_ASSOC_READ", "1");
-    let assoc_rel_value_mix = std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX")
-        .unwrap_or_else(|_| "1".to_string());
+    let assoc_rel_value_mix =
+        std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX").unwrap_or_else(|_| "1".to_string());
     std::env::set_var("AIDEEN_ASSOC_REL_VALUE_MIX", assoc_rel_value_mix);
 
     let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), seed);
@@ -699,8 +699,8 @@ fn run_four_token_sequence_with_assoc_enabled(
     std::env::set_var("AIDEEN_FPM_STAGE", "4");
     std::env::set_var("AIDEEN_ASSOC_BANKS", "1");
     std::env::set_var("AIDEEN_ASSOC_READ", "1");
-    let assoc_rel_value_mix = std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX")
-        .unwrap_or_else(|_| "1".to_string());
+    let assoc_rel_value_mix =
+        std::env::var("AIDEEN_ASSOC_REL_VALUE_MIX").unwrap_or_else(|_| "1".to_string());
     std::env::set_var("AIDEEN_ASSOC_REL_VALUE_MIX", assoc_rel_value_mix);
 
     let reasoning = FixedPointMemoryReasoning::new_with_seed(config.clone(), seed);
@@ -1387,7 +1387,10 @@ fn test_token_context_reposition_per_slot_probe() {
             slot_single_vs_two_l2_on,
             slot_single_vs_two_l2_off,
         ] {
-            assert!(value.is_finite(), "slot {slot} non-finite geometry metric: {value}");
+            assert!(
+                value.is_finite(),
+                "slot {slot} non-finite geometry metric: {value}"
+            );
         }
     }
 }
@@ -1556,7 +1559,10 @@ fn test_hist_gated_context_triangle_geometry_probe() {
         off_single_to_b_l2,
         off_a_to_b_l2,
     ] {
-        assert!(value.is_finite(), "non-finite hist-gated triangle metric: {value}");
+        assert!(
+            value.is_finite(),
+            "non-finite hist-gated triangle metric: {value}"
+        );
     }
 }
 
@@ -1717,10 +1723,7 @@ fn test_assoc_pooled_differentiates_previous_context_probe() {
     let cos_off = cosine(pooled_a_off_curr, pooled_b_off_curr);
     let l2_off = l2_distance(pooled_a_off_curr, pooled_b_off_curr);
 
-    println!(
-        "[assoc-pooled-diff] on  cos={:.6} l2={:.6}",
-        cos_on, l2_on
-    );
+    println!("[assoc-pooled-diff] on  cos={:.6} l2={:.6}", cos_on, l2_on);
     println!(
         "[assoc-pooled-diff] off cos={:.6} l2={:.6}",
         cos_off, l2_off
